@@ -1,0 +1,396 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc32_rpx_i2c_platform_device
+# Date: Mon Jun 26 16:25:49 2006
+# Source: MontaVista Software, Inc.
+# MR: 16535
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded@ozlabs.org
+# Signed-off-by: Yuri Shpilevsky <yshpilevsky@ru.mvista.com>
+# Description:
+#     Converts the initialization of I2C interface on RPX boards from
+#     using the old style to a platform device.
+# 
+# 
+
+PATCHNUM=665
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16535
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded@ozlabs.org
+Signed-off-by: Yuri Shpilevsky <yshpilevsky@ru.mvista.com>
+Description:
+    Converts the initialization of I2C interface on RPX boards from
+    using the old style to a platform device.
+
+
+Index: linux-2.6.10/drivers/i2c/busses/i2c-rpx.c
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/i2c-rpx.c
++++ linux-2.6.10/drivers/i2c/busses/i2c-rpx.c
+@@ -21,82 +21,115 @@
+ #include <asm/mpc8xx.h>
+ #include <asm/commproc.h>
+ 
++struct m8xx_i2c {
++	char *base;
++	struct device *dev;
++	struct i2c_adapter adap;
++	struct i2c_algo_8xx_data *algo_8xx;
++};
++
++static struct i2c_algo_8xx_data rpx_data;
++
++static struct i2c_adapter rpx_ops = {
++	.owner		= THIS_MODULE,
++	.name		= "m8xx",
++	.id		= I2C_HW_MPC8XX_EPON,
++	.algo_data	= &rpx_data,
++};
+ 
+-static void
+-rpx_iic_init(struct i2c_algo_8xx_data *data)
++static void rpx_iic_init(struct m8xx_i2c *i2c)
+ {
+ 	volatile cpm8xx_t *cp;
+ 	volatile immap_t *immap;
++	struct resource *r;
++	struct i2c_algo_8xx_data *data = i2c->algo_8xx;
++	struct platform_device *pdev = to_platform_device(i2c->dev);
+ 
+-	cp = cpmp;	/* Get pointer to Communication Processor */
+-	immap = (immap_t *)IMAP_ADDR;	/* and to internal registers */
++	immap = (immap_t *)IMAP_ADDR;	/* pointer to internal registers */
++	cp = cpmp;		/* pointer to Communication Processor */
+ 
+-	data->iip = (iic_t *)&cp->cp_dparam[PROFF_IIC];
++	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pram");
++	data->iip = (void *)r->start;
+ 
+ 	/* Check for and use a microcode relocation patch.
+-	*/
++	 */
+ 	if ((data->reloc = data->iip->iic_rpbase))
+ 		data->iip = (iic_t *)&cp->cp_dpmem[data->iip->iic_rpbase];
+ 		
+-	data->i2c = (i2c8xx_t *)&(immap->im_i2c);
+-	data->cp = cp;
++	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
++	data->i2c = (void *)r->start;
+ 
+-	/* Initialize Port B IIC pins.
+-	*/
+-	cp->cp_pbpar |= 0x00000030;
+-	cp->cp_pbdir |= 0x00000030;
+-	cp->cp_pbodr |= 0x00000030;
++	data->cp = cp;
+ 
+ 	/* Allocate space for two transmit and two receive buffer
+ 	 * descriptors in the DP ram.
+ 	 */
+ 	data->dp_addr = cpm_dpalloc(sizeof(cbd_t) * 4, 8);
+-		
+-	/* ptr to i2c area */
+-	data->i2c = (i2c8xx_t *)&(((immap_t *)IMAP_ADDR)->im_i2c);
+ }
+ 
+-static int rpx_install_isr(int irq, void (*func)(void *, void *), void *data)
++
++static int i2c_rpx_probe(struct device *device)
+ {
+-	/* install interrupt handler */
+-	cpm_install_handler(irq, (void (*)(void *, struct pt_regs *)) func, data);
++	int result = 0;
++	struct m8xx_i2c *i2c;
++	struct platform_device *pdev = to_platform_device(device);
+ 
+-	return 0;
+-}
++	if (!(i2c = kmalloc(sizeof(*i2c), GFP_KERNEL))) {
++		return -ENOMEM;
++	}
++	memset(i2c, 0, sizeof(*i2c));
++	i2c->dev = device;
++	i2c->algo_8xx = &rpx_data;
++	
++	rpx_iic_init(i2c);
++
++	dev_set_drvdata(device, i2c);
++
++	i2c->adap = rpx_ops;
++	i2c_set_adapdata(&i2c->adap, i2c);
++	i2c->adap.dev.parent = &pdev->dev;
+ 
+-static struct i2c_algo_8xx_data rpx_data = {
+-	.setisr = rpx_install_isr
+-};
++	if ((result = i2c_8xx_add_bus(&rpx_ops) < 0)) {
++		printk(KERN_ERR "i2c-rpx: Unable to register with I2C\n");
++		kfree(i2c);
++	}
+ 
+-static struct i2c_adapter rpx_ops = {
+-	.owner		= THIS_MODULE,
+-	.name		= "m8xx",
+-	.id		= I2C_HW_MPC8XX_EPON,
+-	.algo_data	= &rpx_data,
+-};
++	return result;
++}
+ 
+-int __init i2c_rpx_init(void)
+-{
+-	printk(KERN_INFO "i2c-rpx: i2c MPC8xx driver\n");
+ 
+-	/* reset hardware to sane state */
+-	rpx_iic_init(&rpx_data);
++static int i2c_rpx_remove(struct device *device)
++{
++	struct m8xx_i2c *i2c = dev_get_drvdata(device);
+ 
+-	if (i2c_8xx_add_bus(&rpx_ops) < 0) {
+-		printk(KERN_ERR "i2c-rpx: Unable to register with I2C\n");
+-		return -ENODEV;
+-	}
++	i2c_8xx_add_bus(&i2c->adap);
++	dev_set_drvdata(device, NULL);
+ 
++	kfree(i2c);
+ 	return 0;
+ }
++	
++
++/* Structure for a device driver */
++static struct device_driver i2c_rpx_driver = {
++	.name = "fsl-cpm-i2c",
++	.bus = &platform_bus_type,
++	.probe = i2c_rpx_probe,
++	.remove = i2c_rpx_remove,
++};
+ 
+-void __exit i2c_rpx_exit(void)
++static int __init i2c_rpx_init(void)
+ {
+-	i2c_8xx_del_bus(&rpx_ops);
++	return driver_register(&i2c_rpx_driver);
+ }
+ 
+-MODULE_AUTHOR("Dan Malek <dmalek@jlc.net>");
+-MODULE_DESCRIPTION("I2C-Bus adapter routines for MPC8xx boards");
++static void __exit i2c_rpx_exit(void)
++{
++	driver_unregister(&i2c_rpx_driver);
++}
+ 
+ module_init(i2c_rpx_init);
+ module_exit(i2c_rpx_exit);
++
++MODULE_AUTHOR("Dan Malek <dmalek@jlc.net>");
++MODULE_DESCRIPTION("I2C-Bus adapter routines for MPC8xx boards");
+Index: linux-2.6.10/mvl_patches/pro-0665.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0665.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(665);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

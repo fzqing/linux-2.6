@@ -1,0 +1,581 @@
+#! /usr/bin/env bash
+# Patch: -mips_rbtx4939_big_endian_ide_bugfix
+# Date: Fri Mar  3 14:30:39 2006
+# Source: MontaVista Software, Inc.
+# MR: 16372
+# Type: Defect Fix
+# Disposition: needs submitting to linux-mips.org
+# Signed-off-by: Atsuo Igarashi <aigarashi@mvista.com>
+# Description:
+#     Support TX4939 IDE for Big Endian mode.
+# 
+
+PATCHNUM=308
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16372
+Type: Defect Fix
+Disposition: needs submitting to linux-mips.org
+Signed-off-by: Atsuo Igarashi <aigarashi@mvista.com>
+Description:
+    Support TX4939 IDE for Big Endian mode.
+
+ arch/mips/tx4939/common/ide.c    |    2 
+ drivers/ide/mips/ide-tx4939.c    |   85 ++++++++++++++++++++++++++++++++++-----
+ include/asm-mips/tx4939/ide.h    |   36 ++++++++++++++--
+ include/asm-mips/tx4939/tx4939.h |   71 +++++++++++++++++---------------
+ mvl_patches/pro-0308.c           |   16 +++++++
+ 5 files changed, 163 insertions(+), 47 deletions(-)
+
+Index: linux-2.6.10/arch/mips/tx4939/common/ide.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/tx4939/common/ide.c
++++ linux-2.6.10/arch/mips/tx4939/common/ide.c
+@@ -33,7 +33,7 @@ void __init tx4939_ide_setup(int ch)
+ 	u16 s;
+ 	int i;
+ 
+-	status_base = (TX4939_ATA_REG(ch) + TX4939_ATA_ALT_STATUS_OFFSET
++	status_base = (TX4939_ATA_REG(ch) + offsetof(struct tx4939_ata_reg, alt_devctl)
+ 		       - mips_io_port_base);
+ 
+ 	/* Soft Reset */
+Index: linux-2.6.10/drivers/ide/mips/ide-tx4939.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/mips/ide-tx4939.c
++++ linux-2.6.10/drivers/ide/mips/ide-tx4939.c
+@@ -224,7 +224,7 @@ tx4939_ide_atapi_output_bytes(ide_drive_
+ 
+ 	/* set the command packet in FIFO */
+ 	for (i = 0; i < bytecount; i += 2) {
+-		reg_wr16(&tx4939_ataptr(ch)->pkt_cmd, *(u16 *) (buffer + i));
++		reg_wr16(&tx4939_ataptr(ch)->pkt_cmd, cpu_to_le16(*(u16 *)(buffer + i)));
+ 	}
+ 
+ 	/* set the transfer count and the packet start bit */
+@@ -295,6 +295,11 @@ static int tx4939_ide_intr(struct hwif_s
+ 		wait_transfer_end[ch] |= int_ctl;
+ 		if ((wait_transfer_end[ch] & 0x3) == 0x3)
+ 			return 1;
++		/* On error, XFEREND might not be asserted. */
++		if ((int_ctl & TX4939_ATA_IC_HOSTINT) &&
++		    (hwif->INB(IDE_ALTSTATUS_REG) &
++		     (BUSY_STAT|DRQ_STAT|ERR_STAT)) == ERR_STAT)
++			return 1;
+ 		return 0;
+ 	}
+ 	return (int_ctl & TX4939_ATA_IC_HOSTINT);
+@@ -413,6 +418,7 @@ static int tx4939_ide_dma_setup(ide_driv
+ 	unsigned int ch = GET_CH(HWIF(drive));
+ 	ide_hwif_t *hwif = HWIF(drive);
+ 	struct request *rq = HWGROUP(drive)->rq;
++	int ret;
+ 
+ 	/* set sector count (cpu:c10h) */
+ 	if (!IS_ATAPI(drive)) {
+@@ -437,14 +443,43 @@ static int tx4939_ide_dma_setup(ide_driv
+ 
+ 	wait_transfer_end[ch] = 0;
+ 
+-	return ide_dma_setup(drive);
++	ret = ide_dma_setup(drive);
++#ifndef CONFIG_CPU_LITTLE_ENDIAN
++	/*
++	 * swap the IDE DMA table for Big Endian, address and length, too.
++	 */
++	if (ret == 0) {
++		unsigned int *table = hwif->dmatable_cpu;
++		while (1) {
++			le64_to_cpus((u64 *)table);
++			if (*table & 0x80000000)
++				break;
++			table += 2;
++		}
++	}
++#endif	/* CONFIG_CPU_LITTLE_ENDIAN */
++
++#ifndef DEBUG
++	{
++		/*
++		 * mask the interrupt of Ultra DMA Dev Terminate for the performance.
++		 */
++		u16 int_ctl;
++		int_ctl = reg_rd16(&tx4939_ataptr(ch)->int_ctl);
++		int_ctl &= TX4939_ATA_IC_MASK_ALL;
++		int_ctl |= TX4939_ATA_IC_DMA_DEV_TERMINATE << 8;
++		reg_wr16(&tx4939_ataptr(ch)->int_ctl, int_ctl);
++	}
++#endif
++
++	return ret;
+ }
+ 
+ static void tx4939_ide_outb (u8 val, unsigned long port)
+ {
+ 	outb(val, port);
+ 	/* if Device/Head register access */
+-	if ((port & 0xfff) == TX4939_ATA_DEVICE_OFFSET) {
++	if ((port & 0xfff) == offsetof(struct tx4939_ata_reg, device)) {
+ 		unsigned int ch;
+ 		u8 dev;
+ 
+@@ -456,6 +491,26 @@ static void tx4939_ide_outb (u8 val, uns
+ 	}
+ }
+ 
++#ifndef CONFIG_CPU_LITTLE_ENDIAN
++static void tx4939_ide_insw (unsigned long port, void *addr, u32 count)
++{
++	u16 *__addr = addr;
++	port &= ~0x1;
++	while (count--) {
++		*__addr++ = le16_to_cpu(__raw_inw((void *)port));
++	}
++}
++
++static void tx4939_ide_outsw (unsigned long port, void *addr, u32 count)
++{
++	u16 *__addr = addr;
++	port &= ~0x1;
++	while (count--) {
++		__raw_outw(cpu_to_le16(*__addr++), (void *)port);
++	}
++}
++#endif	/* CONFIG_CPU_LITTLE_ENDIAN */
++
+ /**
+  * tx4939_ide_init - initialize TX4939 IDE function
+  * @ch: TX4939-ATA controller channel
+@@ -464,16 +519,21 @@ static void tx4939_ide_outb (u8 val, uns
+ void __init tx4939_ide_init(int ch)
+ {
+ 	hw_regs_t hw;
+-	int i, idx;
++	int idx;
+ 	int offsets[IDE_NR_PORTS];
+ 	void *base;
+ 	ide_hwif_t *hwif;
+ 	unsigned long dma_base;
+ 
+-	for (i = 0; i < 8; i++)
+-		offsets[i] = i;
+-
+-	offsets[IDE_CONTROL_OFFSET] = TX4939_ATA_ALT_STATUS_OFFSET;
++	offsets[IDE_DATA_OFFSET]    = offsetof(struct tx4939_ata_reg, data);
++	offsets[IDE_ERROR_OFFSET]   = offsetof(struct tx4939_ata_reg, error);
++	offsets[IDE_NSECTOR_OFFSET] = offsetof(struct tx4939_ata_reg, sector);
++	offsets[IDE_SECTOR_OFFSET]  = offsetof(struct tx4939_ata_reg, low);
++	offsets[IDE_LCYL_OFFSET]    = offsetof(struct tx4939_ata_reg, mid);
++	offsets[IDE_HCYL_OFFSET]    = offsetof(struct tx4939_ata_reg, high);
++	offsets[IDE_SELECT_OFFSET]  = offsetof(struct tx4939_ata_reg, device);
++	offsets[IDE_STATUS_OFFSET]  = offsetof(struct tx4939_ata_reg, status);
++	offsets[IDE_CONTROL_OFFSET] = offsetof(struct tx4939_ata_reg, alt_devctl);
+ 	base = (void *)(TX4939_ATA_REG(ch) - mips_io_port_base);
+ 
+ 	memset(&hw, 0, sizeof(hw));
+@@ -502,6 +562,10 @@ void __init tx4939_ide_init(int ch)
+ 	hwif->mmio = 0;
+ 
+ 	hwif->OUTB = tx4939_ide_outb;
++#ifndef CONFIG_CPU_LITTLE_ENDIAN
++	hwif->INSW 	= tx4939_ide_insw;
++	hwif->OUTSW 	= tx4939_ide_outsw;
++#endif	/* CONFIG_CPU_LITTLE_ENDIAN */
+ 
+ 	/* cable(PDIAGN) check */
+ 	if (!(hwif->udma_four)) {
+@@ -518,7 +582,10 @@ void __init tx4939_ide_init(int ch)
+ 	hwif->ide_dma_test_irq = &tx4939_ide_dma_test_irq;
+ 	hwif->ide_dma_end = &tx4939_ide_dma_end;
+ 	hwif->atapi_output_bytes = &tx4939_ide_atapi_output_bytes;
+-	dma_base = TX4939_ATA_REG(ch) + TX4939_ATA_DMA_BASE_OFFSET  - mips_io_port_base;
++        dma_base = TX4939_ATA_REG(ch) + offsetof(struct tx4939_ata_reg, dma_cmd) - mips_io_port_base;
++        hwif->dma_status   = TX4939_ATA_REG(ch) + offsetof(struct tx4939_ata_reg, dma_stat) - mips_io_port_base;
++        hwif->dma_prdtable = TX4939_ATA_REG(ch) + offsetof(struct tx4939_ata_reg, prd_tbl) - mips_io_port_base;
++
+ 	ide_setup_dma(hwif, dma_base, 8);
+ #endif	/*CONFIG_BLK_DEV_IDEDMA */
+ }
+Index: linux-2.6.10/include/asm-mips/tx4939/ide.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/tx4939/ide.h
++++ linux-2.6.10/include/asm-mips/tx4939/ide.h
+@@ -45,6 +45,10 @@
+  * allowing each to have about 256 entries (8 bytes each) from this.
+  */
+ 
++#ifdef PRD_ENTRIES
++#undef PRD_ENTRIES
++#endif
++
+ #define PRD_BYTES       8
+ #define PRD_ENTRIES     (PAGE_SIZE / (2 * PRD_BYTES))
+ 
+@@ -52,17 +56,39 @@
+ #define ide_ack_intr(hwif) (hwif->hw.ack_intr ? hwif->hw.ack_intr(hwif) : 1)
+ #define IDE_ARCH_ACK_INTR
+ 
+-#define __ide_insw	insw
+-#define __ide_insl	insl
+-#define __ide_outsw	outsw
+-#define __ide_outsl	outsl
+-
+ #define __ide_mm_insw	readsw
+ #define __ide_mm_insl	readsl
+ #define __ide_mm_outsw	writesw
+ #define __ide_mm_outsl	writesl
+ 
++#ifndef CONFIG_CPU_LITTLE_ENDIAN
++/*
++ * Only for the Big Endian systems, do not do the swapping.
++ * We cannot turn off the CONFIG_SWAP_IO_SPACE since the
++ * other subsystems need it. Hence we need this approach for
++ * IDE only.
++ * Furthermore, since the big endian mode of TX4939 is more specific,
++ * so add more the following to include/asm-mips/ide.h.
++ */
++#ifdef inw
++#undef inw
++#endif
++#ifdef outw
++#undef outw
++#endif
++#ifdef inl
++#undef inl
++#endif
++#ifdef outl
++#undef outl
++#endif
++
++#define inw(port)		__raw_inw(port & ~0x1)
++#define inl(port)		__raw_inl(port)
++#define outw(val, port)		__raw_outw(val, port & ~0x01)
++#define outl(val, port)		__raw_outl(val, port)
+ 
++#endif /* CONFIG_LITTLE_ENDIAN */
+ #endif /* __KERNEL__ */
+ 
+ #define IS_IDE_TX4939 (HWIF(drive)->chipset == ide_tx4939)
+Index: linux-2.6.10/include/asm-mips/tx4939/tx4939.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/tx4939/tx4939.h
++++ linux-2.6.10/include/asm-mips/tx4939/tx4939.h
+@@ -225,6 +225,8 @@ typedef volatile unsigned long long vu64
+         u8 e1,e2,e3,e4
+ #define endian_def_b8(e1,e2,e3,e4,e5,e6,e7,e8)      \
+         u8 e1,e2,e3,e4,e5,e6,e7,e8
++#define endian_def_lb4(e1,e2,e3,e4,e5)      \
++        u32 e1;u8 e2,e3,e4,e5
+ #else
+ #define endian_def_l2(e1,e2)    \
+         u32 e2,e1
+@@ -240,6 +242,8 @@ typedef volatile unsigned long long vu64
+         u8 e4,e3,e2,e1
+ #define endian_def_b8(e1,e2,e3,e4,e5,e6,e7,e8)      \
+         u8 e8,e7,e6,e5,e4,e3,e2,e1
++#define endian_def_lb4(e1,e2,e3,e4,e5)      \
++        u8 e5,e4,e3,e2;u32 e1
+ #endif				/* __BIG_ENDIAN */
+ #endif				/* __ASSEMBLY__ */
+ 
+@@ -248,33 +252,54 @@ typedef volatile unsigned long long vu64
+ #ifndef __ASSEMBLY__
+ 
+ struct tx4939_ata_reg {
+-	u64 ata_shadow;
++	/*
++	 * In little endian mode, address of DATA is 0 and Error/Feature
++	 * register is 1. So, they don't conflict.
++	 *   Gbus Address |Width  |Access Type  |Register Name
++	 *   -------------+-------+-------------+--------------
++	 *   000          |16     |R/W          |DATA
++	 *   001          |8      |R            |Error
++	 *   001          |8      |W            |Feature
++	 *   ...
++	 * In big endian mode, address of DATA and Error/Feature register
++	 * is 6. So, they will conflict in __request_region().
++	 *   Gbus Address |Width  |Access Type  |Register Name
++	 *   -------------+-------+-------------+--------------
++	 *   006          |16     |R/W          |DATA
++	 *   006          |8      |R            |Error
++	 *   006          |8      |W            |Feature
++	 *   ...
++	 * then in big endian mode, put 7 as address of DATA register in
++	 * io_ports[], then mask the address when accessing DATA register.
++	 */
++	endian_def_b8(status, device, high, mid,
++		      low, sector, error, data);
+ 	u64 unused0[127];
+-	endian_def_b8(unused10, unused11, unused12, unused13, unused14,
+-		      alt_devctl, unused16, unused17);
++	endian_def_b8(unused10, unused11, unused12, unused13,
++		      unused14, alt_devctl, unused16, unused17);/* +0x400 */
+ 	u64 unused1[127];
+-	endian_def_b8(unused20, unused21, unused22, prd_tbl, unused24,
+-		      dma_stat, unused26, dma_cmd);
++	endian_def_lb4(prd_tbl,
++		      unused20, dma_stat, unused21, dma_cmd);	/* +0x800 */
+ 	u64 unused2[127];
+ 	endian_def_s4(unused30, unused31, unused25, sysctl);	/* +0xc00 */
+ 	endian_def_s4(unused32, unused33, xfer_cnt2, xfer_cnt1);
+-	endian_def_s4(unused34, unused35, unused36, sec_cnt);
++	endian_def_s4(unused34, unused35, unused36, sec_cnt);	/* +0xc10 */
+ 	endian_def_s4(unused37, unused38, unused39, strt_addl);
+-	endian_def_s4(unused40, unused41, unused42, strt_addu);
++	endian_def_s4(unused40, unused41, unused42, strt_addu);	/* +0xc20 */
+ 	endian_def_s4(unused43, unused44, unused45, add_ctrl);
+-	endian_def_s4(unused46, unused47, unused48, lo_bcnt);
++	endian_def_s4(unused46, unused47, unused48, lo_bcnt);	/* +0xc30 */
+         endian_def_s4(unused49, unused50, unused51, hi_bcnt);
+ 	volatile u64 unused52[9];
+-        endian_def_s4(unused53, unused54, unused55, pio_acc);
+-        endian_def_s4(unused56, unused57, unused58, h_rst_tim);
++        endian_def_s4(unused53, unused54, unused55, pio_acc);	/* +0xc88 */
++        endian_def_s4(unused56, unused57, unused58, h_rst_tim);	/* +0xc90 */
+         endian_def_s4(unused59, unused60, unused61, int_ctl);
+ 	volatile u64 unused62[3];
+-        endian_def_s4(unused63, unused64, unused65, pkt_cmd);
+-        endian_def_s4(unused66, unused67, unused68, bxfer_cnth);
++        endian_def_s4(unused63, unused64, unused65, pkt_cmd);	/* +0xcb8 */
++        endian_def_s4(unused66, unused67, unused68, bxfer_cnth);/* +0xcc0 */
+         endian_def_s4(unused69, unused70, unused71, bxfer_cntl);
+-        endian_def_s4(unused72, unused73, unused74, dev_terr);
++        endian_def_s4(unused72, unused73, unused74, dev_terr);	/* +0xcd0 */
+         endian_def_s4(unused75, unused76, unused77, pkt_xfer_ct);
+-        endian_def_s4(unused78, unused79, unused80, strt_addr);
++        endian_def_s4(unused78, unused79, unused80, strt_addr);	/* +0xce0 */
+ };
+ 
+ struct tx4939_ndfmc_reg {
+@@ -1562,24 +1587,6 @@ struct tx4939_cir_reg {
+ /*
+  * ATA
+  */
+-
+-#define TX4939_ATA_DATA_OFFSET            0x000
+-#define TX4939_ATA_ERROR_OFFSET           0x001
+-#define TX4939_ATA_SECTOR_OFFSET          0x002
+-#define TX4939_ATA_LBA_LOW_OFFSET         0x003
+-#define TX4939_ATA_LBA_MID_OFFSET         0x004
+-#define TX4939_ATA_LBA_HIGH_OFFSET        0x005
+-#define TX4939_ATA_DEVICE_OFFSET          0x006
+-#define TX4939_ATA_STATUS_OFFSET          0x007
+-
+-#define TX4939_ATA_DEVICE_CONTROL_OFFSET  0x402
+-#define TX4939_ATA_ALT_STATUS_OFFSET      0x402
+-
+-#define TX4939_ATA_DMA_BASE_OFFSET        0x800
+-
+-#define TX4939_ATA_SYSTEM_CONTROL1_OFFSET 0xc00
+-#define TX4939_ATA_SYSTEM_CONTROL2_OFFSET 0xc02
+-
+ #define TX4939_ATA_SC_SOFT_RESET          0x8000
+ #define TX4939_ATA_SC_FIFO_RESET          0x4000
+ #define TX4939_ATA_SC_PDIAGN              0x2000
+Index: linux-2.6.10/mvl_patches/pro-0308.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0308.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(308);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

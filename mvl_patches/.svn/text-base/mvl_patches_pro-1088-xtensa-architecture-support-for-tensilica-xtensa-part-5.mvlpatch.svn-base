@@ -1,0 +1,2059 @@
+#! /usr/bin/env bash
+# Patch: -xtensa-architecture-support-for-tensilica-xtensa-part-5
+# Date: Fri Feb 16 17:10:04 2007
+# 
+# From: Chris Zankel <czankel@tensilica.com>
+# 
+# The attached patches provides part 5 of an architecture implementation for the
+# Tensilica Xtensa CPU series.
+# 
+# Signed-off-by: Chris Zankel <chris@zankel.net>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+
+PATCHNUM=1088
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+
+From: Chris Zankel <czankel@tensilica.com>
+
+The attached patches provides part 5 of an architecture implementation for the
+Tensilica Xtensa CPU series.
+
+Signed-off-by: Chris Zankel <chris@zankel.net>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Index: linux-2.6.10/arch/xtensa/mm/fault.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/mm/fault.c
+@@ -0,0 +1,241 @@
++// TODO VM_EXEC flag work-around, cache aliasing
++/*
++ * arch/xtensa/mm/fault.c
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2001 - 2005 Tensilica Inc.
++ *
++ * Chris Zankel <chris@zankel.net>
++ * Joe Taylor	<joe@tensilica.com, joetylr@yahoo.com>
++ */
++
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <asm/mmu_context.h>
++#include <asm/cacheflush.h>
++#include <asm/hardirq.h>
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/pgalloc.h>
++
++unsigned long asid_cache = ASID_FIRST_VERSION;
++void bad_page_fault(struct pt_regs*, unsigned long, int);
++
++/*
++ * This routine handles page faults.  It determines the address,
++ * and the problem, and then passes it off to one of the appropriate
++ * routines.
++ *
++ * Note: does not handle Miss and MultiHit.
++ */
++
++void do_page_fault(struct pt_regs *regs)
++{
++	struct vm_area_struct * vma;
++	struct mm_struct *mm = current->mm;
++	unsigned int exccause = regs->exccause;
++	unsigned int address = regs->excvaddr;
++	siginfo_t info;
++
++	int is_write, is_exec;
++
++	info.si_code = SEGV_MAPERR;
++
++	/* We fault-in kernel-space virtual memory on-demand. The
++	 * 'reference' page table is init_mm.pgd.
++	 */
++	if (address >= TASK_SIZE && !user_mode(regs))
++		goto vmalloc_fault;
++
++	/* If we're in an interrupt or have no user
++	 * context, we must not take the fault..
++	 */
++	if (in_atomic() || !mm) {
++		bad_page_fault(regs, address, SIGSEGV);
++		return;
++	}
++
++	is_write = (exccause == XCHAL_EXCCAUSE_STORE_CACHE_ATTRIBUTE) ? 1 : 0;
++	is_exec =  (exccause == XCHAL_EXCCAUSE_ITLB_PRIVILEGE ||
++		    exccause == XCHAL_EXCCAUSE_ITLB_MISS ||
++		    exccause == XCHAL_EXCCAUSE_FETCH_CACHE_ATTRIBUTE) ? 1 : 0;
++
++#if 0
++	printk("[%s:%d:%08x:%d:%08x:%s%s]\n", current->comm, current->pid,
++	       address, exccause, regs->pc, is_write? "w":"", is_exec? "x":"");
++#endif
++
++	down_read(&mm->mmap_sem);
++	vma = find_vma(mm, address);
++
++	if (!vma)
++		goto bad_area;
++	if (vma->vm_start <= address)
++		goto good_area;
++	if (!(vma->vm_flags & VM_GROWSDOWN))
++		goto bad_area;
++	if (expand_stack(vma, address))
++		goto bad_area;
++
++	/* Ok, we have a good vm_area for this memory access, so
++	 * we can handle it..
++	 */
++
++good_area:
++	info.si_code = SEGV_ACCERR;
++
++	if (is_write) {
++		if (!(vma->vm_flags & VM_WRITE))
++			goto bad_area;
++	} else if (is_exec) {
++		if (!(vma->vm_flags & VM_EXEC))
++			goto bad_area;
++	} else	/* Allow read even from write-only pages. */
++		if (!(vma->vm_flags & (VM_READ | VM_WRITE)))
++			goto bad_area;
++
++	/* If for any reason at all we couldn't handle the fault,
++	 * make sure we exit gracefully rather than endlessly redo
++	 * the fault.
++	 */
++survive:
++	switch (handle_mm_fault(mm, vma, address, is_write)) {
++	case VM_FAULT_MINOR:
++		current->min_flt++;
++		break;
++	case VM_FAULT_MAJOR:
++		current->maj_flt++;
++		break;
++	case VM_FAULT_SIGBUS:
++		goto do_sigbus;
++	case VM_FAULT_OOM:
++		goto out_of_memory;
++	default:
++		BUG();
++	}
++
++	up_read(&mm->mmap_sem);
++	return;
++
++	/* Something tried to access memory that isn't in our memory map..
++	 * Fix it, but check if it's kernel or user first..
++	 */
++bad_area:
++	up_read(&mm->mmap_sem);
++	if (user_mode(regs)) {
++		current->thread.bad_vaddr = address;
++		current->thread.error_code = is_write;
++		info.si_signo = SIGSEGV;
++		info.si_errno = 0;
++		/* info.si_code has been set above */
++		info.si_addr = (void *) address;
++		force_sig_info(SIGSEGV, &info, current);
++		return;
++	}
++	bad_page_fault(regs, address, SIGSEGV);
++	return;
++
++
++	/* We ran out of memory, or some other thing happened to us that made
++	 * us unable to handle the page fault gracefully.
++	 */
++out_of_memory:
++	up_read(&mm->mmap_sem);
++	if (current->pid == 1) {
++		yield();
++		down_read(&mm->mmap_sem);
++		goto survive;
++	}
++	printk("VM: killing process %s\n", current->comm);
++	if (user_mode(regs))
++		do_exit(SIGKILL);
++	bad_page_fault(regs, address, SIGKILL);
++	return;
++
++do_sigbus:
++	up_read(&mm->mmap_sem);
++
++	/* Send a sigbus, regardless of whether we were in kernel
++	 * or user mode.
++	 */
++	current->thread.bad_vaddr = address;
++	info.si_code = SIGBUS;
++	info.si_errno = 0;
++	info.si_code = BUS_ADRERR;
++	info.si_addr = (void *) address;
++	force_sig_info(SIGBUS, &info, current);
++
++	/* Kernel mode? Handle exceptions or die */
++	if (!user_mode(regs))
++		bad_page_fault(regs, address, SIGBUS);
++
++vmalloc_fault:
++	{
++		/* Synchronize this task's top level page-table
++		 * with the 'reference' page table.
++		 */
++		struct mm_struct *act_mm = current->active_mm;
++		int index = pgd_index(address);
++		pgd_t *pgd, *pgd_k;
++		pmd_t *pmd, *pmd_k;
++		pte_t *pte_k;
++
++		if (act_mm == NULL)
++			goto bad_page_fault;
++
++		pgd = act_mm->pgd + index;
++		pgd_k = init_mm.pgd + index;
++
++		if (!pgd_present(*pgd_k))
++			goto bad_page_fault;
++
++		pgd_val(*pgd) = pgd_val(*pgd_k);
++
++		pmd = pmd_offset(pgd, address);
++		pmd_k = pmd_offset(pgd_k, address);
++		if (!pmd_present(*pmd) || !pmd_present(*pmd_k))
++			goto bad_page_fault;
++
++		pmd_val(*pmd) = pmd_val(*pmd_k);
++		pte_k = pte_offset_kernel(pmd_k, address);
++
++		if (!pte_present(*pte_k))
++			goto bad_page_fault;
++		return;
++	}
++bad_page_fault:
++	bad_page_fault(regs, address, SIGKILL);
++	return;
++}
++
++
++void
++bad_page_fault(struct pt_regs *regs, unsigned long address, int sig)
++{
++	extern void die(const char*, struct pt_regs*, long);
++	const struct exception_table_entry *entry;
++
++	/* Are we prepared to handle this kernel fault?  */
++	if ((entry = search_exception_tables(regs->pc)) != NULL) {
++#if 1
++		printk(KERN_DEBUG "%s: Exception at pc=%#010lx (%lx)\n",
++				current->comm, regs->pc, entry->fixup);
++#endif
++		current->thread.bad_uaddr = address;
++		regs->pc = entry->fixup;
++		return;
++	}
++
++	/* Oops. The kernel tried to access some bad page. We'll have to
++	 * terminate things with extreme prejudice.
++	 */
++	printk(KERN_ALERT "Unable to handle kernel paging request at virtual "
++	       "address %08lx\n pc = %08lx, ra = %08lx\n",
++	       address, regs->pc, regs->areg[0]);
++	die("Oops", regs, sig);
++	do_exit(sig);
++}
++
+Index: linux-2.6.10/arch/xtensa/mm/init.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/mm/init.c
+@@ -0,0 +1,551 @@
++/*
++ * arch/xtensa/mm/init.c
++ *
++ * Derived from MIPS, PPC.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2001 - 2005 Tensilica Inc.
++ *
++ * Chris Zankel	<chris@zankel.net>
++ * Joe Taylor	<joe@tensilica.com, joetylr@yahoo.com>
++ * Marc Gauthier
++ * Kevin Chea
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/signal.h>
++#include <linux/sched.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/ptrace.h>
++#include <linux/bootmem.h>
++#include <linux/swap.h>
++
++#include <asm/pgtable.h>
++#include <asm/bootparam.h>
++#include <asm/mmu_context.h>
++#include <asm/tlb.h>
++#include <asm/tlbflush.h>
++#include <asm/page.h>
++#include <asm/pgalloc.h>
++#include <asm/pgtable.h>
++
++
++#define DEBUG 0
++
++DEFINE_PER_CPU(struct mmu_gather, mmu_gathers);
++//static DEFINE_SPINLOCK(tlb_lock);
++
++/*
++ * This flag is used to indicate that the page was mapped and modified in
++ * kernel space, so the cache is probably dirty at that address.
++ * If cache aliasing is enabled and the page color mismatches, update_mmu_cache
++ * synchronizes the caches if this bit is set.
++ */
++
++#define PG_cache_clean PG_arch_1
++
++/* References to section boundaries */
++
++extern char _ftext, _etext, _fdata, _edata, _rodata_end;
++extern char __init_begin, __init_end;
++
++/*
++ * mem_reserve(start, end, must_exist)
++ *
++ * Reserve some memory from the memory pool.
++ *
++ * Parameters:
++ *  start	Start of region,
++ *  end		End of region,
++ *  must_exist	Must exist in memory pool.
++ *
++ * Returns:
++ *  0 (memory area couldn't be mapped)
++ * -1 (success)
++ */
++
++int __init mem_reserve(unsigned long start, unsigned long end, int must_exist)
++{
++	int i;
++
++	if (start == end)
++		return 0;
++
++	start = start & PAGE_MASK;
++	end = PAGE_ALIGN(end);
++
++	for (i = 0; i < sysmem.nr_banks; i++)
++		if (start < sysmem.bank[i].end
++		    && end >= sysmem.bank[i].start)
++			break;
++
++	if (i == sysmem.nr_banks) {
++		if (must_exist)
++			printk (KERN_WARNING "mem_reserve: [0x%0lx, 0x%0lx) "
++				"not in any region!\n", start, end);
++		return 0;
++	}
++
++	if (start > sysmem.bank[i].start) {
++		if (end < sysmem.bank[i].end) {
++			/* split entry */
++			if (sysmem.nr_banks >= SYSMEM_BANKS_MAX)
++				panic("meminfo overflow\n");
++			sysmem.bank[sysmem.nr_banks].start = end;
++			sysmem.bank[sysmem.nr_banks].end = sysmem.bank[i].end;
++			sysmem.nr_banks++;
++		}
++		sysmem.bank[i].end = start;
++	} else {
++		if (end < sysmem.bank[i].end)
++			sysmem.bank[i].start = end;
++		else {
++			/* remove entry */
++			sysmem.nr_banks--;
++			sysmem.bank[i].start = sysmem.bank[sysmem.nr_banks].start;
++			sysmem.bank[i].end   = sysmem.bank[sysmem.nr_banks].end;
++		}
++	}
++	return -1;
++}
++
++
++/*
++ * Initialize the bootmem system and give it all the memory we have available.
++ */
++
++void __init bootmem_init(void)
++{
++	unsigned long pfn;
++	unsigned long bootmap_start, bootmap_size;
++	int i;
++
++	max_low_pfn = max_pfn = 0;
++	min_low_pfn = ~0;
++
++	for (i=0; i < sysmem.nr_banks; i++) {
++		pfn = PAGE_ALIGN(sysmem.bank[i].start) >> PAGE_SHIFT;
++		if (pfn < min_low_pfn)
++			min_low_pfn = pfn;
++		pfn = PAGE_ALIGN(sysmem.bank[i].end - 1) >> PAGE_SHIFT;
++		if (pfn > max_pfn)
++			max_pfn = pfn;
++	}
++
++	if (min_low_pfn > max_pfn)
++		panic("No memory found!\n");
++
++	max_low_pfn = max_pfn < MAX_LOW_MEMORY >> PAGE_SHIFT ?
++		max_pfn : MAX_LOW_MEMORY >> PAGE_SHIFT;
++
++	/* Find an area to use for the bootmem bitmap. */
++
++	bootmap_size = bootmem_bootmap_pages(max_low_pfn) << PAGE_SHIFT;
++	bootmap_start = ~0;
++
++	for (i=0; i<sysmem.nr_banks; i++)
++		if (sysmem.bank[i].end - sysmem.bank[i].start >= bootmap_size) {
++			bootmap_start = sysmem.bank[i].start;
++			break;
++		}
++
++	if (bootmap_start == ~0UL)
++		panic("Cannot find %ld bytes for bootmap\n", bootmap_size);
++
++	/* Reserve the bootmem bitmap area */
++
++	mem_reserve(bootmap_start, bootmap_start + bootmap_size, 1);
++	bootmap_size = init_bootmem_node(NODE_DATA(0), min_low_pfn,
++					 bootmap_start >> PAGE_SHIFT,
++					 max_low_pfn);
++
++	/* Add all remaining memory pieces into the bootmem map */
++
++	for (i=0; i<sysmem.nr_banks; i++)
++		free_bootmem(sysmem.bank[i].start,
++			     sysmem.bank[i].end - sysmem.bank[i].start);
++
++}
++
++
++void __init paging_init(void)
++{
++	unsigned long zones_size[MAX_NR_ZONES];
++	int i;
++
++	/* All pages are DMA-able, so we put them all in the DMA zone. */
++
++	zones_size[ZONE_DMA] = max_low_pfn;
++	for (i = 1; i < MAX_NR_ZONES; i++)
++		zones_size[i] = 0;
++
++#ifdef CONFIG_HIGHMEM
++	zones_size[ZONE_HIGHMEM] = max_pfn - max_low_pfn;
++#endif
++
++	/* Initialize the kernel's page tables. */
++
++	memset(swapper_pg_dir, 0, PAGE_SIZE);
++
++	free_area_init(zones_size);
++}
++
++/*
++ * Flush the mmu and reset associated register to default values.
++ */
++
++void __init init_mmu (void)
++{
++	/* Writing zeros to the <t>TLBCFG special registers ensure
++	 * that valid values exist in the register.  For existing
++	 * PGSZID<w> fields, zero selects the first element of the
++	 * page-size array.  For nonexistant PGSZID<w> fields, zero is
++	 * the best value to write.  Also, when changing PGSZID<w>
++	 * fields, the corresponding TLB must be flushed.
++	 */
++	set_itlbcfg_register (0);
++	set_dtlbcfg_register (0);
++	flush_tlb_all ();
++
++	/* Set rasid register to a known value. */
++
++	set_rasid_register (ASID_ALL_RESERVED);
++
++	/* Set PTEVADDR special register to the start of the page
++	 * table, which is in kernel mappable space (ie. not
++	 * statically mapped).  This register's value is undefined on
++	 * reset.
++	 */
++	set_ptevaddr_register (PGTABLE_START);
++}
++
++/*
++ * Initialize memory pages.
++ */
++
++void __init mem_init(void)
++{
++	unsigned long codesize, reservedpages, datasize, initsize;
++	unsigned long highmemsize, tmp, ram;
++
++	max_mapnr = num_physpages = max_low_pfn;
++	high_memory = (void *) __va(max_mapnr << PAGE_SHIFT);
++	highmemsize = 0;
++
++#if CONFIG_HIGHMEM
++#error HIGHGMEM not implemented in init.c
++#endif
++
++	totalram_pages += free_all_bootmem();
++
++	reservedpages = ram = 0;
++	for (tmp = 0; tmp < max_low_pfn; tmp++) {
++		ram++;
++		if (PageReserved(mem_map+tmp))
++			reservedpages++;
++	}
++
++	codesize =  (unsigned long) &_etext - (unsigned long) &_ftext;
++	datasize =  (unsigned long) &_edata - (unsigned long) &_fdata;
++	initsize =  (unsigned long) &__init_end - (unsigned long) &__init_begin;
++
++	printk("Memory: %luk/%luk available (%ldk kernel code, %ldk reserved, "
++	       "%ldk data, %ldk init %ldk highmem)\n",
++	       (unsigned long) nr_free_pages() << (PAGE_SHIFT-10),
++	       ram << (PAGE_SHIFT-10),
++	       codesize >> 10,
++	       reservedpages << (PAGE_SHIFT-10),
++	       datasize >> 10,
++	       initsize >> 10,
++	       highmemsize >> 10);
++}
++
++void
++free_reserved_mem(void *start, void *end)
++{
++	for (; start < end; start += PAGE_SIZE) {
++		ClearPageReserved(virt_to_page(start));
++		set_page_count(virt_to_page(start), 1);
++		free_page((unsigned long)start);
++		totalram_pages++;
++	}
++}
++
++#ifdef CONFIG_BLK_DEV_INITRD
++extern int initrd_is_mapped;
++
++void free_initrd_mem(unsigned long start, unsigned long end)
++{
++	if (initrd_is_mapped) {
++		free_reserved_mem((void*)start, (void*)end);
++		printk ("Freeing initrd memory: %ldk freed\n",(end-start)>>10);
++	}
++}
++#endif
++
++void free_initmem(void)
++{
++	free_reserved_mem(&__init_begin, &__init_end);
++	printk("Freeing unused kernel memory: %dk freed\n",
++	       (&__init_end - &__init_begin) >> 10);
++}
++
++void show_mem(void)
++{
++	int i, free = 0, total = 0, reserved = 0;
++	int shared = 0, cached = 0;
++
++	printk("Mem-info:\n");
++	show_free_areas();
++	printk("Free swap:       %6ldkB\n", nr_swap_pages<<(PAGE_SHIFT-10));
++	i = max_mapnr;
++	while (i-- > 0) {
++		total++;
++		if (PageReserved(mem_map+i))
++			reserved++;
++		else if (PageSwapCache(mem_map+i))
++			cached++;
++		else if (!page_count(mem_map + i))
++			free++;
++		else
++			shared += page_count(mem_map + i) - 1;
++	}
++	printk("%d pages of RAM\n", total);
++	printk("%d reserved pages\n", reserved);
++	printk("%d pages shared\n", shared);
++	printk("%d pages swap cached\n",cached);
++	printk("%d free pages\n", free);
++}
++
++/* ------------------------------------------------------------------------- */
++
++#if (DCACHE_WAY_SIZE > PAGE_SIZE)
++
++/*
++ * With cache aliasing, the page color of the page in kernel space and user
++ * space might mismatch. We temporarily map the page to a different virtual
++ * address with the same color and clear the page there.
++ */
++
++void clear_user_page(void *kaddr, unsigned long vaddr, struct page* page)
++{
++
++  	/*  There shouldn't be any entries for this page. */
++
++	__flush_invalidate_dcache_page_phys(__pa(page_address(page)));
++
++	if (!PAGE_COLOR_EQ(vaddr, kaddr)) {
++		unsigned long v, p;
++
++		/* Temporarily map page to DTLB_WAY_DCACHE_ALIAS0. */
++
++		spin_lock(&tlb_lock);
++
++		p = (unsigned long)pte_val((mk_pte(page,PAGE_KERNEL)));
++		kaddr = (void*)PAGE_COLOR_MAP0(vaddr);
++		v = (unsigned long)kaddr | DTLB_WAY_DCACHE_ALIAS0;
++		__asm__ __volatile__("wdtlb %0,%1; dsync" : :"a" (p), "a" (v));
++
++		clear_page(kaddr);
++
++		spin_unlock(&tlb_lock);
++	} else {
++		clear_page(kaddr);
++	}
++
++	/* We need to make sure that i$ and d$ are coherent. */
++
++	clear_bit(PG_cache_clean, &page->flags);
++}
++
++/*
++ * With cache aliasing, we have to make sure that the page color of the page
++ * in kernel space matches that of the virtual user address before we read
++ * the page. If the page color differ, we create a temporary DTLB entry with
++ * the corrent page color and use this 'temporary' address as the source.
++ * We then use the same approach as in clear_user_page and copy the data
++ * to the kernel space and clear the PG_cache_clean bit to synchronize caches
++ * later.
++ *
++ * Note:
++ * Instead of using another 'way' for the temporary DTLB entry, we could
++ * probably use the same entry that points to the kernel address (after
++ * saving the original value and restoring it when we are done).
++ */
++
++void copy_user_page(void* to, void* from, unsigned long vaddr,
++    		    struct page* to_page)
++{
++	/* There shouldn't be any entries for the new page. */
++
++	__flush_invalidate_dcache_page_phys(__pa(page_address(to_page)));
++
++	spin_lock(&tlb_lock);
++
++	if (!PAGE_COLOR_EQ(vaddr, from)) {
++		unsigned long v, p, t;
++
++		__asm__ __volatile__ ("pdtlb %1,%2; rdtlb1 %0,%1"
++				      : "=a"(p), "=a"(t) : "a"(from));
++		from = (void*)PAGE_COLOR_MAP0(vaddr);
++		v = (unsigned long)from | DTLB_WAY_DCACHE_ALIAS0;
++		__asm__ __volatile__ ("wdtlb %0,%1; dsync" ::"a" (p), "a" (v));
++	}
++
++	if (!PAGE_COLOR_EQ(vaddr, to)) {
++		unsigned long v, p;
++
++		p = (unsigned long)pte_val((mk_pte(to_page,PAGE_KERNEL)));
++		to = (void*)PAGE_COLOR_MAP1(vaddr);
++		v = (unsigned long)to | DTLB_WAY_DCACHE_ALIAS1;
++		__asm__ __volatile__ ("wdtlb %0,%1; dsync" ::"a" (p), "a" (v));
++	}
++	copy_page(to, from);
++
++	spin_unlock(&tlb_lock);
++
++	/* We need to make sure that i$ and d$ are coherent. */
++
++	clear_bit(PG_cache_clean, &to_page->flags);
++}
++
++
++
++/*
++ * Any time the kernel writes to a user page cache page, or it is about to
++ * read from a page cache page this routine is called.
++ *
++ * Note:
++ * The kernel currently only provides one architecture bit in the page
++ * flags that we use for I$/D$ coherency. Maybe, in future, we can
++ * use a sepearte bit for deferred dcache aliasing:
++ * If the page is not mapped yet, we only need to set a flag,
++ * if mapped, we need to invalidate the page.
++ */
++// FIXME: we probably need this for WB caches not only for Page Coloring..
++
++void flush_dcache_page(struct page *page)
++{
++	unsigned long addr = __pa(page_address(page));
++	struct address_space *mapping = page_mapping(page);
++
++	__flush_invalidate_dcache_page_phys(addr);
++
++	if (!test_bit(PG_cache_clean, &page->flags))
++		return;
++
++	/* If this page hasn't been mapped, yet, handle I$/D$ coherency later.*/
++#if 0
++	if (mapping && !mapping_mapped(mapping))
++		clear_bit(PG_cache_clean, &page->flags);
++	else
++#endif
++		__invalidate_icache_page_phys(addr);
++}
++
++void flush_cache_range(struct vm_area_struct* vma, unsigned long s,
++		       unsigned long e)
++{
++	__flush_invalidate_cache_all();
++}
++
++void flush_cache_page(struct vm_area_struct* vma, unsigned long address,
++    		      unsigned long pfn)
++{
++	struct page *page = pfn_to_page(pfn);
++
++	/* Remove any entry for the old mapping. */
++
++	if (current->active_mm == vma->vm_mm) {
++		unsigned long addr = __pa(page_address(page));
++		__flush_invalidate_dcache_page_phys(addr);
++		if ((vma->vm_flags & VM_EXEC) != 0)
++			__invalidate_icache_page_phys(addr);
++	} else {
++		BUG();
++	}
++}
++
++#endif	/* (DCACHE_WAY_SIZE > PAGE_SIZE) */
++
++
++pte_t* pte_alloc_one_kernel (struct mm_struct* mm, unsigned long addr)
++{
++	pte_t* pte = (pte_t*)__get_free_pages(GFP_KERNEL|__GFP_REPEAT, 0);
++	if (likely(pte)) {
++	       	pte_t* ptep = (pte_t*)(pte_val(*pte) + PAGE_OFFSET);
++		int i;
++		for (i = 0; i < 1024; i++, ptep++)
++			pte_clear(mm, addr, ptep);
++	}
++	return pte;
++}
++
++struct page* pte_alloc_one(struct mm_struct *mm, unsigned long addr)
++{
++	struct page *page;
++
++	page = alloc_pages(GFP_KERNEL | __GFP_REPEAT, 0);
++
++	if (likely(page)) {
++		pte_t* ptep = kmap_atomic(page, KM_USER0);
++		int i;
++
++		for (i = 0; i < 1024; i++, ptep++)
++			pte_clear(mm, addr, ptep);
++
++		kunmap_atomic(ptep, KM_USER0);
++	}
++	return page;
++}
++
++
++/*
++ * Handle D$/I$ coherency.
++ *
++ * Note:
++ * We only have one architecture bit for the page flags, so we cannot handle
++ * cache aliasing, yet.
++ */
++
++void
++update_mmu_cache(struct vm_area_struct * vma, unsigned long addr, pte_t pte)
++{
++	unsigned long pfn = pte_pfn(pte);
++	struct page *page;
++	unsigned long vaddr = addr & PAGE_MASK;
++
++	if (!pfn_valid(pfn))
++		return;
++
++	page = pfn_to_page(pfn);
++
++	invalidate_itlb_mapping(addr);
++	invalidate_dtlb_mapping(addr);
++
++	/* We have a new mapping. Use it. */
++
++	write_dtlb_entry(pte, dtlb_probe(addr));
++
++	/* If the processor can execute from this page, synchronize D$/I$. */
++
++	if ((vma->vm_flags & VM_EXEC) != 0) {
++
++		write_itlb_entry(pte, itlb_probe(addr));
++
++		/* Synchronize caches, if not clean. */
++
++		if (!test_and_set_bit(PG_cache_clean, &page->flags)) {
++			__flush_dcache_page(vaddr);
++			__invalidate_icache_page(vaddr);
++		}
++	}
++}
++
+Index: linux-2.6.10/arch/xtensa/mm/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/mm/Makefile
+@@ -0,0 +1,13 @@
++#
++# Makefile for the Linux/Xtensa-specific parts of the memory manager.
++#
++# Note! Dependencies are done automagically by 'make dep', which also
++# removes any old dependencies. DON'T put your own dependencies here
++# unless it's something special (ie not a .c file).
++#
++# Note 2! The CFLAGS definition is now in the main makefile...
++
++obj-y	 := init.o fault.o tlb.o misc.o
++obj-m	 :=
++obj-n	 :=
++obj-	 :=
+Index: linux-2.6.10/arch/xtensa/mm/misc.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/mm/misc.S
+@@ -0,0 +1,374 @@
++/*
++ * arch/xtensa/mm/misc.S
++ *
++ * Miscellaneous assembly functions.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2001 - 2005 Tensilica Inc.
++ *
++ * Chris Zankel	<chris@zankel.net>
++ */
++
++/* Note: we might want to implement some of the loops as zero-overhead-loops,
++ *	 where applicable and if supported by the processor.
++ */
++
++#include <linux/linkage.h>
++#include <asm/page.h>
++#include <asm/pgtable.h>
++
++#include <xtensa/cacheasm.h>
++#include <xtensa/cacheattrasm.h>
++
++/* clear_page (page) */
++
++ENTRY(clear_page)
++	entry	a1, 16
++	addi	a4, a2, PAGE_SIZE
++	movi	a3, 0
++
++1:	s32i	a3, a2, 0
++	s32i	a3, a2, 4
++	s32i	a3, a2, 8
++	s32i	a3, a2, 12
++	s32i	a3, a2, 16
++	s32i	a3, a2, 20
++	s32i	a3, a2, 24
++	s32i	a3, a2, 28
++	addi	a2, a2, 32
++	blt	a2, a4, 1b
++
++	retw
++
++/*
++ * copy_page (void *to, void *from)
++ *                  a2        a3
++ */
++
++ENTRY(copy_page)
++	entry	a1, 16
++	addi	a4, a2, PAGE_SIZE
++
++1:	l32i	a5, a3, 0
++	l32i	a6, a3, 4
++	l32i	a7, a3, 8
++	s32i	a5, a2, 0
++	s32i	a6, a2, 4
++	s32i	a7, a2, 8
++	l32i	a5, a3, 12
++	l32i	a6, a3, 16
++	l32i	a7, a3, 20
++	s32i	a5, a2, 12
++	s32i	a6, a2, 16
++	s32i	a7, a2, 20
++	l32i	a5, a3, 24
++	l32i	a6, a3, 28
++	s32i	a5, a2, 24
++	s32i	a6, a2, 28
++	addi	a2, a2, 32
++	addi	a3, a3, 32
++	blt	a2, a4, 1b
++
++	retw
++
++
++/*
++ * void __flush_invalidate_cache_all(void)
++ */
++
++ENTRY(__flush_invalidate_cache_all)
++	entry	sp, 16
++	dcache_writeback_inv_all a2, a3
++	icache_invalidate_all a2, a3
++	retw
++
++/*
++ * void __invalidate_icache_all(void)
++ */
++
++ENTRY(__invalidate_icache_all)
++	entry	sp, 16
++	icache_invalidate_all a2, a3
++	retw
++
++/*
++ * void __flush_invalidate_dcache_all(void)
++ */
++
++ENTRY(__flush_invalidate_dcache_all)
++	entry	sp, 16
++	dcache_writeback_inv_all a2, a3
++	retw
++
++
++/*
++ * void __flush_invalidate_cache_range(ulong start, ulong size)
++ */
++
++ENTRY(__flush_invalidate_cache_range)
++	entry	sp, 16
++	mov	a4, a2
++	mov	a5, a3
++	dcache_writeback_inv_region a4, a5, a6
++	icache_invalidate_region a2, a3, a4
++	retw
++
++/*
++ * void __invalidate_icache_page(ulong start)
++ */
++
++ENTRY(__invalidate_icache_page)
++	entry	sp, 16
++	movi	a3, PAGE_SIZE
++	icache_invalidate_region a2, a3, a4
++	retw
++
++/*
++ * void __invalidate_dcache_page(ulong start)
++ */
++
++ENTRY(__invalidate_dcache_page)
++	entry	sp, 16
++	movi	a3, PAGE_SIZE
++	dcache_invalidate_region a2, a3, a4
++	retw
++
++/*
++ * void __invalidate_icache_range(ulong start, ulong size)
++ */
++
++ENTRY(__invalidate_icache_range)
++	entry	sp, 16
++	icache_invalidate_region a2, a3, a4
++	retw
++
++/*
++ * void __invalidate_dcache_range(ulong start, ulong size)
++ */
++
++ENTRY(__invalidate_dcache_range)
++	entry	sp, 16
++	dcache_invalidate_region a2, a3, a4
++	retw
++
++/*
++ * void __flush_dcache_page(ulong start)
++ */
++
++ENTRY(__flush_dcache_page)
++	entry	sp, 16
++	movi	a3, PAGE_SIZE
++	dcache_writeback_region a2, a3, a4
++	retw
++
++/*
++ * void __flush_invalidate_dcache_page(ulong start)
++ */
++
++ENTRY(__flush_invalidate_dcache_page)
++	entry	sp, 16
++	movi	a3, PAGE_SIZE
++	dcache_writeback_inv_region a2, a3, a4
++	retw
++
++/*
++ * void __flush_invalidate_dcache_range(ulong start, ulong size)
++ */
++
++ENTRY(__flush_invalidate_dcache_range)
++	entry	sp, 16
++	dcache_writeback_inv_region a2, a3, a4
++	retw
++
++/*
++ * void __invalidate_dcache_all(void)
++ */
++
++ENTRY(__invalidate_dcache_all)
++	entry	sp, 16
++	dcache_invalidate_all a2, a3
++	retw
++
++/*
++ * void __flush_invalidate_dcache_page_phys(ulong start)
++ */
++
++ENTRY(__flush_invalidate_dcache_page_phys)
++	entry	sp, 16
++
++	movi	a3, XCHAL_DCACHE_SIZE
++	movi	a4, PAGE_MASK | 1
++	addi	a2, a2, 1
++
++1:	addi	a3, a3, -XCHAL_DCACHE_LINESIZE
++
++	ldct	a6, a3
++	dsync
++	and	a6, a6, a4
++	beq	a6, a2, 2f
++	bgeui	a3, 2, 1b
++	retw
++
++2:	diwbi	a3, 0
++	bgeui	a3, 2, 1b
++	retw
++
++ENTRY(check_dcache_low0)
++	entry	sp, 16
++
++	movi	a3, XCHAL_DCACHE_SIZE / 4
++	movi	a4, PAGE_MASK | 1
++	addi	a2, a2, 1
++
++1:	addi	a3, a3, -XCHAL_DCACHE_LINESIZE
++
++	ldct	a6, a3
++	dsync
++	and	a6, a6, a4
++	beq	a6, a2, 2f
++	bgeui	a3, 2, 1b
++	retw
++
++2:	j 2b
++
++ENTRY(check_dcache_high0)
++	entry	sp, 16
++
++	movi	a5, XCHAL_DCACHE_SIZE / 4
++	movi	a3, XCHAL_DCACHE_SIZE / 2
++	movi	a4, PAGE_MASK | 1
++	addi	a2, a2, 1
++
++1:	addi	a3, a3, -XCHAL_DCACHE_LINESIZE
++	addi	a5, a5, -XCHAL_DCACHE_LINESIZE
++
++	ldct	a6, a3
++	dsync
++	and	a6, a6, a4
++	beq	a6, a2, 2f
++	bgeui	a5, 2, 1b
++	retw
++
++2:	j 2b
++
++ENTRY(check_dcache_low1)
++	entry	sp, 16
++
++	movi	a5, XCHAL_DCACHE_SIZE / 4
++	movi	a3, XCHAL_DCACHE_SIZE * 3 / 4
++	movi	a4, PAGE_MASK | 1
++	addi	a2, a2, 1
++
++1:	addi	a3, a3, -XCHAL_DCACHE_LINESIZE
++	addi	a5, a5, -XCHAL_DCACHE_LINESIZE
++
++	ldct	a6, a3
++	dsync
++	and	a6, a6, a4
++	beq	a6, a2, 2f
++	bgeui	a5, 2, 1b
++	retw
++
++2:	j 2b
++
++ENTRY(check_dcache_high1)
++	entry	sp, 16
++
++	movi	a5, XCHAL_DCACHE_SIZE / 4
++	movi	a3, XCHAL_DCACHE_SIZE
++	movi	a4, PAGE_MASK | 1
++	addi	a2, a2, 1
++
++1:	addi	a3, a3, -XCHAL_DCACHE_LINESIZE
++	addi	a5, a5, -XCHAL_DCACHE_LINESIZE
++
++	ldct	a6, a3
++	dsync
++	and	a6, a6, a4
++	beq	a6, a2, 2f
++	bgeui	a5, 2, 1b
++	retw
++
++2:	j 2b
++
++
++/*
++ * void __invalidate_icache_page_phys(ulong start)
++ */
++
++ENTRY(__invalidate_icache_page_phys)
++	entry	sp, 16
++
++	movi	a3, XCHAL_ICACHE_SIZE
++	movi	a4, PAGE_MASK | 1
++	addi	a2, a2, 1
++
++1:	addi	a3, a3, -XCHAL_ICACHE_LINESIZE
++
++	lict	a6, a3
++	isync
++	and	a6, a6, a4
++	beq	a6, a2, 2f
++	bgeui	a3, 2, 1b
++	retw
++
++2:	iii	a3, 0
++	bgeui	a3, 2, 1b
++	retw
++
++
++#if 0
++
++	movi	a3, XCHAL_DCACHE_WAYS - 1
++	movi	a4, PAGE_SIZE
++
++1:	mov	a5, a2
++	add	a6, a2, a4
++
++2:	diwbi	a5, 0
++	diwbi	a5, XCHAL_DCACHE_LINESIZE
++	diwbi	a5, XCHAL_DCACHE_LINESIZE * 2
++	diwbi	a5, XCHAL_DCACHE_LINESIZE * 3
++
++	addi	a5, a5, XCHAL_DCACHE_LINESIZE * 4
++	blt	a5, a6, 2b
++
++	addi	a3, a3, -1
++	addi	a2, a2, XCHAL_DCACHE_SIZE / XCHAL_DCACHE_WAYS
++	bgez	a3, 1b
++
++	retw
++
++ENTRY(__invalidate_icache_page_index)
++	entry	sp, 16
++
++	movi	a3, XCHAL_ICACHE_WAYS - 1
++	movi	a4, PAGE_SIZE
++
++1:	mov	a5, a2
++	add	a6, a2, a4
++
++2:	iii	a5, 0
++	iii	a5, XCHAL_ICACHE_LINESIZE
++	iii	a5, XCHAL_ICACHE_LINESIZE * 2
++	iii	a5, XCHAL_ICACHE_LINESIZE * 3
++
++	addi	a5, a5, XCHAL_ICACHE_LINESIZE * 4
++	blt	a5, a6, 2b
++
++	addi	a3, a3, -1
++	addi	a2, a2, XCHAL_ICACHE_SIZE / XCHAL_ICACHE_WAYS
++	bgez	a3, 2b
++
++	retw
++
++#endif
++
++
++
++
++
++
+Index: linux-2.6.10/arch/xtensa/mm/pgtable.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/mm/pgtable.c
+@@ -0,0 +1,76 @@
++/*
++ * arch/xtensa/mm/fault.c
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2001 - 2005 Tensilica Inc.
++ *
++ * Chris Zankel <chris@zankel.net>
++ */
++
++#if (DCACHE_SIZE > PAGE_SIZE)
++
++pte_t* pte_alloc_one_kernel(struct mm_struct *mm, unsigned long address)
++{
++	pte_t *pte, p;
++	int color = ADDR_COLOR(address);
++	int i;
++
++	p = (pte_t*) __get_free_pages(GFP_KERNEL|__GFP_REPEAT, COLOR_ORDER);
++
++	if (likely(p)) {
++		struct page *page;
++
++		for (i = 0; i < COLOR_SIZE; i++, p++) {
++			page = virt_to_page(pte);
++
++			set_page_count(page, 1);
++			ClearPageCompound(page);
++
++			if (ADDR_COLOR(p) == color)
++				pte = p;
++			else
++				free_page(p);
++		}
++		clear_page(pte);
++	}
++	return pte;
++}
++
++#ifdef PROFILING
++
++int mask;
++int hit;
++int flush;
++
++#endif
++
++struct page* pte_alloc_one(struct mm_struct *mm, unsigned long address)
++{
++	struct page *page, p;
++	int color = ADDR_COLOR(address);
++
++	p = alloc_pages(GFP_KERNEL | __GFP_REPEAT, PTE_ORDER);
++
++	if (likely(p)) {
++		for (i = 0; i < PAGE_ORDER; i++) {
++			set_page_count(p, 1);
++			ClearPageCompound(p);
++
++			if (PADDR_COLOR(page_address(pg)) == color)
++				page = p;
++			else
++				free_page(p);
++		}
++		clear_highpage(page);
++	}
++
++	return page;
++}
++
++#endif
++
++
++
+Index: linux-2.6.10/arch/xtensa/mm/tlb.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/mm/tlb.c
+@@ -0,0 +1,545 @@
++/*
++ * arch/xtensa/mm/mmu.c
++ *
++ * Logic that manipulates the Xtensa MMU.  Derived from MIPS.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2001 - 2003 Tensilica Inc.
++ *
++ * Joe Taylor
++ * Chris Zankel	<chris@zankel.net>
++ * Marc Gauthier
++ */
++
++#include <linux/mm.h>
++#include <asm/processor.h>
++#include <asm/mmu_context.h>
++#include <asm/tlbflush.h>
++#include <asm/system.h>
++#include <asm/cacheflush.h>
++
++
++static inline void __flush_itlb_all (void)
++{
++	int way, index;
++
++	for (way = 0; way < XCHAL_ITLB_ARF_WAYS; way++) {
++		for (index = 0; index < ITLB_ENTRIES_PER_ARF_WAY; index++) {
++			int entry = way + (index << PAGE_SHIFT);
++			invalidate_itlb_entry_no_isync (entry);
++		}
++	}
++	asm volatile ("isync\n");
++}
++
++static inline void __flush_dtlb_all (void)
++{
++	int way, index;
++
++	for (way = 0; way < XCHAL_DTLB_ARF_WAYS; way++) {
++		for (index = 0; index < DTLB_ENTRIES_PER_ARF_WAY; index++) {
++			int entry = way + (index << PAGE_SHIFT);
++			invalidate_dtlb_entry_no_isync (entry);
++		}
++	}
++	asm volatile ("isync\n");
++}
++
++
++void flush_tlb_all (void)
++{
++	__flush_itlb_all();
++	__flush_dtlb_all();
++}
++
++/* If mm is current, we simply assign the current task a new ASID, thus,
++ * invalidating all previous tlb entries. If mm is someone else's user mapping,
++ * wie invalidate the context, thus, when that user mapping is swapped in,
++ * a new context will be assigned to it.
++ */
++
++void flush_tlb_mm(struct mm_struct *mm)
++{
++#if 0
++	printk("[tlbmm<%lx>]\n", (unsigned long)mm->context);
++#endif
++
++	if (mm == current->active_mm) {
++		int flags;
++		local_save_flags(flags);
++		get_new_mmu_context(mm, asid_cache);
++		set_rasid_register(ASID_INSERT(mm->context));
++		local_irq_restore(flags);
++	}
++	else
++		mm->context = 0;
++}
++
++void flush_tlb_range (struct vm_area_struct *vma,
++    		      unsigned long start, unsigned long end)
++{
++	struct mm_struct *mm = vma->vm_mm;
++	unsigned long flags;
++
++	if (mm->context == NO_CONTEXT)
++		return;
++
++#if 0
++	printk("[tlbrange<%02lx,%08lx,%08lx>]\n",
++			(unsigned long)mm->context, start, end);
++#endif
++	local_save_flags(flags);
++
++	if (end-start + (PAGE_SIZE-1) <= SMALLEST_NTLB_ENTRIES << PAGE_SHIFT) {
++		int oldpid = get_rasid_register();
++		set_rasid_register (ASID_INSERT(mm->context));
++		start &= PAGE_MASK;
++ 		if (vma->vm_flags & VM_EXEC)
++			while(start < end) {
++				invalidate_itlb_mapping(start);
++				invalidate_dtlb_mapping(start);
++				start += PAGE_SIZE;
++			}
++		else
++			while(start < end) {
++				invalidate_dtlb_mapping(start);
++				start += PAGE_SIZE;
++			}
++
++		set_rasid_register(oldpid);
++	} else {
++		get_new_mmu_context(mm, asid_cache);
++		if (mm == current->active_mm)
++			set_rasid_register(ASID_INSERT(mm->context));
++	}
++	local_irq_restore(flags);
++}
++
++void flush_tlb_page (struct vm_area_struct *vma, unsigned long page)
++{
++	struct mm_struct* mm = vma->vm_mm;
++	unsigned long flags;
++	int oldpid;
++#if 0
++	printk("[tlbpage<%02lx,%08lx>]\n",
++			(unsigned long)mm->context, page);
++#endif
++
++	if(mm->context == NO_CONTEXT)
++		return;
++
++	local_save_flags(flags);
++
++       	oldpid = get_rasid_register();
++
++	if (vma->vm_flags & VM_EXEC)
++		invalidate_itlb_mapping(page);
++	invalidate_dtlb_mapping(page);
++
++	set_rasid_register(oldpid);
++
++	local_irq_restore(flags);
++
++#if 0
++	flush_tlb_all();
++	return;
++#endif
++}
++
++
++#ifdef DEBUG_TLB
++
++#define USE_ITLB  0
++#define USE_DTLB  1
++
++struct way_config_t {
++	int indicies;
++	int indicies_log2;
++	int pgsz_log2;
++	int arf;
++};
++
++static struct way_config_t itlb[XCHAL_ITLB_WAYS] =
++{
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY0_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY0_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY0_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY0_SET, ARF)
++	},
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY1_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY1_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY1_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY1_SET, ARF)
++	},
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY2_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY2_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY2_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY2_SET, ARF)
++	},
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY3_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY3_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY3_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY3_SET, ARF)
++	},
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY4_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY4_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY4_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY4_SET, ARF)
++	},
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY5_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY5_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY5_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY5_SET, ARF)
++	},
++	{ XCHAL_ITLB_SET(XCHAL_ITLB_WAY6_SET, ENTRIES),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY6_SET, ENTRIES_LOG2),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY6_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_ITLB_SET(XCHAL_ITLB_WAY6_SET, ARF)
++	}
++};
++
++static struct way_config_t dtlb[XCHAL_DTLB_WAYS] =
++{
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY0_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY0_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY0_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY0_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY1_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY1_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY1_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY1_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY2_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY2_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY2_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY2_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY3_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY3_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY3_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY3_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY4_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY4_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY4_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY4_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY5_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY5_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY5_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY5_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY6_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY6_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY6_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY6_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY7_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY7_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY7_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY7_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY8_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY8_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY8_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY8_SET, ARF)
++	},
++	{ XCHAL_DTLB_SET(XCHAL_DTLB_WAY9_SET, ENTRIES),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY9_SET, ENTRIES_LOG2),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY9_SET, PAGESZ_LOG2_MIN),
++	  XCHAL_DTLB_SET(XCHAL_DTLB_WAY9_SET, ARF)
++	}
++};
++
++/*  Total number of entries:  */
++#define ITLB_TOTAL_ENTRIES	\
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY0_SET, ENTRIES) + \
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY1_SET, ENTRIES) + \
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY2_SET, ENTRIES) + \
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY3_SET, ENTRIES) + \
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY4_SET, ENTRIES) + \
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY5_SET, ENTRIES) + \
++		XCHAL_ITLB_SET(XCHAL_ITLB_WAY6_SET, ENTRIES)
++#define DTLB_TOTAL_ENTRIES	\
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY0_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY1_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY2_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY3_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY4_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY5_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY6_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY7_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY8_SET, ENTRIES) + \
++		XCHAL_DTLB_SET(XCHAL_DTLB_WAY9_SET, ENTRIES)
++
++
++typedef struct {
++    unsigned		va;
++    unsigned		pa;
++    unsigned char	asid;
++    unsigned char	ca;
++    unsigned char	way;
++    unsigned char	index;
++    unsigned char	pgsz_log2;	/* 0 .. 32 */
++    unsigned char	type;		/* 0=ITLB 1=DTLB */
++} tlb_dump_entry_t;
++
++/*  Return -1 if a precedes b, +1 if a follows b, 0 if same:  */
++int cmp_tlb_dump_info( tlb_dump_entry_t *a, tlb_dump_entry_t *b )
++{
++    if (a->asid < b->asid) return -1;
++    if (a->asid > b->asid) return  1;
++    if (a->va < b->va) return -1;
++    if (a->va > b->va) return  1;
++    if (a->pa < b->pa) return -1;
++    if (a->pa > b->pa) return  1;
++    if (a->ca < b->ca) return -1;
++    if (a->ca > b->ca) return  1;
++    if (a->way < b->way) return -1;
++    if (a->way > b->way) return  1;
++    if (a->index < b->index) return -1;
++    if (a->index > b->index) return  1;
++    return 0;
++}
++
++void sort_tlb_dump_info( tlb_dump_entry_t *t, int n )
++{
++    int i, j;
++    /*  Simple O(n*n) sort:  */
++    for (i = 0; i < n-1; i++)
++	for (j = i+1; j < n; j++)
++	    if (cmp_tlb_dump_info(t+i, t+j) > 0) {
++		tlb_dump_entry_t tmp = t[i];
++		t[i] = t[j];
++		t[j] = tmp;
++	    }
++}
++
++
++static tlb_dump_entry_t itlb_dump_info[ITLB_TOTAL_ENTRIES];
++static tlb_dump_entry_t dtlb_dump_info[DTLB_TOTAL_ENTRIES];
++
++
++static inline char *way_type (int type)
++{
++	return type ? "autorefill" : "non-autorefill";
++}
++
++void print_entry (struct way_config_t *way_info,
++		  unsigned int way,
++		  unsigned int index,
++		  unsigned int virtual,
++		  unsigned int translation)
++{
++	char valid_chr;
++	unsigned int va, pa, asid, ca;
++
++	va = virtual &
++	  	~((1 << (way_info->pgsz_log2 + way_info->indicies_log2)) - 1);
++	asid = virtual & ((1 << XCHAL_MMU_ASID_BITS) - 1);
++	pa = translation & ~((1 << way_info->pgsz_log2) - 1);
++	ca = translation & ((1 << XCHAL_MMU_CA_BITS) - 1);
++	valid_chr = asid ? 'V' : 'I';
++
++	/* Compute and incorporate the effect of the index bits on the
++	 * va.  It's more useful for kernel debugging, since we always
++	 * want to know the effective va anyway. */
++
++	va += index << way_info->pgsz_log2;
++
++	printk ("\t[%d,%d] (%c) vpn 0x%.8x  ppn 0x%.8x  asid 0x%.2x  am 0x%x\n",
++		way, index, valid_chr, va, pa, asid, ca);
++}
++
++void print_itlb_entry (struct way_config_t *way_info, int way, int index)
++{
++	print_entry (way_info, way, index,
++		     read_itlb_virtual (way + (index << way_info->pgsz_log2)),
++		     read_itlb_translation (way + (index << way_info->pgsz_log2)));
++}
++
++void print_dtlb_entry (struct way_config_t *way_info, int way, int index)
++{
++	print_entry (way_info, way, index,
++		     read_dtlb_virtual (way + (index << way_info->pgsz_log2)),
++		     read_dtlb_translation (way + (index << way_info->pgsz_log2)));
++}
++
++void dump_itlb (void)
++{
++	int way, index;
++
++	printk ("\nITLB: ways = %d\n", XCHAL_ITLB_WAYS);
++
++	for (way = 0; way < XCHAL_ITLB_WAYS; way++) {
++		printk ("\nWay: %d, Entries: %d, MinPageSize: %d, Type: %s\n",
++			way, itlb[way].indicies,
++			itlb[way].pgsz_log2, way_type(itlb[way].arf));
++		for (index = 0; index < itlb[way].indicies; index++) {
++			print_itlb_entry(&itlb[way], way, index);
++		}
++	}
++}
++
++void dump_dtlb (void)
++{
++	int way, index;
++
++	printk ("\nDTLB: ways = %d\n", XCHAL_DTLB_WAYS);
++
++	for (way = 0; way < XCHAL_DTLB_WAYS; way++) {
++		printk ("\nWay: %d, Entries: %d, MinPageSize: %d, Type: %s\n",
++			way, dtlb[way].indicies,
++			dtlb[way].pgsz_log2, way_type(dtlb[way].arf));
++		for (index = 0; index < dtlb[way].indicies; index++) {
++			print_dtlb_entry(&dtlb[way], way, index);
++		}
++	}
++}
++
++void dump_tlb (tlb_dump_entry_t *tinfo, struct way_config_t *config,
++		int entries, int ways, int type, int show_invalid)
++{
++    tlb_dump_entry_t *e = tinfo;
++    int way, i;
++
++    /*  Gather all info:  */
++    for (way = 0; way < ways; way++) {
++	struct way_config_t *cfg = config + way;
++	for (i = 0; i < cfg->indicies; i++) {
++	    unsigned wayindex = way + (i << cfg->pgsz_log2);
++	    unsigned vv = (type ? read_dtlb_virtual (wayindex)
++		    		: read_itlb_virtual (wayindex));
++	    unsigned pp = (type ? read_dtlb_translation (wayindex)
++		    		: read_itlb_translation (wayindex));
++
++	    /* Compute and incorporate the effect of the index bits on the
++	     * va.  It's more useful for kernel debugging, since we always
++	     * want to know the effective va anyway. */
++
++	    e->va = (vv & ~((1 << (cfg->pgsz_log2 + cfg->indicies_log2)) - 1));
++	    e->va += (i << cfg->pgsz_log2);
++	    e->pa = (pp & ~((1 << cfg->pgsz_log2) - 1));
++	    e->asid = (vv & ((1 << XCHAL_MMU_ASID_BITS) - 1));
++	    e->ca = (pp & ((1 << XCHAL_MMU_CA_BITS) - 1));
++	    e->way = way;
++	    e->index = i;
++	    e->pgsz_log2 = cfg->pgsz_log2;
++	    e->type = type;
++	    e++;
++	}
++    }
++#if 1
++    /*  Sort by ASID and VADDR:  */
++    sort_tlb_dump_info (tinfo, entries);
++#endif
++
++    /*  Display all sorted info:  */
++    printk ("\n%cTLB dump:\n", (type ? 'D' : 'I'));
++    for (e = tinfo, i = 0; i < entries; i++, e++) {
++#if 0
++	if (e->asid == 0 && !show_invalid)
++	    continue;
++#endif
++	printk ("%c way=%d i=%d  ASID=%02X V=%08X -> P=%08X CA=%X (%d %cB)\n",
++		(e->type ? 'D' : 'I'), e->way, e->index,
++		e->asid, e->va, e->pa, e->ca,
++		(1 << (e->pgsz_log2 % 10)),
++		" kMG"[e->pgsz_log2 / 10]
++		);
++    }
++}
++
++void dump_tlbs2 (int showinv)
++{
++    dump_tlb (itlb_dump_info, itlb, ITLB_TOTAL_ENTRIES, XCHAL_ITLB_WAYS, 0, showinv);
++    dump_tlb (dtlb_dump_info, dtlb, DTLB_TOTAL_ENTRIES, XCHAL_DTLB_WAYS, 1, showinv);
++}
++
++void dump_all_tlbs (void)
++{
++    dump_tlbs2 (1);
++}
++
++void dump_valid_tlbs (void)
++{
++    dump_tlbs2 (0);
++}
++
++
++void dump_tlbs (void)
++{
++	dump_itlb();
++	dump_dtlb();
++}
++
++void dump_cache_tag(int dcache, int idx)
++{
++	int w, i, s, e;
++	unsigned long tag, index;
++	unsigned long num_lines, num_ways, cache_size, line_size;
++
++	num_ways = dcache ? XCHAL_DCACHE_WAYS : XCHAL_ICACHE_WAYS;
++	cache_size = dcache ? XCHAL_DCACHE_SIZE : XCHAL_ICACHE_SIZE;
++	line_size = dcache ? XCHAL_DCACHE_LINESIZE : XCHAL_ICACHE_LINESIZE;
++
++	num_lines = cache_size / num_ways;
++
++	s = 0; e = num_lines;
++
++	if (idx >= 0)
++		e = (s = idx * line_size) + 1;
++
++	for (i = s; i < e; i+= line_size) {
++		printk("\nline %#08x:", i);
++		for (w = 0; w < num_ways; w++) {
++			index = w * num_lines + i;
++			if (dcache)
++				__asm__ __volatile__("ldct %0, %1\n\t"
++						: "=a"(tag) : "a"(index));
++			else
++				__asm__ __volatile__("lict %0, %1\n\t"
++						: "=a"(tag) : "a"(index));
++
++			printk(" %#010lx", tag);
++		}
++	}
++	printk ("\n");
++}
++
++void dump_icache(int index)
++{
++	unsigned long data, addr;
++	int w, i;
++
++	const unsigned long num_ways = XCHAL_ICACHE_WAYS;
++	const unsigned long cache_size = XCHAL_ICACHE_SIZE;
++	const unsigned long line_size = XCHAL_ICACHE_LINESIZE;
++	const unsigned long num_lines = cache_size / num_ways / line_size;
++
++	for (w = 0; w < num_ways; w++) {
++		printk ("\nWay %d", w);
++
++		for (i = 0; i < line_size; i+= 4) {
++			addr = w * num_lines + index * line_size + i;
++			__asm__ __volatile__("licw %0, %1\n\t"
++					: "=a"(data) : "a"(addr));
++			printk(" %#010lx", data);
++		}
++	}
++	printk ("\n");
++}
++
++void dump_cache_tags(void)
++{
++	printk("Instruction cache\n");
++	dump_cache_tag(0, -1);
++	printk("Data cache\n");
++	dump_cache_tag(1, -1);
++}
++
++#endif
+Index: linux-2.6.10/mvl_patches/pro-1088.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1088.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1088);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,528 @@
+#! /usr/bin/env bash
+# Patch: -pro_sl82c105_dma_support_code_cleanup
+# Date: Fri Jan  4 18:42:45 2008
+# Source: MontaVista Software, Inc.
+# MR: 18243
+# Type: Enhancement
+# Disposition: accepted into 2.6.22-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# sl82c105: DMA support code cleanup (take 4)
+# 
+# Fold the now equivalent code in the ide_dma_check() method into a mere call to
+# ide_use_dma().  Make config_for_dma() return non-zero if DMA mode has been set
+# and call it from the ide_dma_check() method instead of ide_dma_on().
+# Defer writing the DMA timings to the chip registers until DMA is really turned
+# on (and do not enable IORDY for DMA).
+# Remove unneeded code from the init_hwif() method, improve its overall looks.
+# Rename the dma_start(), ide_dma_check(), and ide_dma_lostirq() methods, and
+# also use more proper hwif->dma_command, fix printk() and comment in the latter
+# one as well.  While at it, cleanup style in several places.
+# 
+# The patch is somewhat different from the upstream version due to some IDE clean
+# ups which went into the tree  before the original patch...
+# 
+# commit 688a87d145e04f6761c63e7f2e19fd9b3e4ca060
+# tree 28aa795f2d63729fcba993d292a827a915de3138
+# parent e93df705af1992dbf5956a8c80fcb9987bc595c0
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:49 +0200
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:49 +0200
+# 
+#  drivers/ide/pci/sl82c105.c |  150 ++++++++++++++++++---------------------------
+#  1 files changed, 61 insertions(+), 89 deletions(-)
+# 
+
+PATCHNUM=1566
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18243
+Type: Enhancement
+Disposition: accepted into 2.6.22-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+sl82c105: DMA support code cleanup (take 4)
+
+Fold the now equivalent code in the ide_dma_check() method into a mere call to
+ide_use_dma().  Make config_for_dma() return non-zero if DMA mode has been set
+and call it from the ide_dma_check() method instead of ide_dma_on().
+Defer writing the DMA timings to the chip registers until DMA is really turned
+on (and do not enable IORDY for DMA).
+Remove unneeded code from the init_hwif() method, improve its overall looks.
+Rename the dma_start(), ide_dma_check(), and ide_dma_lostirq() methods, and
+also use more proper hwif->dma_command, fix printk() and comment in the latter
+one as well.  While at it, cleanup style in several places.
+
+The patch is somewhat different from the upstream version due to some IDE clean
+ups which went into the tree  before the original patch...
+
+commit 688a87d145e04f6761c63e7f2e19fd9b3e4ca060
+tree 28aa795f2d63729fcba993d292a827a915de3138
+parent e93df705af1992dbf5956a8c80fcb9987bc595c0
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:49 +0200
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:49 +0200
+
+ drivers/ide/pci/sl82c105.c |  150 ++++++++++++++++++---------------------------
+ mvl_patches/pro-1566.c     |   16 ++++
+ 2 files changed, 77 insertions(+), 89 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/sl82c105.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/sl82c105.c
++++ linux-2.6.10/drivers/ide/pci/sl82c105.c
+@@ -101,59 +101,32 @@ static u8 sl82c105_tune_pio(ide_drive_t 
+ }
+ 
+ /*
+- * Configure the drive and the chipset for DMA
++ * Configure the drive for DMA.
++ * We'll program the chipset only when DMA is actually turned on.
+  */
+-static int config_for_dma (ide_drive_t *drive)
++static int config_for_dma(ide_drive_t *drive)
+ {
+-	ide_hwif_t *hwif = HWIF(drive);
+-	struct pci_dev *dev = hwif->pci_dev;
+-	unsigned int reg;
+-
+ 	DBG(("config_for_dma(drive:%s)\n", drive->name));
+ 
+-	reg = (hwif->channel ? 0x4c : 0x44) + (drive->select.b.unit ? 4 : 0);
+-
+ 	if (ide_config_drive_speed(drive, XFER_MW_DMA_2) != 0)
+-		return 1;
+-
+-	pci_write_config_word(dev, reg, 0x0240);
++		return 0;
+ 
+-	return 0;
++	return ide_dma_enable(drive);
+ }
+ 
+ /*
+- * Check to see if the drive and
+- * chipset is capable of DMA mode
++ * Check to see if the drive and chipset are capable of DMA mode.
+  */
+-
+-static int sl82c105_check_drive (ide_drive_t *drive)
++static int sl82c105_ide_dma_check(ide_drive_t *drive)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
++	struct hd_driveid *id	= drive->id;
+ 
+-	DBG(("sl82c105_check_drive(drive:%s)\n", drive->name));
++	DBG(("sl82c105_ide_dma_check(drive:%s)\n", drive->name));
+ 
+-	do {
+-		struct hd_driveid *id = drive->id;
+-
+-		if (!drive->autodma)
+-			break;
+-
+-		if (!id || !(id->capability & 1))
+-			break;
+-
+-		/* Consult the list of known "bad" drives */
+-		if (__ide_dma_bad_drive(drive))
+-			break;
+-
+-		if (id->field_valid & 2) {
+-			if ((id->dma_mword & hwif->mwdma_mask) ||
+-			    (id->dma_1word & hwif->swdma_mask))
+-				return hwif->ide_dma_on(drive);
+-		}
+-
+-		if (__ide_dma_good_drive(drive) && id->eide_dma_time < 150)
+-			return hwif->ide_dma_on(drive);
+-	} while (0);
++	if (drive->autodma && (id->capability & 1) &&
++	    ide_use_dma(drive) && config_for_dma(drive))
++		return hwif->ide_dma_on(drive);
+ 
+ 	return hwif->ide_dma_off_quietly(drive);
+ }
+@@ -182,14 +155,14 @@ static inline void sl82c105_reset_host(s
+  * This function is called when the IDE timer expires, the drive
+  * indicates that it is READY, and we were waiting for DMA to complete.
+  */
+-static int sl82c105_ide_dma_lost_irq(ide_drive_t *drive)
++static int sl82c105_ide_dma_lostirq(ide_drive_t *drive)
+ {
+-	ide_hwif_t *hwif = HWIF(drive);
+-	struct pci_dev *dev = hwif->pci_dev;
+-	u32 val, mask = hwif->channel ? CTRL_IDE_IRQB : CTRL_IDE_IRQA;
+-	unsigned long dma_base = hwif->dma_base;
++	ide_hwif_t *hwif	= HWIF(drive);
++	struct pci_dev *dev	= hwif->pci_dev;
++	u32 val, mask		= hwif->channel ? CTRL_IDE_IRQB : CTRL_IDE_IRQA;
++	u8 dma_cmd;
+ 
+-	printk("sl82c105: lost IRQ: resetting host\n");
++	printk("sl82c105: lost IRQ, resetting host\n");
+ 
+ 	/*
+ 	 * Check the raw interrupt from the drive.
+@@ -202,15 +175,15 @@ static int sl82c105_ide_dma_lost_irq(ide
+ 	 * Was DMA enabled?  If so, disable it - we're resetting the
+ 	 * host.  The IDE layer will be handling the drive for us.
+ 	 */
+-	val = hwif->INB(dma_base);
+-	if (val & 1) {
+-		outb(val & ~1, dma_base);
++	dma_cmd = inb(hwif->dma_command);
++	if (dma_cmd & 1) {
++		outb(dma_cmd & ~1, hwif->dma_command);
+ 		printk("sl82c105: DMA was enabled\n");
+ 	}
+ 
+ 	sl82c105_reset_host(dev);
+ 
+-	/* ide_dmaproc would return 1, so we do as well */
++	/* __ide_dma_lostirq would return 1, so we do as well */
+ 	return 1;
+ }
+ 
+@@ -222,10 +195,10 @@ static int sl82c105_ide_dma_lost_irq(ide
+  * The generic IDE core will have disabled the BMEN bit before this
+  * function is called.
+  */
+-static void sl82c105_ide_dma_start(ide_drive_t *drive)
++static void sl82c105_dma_start(ide_drive_t *drive)
+ {
+-	ide_hwif_t *hwif = HWIF(drive);
+-	struct pci_dev *dev = hwif->pci_dev;
++	ide_hwif_t *hwif	= HWIF(drive);
++	struct pci_dev *dev	= hwif->pci_dev;
+ 
+ 	sl82c105_reset_host(dev);
+ 	ide_dma_start(drive);
+@@ -233,8 +206,8 @@ static void sl82c105_ide_dma_start(ide_d
+ 
+ static int sl82c105_ide_dma_timeout(ide_drive_t *drive)
+ {
+-	ide_hwif_t *hwif = HWIF(drive);
+-	struct pci_dev *dev = hwif->pci_dev;
++	ide_hwif_t *hwif	= HWIF(drive);
++	struct pci_dev *dev	= hwif->pci_dev;
+ 
+ 	DBG(("sl82c105_ide_dma_timeout(drive:%s)\n", drive->name));
+ 
+@@ -242,14 +215,20 @@ static int sl82c105_ide_dma_timeout(ide_
+ 	return __ide_dma_timeout(drive);
+ }
+ 
+-static int sl82c105_ide_dma_on (ide_drive_t *drive)
++static int sl82c105_ide_dma_on(ide_drive_t *drive)
+ {
++	struct pci_dev *dev	= HWIF(drive)->pci_dev;
++	int rc, reg 		= 0x44 + drive->dn * 4;
++
+ 	DBG(("sl82c105_ide_dma_on(drive:%s)\n", drive->name));
+ 
+-	if (config_for_dma(drive))
+-		return 1;
+-	printk(KERN_INFO "%s: DMA enabled\n", drive->name);
+-	return __ide_dma_on(drive);
++	rc = __ide_dma_on(drive);
++	if (rc == 0) {
++		pci_write_config_word(dev, reg, 0x0200);
++
++		printk(KERN_INFO "%s: DMA enabled\n", drive->name);
++	}
++	return rc;
+ }
+ 
+ static int sl82c105_ide_dma_off_quietly(ide_drive_t *drive)
+@@ -273,8 +252,8 @@ static int sl82c105_ide_dma_off_quietly(
+  */
+ static void sl82c105_selectproc(ide_drive_t *drive)
+ {
+-	ide_hwif_t *hwif = HWIF(drive);
+-	struct pci_dev *dev = hwif->pci_dev;
++	ide_hwif_t *hwif	= HWIF(drive);
++	struct pci_dev *dev	= hwif->pci_dev;
+ 	u32 val, old, mask;
+ 
+ 	//DBG(("sl82c105_selectproc(drive:%s)\n", drive->name));
+@@ -374,7 +353,7 @@ static unsigned int __devinit init_chips
+ }
+ 
+ /*
+- * Initialise the chip
++ * Initialise IDE channel
+  */
+ static void __devinit init_hwif_sl82c105(ide_hwif_t *hwif)
+ {
+@@ -399,11 +378,6 @@ static void __devinit init_hwif_sl82c105
+ 	 */
+ 	hwif->drives[0].autotune = hwif->drives[1].autotune = 1;
+ 
+-	hwif->atapi_dma = 0;
+-	hwif->mwdma_mask = 0;
+-	hwif->swdma_mask = 0;
+-	hwif->autodma = 0;
+-
+ 	if (!hwif->dma_base)
+ 		return;
+ 
+@@ -413,29 +387,27 @@ static void __devinit init_hwif_sl82c105
+ 		 * Never ever EVER under any circumstances enable
+ 		 * DMA when the bridge is this old.
+ 		 */
+-		printk("    %s: Winbond 553 bridge revision %d, BM-DMA disabled\n",
+-		       hwif->name, rev);
+-	} else {
+-#ifdef CONFIG_BLK_DEV_IDEDMA
+-		hwif->atapi_dma = 1;
+-		hwif->mwdma_mask = 0x04;
+-
+-		hwif->ide_dma_check = &sl82c105_check_drive;
+-		hwif->ide_dma_on = &sl82c105_ide_dma_on;
+-		hwif->ide_dma_off_quietly = &sl82c105_ide_dma_off_quietly;
+-		hwif->ide_dma_lostirq = &sl82c105_ide_dma_lost_irq;
+-		hwif->dma_start = &sl82c105_ide_dma_start;
+-		hwif->ide_dma_timeout = &sl82c105_ide_dma_timeout;
+-
+-		if (!noautodma)
+-			hwif->autodma = 1;
+-		hwif->drives[0].autodma = hwif->autodma;
+-		hwif->drives[1].autodma = hwif->autodma;
+-
+-		if (hwif->mate)
+-			hwif->serialized = hwif->mate->serialized = 1;
+-#endif /* CONFIG_BLK_DEV_IDEDMA */
++		printk("    %s: Winbond W83C553 bridge revision %d, "
++		       "BM-DMA disabled\n", hwif->name, rev);
++		return;
+ 	}
++
++	hwif->atapi_dma  = 1;
++	hwif->mwdma_mask = 0x04;
++
++	hwif->ide_dma_check		= &sl82c105_ide_dma_check;
++	hwif->ide_dma_on		= &sl82c105_ide_dma_on;
++	hwif->ide_dma_off_quietly	= &sl82c105_ide_dma_off_quietly;
++	hwif->ide_dma_lostirq		= &sl82c105_ide_dma_lostirq;
++	hwif->dma_start			= &sl82c105_dma_start;
++	hwif->ide_dma_timeout		= &sl82c105_ide_dma_timeout;
++
++	if (!noautodma)
++		hwif->autodma = 1;
++	hwif->drives[0].autodma = hwif->drives[1].autodma = hwif->autodma;
++
++	if (hwif->mate)
++		hwif->serialized = hwif->mate->serialized = 1;
+ }
+ 
+ static ide_pci_device_t sl82c105_chipset __devinitdata = {
+Index: linux-2.6.10/mvl_patches/pro-1566.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1566.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1566);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

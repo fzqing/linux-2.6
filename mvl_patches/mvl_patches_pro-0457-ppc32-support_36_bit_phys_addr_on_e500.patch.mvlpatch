@@ -1,0 +1,614 @@
+#! /usr/bin/env bash
+# Patch: -ppc32-support_36_bit_phys_addr_on_e500.patch
+# Date: Thu Apr 20 12:19:24 2006
+# commit f50b153b1966230e78034d5ab1641ca4bb5db56d
+# Author: Kumar Gala <galak@freescale.com>
+# Date:   Sat Apr 16 15:24:22 2005 -0700
+# MontaVista Modified: by Dale Farnsworth - Mon Nov 14 15:14:17 MST 2005
+# 
+#     [PATCH] ppc32: Support 36-bit physical addressing on e500
+#     
+#     To add support for 36-bit physical addressing on e500 the following changes
+#     have been made.  The changes are generalized to support any physical address
+#     size larger than 32-bits:
+#     
+#     * Allow FSL Book-E parts to use a 64-bit PTE, it is 44-bits of pfn, 20-bits
+#       of flags.
+#     
+#     * Introduced new CPU feature (CPU_FTR_BIG_PHYS) to allow runtime handling of
+#       updating hardware register (SPRN_MAS7) which holds the upper 32-bits of
+#       physical address that will be written into the TLB.  This is useful since
+#       not all e500 cores support 36-bit physical addressing.
+#     
+#     * Currently have a pass through implementation of fixup_bigphys_addr
+#     
+#     * Moved _PAGE_DIRTY in the 64-bit PTE case to free room for three additional
+#       storage attributes that may exist in future FSL Book-E cores and updated
+#       fault handler to copy these bits into the hardware TLBs.
+#     
+#     Signed-off-by: Kumar Gala <kumar.gala@freescale.com>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# 
+
+PATCHNUM=457
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+commit f50b153b1966230e78034d5ab1641ca4bb5db56d
+Author: Kumar Gala <galak@freescale.com>
+Date:   Sat Apr 16 15:24:22 2005 -0700
+MontaVista Modified: by Dale Farnsworth - Mon Nov 14 15:14:17 MST 2005
+
+    [PATCH] ppc32: Support 36-bit physical addressing on e500
+    
+    To add support for 36-bit physical addressing on e500 the following changes
+    have been made.  The changes are generalized to support any physical address
+    size larger than 32-bits:
+    
+    * Allow FSL Book-E parts to use a 64-bit PTE, it is 44-bits of pfn, 20-bits
+      of flags.
+    
+    * Introduced new CPU feature (CPU_FTR_BIG_PHYS) to allow runtime handling of
+      updating hardware register (SPRN_MAS7) which holds the upper 32-bits of
+      physical address that will be written into the TLB.  This is useful since
+      not all e500 cores support 36-bit physical addressing.
+    
+    * Currently have a pass through implementation of fixup_bigphys_addr
+    
+    * Moved _PAGE_DIRTY in the 64-bit PTE case to free room for three additional
+      storage attributes that may exist in future FSL Book-E cores and updated
+      fault handler to copy these bits into the hardware TLBs.
+    
+    Signed-off-by: Kumar Gala <kumar.gala@freescale.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+
+diff --git a/arch/ppc/Kconfig b/arch/ppc/Kconfig
+index 813c6c9..74aa1e9 100644
+ arch/ppc/Kconfig                 |   16 +++--
+ arch/ppc/kernel/head_fsl_booke.S |  113 +++++++++++++++++++++++++--------------
+ arch/ppc/syslib/ppc85xx_common.c |    8 ++
+ include/asm-ppc/cputable.h       |    3 -
+ include/asm-ppc/pgtable.h        |   45 +++++++++------
+ include/asm-ppc/reg_booke.h      |    1 
+ mvl_patches/pro-0457.c           |   16 +++++
+ 7 files changed, 139 insertions(+), 63 deletions(-)
+
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -104,13 +104,19 @@ config FSL_BOOKE
+ 
+ config PTE_64BIT
+ 	bool
+-	depends on 44x
+-	default y
++	depends on 44x || E500
++	default y if 44x
++	default y if E500 && PHYS_64BIT
+ 
+ config PHYS_64BIT
+-	bool
+-	depends on 44x
+-	default y
++	bool 'Large physical address support' if E500
++	depends on 44x || E500
++	default y if 44x
++	---help---
++	  This option enables kernel support for larger than 32-bit physical
++	  addresses.  This features is not be available on all e500 cores.
++
++	  If in doubt, say N here.
+ 
+ config ALTIVEC
+ 	bool "AltiVec Support"
+Index: linux-2.6.10/arch/ppc/kernel/head_fsl_booke.S
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/head_fsl_booke.S
++++ linux-2.6.10/arch/ppc/kernel/head_fsl_booke.S
+@@ -347,6 +347,38 @@ skpinv:	addi	r6,r6,1				/* Increment */
+ 	mtspr	SRR1,r3
+ 	rfi			/* change context and jump to start_kernel */
+ 
++/* Macros to hide the PTE size differences
++ *
++ * FIND_PTE -- walks the page tables given EA & pgdir pointer
++ *   r10 -- EA of fault
++ *   r11 -- PGDIR pointer
++ *   r12 -- free
++ *   label 2: is the bailout case
++ *
++ * if we find the pte (fall through):
++ *   r11 is low pte word
++ *   r12 is pointer to the pte
++ */
++#ifdef CONFIG_PTE_64BIT
++#define PTE_FLAGS_OFFSET	4
++#define FIND_PTE	\
++	rlwinm 	r12, r10, 13, 19, 29;	/* Compute pgdir/pmd offset */	\
++	lwzx	r11, r12, r11;		/* Get pgd/pmd entry */		\
++	rlwinm.	r12, r11, 0, 0, 20;	/* Extract pt base address */	\
++	beq	2f;			/* Bail if no table */		\
++	rlwimi	r12, r10, 23, 20, 28;	/* Compute pte address */	\
++	lwz	r11, 4(r12);		/* Get pte entry */
++#else
++#define PTE_FLAGS_OFFSET	0
++#define FIND_PTE	\
++	rlwimi	r11, r10, 12, 20, 29;	/* Create L1 (pgdir/pmd) address */	\
++	lwz	r11, 0(r11);		/* Get L1 entry */			\
++	rlwinm.	r12, r11, 0, 0, 19;	/* Extract L2 (pte) base address */	\
++	beq	2f;			/* Bail if no table */			\
++	rlwimi	r12, r10, 22, 20, 29;	/* Compute PTE address */		\
++	lwz	r11, 0(r12);		/* Get Linux PTE */
++#endif
++
+ /*
+  * Interrupt vector entry code
+  *
+@@ -405,13 +437,7 @@ interrupt_base:
+ 	mfspr	r11,SPRG3
+ 	lwz	r11,PGDIR(r11)
+ 4:
+-	rlwimi	r11, r10, 12, 20, 29	/* Create L1 (pgdir/pmd) address */
+-	lwz	r11, 0(r11)		/* Get L1 entry */
+-	rlwinm.	r12, r11, 0, 0, 19	/* Extract L2 (pte) base address */
+-	beq	2f			/* Bail if no table */
+-
+-	rlwimi	r12, r10, 22, 20, 29	/* Compute PTE address */
+-	lwz	r11, 0(r12)		/* Get Linux PTE */
++	FIND_PTE
+ 
+ 	/* Are _PAGE_USER & _PAGE_RW set & _PAGE_HWWRITE not? */
+ 	andi.	r13, r11, _PAGE_RW|_PAGE_USER|_PAGE_HWWRITE
+@@ -420,14 +446,12 @@ interrupt_base:
+ 
+ 	/* Update 'changed'. */
+ 	ori	r11, r11, _PAGE_DIRTY|_PAGE_ACCESSED|_PAGE_HWWRITE
+-	stw	r11, 0(r12)		/* Update Linux page table */
++	stw	r11, PTE_FLAGS_OFFSET(r12) /* Update Linux page table */
+ 
+ 	/* MAS2 not updated as the entry does exist in the tlb, this
+ 	   fault taken to detect state transition (eg: COW -> DIRTY)
+ 	 */
+-	lis	r12, MAS3_RPN@h
+-	ori	r12, r12, _PAGE_HWEXEC | MAS3_RPN@l
+-	and	r11, r11, r12
++	andi.	r11, r11, _PAGE_HWEXEC
+ 	rlwimi	r11, r11, 31, 27, 27	/* SX <- _PAGE_HWEXEC */
+ 	ori     r11, r11, (MAS3_UW|MAS3_SW|MAS3_UR|MAS3_SR)@l /* set static perms */
+ 
+@@ -439,7 +463,10 @@ interrupt_base:
+ 	/* find the TLB index that caused the fault.  It has to be here. */
+ 	tlbsx	0, r10
+ 
+-	mtspr	SPRN_MAS3,r11
++	/* only update the perm bits, assume the RPN is fine */
++	mfspr	r12, SPRN_MAS3
++	rlwimi	r12, r11, 0, 20, 31
++	mtspr	SPRN_MAS3,r12
+ 	tlbwe
+ 
+ 	/* Done...restore registers and get out of here.  */
+@@ -537,18 +564,15 @@ interrupt_base:
+ 	lwz	r11,PGDIR(r11)
+ 
+ 4:
+-	rlwimi	r11, r10, 12, 20, 29	/* Create L1 (pgdir/pmd) address */
+-	lwz	r11, 0(r11)		/* Get L1 entry */
+-	rlwinm.	r12, r11, 0, 0, 19	/* Extract L2 (pte) base address */
+-	beq	2f			/* Bail if no table */
+-
+-	rlwimi	r12, r10, 22, 20, 29	/* Compute PTE address */
+-	lwz	r11, 0(r12)		/* Get Linux PTE */
+-	andi.	r13, r11, _PAGE_PRESENT
+-	beq	2f
++	FIND_PTE
++	andi.	r13, r11, _PAGE_PRESENT	/* Is the page present? */
++	beq	2f			/* Bail if not present */
+ 
++#ifdef CONFIG_PTE_64BIT
++	lwz	r13, 0(r12)
++#endif
+ 	ori	r11, r11, _PAGE_ACCESSED
+-	stw	r11, 0(r12)
++	stw	r11, PTE_FLAGS_OFFSET(r12)
+ 
+ 	 /* Jump to common tlb load */
+ 	b	finish_tlb_load
+@@ -601,18 +625,15 @@ interrupt_base:
+ 	lwz	r11,PGDIR(r11)
+ 
+ 4:
+-	rlwimi	r11, r10, 12, 20, 29	/* Create L1 (pgdir/pmd) address */
+-	lwz	r11, 0(r11)		/* Get L1 entry */
+-	rlwinm.	r12, r11, 0, 0, 19	/* Extract L2 (pte) base address */
+-	beq	2f			/* Bail if no table */
+-
+-	rlwimi	r12, r10, 22, 20, 29	/* Compute PTE address */
+-	lwz	r11, 0(r12)		/* Get Linux PTE */
+-	andi.	r13, r11, _PAGE_PRESENT
+-	beq	2f
++	FIND_PTE
++	andi.	r13, r11, _PAGE_PRESENT	/* Is the page present? */
++	beq	2f			/* Bail if not present */
+ 
++#ifdef CONFIG_PTE_64BIT
++	lwz	r13, 0(r12)
++#endif
+ 	ori	r11, r11, _PAGE_ACCESSED
+-	stw	r11, 0(r12)
++	stw	r11, PTE_FLAGS_OFFSET(r12)
+ 
+ 	/* Jump to common TLB load point */
+ 	b	finish_tlb_load
+@@ -696,27 +717,39 @@ finish_tlb_load:
+ 	 */
+ 
+ 	mfspr	r12, SPRN_MAS2
++#ifdef CONFIG_PTE_64BIT
++	rlwimi	r12, r11, 26, 24, 31	/* extract ...WIMGE from pte */
++#else
+ 	rlwimi	r12, r11, 26, 27, 31	/* extract WIMGE from pte */
++#endif
+ 	mtspr	SPRN_MAS2, r12
+ 
+ 	bge	5, 1f
+ 
+-	/* addr > TASK_SIZE */
+-	li	r10, (MAS3_UX | MAS3_UW | MAS3_UR)
+-	andi.	r13, r11, (_PAGE_USER | _PAGE_HWWRITE | _PAGE_HWEXEC)
+-	andi.	r12, r11, _PAGE_USER	/* Test for _PAGE_USER */
+-	iseleq	r12, 0, r10
+-	and	r10, r12, r13
+-	srwi	r12, r10, 1
++	/* is user addr */
++	andi.	r12, r11, (_PAGE_USER | _PAGE_HWWRITE | _PAGE_HWEXEC)
++	andi.	r10, r11, _PAGE_USER	/* Test for _PAGE_USER */
++	srwi	r10, r12, 1
+ 	or	r12, r12, r10	/* Copy user perms into supervisor */
++	iseleq	r12, 0, r12
+ 	b	2f
+ 
+-	/* addr <= TASK_SIZE */
++	/* is kernel addr */
+ 1:	rlwinm	r12, r11, 31, 29, 29	/* Extract _PAGE_HWWRITE into SW */
+ 	ori	r12, r12, (MAS3_SX | MAS3_SR)
+ 
++#ifdef CONFIG_PTE_64BIT
++2:	rlwimi	r12, r13, 24, 0, 7	/* grab RPN[32:39] */
++	rlwimi	r12, r11, 24, 8, 19	/* grab RPN[40:51] */
++	mtspr	SPRN_MAS3, r12
++BEGIN_FTR_SECTION
++	srwi	r10, r13, 8		/* grab RPN[8:31] */
++	mtspr	SPRN_MAS7, r10
++END_FTR_SECTION_IFSET(CPU_FTR_BIG_PHYS)
++#else
+ 2:	rlwimi	r11, r12, 0, 20, 31	/* Extract RPN from PTE and merge with perms */
+ 	mtspr	SPRN_MAS3, r11
++#endif
+ 	tlbwe
+ 
+ 	/* Done...restore registers and get out of here.  */
+Index: linux-2.6.10/arch/ppc/syslib/ppc85xx_common.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc85xx_common.c
++++ linux-2.6.10/arch/ppc/syslib/ppc85xx_common.c
+@@ -31,3 +31,11 @@ get_ccsrbar(void)
+ }
+ 
+ EXPORT_SYMBOL(get_ccsrbar);
++
++/* For now this is a pass through */
++phys_addr_t fixup_bigphys_addr(phys_addr_t addr, phys_addr_t size)
++{
++	return addr;
++};
++EXPORT_SYMBOL(fixup_bigphys_addr);
++
+Index: linux-2.6.10/include/asm-ppc/cputable.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/cputable.h
++++ linux-2.6.10/include/asm-ppc/cputable.h
+@@ -81,8 +81,9 @@ extern struct cpu_spec		*cur_cpu_spec[];
+ #define CPU_FTR_DUAL_PLL_750FX		0x00004000
+ #define CPU_FTR_NO_DPM			0x00008000
+ #define CPU_FTR_HAS_HIGH_BATS		0x00010000
+-#define CPU_FTR_NEED_COHERENT           0x00020000
++#define CPU_FTR_NEED_COHERENT		0x00020000
+ #define CPU_FTR_NO_BTIC			0x00040000
++#define CPU_FTR_BIG_PHYS		0x00080000
+ 
+ #ifdef __ASSEMBLY__
+ 
+Index: linux-2.6.10/include/asm-ppc/pgtable.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/pgtable.h
++++ linux-2.6.10/include/asm-ppc/pgtable.h
+@@ -269,8 +269,7 @@ extern unsigned long ioremap_bot, iorema
+ /* ERPN in a PTE never gets cleared, ignore it */
+ #define _PTE_NONE_MASK	0xffffffff00000000ULL
+ 
+-#elif defined(CONFIG_E500)
+-
++#elif defined(CONFIG_FSL_BOOKE)
+ /*
+    MMU Assist Register 3:
+ 
+@@ -284,21 +283,29 @@ extern unsigned long ioremap_bot, iorema
+      entries use the top 29 bits.
+ */
+ 
+-/* Definitions for e500 core */
+-#define _PAGE_PRESENT	0x001	/* S: PTE contains a translation */
+-#define _PAGE_USER	0x002	/* S: User page (maps to UR) */
+-#define _PAGE_FILE	0x002	/* S: when !present: nonlinear file mapping */
+-#define _PAGE_ACCESSED	0x004	/* S: Page referenced */
+-#define _PAGE_HWWRITE	0x008	/* H: Dirty & RW, set in exception */
+-#define _PAGE_RW	0x010	/* S: Write permission */
+-#define _PAGE_HWEXEC	0x020	/* H: UX permission */
+-
+-#define _PAGE_ENDIAN	0x040	/* H: E bit */
+-#define _PAGE_GUARDED	0x080	/* H: G bit */
+-#define _PAGE_COHERENT	0x100	/* H: M bit */
+-#define _PAGE_NO_CACHE	0x200	/* H: I bit */
+-#define _PAGE_WRITETHRU	0x400	/* H: W bit */
+-#define _PAGE_DIRTY	0x800	/* S: Page dirty */
++/* Definitions for FSL Book-E Cores */
++#define _PAGE_PRESENT	0x00001	/* S: PTE contains a translation */
++#define _PAGE_USER	0x00002	/* S: User page (maps to UR) */
++#define _PAGE_FILE	0x00002	/* S: when !present: nonlinear file mapping */
++#define _PAGE_ACCESSED	0x00004	/* S: Page referenced */
++#define _PAGE_HWWRITE	0x00008	/* H: Dirty & RW, set in exception */
++#define _PAGE_RW	0x00010	/* S: Write permission */
++#define _PAGE_HWEXEC	0x00020	/* H: UX permission */
++
++#define _PAGE_ENDIAN	0x00040	/* H: E bit */
++#define _PAGE_GUARDED	0x00080	/* H: G bit */
++#define _PAGE_COHERENT	0x00100	/* H: M bit */
++#define _PAGE_NO_CACHE	0x00200	/* H: I bit */
++#define _PAGE_WRITETHRU	0x00400	/* H: W bit */
++
++#ifdef CONFIG_PTE_64BIT
++#define _PAGE_DIRTY	0x08000	/* S: Page dirty */
++
++/* ERPN in a PTE never gets cleared, ignore it */
++#define _PTE_NONE_MASK	0xffffffffffff0000ULL
++#else
++#define _PAGE_DIRTY	0x00800	/* S: Page dirty */
++#endif
+ 
+ #define _PMD_PRESENT	0
+ #define _PMD_PRESENT_MASK (PAGE_MASK)
+@@ -475,7 +482,11 @@ extern unsigned long bad_call_to_PMD_PAG
+ 
+ /* in some case we want to additionaly adjust where the pfn is in the pte to
+  * allow room for more flags */
++#if defined(CONFIG_FSL_BOOKE) && defined(CONFIG_PTE_64BIT)
++#define PFN_SHIFT_OFFSET	(PAGE_SHIFT + 8)
++#else
+ #define PFN_SHIFT_OFFSET	(PAGE_SHIFT)
++#endif
+ 
+ #define pte_pfn(x)		(pte_val(x) >> PFN_SHIFT_OFFSET)
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+Index: linux-2.6.10/include/asm-ppc/reg_booke.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/reg_booke.h
++++ linux-2.6.10/include/asm-ppc/reg_booke.h
+@@ -119,6 +119,7 @@ do {						\
+ #define SPRN_MAS4	0x274	/* MMU Assist Register 4 */
+ #define SPRN_MAS5	0x275	/* MMU Assist Register 5 */
+ #define SPRN_MAS6	0x276	/* MMU Assist Register 6 */
++#define SPRN_MAS7	0x3b0	/* MMU Assist Register 7 */
+ #define SPRN_PID1	0x279	/* Process ID Register 1 */
+ #define SPRN_PID2	0x27A	/* Process ID Register 2 */
+ #define SPRN_TLB0CFG	0x2B0	/* TLB 0 Config Register */
+Index: linux-2.6.10/mvl_patches/pro-0457.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0457.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(457);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

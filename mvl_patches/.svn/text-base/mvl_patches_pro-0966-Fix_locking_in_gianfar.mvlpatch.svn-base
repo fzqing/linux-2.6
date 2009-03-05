@@ -1,0 +1,753 @@
+#! /usr/bin/env bash
+# Patch: -Fix_locking_in_gianfar
+# Date: Fri Nov  3 21:28:29 2006
+# MR: 20091
+# commit fef6108d4556917c45cd9ba397c1c7597f3990e1
+# Author: Andy Fleming <afleming@freescale.com>
+# Date:   Thu Apr 20 16:44:29 2006 -0500
+# 
+#     [PATCH] Fix locking in gianfar
+#     
+#     This patch fixes several bugs in the gianfar driver, including a major one
+#     where spinlocks were horribly broken:
+#     
+#     * Split gianfar locks into two types: TX and RX
+#     * Made it so gfar_start() now clears RHALT
+#     * Fixed a bug where calling gfar_start_xmit() with interrupts off would
+#     corrupt the interrupt state
+#     * Fixed a bug where a frame could potentially arrive, and never be handled
+#     (if no more frames arrived
+#     * Fixed a bug where the rx_work_limit would never be observed by the rx
+#     completion code
+#     * Fixed a bug where the interrupt handlers were not actually protected by
+#     their spinlocks
+#     
+#     Signed-off-by: Andy Fleming <afleming@freescale.com>
+#     Signed-off-by: Jeff Garzik <jeff@garzik.org>
+# 
+
+PATCHNUM=966
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 20091
+commit fef6108d4556917c45cd9ba397c1c7597f3990e1
+Author: Andy Fleming <afleming@freescale.com>
+Date:   Thu Apr 20 16:44:29 2006 -0500
+
+    [PATCH] Fix locking in gianfar
+    
+    This patch fixes several bugs in the gianfar driver, including a major one
+    where spinlocks were horribly broken:
+    
+    * Split gianfar locks into two types: TX and RX
+    * Made it so gfar_start() now clears RHALT
+    * Fixed a bug where calling gfar_start_xmit() with interrupts off would
+    corrupt the interrupt state
+    * Fixed a bug where a frame could potentially arrive, and never be handled
+    (if no more frames arrived
+    * Fixed a bug where the rx_work_limit would never be observed by the rx
+    completion code
+    * Fixed a bug where the interrupt handlers were not actually protected by
+    their spinlocks
+    
+    Signed-off-by: Andy Fleming <afleming@freescale.com>
+    Signed-off-by: Jeff Garzik <jeff@garzik.org>
+
+diff --git a/drivers/net/gianfar.c b/drivers/net/gianfar.c
+index 771e25d..218d317 100644
+Index: linux-2.6.10/drivers/net/gianfar.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar.c
++++ linux-2.6.10/drivers/net/gianfar.c
+@@ -211,7 +211,8 @@ static int gfar_probe(struct device *dev
+ 		goto regs_fail;
+ 	}
+ 
+-	spin_lock_init(&priv->lock);
++	spin_lock_init(&priv->txlock);
++	spin_lock_init(&priv->rxlock);
+ 
+ 	dev_set_drvdata(device, dev);
+ 
+@@ -521,11 +522,13 @@ void stop_gfar(struct net_device *dev)
+ 	phy_stop(priv->phydev);
+ 
+ 	/* Lock it down */
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->txlock, flags);
++	spin_lock(&priv->rxlock);
+ 
+ 	gfar_halt(dev);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock(&priv->rxlock);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 	/* Free the IRQs */
+ 	if (priv->einfo->device_flags & FSL_GIANFAR_DEV_HAS_MULTI_INTR) {
+@@ -611,14 +614,15 @@ void gfar_start(struct net_device *dev)
+ 	tempval |= DMACTRL_INIT_SETTINGS;
+ 	gfar_write(&priv->regs->dmactrl, tempval);
+ 
+-	/* Clear THLT, so that the DMA starts polling now */
+-	gfar_write(&regs->tstat, TSTAT_CLEAR_THALT);
+-
+ 	/* Make sure we aren't stopped */
+ 	tempval = gfar_read(&priv->regs->dmactrl);
+ 	tempval &= ~(DMACTRL_GRS | DMACTRL_GTS);
+ 	gfar_write(&priv->regs->dmactrl, tempval);
+ 
++	/* Clear THLT/RHLT, so that the DMA starts polling now */
++	gfar_write(&regs->tstat, TSTAT_CLEAR_THALT);
++	gfar_write(&regs->rstat, RSTAT_CLEAR_RHALT);
++
+ 	/* Unmask the interrupts we look for */
+ 	gfar_write(&regs->imask, IMASK_DEFAULT);
+ }
+@@ -933,14 +937,14 @@ static int gfar_start_xmit(struct sk_buf
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	struct txfcb *fcb = NULL;
+ 	struct txbd8 *txbdp;
+-	unsigned long irq_flags;
+ 	u16 status;
++	unsigned long flags;
+ 
+ 	/* Update transmit stats */
+ 	priv->stats.tx_bytes += skb->len;
+ 
+ 	/* Lock priv now */
+-	spin_lock_irqsave(&priv->lock, irq_flags);
++	spin_lock_irqsave(&priv->txlock, flags);
+ 
+ 	/* Point at the first free tx descriptor */
+ 	txbdp = priv->cur_tx;
+@@ -1011,7 +1015,7 @@ static int gfar_start_xmit(struct sk_buf
+ 	gfar_write(&priv->regs->tstat, TSTAT_CLEAR_THALT);
+ 
+ 	/* Unlock priv */
+-	spin_unlock_irqrestore(&priv->lock, irq_flags);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 	return 0;
+ }
+@@ -1081,7 +1085,7 @@ static void gfar_vlan_rx_register(struct
+ 	unsigned long flags;
+ 	u32 tempval;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->rxlock, flags);
+ 
+ 	priv->vlgrp = grp;
+ 
+@@ -1108,7 +1112,7 @@ static void gfar_vlan_rx_register(struct
+ 		gfar_write(&priv->regs->rctrl, tempval);
+ 	}
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->rxlock, flags);
+ }
+ 
+ 
+@@ -1117,12 +1121,12 @@ static void gfar_vlan_rx_kill_vid(struct
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->rxlock, flags);
+ 
+ 	if (priv->vlgrp)
+ 		priv->vlgrp->vlan_devices[vid] = NULL;
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->rxlock, flags);
+ }
+ 
+ 
+@@ -1211,7 +1215,7 @@ static irqreturn_t gfar_transmit(int irq
+ 	gfar_write(&priv->regs->ievent, IEVENT_TX_MASK);
+ 
+ 	/* Lock priv */
+-	spin_lock(&priv->lock);
++	spin_lock(&priv->txlock);
+ 	bdp = priv->dirty_tx;
+ 	while ((bdp->status & TXBD_READY) == 0) {
+ 		/* If dirty_tx and cur_tx are the same, then either the */
+@@ -1256,7 +1260,7 @@ static irqreturn_t gfar_transmit(int irq
+ 	else
+ 		gfar_write(&priv->regs->txic, 0);
+ 
+-	spin_unlock(&priv->lock);
++	spin_unlock(&priv->txlock);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1337,9 +1341,10 @@ irqreturn_t gfar_receive(int irq, void *
+ {
+ 	struct net_device *dev = (struct net_device *) dev_id;
+ 	struct gfar_private *priv = netdev_priv(dev);
+-
+ #ifdef CONFIG_GFAR_NAPI
+ 	u32 tempval;
++#else
++	unsigned long flags;
+ #endif
+ 
+ 	/* Clear IEVENT, so rx interrupt isn't called again
+@@ -1362,7 +1367,7 @@ irqreturn_t gfar_receive(int irq, void *
+ 	}
+ #else
+ 
+-	spin_lock(&priv->lock);
++	spin_lock_irqsave(&priv->rxlock, flags);
+ 	gfar_clean_rx_ring(dev, priv->rx_ring_size);
+ 
+ 	/* If we are coalescing interrupts, update the timer */
+@@ -1373,7 +1378,7 @@ irqreturn_t gfar_receive(int irq, void *
+ 	else
+ 		gfar_write(&priv->regs->rxic, 0);
+ 
+-	spin_unlock(&priv->lock);
++	spin_unlock_irqrestore(&priv->rxlock, flags);
+ #endif
+ 
+ 	return IRQ_HANDLED;
+@@ -1522,13 +1527,6 @@ int gfar_clean_rx_ring(struct net_device
+ 	/* Update the current rxbd pointer to be the next one */
+ 	priv->cur_rx = bdp;
+ 
+-	/* If no packets have arrived since the
+-	 * last one we processed, clear the IEVENT RX and
+-	 * BSY bits so that another interrupt won't be
+-	 * generated when we set IMASK */
+-	if (bdp->status & RXBD_EMPTY)
+-		gfar_write(&priv->regs->ievent, IEVENT_RX_MASK);
+-
+ 	return howmany;
+ }
+ 
+@@ -1548,7 +1546,7 @@ static int gfar_poll(struct net_device *
+ 	rx_work_limit -= howmany;
+ 	*budget -= howmany;
+ 
+-	if (rx_work_limit >= 0) {
++	if (rx_work_limit > 0) {
+ 		netif_rx_complete(dev);
+ 
+ 		/* Clear the halt bit in RSTAT */
+@@ -1565,7 +1563,8 @@ static int gfar_poll(struct net_device *
+ 			gfar_write(&priv->regs->rxic, 0);
+ 	}
+ 
+-	return (rx_work_limit < 0) ? 1 : 0;
++	/* Return 1 if there's more work to do */
++	return (rx_work_limit > 0) ? 0 : 1;
+ }
+ #endif
+ 
+@@ -1661,7 +1660,7 @@ static void adjust_link(struct net_devic
+ 	struct phy_device *phydev = priv->phydev;
+ 	int new_state = 0;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->txlock, flags);
+ 	if (phydev->link) {
+ 		u32 tempval = gfar_read(&regs->maccfg2);
+ 		u32 ecntrl = gfar_read(&regs->ecntrl);
+@@ -1726,7 +1725,7 @@ static void adjust_link(struct net_devic
+ 	if (new_state && netif_msg_link(priv))
+ 		phy_print_status(phydev);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ }
+ 
+ /* Update the hash table based on the current list of multicast
+Index: linux-2.6.10/drivers/net/gianfar.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar.h
++++ linux-2.6.10/drivers/net/gianfar.h
+@@ -657,43 +657,62 @@ struct gfar {
+  * the buffer descriptor determines the actual condition.
+  */
+ struct gfar_private {
+-	/* pointers to arrays of skbuffs for tx and rx */
++	/* Fields controlled by TX lock */
++	spinlock_t txlock;
++
++	/* Pointer to the array of skbuffs */
+ 	struct sk_buff ** tx_skbuff;
+-	struct sk_buff ** rx_skbuff;
+ 
+-	/* indices pointing to the next free sbk in skb arrays */
++	/* next free skb in the array */
+ 	u16 skb_curtx;
+-	u16 skb_currx;
+ 
+-	/* index of the first skb which hasn't been transmitted
+-	 * yet. */
++	/* First skb in line to be transmitted */
+ 	u16 skb_dirtytx;
+ 
+ 	/* Configuration info for the coalescing features */
+ 	unsigned char txcoalescing;
+ 	unsigned short txcount;
+ 	unsigned short txtime;
++
++	/* Buffer descriptor pointers */
++	struct txbd8 *tx_bd_base;	/* First tx buffer descriptor */
++	struct txbd8 *cur_tx;	        /* Next free ring entry */
++	struct txbd8 *dirty_tx;		/* First buffer in line
++					   to be transmitted */
++	unsigned int tx_ring_size;
++
++	/* RX Locked fields */
++	spinlock_t rxlock;
++
++	/* skb array and index */
++	struct sk_buff ** rx_skbuff;
++	u16 skb_currx;
++
++	/* RX Coalescing values */
+ 	unsigned char rxcoalescing;
+ 	unsigned short rxcount;
+ 	unsigned short rxtime;
+ 
+-	/* GFAR addresses */
+-	struct rxbd8 *rx_bd_base;	/* Base addresses of Rx and Tx Buffers */
+-	struct txbd8 *tx_bd_base;
++	struct rxbd8 *rx_bd_base;	/* First Rx buffers */
+ 	struct rxbd8 *cur_rx;           /* Next free rx ring entry */
+-	struct txbd8 *cur_tx;	        /* Next free ring entry */
+-	struct txbd8 *dirty_tx;		/* The Ring entry to be freed. */
+-	struct gfar __iomem *regs;	/* Pointer to the GFAR memory mapped Registers */
+-	u32 __iomem *hash_regs[16];
+-	int hash_width;
+-	struct net_device_stats stats; /* linux network statistics */
+-	struct gfar_extra_stats extra_stats;
+-	spinlock_t lock;
++
++	/* RX parameters */
++	unsigned int rx_ring_size;
+ 	unsigned int rx_buffer_size;
+ 	unsigned int rx_stash_size;
+ 	unsigned int rx_stash_index;
+-	unsigned int tx_ring_size;
+-	unsigned int rx_ring_size;
++
++	struct vlan_group *vlgrp;
++
++	/* Unprotected fields */
++	/* Pointer to the GFAR memory mapped Registers */
++	struct gfar __iomem *regs;
++
++	/* Hash registers and their width */
++	u32 __iomem *hash_regs[16];
++	int hash_width;
++
++	/* global parameters */
+ 	unsigned int fifo_threshold;
+ 	unsigned int fifo_starve;
+ 	unsigned int fifo_starve_off;
+@@ -703,13 +722,15 @@ struct gfar_private {
+ 		extended_hash:1,
+ 		bd_stash_en:1;
+ 	unsigned short padding;
+-	struct vlan_group *vlgrp;
+-	/* Info structure initialized by board setup code */
++
+ 	unsigned int interruptTransmit;
+ 	unsigned int interruptReceive;
+ 	unsigned int interruptError;
++
++	/* info structure initialized by platform code */
+ 	struct gianfar_platform_data *einfo;
+ 
++	/* PHY stuff */
+ 	struct phy_device *phydev;
+ 	struct mii_bus *mii_bus;
+ 	int oldspeed;
+@@ -717,6 +738,10 @@ struct gfar_private {
+ 	int oldlink;
+ 
+ 	uint32_t msg_enable;
++
++	/* Network Statistics */
++	struct net_device_stats stats;
++	struct gfar_extra_stats extra_stats;
+ };
+ 
+ static inline u32 gfar_read(volatile unsigned __iomem *addr)
+Index: linux-2.6.10/drivers/net/gianfar_ethtool.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar_ethtool.c
++++ linux-2.6.10/drivers/net/gianfar_ethtool.c
+@@ -456,10 +456,14 @@ static int gfar_sringparam(struct net_de
+ 
+ 		/* Halt TX and RX, and process the frames which
+ 		 * have already been received */
+-		spin_lock_irqsave(&priv->lock, flags);
++		spin_lock_irqsave(&priv->txlock, flags);
++		spin_lock(&priv->rxlock);
++
+ 		gfar_halt(dev);
+ 		gfar_clean_rx_ring(dev, priv->rx_ring_size);
+-		spin_unlock_irqrestore(&priv->lock, flags);
++
++		spin_unlock(&priv->rxlock);
++		spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 		/* Now we take down the rings to rebuild them */
+ 		stop_gfar(dev);
+@@ -489,10 +493,14 @@ static int gfar_set_rx_csum(struct net_d
+ 
+ 		/* Halt TX and RX, and process the frames which
+ 		 * have already been received */
+-		spin_lock_irqsave(&priv->lock, flags);
++		spin_lock_irqsave(&priv->txlock, flags);
++		spin_lock(&priv->rxlock);
++
+ 		gfar_halt(dev);
+ 		gfar_clean_rx_ring(dev, priv->rx_ring_size);
+-		spin_unlock_irqrestore(&priv->lock, flags);
++
++		spin_unlock(&priv->rxlock);
++		spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 		/* Now we take down the rings to rebuild them */
+ 		stop_gfar(dev);
+@@ -524,7 +532,7 @@ static int gfar_set_tx_csum(struct net_d
+ 	if (!(priv->einfo->device_flags & FSL_GIANFAR_DEV_HAS_CSUM))
+ 		return -EOPNOTSUPP;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->txlock, flags);
+ 	gfar_halt(dev);
+ 
+ 	if (data)
+@@ -533,7 +541,7 @@ static int gfar_set_tx_csum(struct net_d
+ 		dev->features &= ~NETIF_F_IP_CSUM;
+ 
+ 	gfar_start(dev);
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 	return 0;
+ }
+Index: linux-2.6.10/drivers/net/gianfar_sysfs.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar_sysfs.c
++++ linux-2.6.10/drivers/net/gianfar_sysfs.c
+@@ -82,7 +82,7 @@ static ssize_t gfar_set_bd_stash(struct 
+ 	else
+ 		return count;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->rxlock, flags);
+ 
+ 	/* Set the new stashing value */
+ 	priv->bd_stash_en = new_setting;
+@@ -96,7 +96,7 @@ static ssize_t gfar_set_bd_stash(struct 
+ 
+ 	gfar_write(&priv->regs->attr, temp);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->rxlock, flags);
+ 
+ 	return count;
+ }
+@@ -118,7 +118,7 @@ static ssize_t gfar_set_rx_stash_size(st
+ 	u32 temp;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->rxlock, flags);
+ 	if (length > priv->rx_buffer_size)
+ 		return count;
+ 
+@@ -142,7 +142,7 @@ static ssize_t gfar_set_rx_stash_size(st
+ 
+ 	gfar_write(&priv->regs->attr, temp);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->rxlock, flags);
+ 
+ 	return count;
+ }
+@@ -166,7 +166,7 @@ static ssize_t gfar_set_rx_stash_index(s
+ 	u32 temp;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->rxlock, flags);
+ 	if (index > priv->rx_stash_size)
+ 		return count;
+ 
+@@ -180,7 +180,7 @@ static ssize_t gfar_set_rx_stash_index(s
+ 	temp |= ATTRELI_EI(index);
+ 	gfar_write(&priv->regs->attreli, flags);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->rxlock, flags);
+ 
+ 	return count;
+ }
+@@ -205,7 +205,7 @@ static ssize_t gfar_set_fifo_threshold(s
+ 	if (length > GFAR_MAX_FIFO_THRESHOLD)
+ 		return count;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->txlock, flags);
+ 
+ 	priv->fifo_threshold = length;
+ 
+@@ -214,7 +214,7 @@ static ssize_t gfar_set_fifo_threshold(s
+ 	temp |= length;
+ 	gfar_write(&priv->regs->fifo_tx_thr, temp);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 	return count;
+ }
+@@ -240,7 +240,7 @@ static ssize_t gfar_set_fifo_starve(stru
+ 	if (num > GFAR_MAX_FIFO_STARVE)
+ 		return count;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->txlock, flags);
+ 
+ 	priv->fifo_starve = num;
+ 
+@@ -249,7 +249,7 @@ static ssize_t gfar_set_fifo_starve(stru
+ 	temp |= num;
+ 	gfar_write(&priv->regs->fifo_tx_starve, temp);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 	return count;
+ }
+@@ -274,7 +274,7 @@ static ssize_t gfar_set_fifo_starve_off(
+ 	if (num > GFAR_MAX_FIFO_STARVE_OFF)
+ 		return count;
+ 
+-	spin_lock_irqsave(&priv->lock, flags);
++	spin_lock_irqsave(&priv->txlock, flags);
+ 
+ 	priv->fifo_starve_off = num;
+ 
+@@ -283,7 +283,7 @@ static ssize_t gfar_set_fifo_starve_off(
+ 	temp |= num;
+ 	gfar_write(&priv->regs->fifo_tx_starve_shutoff, temp);
+ 
+-	spin_unlock_irqrestore(&priv->lock, flags);
++	spin_unlock_irqrestore(&priv->txlock, flags);
+ 
+ 	return count;
+ }
+Index: linux-2.6.10/mvl_patches/pro-0966.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0966.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(966);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

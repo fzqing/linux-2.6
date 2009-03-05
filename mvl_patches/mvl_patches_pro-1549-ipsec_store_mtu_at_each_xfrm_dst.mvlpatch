@@ -1,0 +1,389 @@
+#! /usr/bin/env bash
+# Patch: -ipsec_store_mtu_at_each_xfrm_dst
+# Date: Fri Jan  4 18:41:47 2008
+# Source: kernel.org
+# MR: 25892
+# Type: Defect Fix
+# Disposition: backport
+# Signed-off-by: Tadashi Abe <tabe@mvista.com>
+# Description:
+# the patch that sets the MTU values of each xfrm_dst
+# and keeps it up-to-date.
+# 
+# based on commit: e58c25485309321a74467b8d8dd8fd5d947d9728
+# 
+#  include/net/xfrm.h      |    3 ++
+#  net/ipv4/xfrm4_policy.c |    2 +
+#  net/ipv6/xfrm6_policy.c |    2 +
+#  net/xfrm/xfrm_policy.c  |   65 ++++++++++++++++++++++++++++++++++++++++++++++--
+#  4 files changed, 70 insertions(+), 2 deletions(-)
+# 
+
+PATCHNUM=1549
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: kernel.org
+MR: 25892
+Type: Defect Fix
+Disposition: backport
+Signed-off-by: Tadashi Abe <tabe@mvista.com>
+Description:
+the patch that sets the MTU values of each xfrm_dst
+and keeps it up-to-date.
+
+based on commit: e58c25485309321a74467b8d8dd8fd5d947d9728
+
+ include/net/xfrm.h      |    3 ++
+ mvl_patches/pro-1549.c  |   16 +++++++++++
+ net/ipv4/xfrm4_policy.c |    2 +
+ net/ipv6/xfrm6_policy.c |    2 +
+ net/xfrm/xfrm_policy.c  |   65 ++++++++++++++++++++++++++++++++++++++++++++++--
+ 5 files changed, 86 insertions(+), 2 deletions(-)
+
+Index: linux-2.6.10/include/net/xfrm.h
+===================================================================
+--- linux-2.6.10.orig/include/net/xfrm.h
++++ linux-2.6.10/include/net/xfrm.h
+@@ -587,6 +587,8 @@ struct xfrm_dst
+ 		struct rt6_info		rt6;
+ 	} u;
+ 	struct dst_entry *route;
++	u32 route_mtu_cached;
++	u32 child_mtu_cached;
+ };
+ 
+ /* Decapsulation state, used by the input to store data during
+@@ -959,6 +961,7 @@ extern int xfrm_sk_policy_insert(struct 
+ extern struct xfrm_policy *xfrm_sk_policy_lookup(struct sock *sk, int dir, struct flowi *fl);
+ extern int xfrm_flush_bundles(void);
+ extern int xfrm_bundle_ok(struct xfrm_dst *xdst, struct flowi *fl, int family);
++extern void xfrm_init_pmtu(struct dst_entry *dst);
+ 
+ extern wait_queue_head_t km_waitq;
+ extern void km_state_expired(struct xfrm_state *x, int hard);
+Index: linux-2.6.10/net/ipv4/xfrm4_policy.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/xfrm4_policy.c
++++ linux-2.6.10/net/ipv4/xfrm4_policy.c
+@@ -153,6 +153,8 @@ __xfrm4_bundle_create(struct xfrm_policy
+ 		header_len -= x->u.dst.xfrm->props.header_len;
+ 		trailer_len -= x->u.dst.xfrm->props.trailer_len;
+ 	}
++
++	xfrm_init_pmtu(dst);
+ 	return 0;
+ 
+ error:
+Index: linux-2.6.10/net/ipv6/xfrm6_policy.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/xfrm6_policy.c
++++ linux-2.6.10/net/ipv6/xfrm6_policy.c
+@@ -200,6 +200,8 @@ __xfrm6_bundle_create(struct xfrm_policy
+ 	}
+ 	printk("\n");
+ #endif
++
++	xfrm_init_pmtu(dst);
+ 	return 0;
+ 
+ error:
+Index: linux-2.6.10/net/xfrm/xfrm_policy.c
+===================================================================
+--- linux-2.6.10.orig/net/xfrm/xfrm_policy.c
++++ linux-2.6.10/net/xfrm/xfrm_policy.c
+@@ -1185,26 +1185,87 @@ int xfrm_flush_bundles(void)
+ 	return 0;
+ }
+ 
++void xfrm_init_pmtu(struct dst_entry *dst)
++{
++	do {
++		struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
++		u32 pmtu, route_mtu_cached;
++
++		pmtu = dst_pmtu(dst->child);
++		xdst->child_mtu_cached = pmtu;
++
++		pmtu = xfrm_state_mtu(dst->xfrm, pmtu);
++
++		route_mtu_cached = dst_pmtu(xdst->route);
++		xdst->route_mtu_cached = route_mtu_cached;
++
++		if (pmtu > route_mtu_cached)
++			pmtu = route_mtu_cached;
++
++		dst->metrics[RTAX_MTU-1] = pmtu;
++	} while ((dst = dst->next));
++}
++
++EXPORT_SYMBOL(xfrm_init_pmtu);
++
+ /* Check that the bundle accepts the flow and its components are
+  * still valid.
+  */
+ 
+-int xfrm_bundle_ok(struct xfrm_dst *xdst, struct flowi *fl, int family)
++int xfrm_bundle_ok(struct xfrm_dst *first, struct flowi *fl, int family)
+ {
+-	struct dst_entry *dst = &xdst->u.dst;
++	struct dst_entry *dst = &first->u.dst;
++	struct xfrm_dst *last;
++	u32 mtu;
+ 
+ 	if (dst->path->obsolete > 0 ||
+ 	    (dst->dev && !netif_running(dst->dev)))
+ 		return 0;
+ 
++	last = NULL;
++
+ 	do {
++		struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
++
+ 		if (fl && !xfrm_selector_match(&dst->xfrm->sel, fl, family))
+ 			return 0;
+ 		if (dst->xfrm->km.state != XFRM_STATE_VALID)
+ 			return 0;
++
++		mtu = dst_pmtu(dst->child);
++		if (xdst->child_mtu_cached != mtu) {
++			last = xdst;
++			xdst->child_mtu_cached = mtu;
++		}
++
++		mtu = dst_pmtu(xdst->route);
++		if (xdst->route_mtu_cached != mtu) {
++			last = xdst;
++			xdst->route_mtu_cached = mtu;
++		}
++
+ 		dst = dst->child;
+ 	} while (dst->xfrm);
+ 
++	if (likely(!last))
++		return 1;
++
++	mtu = last->child_mtu_cached;
++	for (;;) {
++		dst = &last->u.dst;
++
++		mtu = xfrm_state_mtu(dst->xfrm, mtu);
++		if (mtu > last->route_mtu_cached)
++			mtu = last->route_mtu_cached;
++		dst->metrics[RTAX_MTU-1] = mtu;
++
++		if (last == first)
++			break;
++
++		last = last->u.next;
++		last->child_mtu_cached = mtu;
++	}
++
+ 	return 1;
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-1549.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1549.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1549);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

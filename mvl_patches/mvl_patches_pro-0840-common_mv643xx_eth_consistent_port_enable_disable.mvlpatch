@@ -1,0 +1,480 @@
+#! /usr/bin/env bash
+# Patch: -common_mv643xx_eth_consistent_port_enable_disable
+# Date: Tue Aug  8 20:56:32 2006
+# Source: MontaVista Software, Inc.
+# MR: 16579
+# Type: Defect Fix/Cleanup
+# Disposition: Submitted to netdev@vger.kernel.org
+# Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+# Description:
+# Make port queue enable/disable code consistent
+# 
+# Add and use the following functions:
+# 	mv643xx_eth_port_enable_tx()
+# 	mv643xx_eth_port_enable_rx()
+# 	mv643xx_eth_port_disable_tx()
+# 	mv643xx_eth_port_disable_rx()
+# 
+# Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+# 
+
+PATCHNUM=840
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16579
+Type: Defect Fix/Cleanup
+Disposition: Submitted to netdev@vger.kernel.org
+Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+Description:
+Make port queue enable/disable code consistent
+
+Add and use the following functions:
+	mv643xx_eth_port_enable_tx()
+	mv643xx_eth_port_enable_rx()
+	mv643xx_eth_port_disable_tx()
+	mv643xx_eth_port_disable_rx()
+
+Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -81,6 +81,12 @@ static int eth_port_link_is_up(unsigned 
+ static void eth_port_uc_addr_get(struct net_device *dev,
+ 						unsigned char *MacAddr);
+ static void eth_port_set_multicast_list(struct net_device *);
++static void mv643xx_eth_port_enable_tx(unsigned int port_num,
++						unsigned int channels);
++static void mv643xx_eth_port_enable_rx(unsigned int port_num,
++						unsigned int channels);
++static unsigned int mv643xx_eth_port_disable_tx(unsigned int port_num);
++static unsigned int mv643xx_eth_port_disable_rx(unsigned int port_num);
+ static int mv643xx_eth_open(struct net_device *);
+ static int mv643xx_eth_stop(struct net_device *);
+ static int mv643xx_eth_change_mtu(struct net_device *, int);
+@@ -533,8 +539,7 @@ static irqreturn_t mv643xx_eth_int_handl
+ 			netif_carrier_on(dev);
+ 			netif_wake_queue(dev);
+ 			/* Start TX queue */
+-			mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG
+-								(port_num), 1);
++			mv643xx_eth_port_enable_tx(port_num, mp->port_tx_queue_command);
+ 		} else {
+ 			netif_carrier_off(dev);
+ 			netif_stop_queue(dev);
+@@ -666,8 +671,8 @@ static void ether_init_rx_desc_ring(stru
+ 
+ 	mp->rx_desc_area_size = rx_desc_num * sizeof(struct eth_rx_desc);
+ 
+-	/* Add the queue to the list of RX queues of this port */
+-	mp->port_rx_queue_command |= 1;
++	/* Enable queue 0 for this port */
++	mp->port_rx_queue_command = 1;
+ }
+ 
+ /*
+@@ -713,8 +718,8 @@ static void ether_init_tx_desc_ring(stru
+ 
+ 	mp->tx_desc_area_size = tx_desc_num * sizeof(struct eth_tx_desc);
+ 
+-	/* Add the queue to the list of Tx queues of this port */
+-	mp->port_tx_queue_command |= 1;
++	/* Enable queue 0 for this port */
++	mp->port_tx_queue_command = 1;
+ }
+ 
+ /*
+@@ -745,9 +750,6 @@ static int mv643xx_eth_open(struct net_d
+ 		return -EAGAIN;
+ 	}
+ 
+-	/* Stop RX Queues */
+-	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
+-
+ 	eth_port_init(mp);
+ 
+ 	INIT_WORK(&mp->rx_task, (void (*)(void *))mv643xx_eth_rx_task, dev);
+@@ -875,7 +877,7 @@ static void mv643xx_eth_free_tx_rings(st
+ 	struct sk_buff *skb;
+ 
+ 	/* Stop Tx Queues */
+-	mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
++	mv643xx_eth_port_disable_tx(port_num);
+ 
+ 	/* Free outstanding skb's on TX rings */
+ 	for (curr = 0; mp->tx_desc_count && curr < mp->tx_ring_size; curr++) {
+@@ -905,7 +907,7 @@ static void mv643xx_eth_free_rx_rings(st
+ 	int curr;
+ 
+ 	/* Stop RX Queues */
+-	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
++	mv643xx_eth_port_disable_rx(port_num);
+ 
+ 	/* Free preallocated skb's on RX rings */
+ 	for (curr = 0; mp->rx_desc_count && curr < mp->rx_ring_size; curr++) {
+@@ -1717,13 +1719,6 @@ MODULE_DESCRIPTION("Ethernet driver for 
+  *		return_info	Tx/Rx user resource return information.
+  */
+ 
+-/* defines */
+-/* SDMA command macros */
+-#define ETH_ENABLE_TX_QUEUE(eth_port) \
+-	mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(eth_port), 1)
+-
+-/* locals */
+-
+ /* PHY routines */
+ static int ethernet_phy_get(unsigned int eth_port_num);
+ static void ethernet_phy_set(unsigned int eth_port_num, int phy_addr);
+@@ -1757,9 +1752,6 @@ static void eth_port_set_filter_table_en
+  */
+ static void eth_port_init(struct mv643xx_private *mp)
+ {
+-	mp->port_rx_queue_command = 0;
+-	mp->port_tx_queue_command = 0;
+-
+ 	mp->rx_resource_err = 0;
+ 	mp->tx_resource_err = 0;
+ 
+@@ -1840,8 +1832,7 @@ static void eth_port_start(struct net_de
+ 							mp->port_sdma_config);
+ 
+ 	/* Enable port Rx. */
+-	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num),
+-						mp->port_rx_queue_command);
++	mv643xx_eth_port_enable_rx(port_num, mp->port_rx_queue_command);
+ 
+ 	/* Disable port bandwidth limits by clearing MTU register */
+ 	mv_write(MV643XX_ETH_MAXIMUM_TRANSMIT_UNIT(port_num), 0);
+@@ -2318,6 +2309,67 @@ static void ethernet_phy_reset(unsigned 
+ 	eth_port_write_smi_reg(eth_port_num, 0, phy_reg_data);
+ }
+ 
++static void mv643xx_eth_port_enable_tx(unsigned int port_num,
++					unsigned int channels)
++{
++	mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num), channels);
++}
++
++static void mv643xx_eth_port_enable_rx(unsigned int port_num,
++					unsigned int channels)
++{
++	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num), channels);
++}
++
++static unsigned int mv643xx_eth_port_disable_tx(unsigned int port_num)
++{
++	u32 channels;
++
++	/* Stop Tx port activity. Check port Tx activity. */
++	channels = mv_read(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num))
++							& 0xFF;
++	if (channels) {
++		/* Issue stop command for active channels only */
++		mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num),
++							(channels << 8));
++
++		/* Wait for all Tx activity to terminate. */
++		/* Check port cause register that all Tx queues are stopped */
++		while (mv_read(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num))
++							& 0xFF)
++			udelay(PHY_WAIT_MICRO_SECONDS);
++
++		/* Wait for Tx FIFO to empty */
++		while (mv_read(MV643XX_ETH_PORT_STATUS_REG(port_num)) &
++							ETH_PORT_TX_FIFO_EMPTY)
++			udelay(PHY_WAIT_MICRO_SECONDS);
++	}
++
++	return channels;
++}
++
++static unsigned int mv643xx_eth_port_disable_rx(unsigned int port_num)
++{
++	u32 channels;
++
++	/* Stop Rx port activity. Check port Rx activity. */
++	channels = mv_read(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num)
++							& 0xFF);
++	if (channels) {
++		/* Issue stop command for active channels only */
++		mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num),
++							(channels << 8));
++
++		/* Wait for all Rx activity to terminate. */
++		/* Check port cause register that all Rx queues are stopped */
++		while (mv_read(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num))
++							& 0xFF)
++			udelay(PHY_WAIT_MICRO_SECONDS);
++	}
++
++	return channels;
++}
++
+ /*
+  * eth_port_reset - Reset Ethernet port
+  *
+@@ -2340,35 +2392,8 @@ static void eth_port_reset(unsigned int 
+ {
+ 	unsigned int reg_data;
+ 
+-	/* Stop Tx port activity. Check port Tx activity. */
+-	reg_data = mv_read(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num));
+-
+-	if (reg_data & 0xFF) {
+-		/* Issue stop command for active channels only */
+-		mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num),
+-							(reg_data << 8));
+-
+-		/* Wait for all Tx activity to terminate. */
+-		/* Check port cause register that all Tx queues are stopped */
+-		while (mv_read(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num))
+-									& 0xFF)
+-			udelay(10);
+-	}
+-
+-	/* Stop Rx port activity. Check port Rx activity. */
+-	reg_data = mv_read(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num));
+-
+-	if (reg_data & 0xFF) {
+-		/* Issue stop command for active channels only */
+-		mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num),
+-							(reg_data << 8));
+-
+-		/* Wait for all Rx activity to terminate. */
+-		/* Check port cause register that all Rx queues are stopped */
+-		while (mv_read(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num))
+-									& 0xFF)
+-			udelay(10);
+-	}
++	mv643xx_eth_port_disable_tx(port_num);
++	mv643xx_eth_port_disable_rx(port_num);
+ 
+ 	/* Clear all MIB counters */
+ 	eth_clear_mib_counters(port_num);
+@@ -2597,7 +2622,7 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 		first_descriptor->cmd_sts = mp->tx_first_command;
+ 
+ 		wmb();
+-		ETH_ENABLE_TX_QUEUE(mp->port_num);
++		mv643xx_eth_port_enable_tx(mp->port_num, mp->port_tx_queue_command);
+ 
+ 		/*
+ 		 * Finish Tx packet. Update first desc in case of Tx resource
+@@ -2650,7 +2675,7 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 			ETH_BUFFER_OWNED_BY_DMA | ETH_TX_ENABLE_INTERRUPT;
+ 
+ 	wmb();
+-	ETH_ENABLE_TX_QUEUE(mp->port_num);
++	mv643xx_eth_port_enable_tx(mp->port_num, mp->port_tx_queue_command);
+ 
+ 	/* Finish Tx packet. Update first desc in case of Tx resource error */
+ 	tx_desc_curr = (tx_desc_curr + 1) % mp->tx_ring_size;
+Index: linux-2.6.10/mvl_patches/pro-0840.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0840.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(840);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

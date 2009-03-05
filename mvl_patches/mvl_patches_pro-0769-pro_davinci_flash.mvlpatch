@@ -1,0 +1,950 @@
+#! /usr/bin/env bash
+# Patch: -pro_davinci_flash
+# Date: Thu Jul  6 19:19:50 2006
+# Source: MontaVista Software, Inc.
+# MR: 15605
+# Type: Integration
+# Disposition: MontaVista
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+#     Integration of TI DaVinci 0.5.2 drop from TI
+
+PATCHNUM=769
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15605
+Type: Integration
+Disposition: MontaVista
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+    Integration of TI DaVinci 0.5.2 drop from TI
+Index: linux-2.6.10/drivers/mtd/nand/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/nand/Kconfig
++++ linux-2.6.10/drivers/mtd/nand/Kconfig
+@@ -55,6 +55,25 @@ config MTD_NAND_OMAP
+         help
+           Support for NAND flash on Texas Instruments H3/H2  platform.
+ 
++config MTD_NAND_DAVINCI
++        tristate "NAND Flash device on DaVinci SoC"
++        depends on ARM && MTD_NAND
++        select MTD_PARTITIONS
++        help
++          Support for NAND flash on Texas Instruments DaVinci SoC.
++
++config NAND_FLASH_HW_ECC
++        bool "Hardware ECC Support on NAND Device for DaVinci"
++        depends on ARM && MTD_NAND_DAVINCI
++        help
++          Support for Hardware ECC on NAND device for DaVinci.
++
++config NAND_FLASH_LINUX
++        bool "Bootloader upgrade on NAND Device for DaVinci"
++        depends on ARM && MTD_NAND_DAVINCI
++        help
++          Support for flashing U-Boot/Linux Image on NAND device for DaVinci.
++
+ config MTD_NAND_TOTO
+ 	tristate "NAND Flash device on TOTO board"
+ 	depends on ARM && ARCH_OMAP && MTD_NAND
+Index: linux-2.6.10/drivers/mtd/nand/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/nand/Makefile
++++ linux-2.6.10/drivers/mtd/nand/Makefile
+@@ -25,5 +25,6 @@ obj-$(CONFIG_MTD_NAND_NANDSIM)		+= nands
+ obj-$(CONFIG_MTD_NAND_OMAP) 		+= omap-nand-flash.o
+ obj-$(CONFIG_MTD_NAND_OMAP_HW)		+= omap-hw.o
+ obj-$(CONFIG_MTD_NAND_PNX8550)		+= pnx8550.o
++obj-$(CONFIG_MTD_NAND_DAVINCI)          += nand_davinci.o
+ 
+ nand-objs = nand_base.o nand_bbt.o
+Index: linux-2.6.10/drivers/mtd/nand/nand_davinci.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/nand/nand_davinci.c
+@@ -0,0 +1,532 @@
++/*
++ * linux/drivers/mtd/nand/nand_davinci.c
++ *
++ * NAND Flash Driver
++ *
++ * Copyright (C) 2006 Texas Instruments.
++ *
++ * ----------------------------------------------------------------------------
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ * ----------------------------------------------------------------------------
++ *
++ *  Overview:
++ *   This is a device driver for the NAND flash device found on the
++ *   DaVinci board which utilizes the Samsung k9k2g08 part.
++ *
++ Modifications:
++ ver. 1.0: Feb 2005, Vinod/Sudhakar
++ -
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/err.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/partitions.h>
++#include <linux/delay.h>
++#include <asm/io.h>
++#include <asm/hardware/clock.h>
++#include <asm/arch/hardware.h>
++
++#include "nand_davinci.h"
++
++#define DAVINCI_NAND_REGS_ADDR DAVINCI_ASYNC_EMIF_CNTRL_BASE
++#define DAVINCI_NAND_PHYS_ADDR DAVINCI_ASYNC_EMIF_DATA_CE0_BASE
++
++static struct clk *nand_clock;
++static void __iomem *nand_vaddr;
++
++/*
++ * MTD structure for DaVinici board
++ */
++static struct mtd_info *nand_davinci_mtd = NULL;
++
++davinci_nandobj nandobj;
++
++#define NAND_READ_START    0x00
++#define NAND_READ_END      0x30
++#define NAND_STATUS        0x70
++
++#ifdef CONFIG_NAND_FLASH_HW_ECC
++#define NAND_Ecc_P1e            (1 << 0)
++#define NAND_Ecc_P2e            (1 << 1)
++#define NAND_Ecc_P4e            (1 << 2)
++#define NAND_Ecc_P8e            (1 << 3)
++#define NAND_Ecc_P16e           (1 << 4)
++#define NAND_Ecc_P32e           (1 << 5)
++#define NAND_Ecc_P64e           (1 << 6)
++#define NAND_Ecc_P128e          (1 << 7)
++#define NAND_Ecc_P256e          (1 << 8)
++#define NAND_Ecc_P512e          (1 << 9)
++#define NAND_Ecc_P1024e         (1 << 10)
++#define NAND_Ecc_P2048e         (1 << 11)
++
++#define NAND_Ecc_P1o            (1 << 16)
++#define NAND_Ecc_P2o            (1 << 17)
++#define NAND_Ecc_P4o            (1 << 18)
++#define NAND_Ecc_P8o            (1 << 19)
++#define NAND_Ecc_P16o           (1 << 20)
++#define NAND_Ecc_P32o           (1 << 21)
++#define NAND_Ecc_P64o           (1 << 22)
++#define NAND_Ecc_P128o          (1 << 23)
++#define NAND_Ecc_P256o          (1 << 24)
++#define NAND_Ecc_P512o          (1 << 25)
++#define NAND_Ecc_P1024o         (1 << 26)
++#define NAND_Ecc_P2048o         (1 << 27)
++
++#define TF(value)       (value ? 1 : 0)
++
++#define P2048e(a)       (TF(a & NAND_Ecc_P2048e)        << 0 )
++#define P2048o(a)       (TF(a & NAND_Ecc_P2048o)        << 1 )
++#define P1e(a)          (TF(a & NAND_Ecc_P1e)           << 2 )
++#define P1o(a)          (TF(a & NAND_Ecc_P1o)           << 3 )
++#define P2e(a)          (TF(a & NAND_Ecc_P2e)           << 4 )
++#define P2o(a)          (TF(a & NAND_Ecc_P2o)           << 5 )
++#define P4e(a)          (TF(a & NAND_Ecc_P4e)           << 6 )
++#define P4o(a)          (TF(a & NAND_Ecc_P4o)           << 7 )
++
++#define P8e(a)          (TF(a & NAND_Ecc_P8e)           << 0 )
++#define P8o(a)          (TF(a & NAND_Ecc_P8o)           << 1 )
++#define P16e(a)         (TF(a & NAND_Ecc_P16e)          << 2 )
++#define P16o(a)         (TF(a & NAND_Ecc_P16o)          << 3 )
++#define P32e(a)         (TF(a & NAND_Ecc_P32e)          << 4 )
++#define P32o(a)         (TF(a & NAND_Ecc_P32o)          << 5 )
++#define P64e(a)         (TF(a & NAND_Ecc_P64e)          << 6 )
++#define P64o(a)         (TF(a & NAND_Ecc_P64o)          << 7 )
++
++#define P128e(a)        (TF(a & NAND_Ecc_P128e)         << 0 )
++#define P128o(a)        (TF(a & NAND_Ecc_P128o)         << 1 )
++#define P256e(a)        (TF(a & NAND_Ecc_P256e)         << 2 )
++#define P256o(a)        (TF(a & NAND_Ecc_P256o)         << 3 )
++#define P512e(a)        (TF(a & NAND_Ecc_P512e)         << 4 )
++#define P512o(a)        (TF(a & NAND_Ecc_P512o)         << 5 )
++#define P1024e(a)       (TF(a & NAND_Ecc_P1024e)        << 6 )
++#define P1024o(a)       (TF(a & NAND_Ecc_P1024o)        << 7 )
++
++#define P8e_s(a)        (TF(a & NAND_Ecc_P8e)           << 0 )
++#define P8o_s(a)        (TF(a & NAND_Ecc_P8o)           << 1 )
++#define P16e_s(a)       (TF(a & NAND_Ecc_P16e)          << 2 )
++#define P16o_s(a)       (TF(a & NAND_Ecc_P16o)          << 3 )
++#define P1e_s(a)        (TF(a & NAND_Ecc_P1e)           << 4 )
++#define P1o_s(a)        (TF(a & NAND_Ecc_P1o)           << 5 )
++#define P2e_s(a)        (TF(a & NAND_Ecc_P2e)           << 6 )
++#define P2o_s(a)        (TF(a & NAND_Ecc_P2o)           << 7 )
++
++#define P4e_s(a)        (TF(a & NAND_Ecc_P4e)           << 0 )
++#define P4o_s(a)        (TF(a & NAND_Ecc_P4o)           << 1 )
++#endif
++
++static int nand_flash_init (void);
++
++/*
++ * Define partitions for flash device
++ */
++static struct mtd_partition partition_info[] = {
++	{ name: "Flash Partition 0",
++	  offset: MTDPART_OFS_APPEND,
++	  size:   MTDPART_SIZ_FULL},
++};
++
++#define NUM_PARTITIONS           1
++
++#define	MASK_CLE	0x10
++#define	MASK_ALE	0x0A
++
++/*
++ *      hardware specific access to control-lines
++*/
++static void nand_davinci_hwcontrol(struct mtd_info *mtd, int cmd)
++{
++        struct nand_chip *this = mtd->priv;
++        u32 IO_ADDR_W = (u32) this->IO_ADDR_W;
++
++	IO_ADDR_W &= ~(MASK_ALE|MASK_CLE);
++	switch(cmd){
++		case NAND_CTL_SETCLE: IO_ADDR_W |= MASK_CLE; break;
++		case NAND_CTL_SETALE: IO_ADDR_W |= MASK_ALE; break;
++	}
++	this->IO_ADDR_W = (void __iomem *) IO_ADDR_W;
++}
++
++static void nand_davinci_select_chip(struct mtd_info *mtd, int chip)
++{
++        /* do nothing */
++}
++
++#ifdef CONFIG_NAND_FLASH_HW_ECC
++static void nand_davinci_enable_hwecc(struct mtd_info *mtd, int mode)
++{
++        emifregsovly    emif_addr;
++
++        emif_addr = (emifregsovly) IO_ADDRESS (DAVINCI_ASYNC_EMIF_CNTRL_BASE);
++        emif_addr->NANDFCR |= (1 << 8);
++}
++
++static u32 nand_davinci_readecc(struct mtd_info *mtd, u32  Reg)
++{
++        u32      l = 0;
++        emifregsovly    emif_base_addr;
++        emif_base_addr = (emifregsovly) IO_ADDRESS (DAVINCI_ASYNC_EMIF_CNTRL_BASE);
++
++        if (Reg == 1)
++                l = emif_base_addr->NANDF1ECC;
++        else if (Reg == 2)
++                l = emif_base_addr->NANDF2ECC;
++        else if (Reg == 3)
++                l = emif_base_addr->NANDF3ECC;
++        else if (Reg == 4)
++                l = emif_base_addr->NANDF4ECC;
++
++        return l;
++}
++
++static int nand_davinci_calculate_ecc(struct mtd_info *mtd, const u_char *dat, u_char *ecc_code)
++{
++        unsigned int      l;
++        int               reg;
++        int               n;
++        struct nand_chip *this = mtd->priv;
++
++        if (this->eccmode == NAND_ECC_HW12_2048)
++                n = 4;
++        else
++                n = 1;
++
++        reg = 1;
++        while (n--) {
++                l = nand_davinci_readecc(mtd, reg);
++                *ecc_code++ = l;          // P128e, ..., P1e
++                *ecc_code++ = l >> 16;    // P128o, ..., P1o
++                // P2048o, P1024o, P512o, P256o, P2048e, P1024e, P512e, P256e
++                *ecc_code++ = ((l >> 8) & 0x0f) | ((l >> 20) & 0xf0);
++                reg++;
++        }
++        return 0;
++}
++
++static void nand_davinci_gen_true_ecc(u8 *ecc_buf)
++{
++        u32 tmp = ecc_buf[0] | (ecc_buf[1] << 16) | ((ecc_buf[2] & 0xF0) << 20) | ((ecc_buf[2] & 0x0F) << 8);
++
++        ecc_buf[0] = ~(P64o(tmp) | P64e(tmp) | P32o(tmp) | P32e(tmp) | P16o(tmp) | P16e(tmp) | P8o(tmp) | P8e(tmp) );
++        ecc_buf[1] = ~(P1024o(tmp) | P1024e(tmp) | P512o(tmp) | P512e(tmp) | P256o(tmp) | P256e(tmp) | P128o(tmp) | P128e(tmp));
++        ecc_buf[2] = ~( P4o(tmp) | P4e(tmp) | P2o(tmp) | P2e(tmp) | P1o(tmp) | P1e(tmp) | P2048o(tmp) | P2048e(tmp));
++}
++
++static int nand_davinci_compare_ecc(u8 *     ecc_data1,   /* read from NAND memory */
++                                    u8 *     ecc_data2,   /* read from register */
++                                    u8 *     page_data)
++{
++        u32    i;
++        u8     tmp0_bit[8], tmp1_bit[8], tmp2_bit[8];
++        u8     comp0_bit[8], comp1_bit[8], comp2_bit[8];
++        u8     ecc_bit[24];
++        u8     ecc_sum = 0;
++        u8     find_bit = 0;
++        u32    find_byte = 0;
++        int    isEccFF;
++
++        isEccFF = ((*(u32 *)ecc_data1 & 0xFFFFFF) == 0xFFFFFF);
++
++        nand_davinci_gen_true_ecc(ecc_data1);
++        nand_davinci_gen_true_ecc(ecc_data2);
++
++        for (i = 0; i <= 2; i++) {
++                *(ecc_data1 + i) = ~(*(ecc_data1 + i));
++                *(ecc_data2 + i) = ~(*(ecc_data2 + i));
++        }
++
++        for (i = 0; i < 8; i++) {
++                tmp0_bit[i]      = *ecc_data1 % 2;
++                *ecc_data1       = *ecc_data1 / 2;
++        }
++
++        for (i = 0; i < 8; i++) {
++                tmp1_bit[i]      = *(ecc_data1 + 1) % 2;
++                *(ecc_data1 + 1) = *(ecc_data1 + 1) / 2;
++        }
++
++        for (i = 0; i < 8; i++) {
++                tmp2_bit[i]      = *(ecc_data1 + 2) % 2;
++                *(ecc_data1 + 2) = *(ecc_data1 + 2) / 2;
++        }
++
++        for (i = 0; i < 8; i++) {
++                comp0_bit[i]     = *ecc_data2 % 2;
++                *ecc_data2       = *ecc_data2 / 2;
++        }
++
++        for (i = 0; i < 8; i++) {
++                comp1_bit[i]     = *(ecc_data2 + 1) % 2;
++                *(ecc_data2 + 1) = *(ecc_data2 + 1) / 2;
++        }
++
++        for (i = 0; i < 8; i++) {
++                comp2_bit[i]     = *(ecc_data2 + 2) % 2;
++                *(ecc_data2 + 2) = *(ecc_data2 + 2) / 2;
++        }
++
++        for (i = 0; i< 6; i++ )
++                ecc_bit[i] = tmp2_bit[i + 2] ^ comp2_bit[i + 2];
++
++        for (i = 0; i < 8; i++)
++                ecc_bit[i + 6] = tmp0_bit[i] ^ comp0_bit[i];
++
++        for (i = 0; i < 8; i++)
++                ecc_bit[i + 14] = tmp1_bit[i] ^ comp1_bit[i];
++
++        ecc_bit[22] = tmp2_bit[0] ^ comp2_bit[0];
++        ecc_bit[23] = tmp2_bit[1] ^ comp2_bit[1];
++
++        for (i = 0; i < 24; i++)
++                ecc_sum += ecc_bit[i];
++
++        switch (ecc_sum) {
++        case 0:
++                /* Not reached because this function is not called if
++                   ECC values are equal */
++                return 0;
++
++        case 1:
++                /* Uncorrectable error */
++                DEBUG (MTD_DEBUG_LEVEL0, "ECC UNCORRECTED_ERROR 1\n");
++                return -1;
++
++        case 12:
++                /* Correctable error */
++                find_byte = (ecc_bit[23] << 8) +
++                            (ecc_bit[21] << 7) +
++                            (ecc_bit[19] << 6) +
++                            (ecc_bit[17] << 5) +
++                            (ecc_bit[15] << 4) +
++                            (ecc_bit[13] << 3) +
++                            (ecc_bit[11] << 2) +
++                            (ecc_bit[9]  << 1) +
++                            ecc_bit[7];
++
++                find_bit = (ecc_bit[5] << 2) + (ecc_bit[3] << 1) + ecc_bit[1];
++
++                DEBUG (MTD_DEBUG_LEVEL0, "Correcting single bit ECC error at offset: %d, bit: %d\n", find_byte, find_bit);
++
++                page_data[find_byte] ^= (1 << find_bit);
++
++                return 0;
++
++        default:
++                if (isEccFF) {
++                        if (ecc_data2[0] == 0 && ecc_data2[1] == 0 && ecc_data2[2] == 0)
++                                return 0;
++                }
++                DEBUG (MTD_DEBUG_LEVEL0, "UNCORRECTED_ERROR default\n");
++                return -1;
++        }
++}
++
++static int nand_davinci_correct_data(struct mtd_info *mtd, u_char *dat, u_char *read_ecc, u_char *calc_ecc)
++{
++        struct nand_chip *this;
++        int block_count = 0, i, r;
++
++        this = mtd->priv;
++        if (this->eccmode == NAND_ECC_HW12_2048)
++                block_count = 4;
++        else
++                block_count = 1;
++        for (i = 0; i < block_count; i++) {
++                if (memcmp(read_ecc, calc_ecc, 3) != 0) {
++                        r = nand_davinci_compare_ecc(read_ecc, calc_ecc, dat);
++                        if (r < 0) {
++                                return r;
++                        }
++                }
++                read_ecc += 3;
++                calc_ecc += 3;
++                dat += 512;
++        }
++        return 0;
++}
++#endif
++
++/*
++ * Main initialization routine
++ */
++int __init nand_davinci_init (void)
++{
++        struct nand_chip        *this;
++        struct device           *dev = NULL;
++        u32                     nand_rev_code;
++        int                     ret;
++
++        nand_clock = clk_get (dev, "AEMIFCLK");
++
++        if (IS_ERR(nand_clock))
++                return -1;
++
++        clk_use (nand_clock);
++	clk_enable (nand_clock);
++
++        /* Allocate memory for MTD device structure and private data */
++        nand_davinci_mtd = kmalloc (sizeof(struct mtd_info) + sizeof (struct nand_chip),
++                           GFP_KERNEL);
++        if (!nand_davinci_mtd) {
++    	        printk ("Unable to allocate davinci NAND MTD device structure.\n");
++		clk_disable(nand_clock);
++		clk_unuse(nand_clock);
++                return -ENOMEM;
++	}
++
++        /* Get pointer to private data */
++        this = (struct nand_chip *) (&nand_davinci_mtd[1]);
++
++        /* Initialize structures */
++        memset((char *) nand_davinci_mtd, 0, sizeof(struct mtd_info));
++        memset((char *) this, 0, sizeof(struct nand_chip));
++
++        /* Link the private data with the MTD structure */
++        nand_davinci_mtd->priv = this;
++
++	nandobj.intrnumnand = 0xFF;
++	nandobj.regs = (nandregsovly)IO_ADDRESS (DAVINCI_NAND_REGS_ADDR);
++
++        nand_rev_code = nandobj.regs->NRCSR;
++
++        printk("DaVinci NAND Controller rev. %d.%d\n",
++        (nand_rev_code >>8) & 0xff, nand_rev_code & 0xff);
++
++	nand_vaddr = ioremap(DAVINCI_NAND_PHYS_ADDR, SZ_16K);
++	if (nand_vaddr == NULL) {
++		printk("DaVinci NAND: ioremap failed.\n");
++		return -ENOMEM;
++	}
++
++        this->IO_ADDR_R   = (void __iomem *) nand_vaddr;
++        this->IO_ADDR_W   = (void __iomem *) nand_vaddr;
++        this->chip_delay  = 0;
++        this->select_chip = nand_davinci_select_chip;
++        this->options     = 0;
++#ifdef CONFIG_NAND_FLASH_HW_ECC
++        this->eccmode     = NAND_ECC_HW6_512;
++#else
++        this->eccmode     = NAND_ECC_SOFT;
++#endif
++
++	/* Set address of hardware control function */
++        this->hwcontrol = nand_davinci_hwcontrol;
++
++#ifdef CONFIG_NAND_FLASH_HW_ECC
++        this->calculate_ecc = nand_davinci_calculate_ecc;
++        this->correct_data  = nand_davinci_correct_data;
++        this->enable_hwecc  = nand_davinci_enable_hwecc;
++#endif
++
++        ret = nand_flash_init();
++
++        /* Scan to find existence of the device */
++        if (nand_scan (nand_davinci_mtd, 1)) {
++                printk ("Chip Select is not set for NAND\n");
++        	clk_disable (nand_clock);
++        	clk_unuse (nand_clock);
++	        kfree (nand_davinci_mtd);
++                return -ENXIO;
++        }
++
++	nand_davinci_mtd->owner = THIS_MODULE;
++
++        /* Register the partitions */
++        add_mtd_partitions(nand_davinci_mtd, partition_info, NUM_PARTITIONS);
++
++        /* Return happy */
++        return 0;
++}
++
++module_init(nand_davinci_init);
++
++#define PINMUX0     __REG(0x01c40000)
++#define PINMUX1     __REG(0x01c40004)
++
++int nand_flash_init (void)
++{
++        u32          acfg1 = 0x3FFFFFFC;
++        u32          acfg2 = 0x3FFFFFFC;
++        u32          acfg3 = 0x3FFFFFFC;
++        u32          acfg4 = 0x3FFFFFFC;
++        emifregsovly emifregs;
++
++        /*------------------------------------------------------------------*
++         *  NAND FLASH CHIP TIMEOUT @ 459 MHz                               *
++         *                                                                  *
++         *  AEMIF.CLK freq   = PLL1/6 = 459/6 = 76.5 MHz                    *
++         *  AEMIF.CLK period = 1/76.5 MHz = 13.1 ns                         *
++         *                                                                  *
++         *------------------------------------------------------------------*/
++        acfg1 = 0
++                | ( 0 << 31 )           // selectStrobe
++                | ( 0 << 30 )           // extWait
++                | ( 1 << 26 )           // writeSetup      //  10 ns
++                | ( 3 << 20 )           // writeStrobe     //  40 ns
++                | ( 1 << 17 )           // writeHold       //  10 ns
++                | ( 1 << 13 )           // readSetup       //  10 ns
++                | ( 5 << 7 )            // readStrobe      //  60 ns
++                | ( 1 << 4 )            // readHold        //  10 ns
++                | ( 3 << 2 )            // turnAround      //  ?? ns
++                | ( 0 << 0 )            // asyncSize       //  8-bit bus
++                ;
++
++
++        *(u32 *)(IO_ADDRESS (DAVINCI_SYSTEM_MODULE_BASE)) &= 0xDFFDFFFF;
++        PINMUX0 |= 0x00000C1F;
++
++        emifregs = (emifregsovly) IO_ADDRESS (DAVINCI_ASYNC_EMIF_CNTRL_BASE);
++
++        emifregs->AWCCR |= 0x10000000;
++        emifregs->AB1CR = acfg1;//0x08244128;
++        emifregs->AB2CR = acfg2;
++        emifregs->AB3CR = acfg3;
++        emifregs->AB4CR = acfg4;
++        emifregs->NANDFCR = 0x00000101;
++
++        return 0;
++
++}
++
++/*
++ * Clean up routine
++ */
++#ifdef MODULE
++static void __exit nand_davinci_cleanup (void)
++{
++        clk_disable (nand_clock);
++        clk_unuse (nand_clock);
++
++	if (nand_vaddr)
++		iounmap(nand_vaddr);
++
++       	/* Release resources, unregister device */
++       	nand_release (nand_davinci_mtd);
++
++       	/* Free the MTD device structure */
++       	kfree (nand_davinci_mtd);
++}
++module_exit(nand_davinci_cleanup);
++#endif
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Texas Instruments");
++MODULE_DESCRIPTION("Board-specific glue layer for NAND flash on davinci board");
+Index: linux-2.6.10/drivers/mtd/nand/nand_davinci.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/nand/nand_davinci.h
+@@ -0,0 +1,140 @@
++/*
++ * linux/drivers/mtd/nand/nand_davinci.h
++ *
++ * Copyright (C) 2006 Texas Instruments.
++ *
++ * ----------------------------------------------------------------------------
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ * ----------------------------------------------------------------------------
++ Modifications:
++ ver. 1.0: Feb 2005, Vinod/Sudhakar
++ -
++ *
++ */
++
++#ifndef _NAND_DAVINCI_H_
++#define _NAND_DAVINCI_H_
++
++#include <asm/arch/hardware.h>
++
++#define NAND_CE0CLE	(u8 *)(DAVINCI_FLASH_VIRT + 0x10)
++#define NAND_CE0ALE	(u8 *)(DAVINCI_FLASH_VIRT + 0xA)
++#define NAND_CE0DATA	(u8 *)DAVINCI_FLASH_VIRT
++
++/**************************************************************************\
++* NAND Register Overlay Structure
++\**************************************************************************/
++typedef struct  {
++    u32 NRCSR;
++    u32 AWCCR;
++    u8 RSVD0[8];
++    u32 AB1CR;
++    u32 AB2CR;
++    u32 AB3CR;
++    u32 AB4CR;
++    u8 RSVD1[32];
++    u32 NIRR;
++    u32 NIMR;
++    u32 NIMSR;
++    u32 NIMCR;
++    u8 RSVD2[16];
++    u32 NANDFCR;
++    u32 NANDFSR;
++    u8 RSVD3[8];
++    u32 NANDF1ECC;
++    u32 NANDF2ECC;
++    u32 NANDF3ECC;
++    u32 NANDF4ECC;
++    u8 RSVD4[4];
++    u32 IODFTECR;
++    u32 IODFTGCR;
++    u8 RSVD5[4];
++    u32 IODFTMRLR;
++    u32 IODFTMRMR;
++    u32 IODFTMRMSBR;
++    u8 RSVD6[20];
++    u32 MODRNR;
++    u8 RSVD7[76];
++    u32 CE0DATA;
++    u32 CE0ALE;
++    u32 CE0CLE;
++    u8 RSVD8[4];
++    u32 CE1DATA;
++    u32 CE1ALE;
++    u32 CE1CLE;
++    u8 RSVD9[4];
++    u32 CE2DATA;
++    u32 CE2ALE;
++    u32 CE2CLE;
++    u8 RSVD10[4];
++    u32 CE3DATA;
++    u32 CE3ALE;
++    u32 CE3CLE;
++} nandregs;
++
++/**************************************************************************\
++* NAND Overlay structure typedef definition
++\**************************************************************************/
++typedef volatile nandregs             *nandregsovly;
++
++/**************************************************************************\
++* EMIF Register Overlay Structure
++\**************************************************************************/
++typedef struct  {
++    u32 ERCSR;
++    u32 AWCCR;
++    u32 SDBCR;
++    u32 SDRCR;
++    u32 AB1CR;
++    u32 AB2CR;
++    u32 AB3CR;
++    u32 AB4CR;
++    u32 SDTIMR;
++    u32 DDRSR;
++    u32 DDRPHYCR;
++    u32 DDRPHYSR;
++    u32 TOTAR;
++    u32 TOTACTR;
++    u32 DDRPHYID_REV;
++    u32 SDSRETR;
++    u32 EIRR;
++    u32 EIMR;
++    u32 EIMSR;
++    u32 EIMCR;
++    u32 IOCTRLR;
++    u32 IOSTATR;
++    u8 RSVD0[8];
++    u32 NANDFCR;
++    u32 NANDFSR;
++    u8 RSVD1[8];
++    u32 NANDF1ECC;
++    u32 NANDF2ECC;
++    u32 NANDF3ECC;
++    u32 NANDF4ECC;
++} emifregs;
++
++/**************************************************************************\
++* EMIF Overlay structure typedef definition
++\**************************************************************************/
++typedef emifregs             *emifregsovly;
++
++typedef struct {
++        u32             instid;
++	nandregsovly    regs;
++	int	        intrnumnand;
++} davinci_nandobj, *davinci_nandhandle;
++
++#endif	/* _NAND_DAVINCI_H_ */
+Index: linux-2.6.10/mvl_patches/pro-0769.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0769.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(769);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

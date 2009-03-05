@@ -1,0 +1,577 @@
+#! /usr/bin/env bash
+# Patch: -common_marker_inode
+# Date: Thu Jun 29 13:42:51 2006
+# Source: MontaVista Software, Inc.
+# MR: 17459
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Mark Bellon <mbellon@mvista.com>
+# Description:
+# The invalidate_list() routine walks a list and occationally yields the
+# processor to allow the system to "breath" - don't hold a lock for too long.
+# Unfortunately the list can be changed while the processor is yielded and
+# the code doesn't take up where it left off properly.
+# 
+# A marker inode system is used to insure that the list is in a known state
+# after resuming after a yield. The system within this patch is an
+# adaptation of the CGE 3.1 patch that uses the same solution for the
+# identical problem.  
+# 
+
+PATCHNUM=697
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 17459
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Mark Bellon <mbellon@mvista.com>
+Description:
+The invalidate_list() routine walks a list and occationally yields the
+processor to allow the system to "breath" - don't hold a lock for too long.
+Unfortunately the list can be changed while the processor is yielded and
+the code doesn't take up where it left off properly.
+
+A marker inode system is used to insure that the list is in a known state
+after resuming after a yield. The system within this patch is an
+adaptation of the CGE 3.1 patch that uses the same solution for the
+identical problem.  
+
+Index: linux-2.6.10/fs/fs-writeback.c
+===================================================================
+--- linux-2.6.10.orig/fs/fs-writeback.c
++++ linux-2.6.10/fs/fs-writeback.c
+@@ -115,7 +115,7 @@ void __mark_inode_dirty(struct inode *in
+ 			if (hlist_unhashed(&inode->i_hash))
+ 				goto out;
+ 		}
+-		if (inode->i_state & (I_FREEING|I_CLEAR))
++		if (inode->i_state & (I_FREEING|I_CLEAR|I_WILL_FREE))
+ 			goto out;
+ 
+ 		/*
+@@ -185,7 +185,7 @@ __sync_single_inode(struct inode *inode,
+ 
+ 	spin_lock(&inode_lock);
+ 	inode->i_state &= ~I_LOCK;
+-	if (!(inode->i_state & I_FREEING)) {
++	if (!(inode->i_state & (I_FREEING|I_CLEAR))) {
+ 		if (!(inode->i_state & I_DIRTY) &&
+ 		    mapping_tagged(mapping, PAGECACHE_TAG_DIRTY)) {
+ 			/*
+@@ -230,7 +230,6 @@ __sync_single_inode(struct inode *inode,
+ 			 * The inode is clean, unused
+ 			 */
+ 			list_move(&inode->i_list, &inode_unused);
+-			inodes_stat.nr_unused++;
+ 		}
+ 	}
+ 	wake_up_inode(inode);
+@@ -311,10 +310,16 @@ sync_sb_inodes(struct super_block *sb, s
+ 	while (!list_empty(&sb->s_io)) {
+ 		struct inode *inode = list_entry(sb->s_io.prev,
+ 						struct inode, i_list);
+-		struct address_space *mapping = inode->i_mapping;
+-		struct backing_dev_info *bdi = mapping->backing_dev_info;
++		struct address_space *mapping = NULL;
++		struct backing_dev_info *bdi = NULL;
+ 		long pages_skipped;
+ 
++		if (inode->i_state & I_MARKER)
++			continue;
++
++		mapping = inode->i_mapping;
++		bdi = mapping->backing_dev_info;
++
+ 		if (bdi->memory_backed) {
+ 			list_move(&inode->i_list, &sb->s_dirty);
+ 			if (sb == blockdev_superblock) {
+Index: linux-2.6.10/fs/inode.c
+===================================================================
+--- linux-2.6.10.orig/fs/inode.c
++++ linux-2.6.10/fs/inode.c
+@@ -285,6 +285,12 @@ static void dispose_list(struct list_hea
+ 		if (inode->i_data.nrpages)
+ 			truncate_inode_pages(&inode->i_data, 0);
+ 		clear_inode(inode);
++
++		spin_lock(&inode_lock);
++		hlist_del_init(&inode->i_hash);
++		spin_unlock(&inode_lock);
++
++		wake_up_inode(inode);
+ 		destroy_inode(inode);
+ 		nr_disposed++;
+ 	}
+@@ -293,18 +299,32 @@ static void dispose_list(struct list_hea
+ 	spin_unlock(&inode_lock);
+ }
+ 
++static void __wait_on_freeing_inode(struct inode *inode);
+ /*
+  * Invalidate all inodes for a device.
+  */
+-static int invalidate_list(struct list_head *head, struct super_block * sb, struct list_head * dispose)
++static int invalidate_list(struct list_head	*head,
++			   struct super_block	*sb,
++			   struct list_head	*dispose,
++			   struct list_head	*mark)
+ {
+-	struct list_head *next;
++	struct inode *inode;
++	struct list_head *tmp;
+ 	int busy = 0, count = 0;
+ 
+-	next = head->next;
++	/*
++	 * Walk the list dropping the inode_lock periodically to avoid
++	 * nasty latencies. Rely on this sb's inodes (including the marker)
++	 * to not be reordered within the list during umount - nothing else
++	 * is supposed to be going on. Other inodes might get reordered but
++	 * that's fine since they aren't interesting either.
++	 */
++
++	tmp = head->next;
++
+ 	for (;;) {
+-		struct list_head * tmp = next;
+-		struct inode * inode;
++		if (tmp == head)
++			break;
+ 
+ 		/*
+ 		 * We can reschedule here without worrying about the list's
+@@ -312,29 +332,65 @@ static int invalidate_list(struct list_h
+ 		 * change during umount anymore, and because iprune_sem keeps
+ 		 * shrink_icache_memory() away.
+ 		 */
+-		cond_resched_lock(&inode_lock);
+ 
+-		next = next->next;
+-		if (tmp == head)
+-			break;
+ 		inode = list_entry(tmp, struct inode, i_list);
+-		if (inode->i_sb != sb)
++		tmp = tmp->next;
++
++		if (inode->i_state & (I_FREEING|I_CLEAR|I_WILL_FREE)) {
++			__wait_on_freeing_inode(inode);
++			continue;
++		}
++		if ((inode->i_state & I_MARKER) || (inode->i_sb != sb))
+ 			continue;
+ 		invalidate_inode_buffers(inode);
+ 		if (!atomic_read(&inode->i_count)) {
+-			hlist_del_init(&inode->i_hash);
+ 			list_move(&inode->i_list, dispose);
+ 			inode->i_state |= I_FREEING;
+ 			count++;
+ 			continue;
+ 		}
+ 		busy = 1;
++
++		list_add_tail(mark, tmp);
++		cond_resched_lock(&inode_lock);
++		tmp = mark->next;
++		list_del(mark);
++
+ 	}
+ 	/* only unused inodes may be cached with i_count zero */
+ 	inodes_stat.nr_unused -= count;
+ 	return busy;
+ }
+ 
++static DECLARE_MUTEX(marker_inode_sem);
++static struct inode fixed_marker_inode;
++
++static struct inode *allocate_marker_inode(void)
++{
++	struct inode *marker;
++
++	marker = kmalloc(sizeof(*marker), GFP_KERNEL);
++
++	if (marker == NULL) {
++		down(&marker_inode_sem);
++		marker = &fixed_marker_inode;
++	}
++
++	memset(marker, 0, sizeof(*marker));
++	marker->i_state = I_MARKER;
++	INIT_LIST_HEAD(&marker->i_list);
++
++	return (marker);
++}
++
++static void free_marker_inode(struct inode *marker)
++{
++	if (marker == &fixed_marker_inode)
++		up(&marker_inode_sem);
++	else
++		kfree(marker);
++}
++
+ /*
+  * This is a two-stage process. First we collect all
+  * offending inodes onto the throw-away list, and in
+@@ -354,19 +410,24 @@ static int invalidate_list(struct list_h
+ int invalidate_inodes(struct super_block * sb)
+ {
+ 	int busy;
++	struct inode *marker;
++
+ 	LIST_HEAD(throw_away);
++	marker = allocate_marker_inode();
+ 
+ 	down(&iprune_sem);
+ 	spin_lock(&inode_lock);
+-	busy = invalidate_list(&inode_in_use, sb, &throw_away);
+-	busy |= invalidate_list(&inode_unused, sb, &throw_away);
+-	busy |= invalidate_list(&sb->s_dirty, sb, &throw_away);
+-	busy |= invalidate_list(&sb->s_io, sb, &throw_away);
++	busy = invalidate_list(&inode_in_use, sb, &throw_away, &marker->i_list);
++	busy |= invalidate_list(&inode_unused, sb, &throw_away,&marker->i_list);
++	busy |= invalidate_list(&sb->s_dirty, sb, &throw_away, &marker->i_list);
++	busy |= invalidate_list(&sb->s_io, sb, &throw_away, &marker->i_list);
+ 	spin_unlock(&inode_lock);
+ 
+ 	dispose_list(&throw_away);
+ 	up(&iprune_sem);
+ 
++	free_marker_inode(marker);
++
+ 	return busy;
+ }
+ 
+@@ -460,7 +521,6 @@ static void prune_icache(int nr_to_scan)
+ 			if (!can_unuse(inode))
+ 				continue;
+ 		}
+-		hlist_del_init(&inode->i_hash);
+ 		list_move(&inode->i_list, &freeable);
+ 		inode->i_state |= I_FREEING;
+ 		nr_pruned++;
+@@ -501,7 +561,6 @@ static int shrink_icache_memory(int nr, 
+ 	return (inodes_stat.nr_unused / 100) * sysctl_vfs_cache_pressure;
+ }
+ 
+-static void __wait_on_freeing_inode(struct inode *inode);
+ /*
+  * Called with the inode lock held.
+  * NOTE: we are not increasing the inode-refcount, you must call __iget()
+@@ -520,7 +579,10 @@ repeat:
+ 			continue;
+ 		if (!test(inode, data))
+ 			continue;
+-		if (inode->i_state & (I_FREEING|I_CLEAR)) {
++		/* never used a marker inode */
++		if (inode->i_state & I_MARKER)
++			continue;
++		if (inode->i_state & (I_FREEING|I_CLEAR|I_WILL_FREE)) {
+ 			__wait_on_freeing_inode(inode);
+ 			goto repeat;
+ 		}
+@@ -545,7 +607,10 @@ repeat:
+ 			continue;
+ 		if (inode->i_sb != sb)
+ 			continue;
+-		if (inode->i_state & (I_FREEING|I_CLEAR)) {
++		/* never used a marker inode */
++		if (inode->i_state & I_MARKER)
++			continue;
++		if (inode->i_state & (I_FREEING|I_CLEAR|I_WILL_FREE)) {
+ 			__wait_on_freeing_inode(inode);
+ 			goto repeat;
+ 		}
+@@ -744,7 +809,7 @@ EXPORT_SYMBOL(iunique);
+ struct inode *igrab(struct inode *inode)
+ {
+ 	spin_lock(&inode_lock);
+-	if (!(inode->i_state & I_FREEING))
++	if (!(inode->i_state & (I_FREEING|I_WILL_FREE)))
+ 		__iget(inode);
+ 	else
+ 		/*
+@@ -1004,8 +1069,9 @@ void generic_delete_inode(struct inode *
+ 	struct super_operations *op = inode->i_sb->s_op;
+ 
+ 	list_del_init(&inode->i_list);
+-	inode->i_state|=I_FREEING;
++	inode->i_state |= I_FREEING;
+ 	inodes_stat.nr_inodes--;
++	inode->i_state |= I_WILL_FREE;
+ 	spin_unlock(&inode_lock);
+ 
+ 	if (inode->i_data.nrpages)
+@@ -1022,6 +1088,7 @@ void generic_delete_inode(struct inode *
+ 	} else
+ 		clear_inode(inode);
+ 	spin_lock(&inode_lock);
++	inode->i_state &= ~I_WILL_FREE;
+ 	hlist_del_init(&inode->i_hash);
+ 	spin_unlock(&inode_lock);
+ 	wake_up_inode(inode);
+@@ -1040,21 +1107,26 @@ static void generic_forget_inode(struct 
+ 		if (!(inode->i_state & (I_DIRTY|I_LOCK)))
+ 			list_move(&inode->i_list, &inode_unused);
+ 		inodes_stat.nr_unused++;
+-		spin_unlock(&inode_lock);
+-		if (!sb || (sb->s_flags & MS_ACTIVE))
++		if (!sb || (sb->s_flags & MS_ACTIVE)) {
++			spin_unlock(&inode_lock);
+ 			return;
++		}
++		inode->i_state |= I_WILL_FREE;
++		spin_unlock(&inode_lock);
+ 		write_inode_now(inode, 1);
+ 		spin_lock(&inode_lock);
++		inode->i_state &= ~I_WILL_FREE;
+ 		inodes_stat.nr_unused--;
+ 		hlist_del_init(&inode->i_hash);
+ 	}
+ 	list_del_init(&inode->i_list);
+-	inode->i_state|=I_FREEING;
++	inode->i_state |= I_FREEING;
+ 	inodes_stat.nr_inodes--;
+ 	spin_unlock(&inode_lock);
+ 	if (inode->i_data.nrpages)
+ 		truncate_inode_pages(&inode->i_data, 0);
+ 	clear_inode(inode);
++	wake_up_inode(inode);
+ 	destroy_inode(inode);
+ }
+ 
+@@ -1110,8 +1182,14 @@ void iput(struct inode *inode)
+ 		if (op && op->put_inode)
+ 			op->put_inode(inode);
+ 
+-		if (atomic_dec_and_lock(&inode->i_count, &inode_lock))
++		if (atomic_dec_and_lock(&inode->i_count, &inode_lock)) {
++			if (inode->i_state & I_WILL_FREE) {
++				atomic_inc(&inode->i_count);
++				spin_unlock(&inode_lock);
++				return;
++			}
+ 			iput_final(inode);
++		}
+ 	}
+ }
+ 
+Index: linux-2.6.10/include/linux/fs.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/fs.h
++++ linux-2.6.10/include/linux/fs.h
+@@ -1009,6 +1009,8 @@ struct super_operations {
+ #define I_FREEING		16
+ #define I_CLEAR			32
+ #define I_NEW			64
++#define I_WILL_FREE		128
++#define I_MARKER		256 /* Never use anything from this inode */
+ 
+ #define I_DIRTY (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES)
+ 
+Index: linux-2.6.10/mvl_patches/pro-0697.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0697.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(697);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

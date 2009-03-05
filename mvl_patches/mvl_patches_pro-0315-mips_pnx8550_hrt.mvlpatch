@@ -1,0 +1,474 @@
+#! /usr/bin/env bash
+# Patch: -mips_pnx8550_hrt
+# Date: Mon Mar  6 10:14:39 2006
+# Source: MontaVista Software, Inc. 
+# MR: 16189
+# Type: Enhancement
+# Disposition: MontaVista
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+#  	HRT support for MIPS PNX8550.
+#  	The MIPS core PR4450 in PNX8550 resets COUNT after 
+#         interrupt, so we can't use only one timer as 
+#  	monotonic, tick and high-res timer. So used 3 
+#  	separate timers.
+# 
+#  arch/mips/kernel/cpu-timer.c            |   75 ++++++++++++++++++++++++++++----
+#  arch/mips/philips/pnx8550/common/time.c |   48 ++++++++++++++++++++
+#  2 files changed, 114 insertions(+), 9 deletions(-)
+# 
+
+PATCHNUM=315
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 16189
+Type: Enhancement
+Disposition: MontaVista
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+ 	HRT support for MIPS PNX8550.
+ 	The MIPS core PR4450 in PNX8550 resets COUNT after 
+        interrupt, so we can't use only one timer as 
+ 	monotonic, tick and high-res timer. So used 3 
+ 	separate timers.
+
+ arch/mips/kernel/cpu-timer.c            |   75 ++++++++++++++++++++++++++++----
+ arch/mips/philips/pnx8550/common/time.c |   48 ++++++++++++++++++++
+ mvl_patches/pro-0315.c                  |   16 ++++++
+ 3 files changed, 130 insertions(+), 9 deletions(-)
+
+Index: linux-2.6.10/arch/mips/kernel/cpu-timer.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/cpu-timer.c
++++ linux-2.6.10/arch/mips/kernel/cpu-timer.c
+@@ -134,6 +134,7 @@ static unsigned long get_intra_jiffy_off
+ 	unsigned long res;
+ 
+ 	/* Get last timer tick in absolute kernel time */
++#if !defined(CONFIG_SOC_PNX8550)
+ 	count = read_c0_count();
+ 
+ 	/* 
+@@ -145,6 +146,14 @@ static unsigned long get_intra_jiffy_off
+ 	       count -= last_count-cycles_per_jiffy; 	
+ 	else
+ 		count = 0;
++#else
++	count = read_c0_count2();
++
++	if (u32_time_after(count, last_count))	 
++		count -= last_count;
++	else
++		count = 0;
++#endif
+ 
+ 	if (!smp_c0_counts_synchronized)
+ 		count = 0;
+@@ -259,6 +268,7 @@ int get_arch_cycles(unsigned long ref_ji
+ 	 * other.
+ 	 */
+ 
++#if !defined(CONFIG_SOC_PNX8550)
+ 	ret = read_c0_count() - last_count + cycles_per_jiffy;
+ 	if (ret < 0) {
+ 		/* this should happen very rarely on smp with small diff */
+@@ -274,7 +284,23 @@ int get_arch_cycles(unsigned long ref_ji
+ 
+ 	if (unlikely(diff = jiffies - ref_jiffies))
+ 	ret += diff * arch_cycles_per_jiffy;
++#else
++	unsigned int temp_jiffies;
+ 
++	do {
++		/* snapshot jiffies */
++		temp_jiffies = jiffies;
++		barrier();
++
++		ret = read_c0_count2() - last_count;
++
++		if (unlikely(diff = jiffies - ref_jiffies))
++			ret += diff * arch_cycles_per_jiffy;
++
++		barrier();
++		/* repeat if we didn't have a consistent view of the world */
++	} while (unlikely(temp_jiffies != jiffies));
++#endif
+ 	return ret;
+ }
+ 
+@@ -299,9 +325,27 @@ int schedule_hr_timer_int(unsigned long 
+ {
+ 	u32 count;
+ 
++#if !defined(CONFIG_SOC_PNX8550)
+ 	count = calc_next_expire(ref_jiffies, (u32)cycles);
+ 	write_c0_compare(count);
++
+ 	return u32_time_after((u32)read_c0_count(), count);
++#else
++	u32 jiffies_f = jiffies;
++	
++	count = (ref_jiffies - jiffies_f) * arch_cycles_per_jiffy +
++		cycles - get_arch_cycles(jiffies);
++
++	if ((long) (ref_jiffies - jiffies_f) <= 0 && (long) count <  0)
++		return -ETIME;
++
++	write_c0_count3(0);
++	write_c0_compare3(count);
++	/* Timer 3 start */
++	write_c0_config7(read_c0_config7() & ~0x00000020);
++
++	return 0;
++#endif
+ }
+ 
+ static inline void schedule_timer_int_asap(void)
+@@ -319,6 +363,7 @@ static inline void schedule_timer_int_as
+ 
+ int schedule_jiffies_int(unsigned long ref_jiffies)
+ {
++#if !defined(CONFIG_SOC_PNX8550)
+ 	int ret;
+ 	u32 count;
+ 
+@@ -334,6 +379,9 @@ int schedule_jiffies_int(unsigned long r
+ 		schedule_timer_int_asap();
+ 
+ 	return ret;
++#else
++	return get_arch_cycles(ref_jiffies) >= arch_cycles_per_jiffy;
++#endif
+ }
+ 
+ /*
+@@ -414,7 +462,7 @@ void local_timer_interrupt(int irq, void
+ irqreturn_t timer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+ {
+ 	 u32 count;  
+-#if defined(CONFIG_HIGH_RES_TIMERS)
++#if defined(CONFIG_HIGH_RES_TIMERS) && !defined(CONFIG_SOC_PNX8550)
+ 	/* Non-zero CPUs only have hrt interrupts */
+ 	if (smp_processor_id()) {
+ 		write_c0_compare(read_c0_compare());    /* ack the interrupt */
+@@ -427,25 +475,34 @@ irqreturn_t timer_interrupt(int irq, voi
+ 
+ 		int loops=0;
+ 		for(;;) {
++#if !defined(CONFIG_SOC_PNX8550)
+ 			write_c0_compare(last_count);
+ 			count = read_c0_count();
+ 			if (u32_time_before(count, last_count))
+ 			break;
+-
++#else
++			write_c0_compare(cycles_per_jiffy);
++#endif
+ 			do_timer(regs);
+ 			local_timer_interrupt(irq, dev_id, regs);
+ 
++			loops++;
++#if !defined(CONFIG_SOC_PNX8550)
+ 			last_count += cycles_per_jiffy;
+-		loops++;
+-	}
++#else
++			count = read_c0_count(); // latency during the interrupt
++			last_count = read_c0_count2() - count;
++			break;
++#endif
++		}
+ 		missed_timer_count += loops - 1;
+-#if defined(CONFIG_HIGH_RES_TIMERS)		
++#if defined(CONFIG_HIGH_RES_TIMERS) && !defined(CONFIG_SOC_PNX8550)
+ 		/* if we are not doing jiffy timer, we must be doing hr timer */
+-	if (!loops) {
+-		do_hr_timer_int();
+-	}
++		if (!loops) {
++			do_hr_timer_int();
++		}
+ #endif
+-}
++	}
+ 
+ 	/*
+ 	 * If we have an externally synchronized Linux clock, then update
+Index: linux-2.6.10/arch/mips/philips/pnx8550/common/time.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/philips/pnx8550/common/time.c
++++ linux-2.6.10/arch/mips/philips/pnx8550/common/time.c
+@@ -22,6 +22,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
++#include <linux/hrtime.h>
+ 
+ #include <asm/bootinfo.h>
+ #include <asm/cpu.h>
+@@ -35,6 +36,40 @@
+ 
+ extern unsigned int mips_hpt_frequency;
+ 
++#ifdef CONFIG_HIGH_RES_TIMERS
++irqreturn_t hrtimer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
++{
++	/* Timer 3 clear interrupt and stop */
++	write_c0_compare3(-1);
++	write_c0_config7(read_c0_config7() | 0x00000020);
++
++	do_hr_timer_int();
++
++	return IRQ_HANDLED;
++}
++
++static struct irqaction hrtimer_irqaction = {
++	.handler = hrtimer_interrupt,
++	.flags = SA_NODELAY | SA_INTERRUPT,
++	.name = "HR timer",
++};
++#endif /* CONFIG_HIGH_RES_TIMERS */
++
++#ifdef CONFIG_CPU_TIMER
++irqreturn_t monotonic_interrupt(int irq, void *dev_id, struct pt_regs *regs)
++{
++	/* Timer 2 clear interrupt */
++	write_c0_compare2(-1);
++
++	return IRQ_HANDLED;
++}
++
++static struct irqaction monotonic_irqaction = {
++	.handler = monotonic_interrupt,
++	.flags = SA_NODELAY | SA_INTERRUPT,
++	.name = "Monotonic timer",
++};
++#endif  /* CONFIG_CPU_TIMER */
+ /*
+  * pnx8550_time_init() - it does the following things:
+  *
+@@ -102,4 +137,17 @@ void __init pnx8550_timer_setup(struct i
+ 	configPR = read_c0_config7();
+ 	configPR |= 0x00000020;
+ 	write_c0_config7(configPR);
++
++#ifdef CONFIG_CPU_TIMER
++	setup_irq(PNX8550_INT_TIMER2, &monotonic_irqaction);
++
++	/* Timer 2 start */
++	configPR = read_c0_config7();
++	configPR &= ~0x00000010;
++	write_c0_config7(configPR);
++#endif
++
++#ifdef CONFIG_HIGH_RES_TIMERS
++	setup_irq(PNX8550_INT_TIMER3, &hrtimer_irqaction);
++#endif /* CONFIG_HIGH_RES_TIMERS */
+ }
+Index: linux-2.6.10/mvl_patches/pro-0315.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0315.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(315);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

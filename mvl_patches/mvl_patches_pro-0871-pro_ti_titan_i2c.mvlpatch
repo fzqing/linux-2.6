@@ -1,0 +1,895 @@
+#! /usr/bin/env bash
+# Patch: -pro_ti_titan_i2c
+# Date: Wed Aug 16 10:58:06 2006
+# Source: Texas Instruments Inc.
+# MR: 18281
+# Type: Enhancement 
+# Disposition: needs submitting to linux-mips.org
+# Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+# Description:
+# 
+# [PATCH 3/4] Support for I2C on TI TITAN Board
+# 
+
+PATCHNUM=871
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments Inc.
+MR: 18281
+Type: Enhancement 
+Disposition: needs submitting to linux-mips.org
+Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+Description:
+
+[PATCH 3/4] Support for I2C on TI TITAN Board
+
+diffstat:
+
+ drivers/i2c/busses/Kconfig         |    8 
+ drivers/i2c/busses/Makefile        |    1 
+ drivers/i2c/busses/i2c_avalanche.c |  208 ++++++++++++++++++++
+ drivers/i2c/chips/Kconfig          |    8 
+ drivers/i2c/chips/Makefile         |    1 
+ drivers/i2c/chips/ds1338.c         |  373 +++++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0871.c             |   16 +
+ 7 files changed, 615 insertions(+)
+
+Index: linux-2.6.10/drivers/i2c/busses/i2c_avalanche.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/busses/i2c_avalanche.c
+@@ -0,0 +1,208 @@
++/*
++ * Copyright: (C) 2005 Texas Instruments, Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/ioport.h>
++#include <linux/version.h>
++#include <linux/i2c.h>
++#include <asm/irq.h>
++#include <asm/io.h>
++	
++#include <asm/uaccess.h>
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <linux/interrupt.h>
++#include <linux/moduleparam.h>
++	
++#include <pal.h>
++#include <ssp_hal.h>
++#include <asm/semaphore.h>
++	
++#define MODULE_NAME	"AVALANCHE I2C"
++#define MAX_MESSAGES	65536   /* max number of messages */
++	
++static int clock = 100; /* Default: Fast Mode = 400 KHz, Standard Mode = 100 KHz */
++	
++typedef struct 
++{
++	ssp_hal_i2c_info_t   *id;      
++	u8 * buf;
++	size_t buf_len;
++} avalanche_i2c_dev_t;
++	
++static avalanche_i2c_dev_t *avalanche_i2c_dev;
++	
++static int avalanche_i2c_setup(avalanche_i2c_dev_t *avalanche_i2c_dev)
++{
++	ssp_drv_desc_t ret;
++	
++	if((ret = ssp_i2c_open()) == NULL) {
++		return -EFAULT;            
++	}
++	
++	avalanche_i2c_dev->id = (ssp_hal_i2c_info_t *)ret;
++	
++	return 0;
++}
++	
++static irqreturn_t avalanche_i2c_isr(int this_irq, void *dev_id, struct pt_regs *regs)
++{
++	ssp_hal_intr_ctrl(SSP_HAL_INTR_DISABLE);
++	ssp_hal_intr_ctrl(SSP_HAL_INTR_ACK);
++	
++	ssp_isr();
++	ssp_hal_intr_ctrl(SSP_HAL_INTR_ENABLE);
++	
++	return IRQ_HANDLED;
++}      
++	
++static int avalanche_i2c_xfer_msg(struct i2c_adapter * adap, struct i2c_msg * msg, int stop)
++{
++	avalanche_i2c_dev_t *dev = i2c_get_adapdata(adap);
++	u8 zero_byte = 0;
++	int ret = 0;
++	int count = 0;
++	
++	if (!msg->len) {
++		return 0;
++	}
++	
++	avalanche_i2c_setup(dev);
++	dev->id->addr = msg->addr;
++	
++	if (dev->id->mode == SSP_HAL_MODE_INTR){
++		request_irq(LNXINTNUM(AVALANCHE_SSP_INT), avalanche_i2c_isr, 0, "i2c", dev);
++		avalanche_intr_type_set(LNXINTNUM(AVALANCHE_SSP_INT),0);  
++	}
++	
++	if (msg->len == 0) {
++		dev->buf = &zero_byte;
++		dev->buf_len = 1;
++	}
++	
++	if (msg->flags != I2C_M_RD){
++		if((count = ssp_i2c_write((ssp_hal_i2c_info_t*)dev->id, msg->buf, msg->len)) != msg->len ) {
++			printk("SSP_I2C: Failed to transmit for  addr: 0x%04x, len: %d, flags: 0x%x, stop: %d \n",
++						msg->addr, msg->len, msg->flags, stop);
++			ret = count;
++		}
++	
++	}
++	else {
++		if((count = ssp_i2c_read((ssp_hal_i2c_info_t *)dev->id, msg->buf, msg->len)) != msg->len ) {
++			printk("SSP_I2C: Failed to transmit for  addr: 0x%04x, len: %d, flags: 0x%x, stop: %d \n",
++						msg->addr, msg->len, msg->flags, stop);
++
++			ret = count;
++		}
++	}
++	
++	if (dev->id->mode == SSP_HAL_MODE_INTR) {
++		free_irq(LNXINTNUM(AVALANCHE_SSP_INT), dev);
++	}
++	
++	ssp_i2c_close(dev->id);    
++	
++	return count;
++}
++
++static int avalanche_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
++{
++	int i;
++	int r = 0;
++	
++	if (num < 1 || num > MAX_MESSAGES)
++		return -EINVAL;
++	
++	for (i = 0; i < num; i++)
++		if (msgs[i].buf == NULL)
++			return -EINVAL;
++	
++	for (i = 0; i < num; i++) {
++		r = avalanche_i2c_xfer_msg(adap, &msgs[i], (i == (num - 1)));
++		if (r != msgs[i].len)
++			break;
++	}
++	
++	if (r >= 0 && num > 1)
++		r = num;
++	
++	return r;
++}
++	
++static u32 avalanche_i2c_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
++}
++	
++static struct i2c_algorithm avalanche_i2c_algo = { 
++	name              : "Avalanche I2C algorithm", 
++	id                : I2C_ALGO_EXP, 
++	master_xfer       : avalanche_i2c_xfer, 
++	smbus_xfer        : NULL, 
++	slave_send        : NULL, 
++	slave_recv        : NULL, 
++	algo_control      : NULL, 
++	functionality     : avalanche_i2c_func,
++};
++	
++static struct i2c_adapter avalanche_i2c_adap = { 
++	owner             : THIS_MODULE, 
++	name              : "AVALANCHE I2C adapter", 
++	id                : I2C_ALGO_EXP, 
++	algo              : &avalanche_i2c_algo, 
++	algo_data         : NULL, 
++	client_register   : NULL, 
++	client_unregister : NULL,
++};
++	
++static int __init avalanche_i2c_init(void)
++{
++	int       r;
++	
++	clock = 400;    /* Fast mode */
++	
++	avalanche_i2c_dev = kmalloc(sizeof(avalanche_i2c_dev_t), GFP_KERNEL); 
++	
++	if(avalanche_i2c_dev == NULL) {
++		printk( "SSP_I2C: Unable to allocate memory for I2C.\n" );
++		return -1;
++	}
++	
++	avalanche_i2c_dev->id = NULL;
++	i2c_set_adapdata(&avalanche_i2c_adap, &avalanche_i2c_dev);
++	r = i2c_add_adapter(&avalanche_i2c_adap);
++	
++	if (r) {
++		printk("failed to add adapter");
++		return r;
++	}
++	
++	return 0;
++}
++	
++static void __exit avalanche_i2c_exit(void)
++{
++	i2c_del_adapter(&avalanche_i2c_adap);
++	
++	if (avalanche_i2c_dev)
++		kfree(avalanche_i2c_dev);
++} 
++
++MODULE_AUTHOR("Texas Instruments");
++	
++MODULE_DESCRIPTION("AVALANCHE I2C bus adapter");
++MODULE_LICENSE("GPL");
++MODULE_PARM_DESC(clock, "Set I2C clock in KHz: 100 (Standard Mode) or 400 (Fast Mode)");
++	
++module_init(avalanche_i2c_init);
++module_exit(avalanche_i2c_exit); 
+Index: linux-2.6.10/drivers/i2c/busses/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Kconfig
++++ linux-2.6.10/drivers/i2c/busses/Kconfig
+@@ -504,6 +504,14 @@ config I2C_OMAP
+ 	  Support for TI OMAP I2C driver. Say yes if you want to use the OMAP
+ 	  I2C interface.
+ 
++config AVALANCHE_SSP_I2C
++	tristate "SSP I2C driver"
++	depends on I2C && MIPS_AVALANCHE_SSP
++	help
++	 Enables the SSP I2C driver
++	 This driver can also be built as a module.  If so, the module
++	 will be called avalanche_ssp
++
+ config I2C_DAVINCI
+         tristate "Davinci i2c driver"
+         depends on I2C && ARCH_DAVINCI
+Index: linux-2.6.10/drivers/i2c/busses/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Makefile
++++ linux-2.6.10/drivers/i2c/busses/Makefile
+@@ -42,6 +42,7 @@ obj-$(CONFIG_I2C_VOODOO3)	+= i2c-voodoo3
+ obj-$(CONFIG_SCx200_ACB)	+= scx200_acb.o
+ obj-$(CONFIG_SCx200_I2C)	+= scx200_i2c.o
+ obj-$(CONFIG_I2C_OMAP)          += i2c-omap.o
++obj-$(CONFIG_AVALANCHE_SSP_I2C) += i2c_avalanche.o
+ obj-$(CONFIG_I2C_DAVINCI)       += i2c-davinci.o
+ obj-$(CONFIG_I2C_EMMA2RH)	+= i2c-emma2rh.o
+ 
+Index: linux-2.6.10/drivers/i2c/chips/ds1338.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/ds1338.c
+@@ -0,0 +1,373 @@
++/*
++ * linux/drivers/i2c/chips/ds1338.c
++ *
++ * Created by ripping apart ds1337 driver by James Chapman 
++ *
++ * Copyright (C) 2005 Sekhar Nori
++ * Copyright (C) 2005 James Chapman <jchapman@katalix.com>
++ *
++ * based on linux/drivers/acron/char/pcf8583.c
++ * Copyright (C) 2000 Russell King
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Driver for Dallas Semiconductor DS1338 real time clock chip
++ */
++	
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/i2c-sensor.h>
++#include <linux/string.h>
++#include <linux/rtc.h>        /* get the user-level API */
++#include <linux/bcd.h>
++#include <linux/time.h>
++#include <asm/time.h>
++	
++#define DS1338_REG_HOUR 	2
++#define DS1338_REG_DAY  	3
++#define DS1338_REG_DATE 	4
++#define DS1338_REG_MONTH 	5
++#define DS1338_REG_CONTROL 	7
++#define DS1338_GET_DATE 	0
++#define DS1338_SET_DATE 	1
++	
++#define EPOCH	1970
++#define DEBUG
++	
++/*
++ * Functions declaration
++ */
++static unsigned short normal_i2c[] = { 0x68, I2C_CLIENT_END };
++static unsigned int normal_isa[] = { I2C_CLIENT_ISA_END };
++	
++SENSORS_INSMOD_1(ds1338);
++	
++static int ds1338_attach_adapter(struct i2c_adapter *adapter);
++static int ds1338_detect(struct i2c_adapter *adapter, int address, int kind);
++static void ds1338_init_client(struct i2c_client *client);
++static int ds1338_detach_client(struct i2c_client *client);
++static int ds1338_command(struct i2c_client *client, unsigned int cmd, void *arg);
++	
++/*
++ * Driver data (common to all clients)
++ */
++static struct i2c_driver ds1338_driver = {
++	.owner		= THIS_MODULE,
++	.name		= "ds1338",
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter	= ds1338_attach_adapter,
++	.detach_client	= ds1338_detach_client,
++	.command	= ds1338_command,
++};
++	
++/*
++ * Client data (each client gets its own)
++ */
++struct ds1338_data {
++	struct i2c_client client;
++	struct list_head list;
++};
++	
++/*
++ * Internal variables
++ */
++static LIST_HEAD(ds1338_clients);
++	
++static inline int ds1338_read(struct i2c_client *client, u8 reg, u8 *value)
++{
++	int err;
++	struct i2c_msg msg[1];
++	
++	if (!client->adapter)
++		return -ENODEV;
++	
++	msg->addr = client->addr;
++	msg->flags = 0;
++	msg->len = 1;
++	msg->buf = &reg;        
++	
++	err = i2c_transfer(client->adapter, msg, 1);
++	
++	if(err >= 0) {
++		msg->len = 1; 
++		msg->flags = I2C_M_RD;
++		err = i2c_transfer(client->adapter, msg, 1);    
++	}
++	
++	*value = msg->buf[0];
++	
++	return 0;
++}
++	
++static int ds1338_get_datetime(struct i2c_client *client, struct rtc_time *dt)
++{
++	int result;
++	u8 buf[7];
++	u8 val;
++	struct i2c_msg msg[2];
++	u8 offs = 0;
++	
++	if (!dt) {
++		return -EINVAL;
++	}
++	
++	msg[0].addr = client->addr;
++	msg[0].flags = 0;
++	msg[0].len = 1;
++	msg[0].buf = &offs;
++	
++	msg[1].addr = client->addr;
++	msg[1].flags = I2C_M_RD;
++	msg[1].len = sizeof(buf);
++	msg[1].buf = &buf[0];
++	
++	/* This is ugly. The i2c adapter did not support sending two messages
++	 * in the same transfer. Hence this workaround. TODO: Update this code
++	 * once that gets fixed.
++	 */
++	result = i2c_transfer(client->adapter, &msg[0], 1);
++	
++	if(result >= 0)
++		result = i2c_transfer(client->adapter, &msg[1], 1);
++	
++	if (result >= 0) {
++		dt->tm_sec = BCD2BIN(buf[0]);
++		dt->tm_min = BCD2BIN(buf[1]);
++		val = buf[2] & 0x3f;
++		dt->tm_hour = BCD2BIN(val);
++		dt->tm_wday = BCD2BIN(buf[3]) - 1; /* chip does 1-7, POSIX needs 0-6 */
++		dt->tm_mday = BCD2BIN(buf[4]); 
++		val = buf[5] & 0x7f;
++		dt->tm_mon = BCD2BIN(val) - 1; /* chip does 1-12, POSIX needs 0-11 */
++	
++		dt->tm_year = EPOCH + BCD2BIN(buf[6]);
++	
++		return 0;
++	}
++	
++	return -EIO;
++}
++	
++static int ds1338_set_datetime(struct i2c_client *client, struct rtc_time *dt)
++{
++	int result;
++	u8 buf[8];
++	struct i2c_msg msg[1];
++	int val;
++	
++	if (!dt) {
++		return -EINVAL;
++	}
++	
++	buf[0] = 0;        /* reg offset */
++	dt->tm_sec &= 0x7f; /* make sure CH bit is unset - the clock starts */
++	buf[1] = BIN2BCD(dt->tm_sec);
++	buf[2] = BIN2BCD(dt->tm_min);
++	buf[3] = BIN2BCD(dt->tm_hour);     
++	buf[3] &= ~(1 << 6); /* ensure 24 hour mode */    
++	dt->tm_wday += 1;
++	buf[4] = BIN2BCD(dt->tm_wday);
++	buf[5] = BIN2BCD(dt->tm_mday);
++	dt->tm_mon += 1;
++	buf[6] = BIN2BCD(dt->tm_mon);    
++	
++	val = dt->tm_year;
++	if((val < EPOCH) || (val > EPOCH + 99)) {
++		val = (dt->tm_year % 100);
++	} else {
++		val -= EPOCH;
++	}
++	
++	buf[7] = BIN2BCD(val);
++	
++	msg[0].addr = client->addr;
++	msg[0].flags = 0;
++	msg[0].len = sizeof(buf);
++	msg[0].buf = &buf[0];
++	
++	result = i2c_transfer(client->adapter, msg, 1);
++	if (result >= 0)
++		return 0;
++	
++	return -EIO;
++}
++	
++static int ds1338_command(struct i2c_client *client, unsigned int cmd, void *arg)
++{
++	switch (cmd) {
++	case DS1338_GET_DATE:
++		return ds1338_get_datetime(client, arg);
++
++	case DS1338_SET_DATE:
++		return ds1338_set_datetime(client, arg);
++	
++	default:
++		return -EINVAL;
++	}
++}
++	
++/*
++ * Public API for access to specific device. Useful for low-level
++ * RTC access from kernel code.
++ */
++int ds1338_do_command(int bus, int cmd, void *arg)
++{
++	struct list_head *walk;
++	struct list_head *tmp;
++	struct ds1338_data *data;
++	
++	list_for_each_safe(walk, tmp, &ds1338_clients) {
++		data = list_entry(walk, struct ds1338_data, list);
++		if (data->client.adapter->nr == bus)
++			return ds1338_command(&data->client, cmd, arg);
++	}
++	
++	return -ENODEV;
++}
++	
++static int ds1338_attach_adapter(struct i2c_adapter *adapter)
++{
++	return i2c_detect(adapter, &addr_data, ds1338_detect);
++}
++	
++/*
++ * The following function does more than just detection. If detection
++ * succeeds, it also registers the new chip.
++ */
++static int ds1338_detect(struct i2c_adapter *adapter, int address, int kind)
++{
++	struct i2c_client *new_client;
++	struct ds1338_data *data;
++	int err = 0;
++	const char *name = "";
++	
++	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_I2C))
++		goto exit;
++	
++	if (!(data = kmalloc(sizeof(struct ds1338_data), GFP_KERNEL))) {
++		err = -ENOMEM;
++		goto exit;
++	}
++	memset(data, 0, sizeof(struct ds1338_data));
++	INIT_LIST_HEAD(&data->list);
++	
++	new_client = &data->client;
++	i2c_set_clientdata(new_client, data);
++	new_client->addr = address;
++	new_client->adapter = adapter;
++	new_client->driver = &ds1338_driver;
++	new_client->flags = 0;
++	
++	/*
++	 * Now we do the remaining detection. A negative kind means that
++	 * the driver was loaded with no force parameter (default), so we
++	 * must both detect and identify the chip. A zero kind means that
++	 * the driver was loaded with the force parameter, the detection
++	 * step shall be skipped. A positive kind means that the driver
++	 * was loaded with the force parameter and a given kind of chip is
++	 * requested, so both the detection and the identification steps
++	 * are skipped.
++	 *
++	 * For detection, we read registers that are most likely to cause
++	 * detection failure, i.e. those that have more bits with fixed
++	 * or reserved values.
++	 */
++	
++	/* Default to an DS1338 if forced */
++	if (kind == 0)
++		kind = ds1338;
++	
++	if (kind < 0) {        /* detection and identification */
++		u8 data;
++	
++		/* Check for a valid day register value */
++		if ((ds1338_read(new_client, DS1338_REG_DAY, &data) < 0) || (data == 0) || (data & 0xf8)) {
++			goto exit_free;
++		}
++	
++		/* Check for a valid date register value */
++		if ((ds1338_read(new_client, DS1338_REG_DATE, &data) < 0) ||
++		   (data == 0) || (data & 0xc0) || ((data & 0x0f) > 9) ||
++		   (data >= 0x32)) {
++			goto exit_free;
++		}
++	
++		/* Check for a valid month register value */
++		if ((ds1338_read(new_client, DS1338_REG_MONTH, &data) < 0) ||
++		   (data == 0) || (data & 0x60) || ((data & 0x0f) > 9) ||
++		   ((data >= 0x13) && (data <= 0x19))) {
++			goto exit_free;
++		}
++	
++		/* Check that control register bits 2,3 and 6 are zero */
++		if ((ds1338_read(new_client, DS1338_REG_CONTROL, &data) < 0) || (data & 0x4C)) {
++			goto exit_free;
++		}
++	
++		kind = ds1338;
++	}
++	
++	if (kind == ds1338)
++		name = "ds1338";
++	
++	/* We can fill in the remaining client fields */
++	strlcpy(new_client->name, name, I2C_NAME_SIZE);
++	
++	/* Tell the I2C layer a new client has arrived */
++	if ((err = i2c_attach_client(new_client)))
++		goto exit_free;
++	
++	/* Initialize the DS1338 chip */
++	ds1338_init_client(new_client);
++	
++	/* Add client to local list */
++	list_add(&data->list, &ds1338_clients);
++	
++	return 0;
++	
++exit_free:
++	kfree(data);
++exit:
++	return err;
++}
++	
++static void ds1338_init_client(struct i2c_client *client)
++{
++}
++static int ds1338_detach_client(struct i2c_client *client)
++{
++	int err;
++	struct ds1338_data *data = i2c_get_clientdata(client);
++	
++	if ((err = i2c_detach_client(client))) {
++		return err;
++	}
++	
++	list_del(&data->list);
++	kfree(data);
++	return 0;
++}
++	
++static int __init ds1338_init(void)
++{
++	return i2c_add_driver(&ds1338_driver);
++}
++	
++static void __exit ds1338_exit(void)
++{
++	i2c_del_driver(&ds1338_driver);
++}
++	
++MODULE_AUTHOR("Sekhar Nori <nsekhar@ti.com>");
++MODULE_DESCRIPTION("DS1338 RTC driver");
++MODULE_LICENSE("GPL");
++	
++EXPORT_SYMBOL_GPL(ds1338_do_command);
++	
++module_init(ds1338_init);
++module_exit(ds1338_exit);
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -315,6 +315,14 @@ config SENSORS_DS1374
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called ds1374.
+ 
++config SENSORS_DS1338
++	bool "Dallas Semiconductor DS1338 Real Time Clock"
++	depends on I2C && EXPERIMENTAL
++	select I2C_SENSOR
++	help
++	  If you say yes here you get support for Dallas Semiconductor
++	  DS1338 real-time clock chips. 
++
+ config SENSORS_EEPROM
+ 	tristate "EEPROM reader"
+ 	depends on I2C && EXPERIMENTAL
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_ISP1301_OMAP)	+= isp1301_om
+ obj-$(CONFIG_SENSORS_TLV320AIC23) += tlv320aic23.o
+ obj-$(CONFIG_SENSORS_TLV320AIC33) += tlv320aic33.o
+ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_expander_omap.o
++obj-$(CONFIG_SENSORS_DS1338)	+= ds1338.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_CHIP),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/mvl_patches/pro-0871.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0871.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(871);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

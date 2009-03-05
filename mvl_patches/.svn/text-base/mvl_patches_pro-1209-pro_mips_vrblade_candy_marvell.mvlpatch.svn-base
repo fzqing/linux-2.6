@@ -1,0 +1,2465 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_vrblade_candy_marvell
+# Date: Mon Mar 12 13:53:25 2007
+# Source: NEC Informatec Systems,Ltd.
+# MR:21157 
+# Type: Integration
+# Disposition: needs submitting to linux-mips community
+# Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+# Signed-off-by: Pavel Kiryukhin <pkiryukhin@ru.mvista.com>
+# Description:
+# New candy driver received from NEC with Marvell switch support.
+# Source code reworked: 
+# 	1) driver uses standard linux mii interface
+# 	2) Davicom and Marvel MII are distinguished by thier OUI registers 
+# 	3) code optimisation,errors and typoo fixing.
+#  arch/mips/vr41xx/vrblade/setup.c |    7 
+#  drivers/net/Kconfig              |   21 -
+#  drivers/net/Makefile             |    1 
+#  drivers/net/mv88e6063.c          |  414 ++++++++++++++++++++
+#  drivers/net/mv88e6063.h          |   95 ++++
+#  drivers/net/nec_candy.c          |  805 +++++++++++++++++++++++++++------------
+#  drivers/net/nec_candy.h          |  103 ++--
+#  include/linux/nec_candy_pd.h     |   43 ++
+#  8 files changed, 1200 insertions(+), 289 deletions(-)
+# 
+
+PATCHNUM=1209
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: NEC Informatec Systems,Ltd.
+MR:21157 
+Type: Integration
+Disposition: needs submitting to linux-mips community
+Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+Signed-off-by: Pavel Kiryukhin <pkiryukhin@ru.mvista.com>
+Description:
+New candy driver received from NEC with Marvell switch support.
+Source code reworked: 
+	1) driver uses standard linux mii interface
+	2) Davicom and Marvel MII are distinguished by thier OUI registers 
+	3) code optimisation,errors and typoo fixing.
+ arch/mips/vr41xx/vrblade/setup.c |    7 
+ drivers/net/Kconfig              |   21 -
+ drivers/net/Makefile             |    1 
+ drivers/net/mv88e6063.c          |  414 ++++++++++++++++++++
+ drivers/net/mv88e6063.h          |   95 ++++
+ drivers/net/nec_candy.c          |  805 +++++++++++++++++++++++++++------------
+ drivers/net/nec_candy.h          |  103 ++--
+ include/linux/nec_candy_pd.h     |   43 ++
+ mvl_patches/pro-1209.c           |   16 
+ 9 files changed, 1216 insertions(+), 289 deletions(-)
+
+Index: linux-2.6.10/drivers/net/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/Kconfig
++++ linux-2.6.10/drivers/net/Kconfig
+@@ -1277,11 +1277,30 @@ config XILINX_EMAC
+ 
+ config NEC_CANDY
+ 	tristate "NEC Candy Ethernet support"
+-	depends on NEC_CMBVR4133
+ 	help
+ 	  This driver supports the NEC "Candy" Ethernet devices found
+ 	  on some NEC MIPS boards.
+ 
++config CANDY_NAPI
++	bool "Enable NAPI support"
++	depends on NEC_CANDY
++	default y
++	help
++	  NAPI is a driver API designed to reduce CPU and interrupt load
++	  when the driver is receiving lots of packets from the card.
++
++	  If your estimated Rx load is 10kpps or more, or if the card will be
++	  deployed on potentially unfriendly networks (e.g. in a firewall),
++	  then say Y here.
++
++	  You may want to say N here in case of low packets rates where latency
++	  is extremely important and no packet overload is likely.
++
++	  See <file:Documentation/networking/NAPI_HOWTO.txt> for more
++	  information.
++
++	  If in doubt, say Y.
++
+ config NET_PCI
+ 	bool "EISA, VLB, PCI and on board controllers"
+ 	depends on NET_ETHERNET && (ISA || EISA || PCI)
+Index: linux-2.6.10/drivers/net/nec_candy.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/nec_candy.c
++++ linux-2.6.10/drivers/net/nec_candy.c
+@@ -33,8 +33,16 @@
+  */
+ 
+ #define DRV_NAME		"nec_candy"
+-#define DRV_VERSION		"0.4"
+-#define DRV_RELDATE		"June 20, 2006"
++#define DRV_VERSION		"0.5"
++#define DRV_RELDATE		"January 25, 2007"
++
++/*
++ * NEC Changes:
++ *  Nov 30, 2006  NEC Informatec Systems,Ltd
++ *  - Base version: 0.3 (release date: Nov 13, 2003)
++ *  - Added support for NEC VR4133A
++ *  - Added support for ring structure of Tx descriptor on VR4133A.
++ */
+ 
+ #include <linux/init.h>
+ #include <linux/types.h>
+@@ -59,7 +67,7 @@
+ #include <asm/pgtable.h>
+ 
+ #include "nec_candy.h"
+-
++#include "mv88e6063.h"
+ /***********************************************************************
+  * debug
+  ***********************************************************************/
+@@ -69,26 +77,24 @@
+ 				 NETIF_MSG_LINK)
+ 
+ static int debug = -1;
+-// #define	DEBUG_NEC_CANDY
+ // #define	DEBUG_VERBOSE_NEC_CANDY
+ // #define	SHOW_BUG		/* targeted bug reporting msgs */
+ 
+ #ifdef DEBUG_VERBOSE_NEC_CANDY
+-#define DEBUG_NEC_CANDY
+-#endif
+-
+-#ifdef DEBUG_NEC_CANDY
+-#define DEBUG(x)  do { x; } while (0)
+-#else
+-#define DEBUG(x)
+-#endif
+-
+-#ifdef DEBUG_VERBOSE_NEC_CANDY
+ #define DEBUG_VERBOSE(x)  do { x; } while (0)
+ #else
+ #define DEBUG_VERBOSE(x)
+ #endif
+ 
++#if 0
++#define MSG_LVL KERN_ERR
++#define DBG_MSG_ON(condition,format,arg...)  				   \
++	do { if (condition)    		     				   \
++	printk(MSG_LVL "%s:%s: " format "\n",__FILE__,__FUNCTION__, ##arg);\
++	} while (0)
++#else
++#define DBG_MSG_ON(condition,format,arg...)
++#endif
+ /***********************************************************************
+  * global data
+  ***********************************************************************/
+@@ -118,11 +124,12 @@ static struct candy_private *candy_priv_
+ #define	candy_clear_macc2_bits(x, mask) \
+ 		candy_out(x, (candy_in(x) & ~mask) & MACC2_RESERVED)
+ 
+-#ifdef CANDY_NAPI
++#ifdef CONFIG_CANDY_NAPI
++#define CANDY_NAPI_MASK_INTS	      ( RCVDN )
+ #define candy_unmask_napi_ints(p) \
+-		candy_out((p)->msr, candy_in((p)->msr) | INT_ISR_RX_MASK)
++		candy_out((p)->msr, (candy_in((p)->msr) | CANDY_NAPI_MASK_INTS))
+ #define candy_mask_napi_ints(p) \
+-		candy_out((p)->msr, candy_in((p)->msr) | INT_ISR_RX_MASK)
++		candy_out((p)->msr, (candy_in((p)->msr) & ~CANDY_NAPI_MASK_INTS))
+ #endif
+ 
+ 
+@@ -168,49 +175,54 @@ mdio_read(struct net_device *dev, int ph
+ 	return (ushort) candy_in(p->mrdd);
+ }
+ 
++static void candy_init_rings(struct net_device *dev);
++
+ static void
+-candy_set_media_speed(struct net_device *dev)
++candy_set_media_speed(struct candy_private *pp)
+ {
+-	struct candy_private *pp = dev->priv;
+-	int lpa, advertise, media, reg;
+-	ulong ccr = RMII_MODE | MII_PIN_SELECT;
++	int lpa, advertise, media;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
++	ulong ccr;
++	if PLATFORM(pdata->platform_id,NEC_VRBLADE_VR4133A_PID) {
++		ccr = MII_PIN_SELECT;
++		if (pdata->platform_id & WORKAROUND_E19_VR4133AR20_BIT)
++			ccr |= SPD100;
++	} else
++		ccr = RMII_MODE | MII_PIN_SELECT;
+ 
+ 	lpa = mdio_read(pp->mii_if.dev, pp->mii_if.phy_id, MII_LPA);
+ 	advertise = mdio_read(pp->mii_if.dev, pp->mii_if.phy_id, MII_ADVERTISE);
+ 
+-	if(lpa == 0 || advertise == 0) {
+-		reg = mdio_read(pp->mii_if.dev, pp->mii_if.phy_id, MII_BMCR);
+-		pp->link_status.fullduplex = (reg & BMCR_FULLDPLX) ? 1 : 0;
+-		if (reg & BMCR_SPEED100) {
+-			candy_out(pp->regs->ccr, ccr);
+-			pp->link_status.speed100 = 1;
+-		} else {
+-			candy_out(pp->regs->ccr, ccr | SPD100);
+-			pp->link_status.speed100 = 0;
+-		}
++	if (lpa == 0 || advertise == 0) {
++		candy_out(pp->regs->ccr, ccr);
++		pp->link_status.speed100 = 1;
++		pp->link_status.fullduplex = 1;
+ 		return;
+ 	}
+ 
+-	media = mii_nway_result(lpa & advertise);
+-	switch(media) {
+-		case LPA_10FULL:
+-		case LPA_10HALF:
+-			ccr |= SPD100;
+-			pp->link_status.speed100 = 0;
+-			break;
++	/* Always set Marvell as 100MBps Full Duplex */
++	if (pp->oui == MARVELL_OUI) {
++		pp->link_status.speed100 = 1;
++		pp->link_status.fullduplex = 1;
++	} else	{
++		media = mii_nway_result(lpa & advertise);
++		switch (media) {
++			case LPA_10FULL:
++			case LPA_10HALF:
++				pp->link_status.speed100 = 0;
++				break;
+ 		default:
+-			pp->link_status.speed100 = 1;
+-	}
+-
+-	switch(media) {
+-		case LPA_10HALF:
+-		case LPA_100HALF:
+-			pp->link_status.fullduplex = 0;
+-			break;
++				pp->link_status.speed100 = 1;
++		}
++		switch (media) {
++			case LPA_10HALF:
++			case LPA_100HALF:
++				pp->link_status.fullduplex = 0;
++				break;
+ 		default:
+-			pp->link_status.fullduplex = 1;
++				pp->link_status.fullduplex = 1;
++		}
+ 	}
+-
+ 	candy_out(pp->regs->ccr, ccr);
+ }
+ 
+@@ -218,7 +230,7 @@ static int
+ candy_ethtool_ioctl(struct candy_private *pp, void *useraddr)
+ {
+ 	u32 ethcmd;
+-
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	/* dev_ioctl() in ../../net/core/dev.c has already checked
+ 	   capable(CAP_NET_ADMIN), so don't bother with that here.  */
+ 
+@@ -311,8 +323,11 @@ candy_ethtool_ioctl(struct candy_private
+ 				rc = -EINVAL;
+ 				goto err_out_gregs;
+ 			}
+-
+-			regs.version = CANDY_REGS_VER;
++			if ((PLATFORM(pdata->platform_id,NEC_CMB_VR4133_PID)) ||
++			(PLATFORM(pdata->platform_id,NEC_VRBLADE_VR4133A_PID)))
++			    regs.version = CANDY_REGS_VER2;
++			else
++			    regs.version = CANDY_REGS_VER1;
+ 			rc = copy_to_user(useraddr, &regs, sizeof(regs));
+ 			if (rc) {
+ 				rc = -EFAULT;
+@@ -393,12 +408,26 @@ candy_ioctl(struct net_device *dev, stru
+ 	struct candy_private *pp = dev->priv;
+ 	struct mii_ioctl_data *mii = (struct mii_ioctl_data *) &rq->ifr_data;
+ 	int rc;
++	struct vlan_ioctl_data *vdata = (struct vlan_ioctl_data *)&rq->ifr_data;
++
++	if (!netif_running(dev))
++		return -EINVAL;
+ 
+ 	if (cmd == SIOCETHTOOL)
+ 		return candy_ethtool_ioctl(pp, (void *) rq->ifr_data);
+ 
+ 	spin_lock_irq(&pp->lock);
+-	rc = generic_mii_ioctl(&pp->mii_if, mii, cmd, NULL);
++
++	if ((cmd > SIOCDEVPRIVATE + 10) && (cmd < SIOCDEVPRIVATE + 14)) {
++		if (vlan_mii_ioctl)
++			rc = vlan_mii_ioctl(&pp->mii_if, mii, vdata, cmd);
++		else {
++			printk(KERN_ERR "vlan_mii_ioctl not defined\n");
++			rc =  -EINVAL;
++		}
++	} else
++		rc = generic_mii_ioctl(&pp->mii_if, mii, cmd, NULL);
++
+ 	spin_unlock_irq(&pp->lock);
+ 	return rc;
+ }
+@@ -420,8 +449,10 @@ static void
+ candy_hw_init(struct net_device *dev)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	candy_regs *p = pp->regs;
+ 	unsigned int temp;
++	unsigned tx_flth;
+ 
+ 	/*
+ 	 * software reset
+@@ -430,57 +461,131 @@ candy_hw_init(struct net_device *dev)
+ 	candy_in(p->isr);
+ 
+ 	/*
+-	 * MAC software reset
+-	 */
+-	candy_out(p->macc2, MCRST);
+-	candy_out(p->macc2, 0x0);
+-
+-	/*
+ 	 * MII software reset
+ 	 */
+-	candy_out(p->miic, MISRT);
+-	candy_out(p->miic, 0);
++	candy_out(p->miic, MISRT|CLKS33);
++	candy_out(p->miic, CLKS33);
+ 
+-	/*
+-	 * initialize MAC
+-	 */
+-	temp = TXFC | RXFC | CRCEN | PADEN;
+-#ifdef WORKAROUND_E13_TXFC
+-	temp &= ~TXFC;
+-#endif
+-#ifdef WORKAROUND_E21_PAD
+-	temp &= ~PADEN;
+-#endif
+-	candy_out(p->macc1, temp);
+ 	candy_out(p->macc2, APD);
+ 	candy_out(p->ipgt, IPGT);
+ 	candy_out(p->ipgr, IPGR1 | IPGR2);
+ 	candy_out(p->clrt, LCOLW | RETRY);
+ 	candy_out(p->lmax, MAXF);
+-	set_mac_addr(dev, dev->dev_addr);
+ 	candy_out(p->vltp, 0x0);
+ 	candy_out(p->miic, CLKS66);
+ 
+ 	/*
+ 	 * initialize DMA / FIFO
+ 	 */
+-#ifdef WORKAROUND_E7_AFCE
+-	candy_out(p->txcfg, DTBS8);
+-#else
+-	candy_out(p->txcfg, DTBS8 | AFCE);
+-#endif
+-	candy_out(p->txfc, TPTV | TX_DRTH | TX_FLTH);
+-	candy_out(p->rxcfg, DRBS8);
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E7_AFCE_BIT))
++		candy_out(p->txcfg, DTBS8);
++	else
++		candy_out(p->txcfg, DTBS8 | AFCE);
++	if (PLATFORM(pdata->platform_id,NEC_CMB_VR4133_PID))
++		candy_out(p->txcfg, DTBS8); /* DTBS is set to 32 bytes for VR4133. */
++
++	/* DTBS is set to 64 bytes for VR4133A. */
++	if (PLATFORM(pdata->platform_id,NEC_VRBLADE_VR4133A_PID)) {
++	        if ( candy_in(p->erev) == 0x20000) {
++			printk("VR4133A: ether block revision 2.0\n");
++			pdata->platform_id |= WORKAROUND_E19_VR4133AR20_BIT | WORKAROUND_E20_VR4133AR20_BIT;
++		}
++		candy_out(p->txcfg, DTBS16);
++		tx_flth = TX_FLTH_VR4133A;
++	} else
++	if (PLATFORM(pdata->platform_id,NEC_CMB_VR4133_PID))
++		tx_flth = TX_FLTH_VR4133;
++	else
++		tx_flth = TX_FLTH;
++	candy_out(p->txfc, TPTV | TX_DRTH | tx_flth);
++	candy_out(p->rxcfg, DRBS16);
+ 	candy_out(p->rxfc, UWM | LWM | RX_DRTH16W);
+ 	candy_out(p->rxpd, AL);
+ 
+-	/* Set pins for RMII use */
+-	candy_set_media_speed(dev);
++        /* Set Transmit Ring Buffer Mode */
++        if (pdata->platform_options.use_tx_ring_buffer)
++		candy_out(p->mode, 0x00000501); /* TABT=0,TFMODE=0, TDMODE=1, TDP=0101 */
++
++       /* Set pins for MII use */
++       candy_set_media_speed(pp);
++
++       /*
++	* initialize MAC
++	*/
++	temp = TXFC | RXFC | CRCEN | PADEN;
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E13_TXFC_BIT))
++		temp &= ~TXFC;
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E21_PAD_BIT))
++		temp &= ~PADEN;
++	candy_out(p->macc1, temp);
++
++	netif_carrier_off(dev);
++	mii_check_media(&pp->mii_if, netif_msg_link(pp), 1);
++
++#define DAVICOM_OUI 0x00606E /*Davicom Semiconductor MII OUI*/
++	pp->oui = mdio_read(pp->mii_if.dev, pp->mii_if.phy_id, MII_PHYSID1) <<6;
++	pp->oui |= mdio_read(pp->mii_if.dev, pp->mii_if.phy_id, MII_PHYSID2)>>10;
++	if (pp->oui == DAVICOM_OUI) {
++		if (pp->mii_if.full_duplex)
++			candy_set_macc1_bits(pp->regs->macc1, FULLD);
++		else
++			candy_clear_macc1_bits(pp->regs->macc1, FULLD);
++	}
++	else {
++		/* ETH1 (Marvell switch) is always set to full duplex! */
++		candy_set_macc1_bits(pp->regs->macc1, FULLD);
++	}
++	netif_carrier_on(dev);
++
++	/* MCRST TFRST RFRST software reset */
++	candy_set_macc2_bits(pp->regs->macc2, (MCRST | TFRST | RFRST));
++	udelay(3);
++	candy_clear_macc2_bits(pp->regs->macc2, (MCRST | TFRST | RFRST));
++
++	set_mac_addr(dev, dev->dev_addr);
++
++	candy_out(p->ht1, 0);
++	candy_out(p->ht2, 0);
++
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E10_PRM_AMC_BIT))
++		candy_out(p->afr, ABC);
++	else
++		candy_out(p->afr, PRM | ABC | AMC);
+ 
+ 	/*
+ 	 * disable all interrupts until dev is opened later
+ 	 */
+ 	candy_out(p->msr, 0);
++       /*
++	* PHY software reset
++	*/
++       /*
++	* enable Davicom PHY device.
++	*/
++	if (pp->oui == DAVICOM_OUI) {
++	       unsigned long start, end;
++	       printk(KERN_INFO "%s: Configuring Davicom PHY tranceiver\n", dev->name);
++	       mdio_write(pp->mii_if.dev, pp->mii_if.phy_id, MII_BMCR, BMCR_RESET);
++	       start = jiffies;
++		end = start + (HZ / 2);
++		while(time_before(jiffies, end)){
++			if( (mdio_read(pp->mii_if.dev, pp->mii_if.phy_id, MII_BMCR) & BMCR_RESET) == 0)
++				break;
++		}
++		mdio_write(pp->mii_if.dev, pp->mii_if.phy_id, MII_BMCR, BMCR_FULLDPLX|BMCR_ANRESTART|BMCR_ANENABLE|BMCR_SPEED100 );
++	}
++
++	/*
++	 * enable Marvell Switch device.
++	 */
++	if (pp->oui == MARVELL_OUI) {
++		if (!enableMarvellSwitch)
++			printk(KERN_ERR "enableMarvellSwitch not defined\n");
++		else {
++			printk(KERN_INFO "%s: Configuring Marvell Switch\n", dev->name);
++			enableMarvellSwitch(&pp->mii_if);
++		}
++	}
+ }
+ 
+ static void
+@@ -495,31 +600,32 @@ candy_down(struct net_device *dev)
+ 
+ 	candy_clear_bits(p->txcfg, TXE);
+ 	candy_clear_bits(p->rxcfg, RXE);
++
++	/*
++	 * disable all interrupts until dev is opened later
++	 */
++	candy_out(p->msr, 0);
+ }
+ 
+ static void
+ candy_up(struct net_device *dev)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	candy_regs *p = pp->regs;
+ 
+ 	DEBUG_VERBOSE(printk("candy_up() invoked.\n"));
+ 
+-	/* soft reset rx/tx */
+-	candy_set_macc2_bits(p->macc2, TFRST);
+-	candy_clear_macc2_bits(p->macc2, TFRST);
+-	candy_set_macc2_bits(p->macc2, RFRST);
+-	candy_clear_macc2_bits(p->macc2, RFRST);
++	/* candy must be down right now */
++	DBG_MSG_ON(((candy_in(p->txcfg) & TXE) != 0),"TX DMA should not be enabled!");
++	DBG_MSG_ON(((candy_in(p->rxcfg) & RXE) != 0),"RX DMA should not be enabled!");
+ 
+-#ifdef	WORKAROUND_E10_PRM_AMC
+-	candy_out(p->afr, ABC);
+-#else
+-	candy_out(p->afr, PRM | ABC | AMC);
+-#endif
++	/* set transmit descriptor pointer register */
++        if (pdata->platform_options.use_tx_ring_buffer)
++		candy_out(p->txdp, CPHYSADDR(&pp->tx_ring[pp->tx_head]));
+ 
+-	/* enable transmit and receive */
++	/* enable transmit */
+ 	candy_set_bits(p->txcfg, TXE);
+-	candy_out(p->rxcfg, RXE | DRBS4);
+ 
+ 	/* set number of descriptors */
+ 	candy_out(p->rxpd, AL | (RX_RING_SIZE & RNOD_MASK));
+@@ -527,13 +633,14 @@ candy_up(struct net_device *dev)
+ 	/* set the receive descriptor pointer */
+ 	candy_out(p->rxdp, CPHYSADDR(&pp->rx_ring[pp->rx_head]));
+ 
+-	candy_set_macc1_bits(p->macc1, SRXEN);
++	/* enable receive */
++	candy_out(p->rxcfg, RXE | DRBS4);
+ 
+-	candy_set_media_speed(dev);
++	candy_set_macc1_bits(p->macc1, SRXEN);
+ 
+ 	/* turn on interrupts */
+-	candy_in(p->isr);
+ 	candy_out(p->msr, 0xffffffff & ISR_RESERVED);
++	candy_in(p->isr);
+ }
+ 
+ static unsigned int
+@@ -620,6 +727,7 @@ static void
+ candy_error_recover(struct net_device *dev)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	candy_regs *p = pp->regs;
+ 
+ 	spin_lock(&pp->lock);
+@@ -627,19 +735,35 @@ candy_error_recover(struct net_device *d
+ 	netif_stop_queue(dev);
+ 
+ 	candy_down(dev);
++
++	/* free tx skb */
++        if (pdata->platform_options.use_tx_ring_buffer)	{
++		while (pp->tx_tail != pp->tx_head) {
++			if (pp->tx_skb[pp->tx_head]) {
++				dev_kfree_skb_irq(pp->tx_skb[pp->tx_head]);
++				pp->tx_skb[pp->tx_head] = NULL;
++			}
++			pp->tx_count--;
++			DBG_MSG_ON((pp->tx_count < 0), " tx_count=%d",pp->tx_count);
++			if (++pp->tx_head == TX_RING_SIZE)
++				pp->tx_head = 0;
++		}
++		candy_init_rings(dev);
++	}
+ 	candy_hw_init(dev);
+ 	candy_up(dev);
+ 
+ 	netif_wake_queue(dev);
+ 
+ 	/* restart transmitting */
++        if (!pdata->platform_options.use_tx_ring_buffer) {
+ 	pp->tx_stop = pp->tx_tail;
+ 	candy_out(p->txdp, CPHYSADDR(&pp->tx_ring[pp->tx_head]));
++	}
+ 
+ 	spin_unlock(&pp->lock);
+ }
+ 
+-#if defined(WORKAROUND_E8_TX_STALL)
+ /*
+  * This implements the workaround described for E-8
+  */
+@@ -666,7 +790,6 @@ tx_stall_recover(struct net_device *dev)
+ 		candy_out(p->txdp, CPHYSADDR(&pp->tx_ring[pp->tx_head]));
+ 	}
+ }
+-#endif
+ 
+ /***********************************************************************
+  * hardware-independent helper routine
+@@ -675,15 +798,19 @@ static void
+ candy_init_rings(struct net_device *dev)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	int i;
+ 
+ 	DEBUG_VERBOSE(printk("candy_init_rings() invoked.\n"));
+ 
+ 	/* tx rings */
+ 	for (i = 0; i < TX_RING_SIZE; i++) {
+-		pp->tx_ring[i].status = 0;
+ 		pp->tx_ring[i].size = 0;
+ 		pp->tx_ring[i].pointer = 0;
++    		if (pdata->platform_options.use_tx_ring_buffer)
++			pp->tx_ring[i].status = OWN;
++		else
++			pp->tx_ring[i].status = 0;
+ 	}
+ 	/* this may be not necessary, if we reset every txdpr in intr */
+ 	pp->tx_ring[TX_RING_SIZE].status = 0;
+@@ -708,7 +835,7 @@ candy_init_rings(struct net_device *dev)
+ }
+ 
+ static void
+-candy_check_intr(ulong isr)
++candy_check_intr(ulong isr, struct nec_candy_platform_data * pdata)
+ {
+ 	static const char *intr_name[32] = {
+ 		"carry flag",
+@@ -726,7 +853,7 @@ candy_check_intr(ulong isr)
+ 		"transmit aborted",
+ 		"underrun",
+ 		"transmit frame length exceed",
+-		"transmit buffer descriptor request at NULL",
++		"",
+ 		"transmit done",
+ 
+ 		"reserved",
+@@ -748,20 +875,25 @@ candy_check_intr(ulong isr)
+ 		"IBUS error"
+ 	};
+ 	ulong i, j;
+-
++	if (pdata->platform_options.use_tx_ring_buffer)
++	    intr_name[14] = "transmit buffer descriptor request at status OWN set";
++	else
++	    intr_name[14] = "transmit buffer descriptor request at NULL";
+ 	for (i = 0, j = 1; i < 32; j <<= 1, i++) {
+ 		if (j & isr)
+ 			printk("\t%s\n", intr_name[i]);
+ 	}
+ }
+ 
+-#ifdef CANDY_NAPI
++#ifdef CONFIG_CANDY_NAPI
+ static void
+ handle_rx_error(struct net_device *dev, struct candy_desc *dp, ulong isr)
+ {
+ 	struct candy_private *pp = (struct candy_private *)dev->priv;
+ 	struct sk_buff *newskb;
+ 
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
++
+ 	dev_kfree_skb(pp->rx_skb[pp->rx_head]);
+ 
+ 	newskb = dev_alloc_skb(RX_BUF_SIZE);    /* allocate a new skb */
+@@ -791,6 +923,7 @@ handle_rx_error(struct net_device *dev, 
+ static int candy_napi_rx(struct net_device *dev, int budget)
+ {
+ 	struct candy_private *pp = (struct candy_private *)dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	candy_regs *p = pp->regs;
+ 	struct candy_desc *dp = &pp->rx_ring[pp->rx_head];
+ 	struct sk_buff *rxskb, *newskb;
+@@ -798,6 +931,8 @@ static int candy_napi_rx(struct net_devi
+ 	int received = 0;
+ 	int rnod = 0;
+ 
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
++
+ 	while (!((dp->status & OWN) == 0) && (received < budget)) {
+ 		if ((dp->status & RXOK) == 0) { /* handle the error case */
+ 			handle_rx_error(dev, dp, 0);
+@@ -832,6 +967,8 @@ static int candy_napi_rx(struct net_devi
+ 		 */
+ 		rxskb = pp->rx_skb[pp->rx_head];
+ 
++		DBG_MSG_ON((rxskb->data != phys_to_virt(dp->pointer)),"wrong rxskb");
++
+ 		newskb = dev_alloc_skb(RX_BUF_SIZE);    /* allocate a new skb */
+ 		if (newskb == NULL) {
+ 			printk(KERN_ERR "%s: memory squeeze.\n", dev->name);
+@@ -868,8 +1005,19 @@ static int candy_napi_rx(struct net_devi
+ 	candy_out(p->rxpd, AL | rnod);
+ 
+ 	if (pp->rx_disable == 1) {
+-		candy_out(p->rxdp, candy_in(p->rxdp));
+-		pp->rx_disable = 0;
++		if (WORKAROUND(pdata->platform_id,WORKAROUND_E20_VR4133AR20)) {
++			ulong current_rxpd = 0;
++			candy_out(p->rxdp, candy_in(p->rxdp));
++			current_rxpd = RNOD_MASK & candy_in(p->rxpd);
++			if ( current_rxpd > 4 ) {
++				udelay(23);
++				candy_set_macc1_bits(p->macc1, SRXEN);
++				pp->rx_disable = 0;
++			}
++		} else {
++			candy_out(p->rxdp, candy_in(p->rxdp));
++			pp->rx_disable = 0;
++		}
+ 	}
+ 
+ 	return received;
+@@ -879,23 +1027,28 @@ static int candy_napi_poll(struct net_de
+ {
+ 	struct candy_private *pp = (struct candy_private *)dev->priv;
+ 	int not_done;
+-	int orig_budget = *budget;
+-	int received = 0;
+ 
+ 	spin_lock(&pp->rxlock);
+ 
+ 	not_done = 0;
+ 
+-	if (orig_budget > dev->quota)
+-		orig_budget = dev->quota;
++	if (pp->prev_rpkt != candy_in((pp->regs)->rpkt)) {
++		int orig_budget = *budget;
++		int received = 0;
+ 
+-	received = candy_napi_rx(dev, orig_budget);
++		if (orig_budget > dev->quota)
++			orig_budget = dev->quota;
+ 
+-	*budget -= received;
+-	dev->quota -= received;
++		received = candy_napi_rx(dev, orig_budget);
++
++		pp->prev_rpkt += received;
++		*budget -= received;
++		dev->quota -= received;
++
++		if (received >= orig_budget)
++			not_done = 1;
++	}
+ 
+-	if (received >= orig_budget)
+-		not_done = 1;
+ 
+ 	if (!not_done) {
+ 		netif_rx_complete(dev);
+@@ -915,6 +1068,8 @@ reclaim_one_rx_desc(struct net_device *d
+ 	candy_regs *p = pp->regs;
+ 	struct candy_desc *dp = &pp->rx_ring[pp->rx_head];
+ 
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
++
+ 	if (buf != NULL) {
+ 		dp->pointer = CPHYSADDR(buf);
+ 	}
+@@ -929,6 +1084,8 @@ reclaim_one_rx_desc(struct net_device *d
+ 
+ 	if (++pp->rx_head == RX_RING_SIZE)
+ 		pp->rx_head = 0;
++	DBG_MSG_ON((pp->rx_head >= RX_RING_SIZE),"rx head (%u) exceeds \
++	RX_RING_SIZE (%u)", pp->rx_head,RX_RING_SIZE);
+ 
+ 	/* tell hardware we have one descriptor to work with */
+ 	candy_out(p->rxpd, AL | 1);
+@@ -947,6 +1104,8 @@ handle_rx_error(struct net_device *dev, 
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
+ 
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
++
+ 	if (netif_msg_rx_err(pp))
+ 		printk(KERN_DEBUG "%s: rx_err, rx_ring[%d] error,"
+ 		       "status =%04x, size=%d, isr = 0x%08lx.\n",
+@@ -974,6 +1133,8 @@ candy_rx(struct net_device *dev, ulong i
+ 	int i;
+ 	int skb_size;
+ 
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
++
+ 	if (netif_msg_rx_status(pp)) {
+ 		printk(KERN_DEBUG "%s: rx, stat=0x%08lx\n",
+ 		       dev->name, (ulong) candy_in(p->rxst));
+@@ -1058,6 +1219,8 @@ candy_rx(struct net_device *dev, ulong i
+ 		if (pkt_len <= rx_copybreak) {
+ 			/* we will copy */
+ 			rxskb = pp->rx_skb[pp->rx_head];
++			DBG_MSG_ON((rxskb->data != (void *)KSEG0ADDR(dp->pointer)),\
++			"ERROR: rxskb->data != (void *)KSEG0ADDR(dp->pointer)");
+ 
+ 			newskb->dev = dev;
+ 			skb_reserve(newskb, 2);	/* align IP pkt to 16-byte */
+@@ -1102,8 +1265,7 @@ candy_rx(struct net_device *dev, ulong i
+ 			if (p->rxdp == CPHYSADDR(&pp->rx_ring[i]))
+ 				break;
+ 		}
+-		if (i == RX_RING_SIZE + 1)
+-			panic("cannot find current rx tail");
++		DBG_MSG_ON((i == RX_RING_SIZE + 1),"cannot find current rx tail");
+ 		printk("\trx_head = %d, rx_tail = %d\n", pp->rx_head, i);
+ 	}
+ #endif
+@@ -1118,34 +1280,35 @@ append_one_tx_desc(struct net_device *de
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
+ 	struct candy_desc *dp = &pp->tx_ring[pp->tx_tail];
+-#ifdef WORKAROUND_E10_VR4133
+-	int i, shift = pointer % 4;
+-#endif
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 
+-	dp->status = status;
+ 	dp->size = size;
+ 	dp->pointer = pointer;
+ 
+-#ifdef WORKAROUND_E10_VR4133
+-	if (shift && (size == 30 || size == 31)) {
+-		if (skb_tailroom(skb) >= 4 - shift) {
+-			shift = 4 - shift;
+-			skb->data += shift;
+-			dp->pointer += shift;
+-			for (i = size + shift - 1; i >= 0; i--)
+-				skb->data[i] = skb->data[i - shift];
+-			dma_cache_wback_inv((ulong) (skb->data), skb->len);
+-		} else if (skb_headroom(skb) >=  shift) {
+-			skb->data -= shift;
+-			dp->pointer -= shift;
+-			for (i = 0; i < size; i++)
+-				skb->data[i] = skb->data[i + shift];
+-			dma_cache_wback_inv((ulong) (skb->data), skb->len);
+-		} else {
+-			panic("nec_candy.c: Unable to do a workaround for hardware bug (Restriction 10 for VR4133).\n");
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E10_VR4133_BIT)) {
++		int i, shift = pointer % 4;
++		if (shift && (size == 30 || size == 31)) {
++			if (skb_tailroom(skb) >= 4 - shift) {
++				shift = 4 - shift;
++				skb->data += shift;
++				dp->pointer += shift;
++				for (i = size + shift - 1; i >= 0; i--)
++					skb->data[i] = skb->data[i - shift];
++				dma_cache_wback_inv((ulong) (skb->data), skb->len);
++			}
++			else if (skb_headroom(skb) >=  shift) {
++				skb->data -= shift;
++				dp->pointer -= shift;
++				for (i = 0; i < size; i++)
++					skb->data[i] = skb->data[i + shift];
++				dma_cache_wback_inv((ulong) (skb->data), skb->len);
++			}
++			else {
++				printk(KERN_ERR "nec_candy.c: Unable to do a workaround for hardware bug (Restriction 10 for VR4133).\n");
++			}
+ 		}
+ 	}
+-#endif
++	dp->status = status;
+ 	pp->tx_skb[pp->tx_tail] = skb;
+ 
+ 	pp->tx_count++;
+@@ -1158,11 +1321,16 @@ reclaim_one_tx_desc(struct net_device *d
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
+ 	struct candy_desc *dp = &pp->tx_ring[pp->tx_head];
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 
+-	dp->status = 0;
+ 	dp->size = 0;
+ 	dp->pointer = 0;
+ 
++	if (pdata->platform_options.use_tx_ring_buffer)
++		dp->status = OWN;
++	else
++		dp->status = 0;
++
+ 	/* free skb */
+ 	if (pp->tx_skb[pp->tx_head]) {
+ 		dev_kfree_skb_irq(pp->tx_skb[pp->tx_head]);
+@@ -1179,10 +1347,19 @@ restart_tx_hw(struct net_device *dev)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
+ 	candy_regs *p = pp->regs;
++	struct candy_desc *dp = &pp->tx_ring[pp->tx_tail];
++	/* the desc should already be set NULL */
++	DBG_MSG_ON((dp->status != 0),"ERROR: candy descriptor status !=0");
++	DBG_MSG_ON((dp->size != 0),"ERROR: candy descriptor size !=0");
++	DBG_MSG_ON((dp->pointer != 0),"ERROR: candy descriptor pointer !=0");
++	/* we need at least one desc for null descriptor */
++	DBG_MSG_ON((pp->tx_count >= TX_RING_SIZE),"tx_count (%d) exceeds TX_RING_SIZE (%u)",\
++	pp->tx_count,TX_RING_SIZE);
+ 
+ 	append_one_tx_desc(dev, 0, 0, 0, NULL);
+ 
+ 	/* start */
++	DBG_MSG_ON((pp->tx_head != pp->tx_stop),"ERROR:tx_head != tx_stop");
+ 	pp->tx_stop = pp->tx_tail;
+ 	candy_out(p->txdp, CPHYSADDR(&pp->tx_ring[pp->tx_head]));
+ }
+@@ -1191,15 +1368,17 @@ static void
+ handle_tx_error(struct net_device *dev, struct candy_desc *dp, ulong isr)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
++
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
+ 
+ 	if (netif_msg_tx_err(pp))
+ 		printk(KERN_DEBUG "%s: tx err, tx_ring[%d] error, "
+ 		       "status = %04x, isr = 0x%08lx.\n",
+ 		       dev->name, pp->tx_head, dp->status, isr);
+ 
+-#if defined(WORKAROUND_E8_TX_STALL)
+-	tx_stall_recover(dev);
+-#endif
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E8_TX_STALL_BIT))
++		tx_stall_recover(dev);
+ 
+ 	pp->stats.tx_errors++;
+ 	pp->stats.tx_aborted_errors++;
+@@ -1213,8 +1392,9 @@ static void
+ candy_tx_done(struct net_device *dev, ulong isr)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	struct candy_desc *dp;
+-
++	unsigned stop;
+ 	if (netif_msg_tx_done(pp))
+ 		printk(KERN_DEBUG "%s: tx done, process %d frames from %d\n",
+ 		       dev->name, pp->tx_tail > pp->tx_head ?
+@@ -1222,14 +1402,23 @@ candy_tx_done(struct net_device *dev, ul
+ 		       pp->tx_tail + TX_RING_SIZE - pp->tx_head, pp->tx_head);
+ 
+ 	spin_lock(&pp->lock);	/* sync with xmit() */
++	if (pdata->platform_options.use_tx_ring_buffer)
++		stop = pp->tx_tail;
++	else
++		stop = pp->tx_stop;
+ 
+-	while (pp->tx_head != pp->tx_stop) {
++	while (pp->tx_head != stop) {
+ 		dp = &pp->tx_ring[pp->tx_head];
++		DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
+ 
+ 		/* deal with null descriptor, the "stop" packet */
+-		if (dp->status == 0) {
+-			reclaim_one_tx_desc(dev);
+-			continue;
++		if (!pdata->platform_options.use_tx_ring_buffer) {
++			if (dp->status == 0) {
++				DBG_MSG_ON((dp->size != 0),"ERROR:candy descriptor size != 0 ");
++				DBG_MSG_ON((dp->pointer != 0),"ERROR:candy descriptor pointer != 0" );
++				reclaim_one_tx_desc(dev);
++				continue;
++			}
+ 		}
+ 
+ 		/* how about checking OWN bit */
+@@ -1244,8 +1433,6 @@ candy_tx_done(struct net_device *dev, ul
+ 		/* handle error */
+ 		if (!(dp->status & TOK)) {
+ 			handle_tx_error(dev, dp, isr);
+-			/* transmitter should have stopped */
+-			break;
+ 		}
+ 
+ 		/* reclaim the descriptor */
+@@ -1261,10 +1448,11 @@ candy_tx_done(struct net_device *dev, ul
+ 	}
+ 
+ 	/* check if tx has stopped */
+-	if ((pp->tx_head == pp->tx_stop) && (pp->tx_stop != pp->tx_tail)) {
+-		restart_tx_hw(dev);
++	if (!pdata->platform_options.use_tx_ring_buffer) {
++		if ((pp->tx_head == pp->tx_stop) && (pp->tx_stop != pp->tx_tail)) {
++			restart_tx_hw(dev);
++		}
+ 	}
+-
+ 	/* check if queue were stopped */
+ 	if (netif_queue_stopped(dev) && (pp->tx_count < TX_RING_SIZE - 2)) {
+ 		if (netif_msg_tx_done(pp))
+@@ -1326,6 +1514,7 @@ candy_interrupt(int irq, void *dev_insta
+ {
+ 	struct net_device *dev = (struct net_device *) dev_instance;
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	candy_regs *p = pp->regs;
+ 	ulong isr;
+ 
+@@ -1333,7 +1522,7 @@ candy_interrupt(int irq, void *dev_insta
+ 
+ 	if (netif_msg_intr(pp)) {
+ 		printk(KERN_DEBUG "%s: intr, isr = 0x%08lx\n", dev->name, isr);
+-		candy_check_intr(isr);
++		candy_check_intr(isr,pdata);
+ 	}
+ 
+ 	if (isr & BUSERR) {
+@@ -1342,12 +1531,19 @@ candy_interrupt(int irq, void *dev_insta
+ 		return IRQ_HANDLED;
+ 
+ 	}
+-#ifdef CANDY_NAPI
++#ifdef CONFIG_CANDY_NAPI
+ 	if (isr & RBDRU) {
++		if (WORKAROUND(pdata->platform_id,WORKAROUND_E20_VR4133AR20)){
++			if ( pp->rx_disable == 0 ) {
++				candy_clear_macc1_bits(p->macc1, SRXEN);
++				pp->rx_disable = 1;
++			}
++		}
++		else
+ 		pp->rx_disable = 1;
+ 	}
+ 
+-	if (isr & INT_ISR_RX_MASK) {
++	if (isr & RCVDN) {
+ 		if (netif_rx_schedule_prep(dev)) {
+ 			candy_mask_napi_ints(p);
+ 			__netif_rx_schedule(dev);
+@@ -1384,7 +1580,6 @@ candy_get_phy_status(struct net_device *
+ 		 * half or full duplex.
+ 		 */
+ 		*duplex = (reg & BMCR_FULLDPLX) ? 1 : 0;
+-		*speed = (reg & BMCR_SPEED100) ? 1: 0;
+ 	} else {
+ 		/*
+ 		 * Auto-negotiation is enabled.  Figure out what was
+@@ -1423,71 +1618,171 @@ candy_poll_mii(unsigned long data)
+ {
+ 	struct net_device *dev = (struct net_device *) data;
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	int phy_duplex, mac_duplex;
+ 	int phy_carrier, netif_carrier;
+ 	int phy_speed, mac_speed;
+ 
+-	/* First, find out what's going on with the PHY. */
+-	candy_get_phy_status(dev, &phy_duplex, &phy_carrier, &phy_speed);
++		/* First, find out what's going on with the PHY. */
++		candy_get_phy_status(dev, &phy_duplex, &phy_carrier,
++				     &phy_speed);
++
++		/* Second, figure out if we have the EMAC in half or full duplex. */
++		mac_duplex = pp->link_status.fullduplex;
++		mac_speed = pp->link_status.speed100;
++
++		/* Now see if there is a mismatch. */
++		if ((mac_duplex != phy_duplex || phy_speed != mac_speed)
++		    && phy_carrier) {
++			/* reset */
++			netif_stop_queue(dev);
++
++			candy_down(dev);
++			/* free tx skb */
++			if (pdata->platform_options.use_tx_ring_buffer) {
++				while (pp->tx_tail != pp->tx_head) {
++					if (pp->tx_skb[pp->tx_head]) {
++						dev_kfree_skb_irq(pp->tx_skb[pp->tx_head]);
++						pp->tx_skb[pp->tx_head] = NULL;
++					}
++					pp->tx_count--;
++					DBG_MSG_ON((pp->tx_count < 0),"ERROR: tx_count (%d) negative",\
++					pp->tx_count);
++					if (++pp->tx_head == TX_RING_SIZE)
++						pp->tx_head = 0;
++				}
++				candy_init_rings(dev);
++			}
++			candy_hw_init(dev);
++			candy_up(dev);
++			netif_wake_queue(dev);
++			if (phy_duplex == 1 && phy_speed == 1) {
++				candy_set_macc1_bits(pp->regs->macc1, FULLD);
++				printk(KERN_INFO
++				       "%s: Duplex has been changed: now %s\n",
++				       dev->name, "100Mbps Full Duplex");
++			} else if (phy_duplex == 1 && phy_speed == 0) {
++				candy_set_macc1_bits(pp->regs->macc1, FULLD);
++				printk(KERN_INFO
++				       "%s: Duplex has been changed: now %s\n",
++				       dev->name, "10Mbps Full Duplex");
++			} else if (phy_duplex == 0 && phy_speed == 1) {
++				candy_clear_macc1_bits(pp->regs->macc1, FULLD);
++				printk(KERN_INFO
++				       "%s: Duplex has been changed: now %s\n",
++				       dev->name, "100Mbps Half Duplex");
++			} else if (phy_duplex == 0 && phy_speed == 0) {
++				candy_clear_macc1_bits(pp->regs->macc1, FULLD);
++				printk(KERN_INFO
++				       "%s: Duplex has been changed: now %s\n",
++				       dev->name, "10Mbps Half Duplex");
++			}
+ 
+-	/* Second, figure out the speed/duplex of the EMAC */
+-	mac_duplex = pp->link_status.fullduplex;
+-	mac_speed = pp->link_status.speed100;
+-
+-	/* Now see if there is a mismatch. */
+-	if ((mac_duplex != phy_duplex || phy_speed != mac_speed)
+-	    && phy_carrier) {
+-		/* reset */
+-		netif_stop_queue(dev);
++			candy_set_media_speed(pp);
++			pp->link_status.fullduplex = phy_duplex;
++			pp->mii_if.full_duplex = phy_duplex;
++		}
++		netif_carrier = netif_carrier_ok(dev) != 0;
++
++		if (phy_carrier != netif_carrier) {
++			if (phy_carrier) {
++				candy_set_media_speed(pp);
++				printk(KERN_INFO "%s: Link carrier restored.\n",
++				       dev->name);
++				netif_carrier_on(dev);
++			} else {
++				printk(KERN_INFO "%s: Link carrier lost.\n",
++				       dev->name);
++				netif_carrier_off(dev);
++			}
++		}
+ 
+-		candy_down(dev);
+-		candy_hw_init(dev);
+-		candy_up(dev);
+ 
+-		netif_wake_queue(dev);
+-		printk(KERN_INFO "%s: Link has been changed: now ", dev->name);
+-		if (phy_duplex == 1 && phy_speed == 1) {
+-			candy_out(pp->regs->ccr,
+-				  candy_in(pp->regs->ccr) | SPD100);
+-			candy_set_macc1_bits(pp->regs->macc1, FULLD);
+-			printk("100Mbps Full Duplex\n");
+-		} else if (phy_duplex == 1 && phy_speed == 0) {
+-			candy_out(pp->regs->ccr,
+-				  candy_in(pp->regs->ccr) & ~SPD100);
+-			candy_set_macc1_bits(pp->regs->macc1, FULLD);
+-			printk("10Mbps Full Duplex\n");
+-		} else if (phy_duplex == 0 && phy_speed == 1) {
+-			candy_out(pp->regs->ccr,
+-				  candy_in(pp->regs->ccr) | SPD100);
+-			candy_clear_macc1_bits(pp->regs->macc1, FULLD);
+-			printk("100Mbps Half Duplex\n");
+-		} else if (phy_duplex == 0 && phy_speed == 0) {
+-			candy_out(pp->regs->ccr,
+-				  candy_in(pp->regs->ccr) & ~SPD100);
+-			candy_clear_macc1_bits(pp->regs->macc1, FULLD);
+-			printk("10Mbps Half Duplex\n");
+-		}
++	/* Set up the timer so we'll get called again in 2 seconds. */
++	pp->phy_timer.expires = jiffies + 2 * HZ;
++	add_timer(&pp->phy_timer);
++}
+ 
+-		pp->link_status.fullduplex = phy_duplex;
+-		pp->link_status.speed100 = phy_speed;
+-		pp->mii_if.full_duplex = phy_duplex;
+-	}
+-	netif_carrier = netif_carrier_ok(dev) != 0;
++static void
++candy_poll_marvell(unsigned long data)
++{
++	struct net_device *dev = (struct net_device *) data;
++	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
++	uint newStatusPort;
++	uint oldCarrierStatus;
++	uint newCarrierStatus;
++	uint newSpeedPort;
++	uint oldSpeedPort;
++	uint i;
++	uint nports = (pdata->platform_options.n_marvell_ports < MAX_MARVELL_PORTS) ? \
++		       pdata->platform_options.n_marvell_ports : MAX_MARVELL_PORTS;
++	for (i=0;i<nports;i++){
++		/* Port i */
++		oldCarrierStatus = pp->carrierPort[i];
++		newStatusPort =
++		    mdio_read(pp->mii_if.dev, pp->mii_if.phy_id + PORT0 + i,
++			      MARVELL_PORTSTAT);
+ 
+-	if (phy_carrier != netif_carrier) {
+-		if (phy_carrier) {
+-			candy_set_media_speed(dev);
+-			printk(KERN_INFO "%s: Link carrier restored.\n",
+-			       dev->name);
+-			netif_carrier_on(dev);
++		if (newStatusPort & PORTSTAT_LINKUP) {
++			newCarrierStatus = 1;
+ 		} else {
+-			printk(KERN_INFO "%s: Link carrier lost.\n", dev->name);
+-			netif_carrier_off(dev);
++			newCarrierStatus = 0;
+ 		}
+-	}
++
++		if (newCarrierStatus != oldCarrierStatus) {
++			if (newCarrierStatus) {
++				printk(KERN_INFO
++				       "%s: PORT%d Link carrier restored.\n",
++				       dev->name,i);
++			} else {
++				printk(KERN_INFO
++				       "%s: PORT%d Link carrier lost.\n",
++				       dev->name,i);
++			}
++			pp->carrierPort[i] = newCarrierStatus;
++		}
++
++
++		if (pp->carrierPort[i]) {
++			oldSpeedPort = pp->speedPort[i];
++			newSpeedPort = newStatusPort &
++			    (PORTSTAT_FULLDUPLEX | PORTSTAT_SPEED100);
++
++			if (newSpeedPort != oldSpeedPort) {
++				if ((newSpeedPort) ==
++				    (PORTSTAT_FULLDUPLEX | PORTSTAT_SPEED100)) {
++					printk(KERN_INFO
++					       "%s: PORT%d has been changed: now %s\n",
++					       dev->name,i,
++					       "100Mbps Full Duplex");
++				} else if ((newSpeedPort) ==
++					   (PORTSTAT_FULLDUPLEX)) {
++					printk(KERN_INFO
++					       "%s: PORT%d has been changed: now %s\n",
++					       dev->name,i, "10Mbps Full Duplex");
++				} else if ((newSpeedPort) ==
++					   (PORTSTAT_SPEED100)) {
++					printk(KERN_INFO
++					       "%s: PORT%d has been changed: now %s\n",
++					       dev->name,i,
++					       "100Mbps Half Duplex");
++				} else if ((newSpeedPort) == (0x00)) {
++					printk(KERN_INFO
++					       "%s: PORT%d has been changed: now %s\n",
++					       dev->name,i, "10Mbps Half Duplex");
++				}
++
++				pp->speedPort[i] = newSpeedPort;
++			}
++    		    }
++
++		}
++
+ 
+ 	/* Set up the timer so we'll get called again in 2 seconds. */
+-	mod_timer(&pp->phy_timer, jiffies + 2 * HZ);
++	pp->phy_timer.expires = jiffies + 2 * HZ;
++	add_timer(&pp->phy_timer);
+ }
+ 
+ static int
+@@ -1516,22 +1811,16 @@ candy_open(struct net_device *dev)
+ 		return retval;
+ 	}
+ 
+-	netif_carrier_off(dev);
+-	mii_check_media(&pp->mii_if, netif_msg_link(pp), 1);
+-
+-	if (pp->mii_if.full_duplex)
+-		candy_set_macc1_bits(pp->regs->macc1, FULLD);
+-	else
+-		candy_clear_macc1_bits(pp->regs->macc1, FULLD);
+-
+-	candy_set_media_speed(dev);
+-
+ 	init_timer(&pp->phy_timer);
+ 
+ 	pp->phy_timer.data = (unsigned long) dev;
+-	pp->phy_timer.function = &candy_poll_mii;
+-	candy_poll_mii((unsigned long) dev);
+-
++	if (pp->oui == MARVELL_OUI) {
++		pp->phy_timer.function = &candy_poll_marvell;
++		candy_poll_marvell((unsigned long) dev);
++	} else {
++		pp->phy_timer.function = &candy_poll_mii;
++		candy_poll_mii((unsigned long) dev);
++	}
+ 	while (!netif_carrier_ok(dev) && ++count < 5) {
+ 		udelay(10);
+ 	}
+@@ -1549,7 +1838,7 @@ candy_close(struct net_device *dev)
+ 	if (netif_msg_ifdown(pp))
+ 		printk(KERN_DEBUG "%s: disabling interface\n", dev->name);
+ 
+-	del_timer_sync(&pp->phy_timer);
++	del_timer(&pp->phy_timer);
+ 
+ 	dev->flags &= ~(IFF_UP | IFF_RUNNING);
+ 
+@@ -1566,6 +1855,9 @@ candy_close(struct net_device *dev)
+ 			}
+ 
+ 			pp->tx_count--;
++			DBG_MSG_ON((pp->tx_count < 0),"ERROR: tx_count (%d) negative",\
++			pp->tx_count);
++
+ 			if (++pp->tx_head == TX_RING_SIZE)
+ 				pp->tx_head = 0;
+ 		}
+@@ -1581,13 +1873,17 @@ candy_xmit(struct sk_buff *skb, struct n
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
+ 	ulong flags;
++	struct candy_desc *dp = &pp->tx_ring[pp->tx_tail];
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
++
++	DBG_MSG_ON((KSEGX(dp) != KSEG1),"candy_desc should be in KSEG1");
+ 
+ 	if (netif_msg_tx_queued(pp))
+ 		printk(KERN_DEBUG "%s: tx queued, skblen %d\n",
+ 		       dev->name, skb->len);
+ 
+ 	/* check packet size */
+-	if (skb->len > ETH_FRAME_SIZE) {
++	if (skb->len > ETH_FRAME_LEN) {
+ 		printk(KERN_ERR "%s: packet size too big, %d\n", dev->name,
+ 		       skb->len);
+ 		pp->stats.tx_dropped++;
+@@ -1610,21 +1906,29 @@ candy_xmit(struct sk_buff *skb, struct n
+ 	/* add the descriptor */
+ 	{
+ 		ushort temp = skb->len;
+-#ifdef WORKAROUND_E21_PAD
+-		if (temp < 60)
+-			temp = 60;
+-#endif
++		if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E21_PAD_BIT)) {
++			if (temp < 60)
++				temp = 60;
++		}
++
+ 		dma_cache_wback_inv((ulong) (skb->data), skb->len);
+-		append_one_tx_desc(dev, LAST | DB_LP, temp,
+-				   CPHYSADDR(skb->data), skb);
++
++		if (pdata->platform_options.use_tx_ring_buffer)
++			append_one_tx_desc(dev, LAST | DB_LP | IEN , temp,
++						CPHYSADDR(skb->data), skb);
++		else
++			append_one_tx_desc(dev, LAST | DB_LP, temp,
++					CPHYSADDR(skb->data), skb);
+ 	}
+ 
+ 	/* logistics */
+ 	dev->trans_start = jiffies;
+ 
+ 	/* do we need to start sending or just append */
+-	if ((pp->tx_head == pp->tx_stop) && (pp->tx_stop != pp->tx_tail)) {
+-		restart_tx_hw(dev);
++	if (!pdata->platform_options.use_tx_ring_buffer){
++		if ((pp->tx_head == pp->tx_stop) && (pp->tx_stop != pp->tx_tail)) {
++			restart_tx_hw(dev);
++		}
+ 	}
+ 
+ 	if (pp->tx_count >= TX_RING_SIZE - 2) {
+@@ -1654,6 +1958,7 @@ static void
+ candy_set_rx_mode(struct net_device *dev)
+ {
+ 	struct candy_private *pp = (struct candy_private *) dev->priv;
++	struct nec_candy_platform_data *pdata = pp->dev->platform_data;
+ 	candy_regs *p = pp->regs;
+ 	ulong val;
+ 
+@@ -1672,11 +1977,10 @@ candy_set_rx_mode(struct net_device *dev
+ 		/* walk the address list, and load the filter */
+ 		candy_set_filter(dev, 1);
+ 	}
+-#ifdef	WORKAROUND_E10_PRM_AMC
+-	candy_out(p->afr, val & ABC);
+-#else
+-	candy_out(p->afr, val);
+-#endif
++	if (COMMON_WORKAROUND(pdata->platform_id,WORKAROUND_E10_PRM_AMC_BIT))
++		candy_out(p->afr, val & ABC);
++	else
++		candy_out(p->afr, val);
+ }
+ 
+ static void
+@@ -1761,7 +2065,7 @@ static int nec_candy_probe(struct device
+ 	ndev->tx_timeout = candy_tx_timeout;
+ 	ndev->watchdog_timeo = TX_TIMEOUT;
+ 
+-#ifdef CANDY_NAPI
++#ifdef CONFIG_CANDY_NAPI
+ 	ndev->poll = candy_napi_poll;
+ 	ndev->weight = 64;
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+@@ -1799,7 +2103,13 @@ static int nec_candy_probe(struct device
+ 	for (i = 0; i < RX_RING_SIZE; i++) {
+ 		pp->rx_skb[i] = dev_alloc_skb(RX_BUF_SIZE);
+ 		if (pp->rx_skb[i] == NULL) {
+-			panic("%s: failed to alloc rx skb!", ndev->name);
++			int j;
++			printk(KERN_ERR "%s: failed to alloc rx skb!", ndev->name);
++			for (j=0; j < i; j++)
++				dev_kfree_skb(pp->rx_skb[j]);
++			kfree((void *)pp->rx_ring);
++			ret = -ENOMEM;
++			goto err5;
+ 		}
+ 		pp->rx_skb[i]->dev = ndev;
+ 		dma_cache_inv((ulong) pp->rx_skb[i]->data, RX_BUF_SIZE);
+@@ -1820,6 +2130,9 @@ static int nec_candy_probe(struct device
+ 	spin_lock_init(&pp->lock);
+ 	spin_lock_init(&pp->rxlock);
+ 
++#ifdef CONFIG_CANDY_NAPI
++	pp->prev_rpkt = candy_in(p->rpkt);
++#endif
+ 	/*==============================================================
+ 	 * hardware initialization
+ 	 *==============================================================
+@@ -1871,7 +2184,6 @@ static int nec_candy_probe(struct device
+ 	candy_out(p->tcse, 0);
+ 	candy_out(p->time, 0);
+ 
+-	candy_hw_init(ndev);
+ 	ret = register_netdev(ndev);
+ 	if (ret != 0)
+ 		goto err6;
+@@ -1890,9 +2202,9 @@ err6:
+ 	printk(KERN_ERR "Failed to register ethernet device\n");
+ 	for (i = 0; i < RX_RING_SIZE; i++)
+ 		dev_kfree_skb(pp->rx_skb[i]);
+-	kfree(pp->rx_ring);
++	kfree((void *)pp->rx_ring);
+ err5:
+-	kfree(pp->tx_ring);
++	kfree((void *)pp->tx_ring);
+ err4:
+ 	iounmap((void *) ndev->base_addr);
+ err3:
+@@ -1903,6 +2215,12 @@ err1:
+ 	return ret;
+ }
+ 
++
++/***********************************************************************
++ * Module hookup
++ ***********************************************************************
++ */
++
+ static int nec_candy_remove(struct device *dev)
+ {
+ 	int i;
+@@ -1916,8 +2234,8 @@ static int nec_candy_remove(struct devic
+ 	for (i = 0; i < RX_RING_SIZE; i++)
+ 		dev_kfree_skb(pp->rx_skb[i]);
+ 
+-	kfree(pp->rx_ring);
+-	kfree(pp->tx_ring);
++	kfree((void *)pp->rx_ring);
++	kfree((void *)pp->tx_ring);
+ 
+ 	iounmap((void *)ndev->base_addr);
+ 	release_mem_region(res->start, res->end - res->start + 1);
+@@ -1951,6 +2269,5 @@ module_exit(nec_candy_module_exit);
+ 
+ #if defined(MODULE)
+ MODULE_AUTHOR("Jun Sun, jsun@mvista.com or jsun@junsun.net");
+-MODULE_DESCRIPTION("Ether driver for NEC Candy controller");
+ MODULE_LICENSE("GPL");
+ #endif
+Index: linux-2.6.10/drivers/net/nec_candy.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/nec_candy.h
++++ linux-2.6.10/drivers/net/nec_candy.h
+@@ -5,7 +5,7 @@
+  *
+  * Author: Wade Farnsworth <wfarnsworth@mvista.com>
+  *
+- * 2001-2006 (c) MontaVista Software, Inc. This file is licensed under
++ * 2001-2007 (c) MontaVista Software, Inc. This file is licensed under
+  * the terms of the GNU General Public License version 2. This program
+  * is licensed "as is" without any warranty of any kind, whether express
+  * or implied.
+@@ -26,11 +26,9 @@
+ 
+ #define TX_TIMEOUT	4*HZ
+ 
+-#ifdef CONFIG_NEC_CMBVR4133
+-#define CANDY_NAPI
+-#endif
++#define MAX_MARVELL_PORTS 10
+ 
+-#ifndef CANDY_NAPI
++#ifndef CONFIG_CANDY_NAPI
+ /* rx_copybreak:  for smaller packet we copy them to avoid emulated
+  * unaligned access overhead.
+  *
+@@ -44,28 +42,38 @@ static int rx_copybreak = 1518;
+ #endif
+ 
+ /***********************************************************************
+- * hardware bug workarounds
+- ***********************************************************************/
++ * Hardware bug workarounds table
++ **********************************************************************/
++/*	                CMBVR4133  |    VRBLADE V 2.0  |   VR7701     */
++/**********************************************************************/
++/*   E7_AFCE		  -        |        -          |     -	      */
++/*   E10_PRM_AMC	  -        |        -          |     -	      */
++/*   E13_TXFC	  	  -        |        -          |     -	      */
++/*   E8_TX_STALL  	  -        |        -          |     -	      */
++/*   E21_PAD  	  	  +        |        +          |     -	      */
++/*   E10_VR4133  	  +        |        +          |     -	      */
++/*   E19_VR4133A  	  -        |        +          |     -	      */
++/*   E20_VR4133A  	  -        |        +          |     -	      */
+ 
+-#define WORKAROUND_E7_AFCE
+-#define WORKAROUND_E10_PRM_AMC
+-#define WORKAROUND_E13_TXFC
+-#define WORKAROUND_E8_TX_STALL
+-
+-#if defined(CONFIG_NEC_CMB_VR7701)
+-#undef WORKAROUND_E7_AFCE
+-#undef WORKAROUND_E10_PRM_AMC
+-#undef WORKAROUND_E13_TXFC
+-#undef WORKAROUND_E8_TX_STALL
+-#endif
++/***********************************************************************
++ * Candy.h macros
++ ***********************************************************************
++ */
++/*---------------------------------------------------------------------------*/
++/* PHY link status                                                           */
++/*---------------------------------------------------------------------------*/
++#define LINK_UP     1
++#define LINK_DOWN   0
+ 
+-#ifdef CONFIG_NEC_CMBVR4133
+-#undef WORKAROUND_E7_AFCE
+-#undef WORKAROUND_E10_PRM_AMC
+-#undef WORKAROUND_E13_TXFC
+-#define WORKAROUND_E21_PAD
+-#define WORKAROUND_E10_VR4133
+-#endif
++/*---------------------------------------------------------------------------*/
++/* receive mode & related definitions                                        */
++/*---------------------------------------------------------------------------*/
++#define ACCEPT_ALL_PHYS         0x0001
++#define ACCEPT_ALL_MCASTS       0x0002
++#define ACCEPT_ALL_BCASTS       0x0004
++#define ACCEPT_QUALIFIED_MCAST  0x0008
++#define ACCEPT_STATION          0x0010
++#define MAC_LOOPBACK            0x0020
+ 
+ /*---------------------------------------------------------------------------*/
+ /* MACC1 - MAC configuration register 1 (00H R/W)                            */
+@@ -263,21 +271,18 @@ static int rx_copybreak = 1518;
+ /*---------------------------------------------------------------------------*/
+ /* TXFC - Transmit FIFO Control (204H R/W)                                   */
+ /*---------------------------------------------------------------------------*/
+-#define TPTV_MASK	0xffff0000	/* Tx Pause Timer Value mask */
+-#define TPTV		0x10000000	/* default 0x1000 slot time */
+-#define TX_DRTH_MASK	0x0000fc00	/* Tx Fill Threshold Level mask */
+-#define TX_DRTH		0x00004000	/* default 010000b (16word, 64byte) */
+-#define TX_FLTH_MASK	0x000000fc	/* Tx Drain Threshold Level mask */
+-#ifdef CONFIG_NEC_CMBVR4133
+-/*
+- * We set this to 160 bytes for VR4133 because of the hardware restriction:
+- * the sum of TX_FLTH and DTBS should be <= 192 bytes. DTBS is set to 32 bytes
+- * for VR4133.
+- */
+-#define TX_FLTH		0x000000a0	/* 101000b (160byte) */
+-#else
++#define TPTV_MASK	0xffff0000	/* Transmit Pause Timer Value mask       */
++#define TPTV	0x10000000	/* default 0x1000 slot time (1slot:512bit) */
++#define TX_DRTH_MASK	0x0000fc00	/* Transmit Fill Threshold Level mask    */
++#define TX_DRTH	0x00004000	/* default 010000b (16word, 64byte)      */
++#define TX_FLTH_MASK	0x000000fc	/* Transmit Drain Threshold Level mask   */
++
++/* The hardware restriction: the sum of TX_FLTH and DTBS should be <= 192 bytes. */
++/* DTBS is set to 32 bytes for VR4133. So we set this to 160 byte */
++#define TX_FLTH_VR4133		0x000000a0	/* 101000b (160byte)     */
++/* DTBS is set to 64 bytes for VR4133A. So we set this to 128 byte */
++#define TX_FLTH_VR4133A		0x00000080	/* 100000b (128byte)     */
+ #define TX_FLTH		0x000000c0	/* default 110000b (48word, 192byte) */
+-#endif
+ #define TXFC_RESERVED	0xfffffcfc	/* reserved bit 0 */
+ 
+ /*---------------------------------------------------------------------------*/
+@@ -399,6 +404,7 @@ static int rx_copybreak = 1518;
+ /* Transmit/Receive Status bit definition in Transmit/Receive Descriptor     */
+ /*---------------------------------------------------------------------------*/
+ #define LAST		0x8000		/* Last Descriptor */
++#define IEN		0x0008		/* Interrupt Enable*/
+ #define DB_LP		0x4000		/* Data Buffer / Link Pointer */
+ #define OWN		0x2000		/* Owner 1:used by candy, 0:host set */
+ 
+@@ -436,11 +442,8 @@ static int rx_copybreak = 1518;
+ #define RFLE		0x0002		/* Receive Frame Length Error */
+ #define RXOK		0x0001		/* Receive OK */
+ 
+-#if defined(CONFIG_NEC_CMBVR4133)
+-#define CANDY_REGS_VER	2		/* version 2 */
+-#else
+-#define CANDY_REGS_VER	1		/* version 1 */
+-#endif
++#define CANDY_REGS_VER1	1		/* version 1 */
++#define CANDY_REGS_VER2	2		/* version 2 */
+ 
+ #define CANDY_REGS_SIZE	(0x3ff + 1)
+ 
+@@ -551,6 +554,10 @@ typedef volatile struct {
+ 	ulong ccr;		/* 0x234 CANDY Config Read/Write register */
+ 	ulong isr;		/* 0x238 Interrupt Status register */
+ 	ulong msr;		/* 0x23c Mask Interuupt register */
++	ulong reserved11[8];
++	ulong mode;		/* 0x260    Mode register */
++	ulong reserved12[14];
++	ulong erev;
+ } candy_regs;
+ 
+ /*
+@@ -593,6 +600,11 @@ struct candy_private {
+ 
+ 	struct mii_if_info mii_if;
+ 
++	uint oui;
++	/* Marvel MIIs */
++	uint carrierPort[MAX_MARVELL_PORTS];
++	uint speedPort[MAX_MARVELL_PORTS];
++
+ 	/* MII status */
+ 	struct link_status {
+ 		uint fullduplex:1;
+@@ -609,6 +621,9 @@ struct candy_private {
+ 	struct net_device *ndev;
+ 	struct device *dev;
+ 	struct candy_private *next;
++#ifdef CONFIG_CANDY_NAPI
++	ulong prev_rpkt;
++#endif
+ };
+ 
+ #endif
+Index: linux-2.6.10/drivers/net/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/net/Makefile
++++ linux-2.6.10/drivers/net/Makefile
+@@ -198,6 +198,7 @@ obj-$(CONFIG_FEC_8XX) += fec_8xx/
+ obj-$(CONFIG_XILINX_EMAC) += xilinx_emac/
+ obj-$(CONFIG_XILINX_TEMAC) += xilinx_temac/
+ obj-$(CONFIG_NEC_CANDY) += nec_candy.o
++obj-$(CONFIG_NEC_VRBLADE) += mv88e6063.o
+ obj-$(CONFIG_CAVIUM_ETHERNET) += cavium-ethernet.o
+ 
+ obj-$(CONFIG_ARM) += arm/
+Index: linux-2.6.10/drivers/net/mv88e6063.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/mv88e6063.c
+@@ -0,0 +1,414 @@
++/*
++	mv88e6063.c: 1) Marvell switch initialisation
++		     2) VLAN configuration
++	Derived from sb500mii.c written and maintained
++	     by Edmond dela Cruz <edmondd@ntsp.nec.co.jp>
++	Copyright:
++		Written 2005 by Edmond dela Cruz.
++		Modified: 2007, MontaVista Software Inc. <source@mvista.com>
++
++		This software may be used and distributed according
++		to the terms of the GNU General Public License (GPL),
++		incorporated herein by reference.  Drivers based on
++		or derived from this code fall under the GPL and must
++		retain the authorship, copyright and license notice.
++		This file is not a complete program and may only be
++		used when the entire operating system is licensed
++		under the GPL.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/ethtool.h>
++#include "mv88e6063.h"
++#include <linux/delay.h>
++
++#if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
++
++static int vlan_config(struct mii_if_info *mii_if,
++		       struct vlan_ioctl_data *vdata)
++{
++	unsigned int value_L, value_H;
++	int i, tempPort;
++	int found;
++
++	struct net_device *dev = mii_if->dev;
++	int pmd_addr = mii_if->phy_id;
++
++	if (strcmp(vdata->cmd, "enable") == 0) {
++		/* Port Control reg. set Egress mode. */
++		mii_if->mdio_write(dev, pmd_addr + PORT0, MARVELL_PORTCTRL,
++				   0x1053);
++		mii_if->mdio_write(dev, pmd_addr + PORT1, MARVELL_PORTCTRL,
++				   0x1053);
++		mii_if->mdio_write(dev, pmd_addr + PORT2, MARVELL_PORTCTRL,
++				   0x1053);
++		mii_if->mdio_write(dev, pmd_addr + PORT3, MARVELL_PORTCTRL,
++				   0x1053);
++		mii_if->mdio_write(dev, pmd_addr + PORT4, MARVELL_PORTCTRL,
++				   0x1053);
++		mii_if->mdio_write(dev, pmd_addr + PORT5, MARVELL_PORTCTRL,
++				   0x2053);
++
++		/* Port Based VLAN Map reg. set Fallback mode */
++		mii_if->mdio_write(dev, pmd_addr + PORT0, MARVELL_PORTVLANMAP,
++				   0x0400 | (mii_if->
++					     mdio_read(dev, pmd_addr + PORT0,
++						       MARVELL_PORTVLANMAP) &
++					     0x003f));
++		mii_if->mdio_write(dev, pmd_addr + PORT1, MARVELL_PORTVLANMAP,
++				   0x0400 | (mii_if->
++					     mdio_read(dev, pmd_addr + PORT1,
++						       MARVELL_PORTVLANMAP) &
++					     0x003f));
++		mii_if->mdio_write(dev, pmd_addr + PORT2, MARVELL_PORTVLANMAP,
++				   0x0400 | (mii_if->
++					     mdio_read(dev, pmd_addr + PORT2,
++						       MARVELL_PORTVLANMAP) &
++					     0x003f));
++		mii_if->mdio_write(dev, pmd_addr + PORT3, MARVELL_PORTVLANMAP,
++				   0x0400 | (mii_if->
++					     mdio_read(dev, pmd_addr + PORT3,
++						       MARVELL_PORTVLANMAP) &
++					     0x003f));
++		mii_if->mdio_write(dev, pmd_addr + PORT4, MARVELL_PORTVLANMAP,
++				   0x0400 | (mii_if->
++					     mdio_read(dev, pmd_addr + PORT4,
++						       MARVELL_PORTVLANMAP) &
++					     0x003f));
++		mii_if->mdio_write(dev, pmd_addr + PORT5, MARVELL_PORTVLANMAP,
++				   0x0400 | (mii_if->
++					     mdio_read(dev, pmd_addr + PORT5,
++						       MARVELL_PORTVLANMAP) &
++					     0x003f));
++	} else if (strcmp(vdata->cmd, "set") == 0) {
++
++		/* Set VLAN ID */
++		if (vdata->port > 0x001f) {
++			return -1;
++		}
++
++		if (vdata->port & 0x0001) {
++			mii_if->mdio_write(dev, pmd_addr + PORT0,
++					   MARVELL_PORTVLANID, vdata->vlan_num);
++			tempPort = PORT0;
++		}
++		if (vdata->port & 0x0002) {
++			mii_if->mdio_write(dev, pmd_addr + PORT1,
++					   MARVELL_PORTVLANID, vdata->vlan_num);
++			tempPort = PORT1;
++		}
++		if (vdata->port & 0x0004) {
++			mii_if->mdio_write(dev, pmd_addr + PORT2,
++					   MARVELL_PORTVLANID, vdata->vlan_num);
++			tempPort = PORT2;
++		}
++		if (vdata->port & 0x0008) {
++			mii_if->mdio_write(dev, pmd_addr + PORT3,
++					   MARVELL_PORTVLANID, vdata->vlan_num);
++			tempPort = PORT3;
++		}
++		if (vdata->port & 0x0010) {
++			mii_if->mdio_write(dev, pmd_addr + PORT4,
++					   MARVELL_PORTVLANID, vdata->vlan_num);
++			tempPort = PORT4;
++		}
++
++		for (i = 0; i <= (PORT4 - PORT0); i++) {	/* Only PORT0 to PORT4 */
++			if ((tempPort & PORT0 + i) == tempPort) {	/* Set the target */
++				port to 0 !
++				    mii_if->mdio_write(dev,
++						       pmd_addr + PORT0 + i,
++						       MARVELL_PORTVLANMAP,
++						       (mii_if->
++							mdio_read(dev,
++								  pmd_addr +
++								  PORT0 + i,
++								  MARVELL_PORTVLANMAP)
++							& ~vdata->port));
++			} else if (vdata->vlan_num ==
++				   (mii_if->
++				    mdio_read(dev, pmd_addr + PORT0 + i,
++					      MARVELL_PORTVLANID) & vdata->
++				    vlan_num)) {
++				int thisPort = 1 << i;
++
++				/* We have the same VID, allow this port to communicate with the target port! */
++				mii_if->mdio_write(dev, pmd_addr + PORT0 + i,
++						   MARVELL_PORTVLANMAP,
++						   (mii_if->
++						    mdio_read(dev,
++							      pmd_addr + PORT0 +
++							      i,
++							      MARVELL_PORTVLANMAP)
++						    | vdata->port));
++
++				/* Allow the target port to communicate with this port! */
++				mii_if->mdio_write(dev, pmd_addr + tempPort,
++						   MARVELL_PORTVLANMAP,
++						   (mii_if->
++						    mdio_read(dev,
++							      pmd_addr +
++							      tempPort,
++							      MARVELL_PORTVLANMAP)
++						    | thisPort));
++			} else {
++				int thisPort = 1 << i;
++
++				/* Do not allow this port to communicate with target port. */
++				mii_if->mdio_write(dev, pmd_addr + PORT0 + i,
++						   MARVELL_PORTVLANMAP,
++						   (mii_if->
++						    mdio_read(dev,
++							      pmd_addr + PORT0 +
++							      i,
++							      MARVELL_PORTVLANMAP)
++						    & ~vdata->port));
++
++				/* Do not allow the target port to communicate with this port. */
++				mii_if->mdio_write(dev, pmd_addr + tempPort,
++						   MARVELL_PORTVLANMAP,
++						   (mii_if->
++						    mdio_read(dev,
++							      pmd_addr +
++							      tempPort,
++							      MARVELL_PORTVLANMAP)
++						    & ~thisPort));
++			}
++		}
++
++		/* Port5 is always open for every ports. */
++		mii_if->mdio_write(dev, pmd_addr + PORT5, MARVELL_PORTVLANMAP,
++				   0x001f |
++				   (mii_if->
++				    mdio_read(dev, pmd_addr + PORT5,
++					      MARVELL_PORTVLANMAP) & 0xffc0));
++
++		/* Set VTU */
++		mii_if->mdio_write(dev, pmd_addr + PORT_GLOBAL, MARVELL_VTU_VID,
++				   vdata->vlan_num);
++
++		value_L = 0x1111;
++		if (vdata->port & 0x0001)
++			value_L = (0x0002 | (0xfff0 & value_L));
++		if (vdata->port & 0x0002)
++			value_L = (0x0020 | (0xff0f & value_L));
++		if (vdata->port & 0x0004)
++			value_L = (0x0200 | (0xf0ff & value_L));
++		if (vdata->port & 0x0008)
++			value_L = (0x2000 | (0x0fff & value_L));
++
++		value_H = 0x0111;
++		if (vdata->port & 0x0010)
++			value_H = (0x0002 | (0xfff0 & value_H));
++		value_H |= 0x0030;	/* Port5 is always tagged. */
++
++		mii_if->mdio_write(dev, pmd_addr + PORT_GLOBAL,
++				   MARVELL_VTU_DATAL, value_L);
++		mii_if->mdio_write(dev, pmd_addr + PORT_GLOBAL,
++				   MARVELL_VTU_DATAH, value_H);
++
++		mii_if->mdio_write(dev, pmd_addr + PORT_GLOBAL, MARVELL_VTU_OPE,
++				   0xb000);
++
++	} else if (strcmp(vdata->cmd, "read") == 0) {
++		i = vdata->vlan_num;
++
++		/* Read VLAN ID */
++		if (i == (mii_if->mdio_read(dev, pmd_addr + PORT0,
++					    MARVELL_PORTVLANID) & 0x0fff)) {
++			vdata->port |= 0x0001;	/* PORT0 Flag */
++		}
++		if (i == (mii_if->mdio_read(dev, pmd_addr + PORT1,
++					    MARVELL_PORTVLANID) & 0x0fff)) {
++			vdata->port |= 0x0002;	/* PORT1 Flag */
++		}
++		if (i == (mii_if->mdio_read(dev, pmd_addr + PORT2,
++					    MARVELL_PORTVLANID) & 0x0fff)) {
++			vdata->port |= 0x0004;	/* PORT2 Flag */
++		}
++		if (i == (mii_if->mdio_read(dev, pmd_addr + PORT3,
++					    MARVELL_PORTVLANID) & 0x0fff)) {
++			vdata->port |= 0x0008;	/* PORT3 Flag */
++		}
++		if (i == (mii_if->mdio_read(dev, pmd_addr + PORT4,
++					    MARVELL_PORTVLANID) & 0x0fff)) {
++			vdata->port |= 0x0010;	/* PORT4 Flag */
++		}
++	} else if (strcmp(vdata->cmd, "disable") == 0) {
++		printk("Disable tagVLAN!\n");
++		/* Port Control reg. set Egress mode. */
++		mii_if->mdio_write(dev, pmd_addr + PORT0, MARVELL_PORTCTRL,
++				   0x0003);
++		mii_if->mdio_write(dev, pmd_addr + PORT1, MARVELL_PORTCTRL,
++				   0x0003);
++		mii_if->mdio_write(dev, pmd_addr + PORT2, MARVELL_PORTCTRL,
++				   0x0003);
++		mii_if->mdio_write(dev, pmd_addr + PORT3, MARVELL_PORTCTRL,
++				   0x0003);
++		mii_if->mdio_write(dev, pmd_addr + PORT4, MARVELL_PORTCTRL,
++				   0x0003);
++		mii_if->mdio_write(dev, pmd_addr + PORT5, MARVELL_PORTCTRL,
++				   0x0003);
++
++		/* Port Based VLAN Map reg. set Fallback mode */
++		mii_if->mdio_write(dev, pmd_addr + PORT0, MARVELL_PORTVLANMAP,
++				   0x007e);
++		mii_if->mdio_write(dev, pmd_addr + PORT1, MARVELL_PORTVLANMAP,
++				   0x007d);
++		mii_if->mdio_write(dev, pmd_addr + PORT2, MARVELL_PORTVLANMAP,
++				   0x007b);
++		mii_if->mdio_write(dev, pmd_addr + PORT3, MARVELL_PORTVLANMAP,
++				   0x0077);
++		mii_if->mdio_write(dev, pmd_addr + PORT4, MARVELL_PORTVLANMAP,
++				   0x006f);
++		mii_if->mdio_write(dev, pmd_addr + PORT5, MARVELL_PORTVLANMAP,
++				   0x005f);
++
++		/* VLAN ID clear */
++		mii_if->mdio_write(dev, pmd_addr + PORT0, MARVELL_PORTVLANID,
++				   1);
++		mii_if->mdio_write(dev, pmd_addr + PORT1, MARVELL_PORTVLANID,
++				   1);
++		mii_if->mdio_write(dev, pmd_addr + PORT2, MARVELL_PORTVLANID,
++				   1);
++		mii_if->mdio_write(dev, pmd_addr + PORT3, MARVELL_PORTVLANID,
++				   1);
++		mii_if->mdio_write(dev, pmd_addr + PORT4, MARVELL_PORTVLANID,
++				   1);
++		mii_if->mdio_write(dev, pmd_addr + PORT5, MARVELL_PORTVLANID,
++				   1);
++	} else if (strcmp(vdata->cmd, "print") == 0) {
++		printk(KERN_INFO "\nVLAN VIDs :\n");
++		for (i = 0; i <= (PORT5 - PORT0); i++) {
++			printk(KERN_INFO "PORT%d VID is : 0x%04X\n", i,
++			       mii_if->mdio_read(dev, pmd_addr + PORT0 + i,
++						 MARVELL_PORTVLANID));
++		}
++
++		printk(KERN_INFO "\nVLAN VTable :\n");
++		for (i = 0; i <= (PORT5 - PORT0); i++) {
++			int nPortTable = 0;
++			nPortTable =
++			    mii_if->mdio_read(dev, pmd_addr + PORT0 + i,
++					      MARVELL_PORTVLANMAP);
++			printk(KERN_INFO "PORT%d VLANMAP  is : 0x%04X\n", i,
++			       nPortTable);
++			printk(KERN_INFO "\tPORT%d VLANMAP  is :\n", i);
++			if ((nPortTable & 0x001) == 0x0001) {	/* PORT0 */
++				printk(KERN_INFO "\t\tPORT0\n");
++			}
++			if ((nPortTable & 0x0002) == 0x0002) {	/* PORT1 */
++				printk(KERN_INFO "\t\tPORT1\n");
++			}
++			if ((nPortTable & 0x0004) == 0x0004) {	/* PORT2 */
++				printk(KERN_INFO "\t\tPORT2\n");
++			}
++			if ((nPortTable & 0x0008) == 0x0008) {	/* PORT3 */
++				printk(KERN_INFO "\t\tPORT3\n");
++			}
++			if ((nPortTable & 0x0010) == 0x0010) {	/* PORT4 */
++				printk(KERN_INFO "\t\tPORT4\n");
++			}
++			if ((nPortTable & 0x0020) == 0x0020) {	/* PORT5 */
++				printk(KERN_INFO "\t\tPORT5\n");
++			}
++		}
++
++	} else {
++		printk("NO tagVLAN command found....\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++#endif
++
++int vlan_mii_ioctl(struct mii_if_info *mii_if, struct mii_ioctl_data *mii_data,
++		   struct vlan_ioctl_data *vdata, int cmd)
++{
++	int rc = 0;
++
++	if (cmd != (SIOCDEVPRIVATE + 13)) {
++		mii_data->phy_id &= mii_if->phy_id_mask;
++		mii_data->reg_num &= mii_if->reg_num_mask;
++	}
++
++	switch (cmd) {
++#if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
++	case SIOCDEVPRIVATE + 11:
++		if (!capable(CAP_NET_ADMIN))
++			return -EPERM;
++
++		mii_if->mdio_write(mii_if->dev, mii_if->dev + mii_data->phy_id,
++				   mii_data->reg_num, mii_data->val_in);
++
++		return 0;
++
++	case SIOCDEVPRIVATE + 12:
++		if (!capable(CAP_NET_ADMIN))
++			return -EPERM;
++
++		mii_data->val_out = mii_if->mdio_read(mii_if->dev,
++						      mii_if->phy_id +
++						      mii_data->phy_id,
++						      mii_data->reg_num);
++		return 0;
++
++	case SIOCDEVPRIVATE + 13:
++		if (!capable(CAP_NET_ADMIN))
++			return -EPERM;
++
++		if (vlan_config(mii_if, vdata))
++			return -EOPNOTSUPP;
++
++		return 0;
++#endif
++
++	default:
++		rc = -EOPNOTSUPP;
++		break;
++	}
++	return rc;
++}
++
++int enableMarvellSwitch(struct mii_if_info *mii)
++{
++	/* Enable and Configure 88E6063 Ports */
++	int port, phy;
++	for (port = 0; port <= (PORT5 - PORT0); port++) {
++		int portctrlval;
++		/* Set the port to forwarding. */
++		mii->mdio_write(mii->dev, (mii->phy_id + PORT0 + port),
++				MARVELL_PORTCTRL, PORTCTRL_PORTSTATEFW);
++		udelay(500);
++
++		/* Check if the port was configured properly. */
++		portctrlval =
++		    mii->mdio_read(mii->dev, (mii->phy_id + PORT0 + port),
++				   MARVELL_PORTCTRL);
++		if ((portctrlval & PORTCTRL_PORTSTATEFW) !=
++		    PORTCTRL_PORTSTATEFW) {
++			printk(KERN_INFO
++			       "%s: Cannot setup PORT%d of Marvell Switch\n",
++			       mii->dev->name, port);
++		}
++	}
++
++	/* Configure MII PHY on all 88E6063 Ports */
++	for (phy = 0; phy <= (MARVELL_MIIPHY4 - MARVELL_MIIPHY0); phy++) {
++
++		/* Reset the Basic mode control register on this MII PHY */
++		mii->mdio_write(mii->dev, (mii->phy_id + MARVELL_MIIPHY0 + phy),
++				MII_BMCR, 0);
++
++		/* Configure this MII PHY */
++		mii->mdio_write(mii->dev, (mii->phy_id + MARVELL_MIIPHY0 + phy),
++				MII_BMCR,
++				BMCR_FULLDPLX | BMCR_ANRESTART | BMCR_ANENABLE |
++				BMCR_SPEED100);
++	}
++	return 1;
++}
+Index: linux-2.6.10/drivers/net/mv88e6063.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/mv88e6063.h
+@@ -0,0 +1,95 @@
++/*
++ * mv88e6063.h
++ * Marvell 88E6063 MII registers.
++ * Marvell 88E6063 Ethernet Switch is embedded on the Source Code together
++ * with Davicom DM9161 Transceiver.
++ *
++ * Copyright (C) 2005 Edmond D. dela Cruz (edmondd@ntsp.nec.co.jp)
++ */
++
++#ifndef __MV88E6063_H__
++#define __MV88E6063_H__
++
++#include <linux/mii.h>
++/***********************************************************************
++ * Marvel Ethernet Switch
++ ***********************************************************************
++*/
++#define MARVELL_OUI 0x005043	/*Marvell Semiconducter MII OUI */
++/**************************
++ * MAX POLL TIMES Setting *
++ **************************/
++#define		MAX_POLL_TIMES_MARVELL	15000
++/*************************************
++ * Marvell 88E6063 Switch registers. *
++ *************************************/
++/* Serial Management Interface (SMI) Port Device Address. */
++#define PORT0			0x08	/* SMI Device Port 0 */
++#define PORT1			0x09	/* SMI Device Port 1 */
++#define PORT2			0x0A	/* SMI Device Port 2 */
++#define PORT3			0x0B	/* SMI Device Port 3 */
++#define PORT4			0x0C	/* SMI Device Port 4 */
++#define PORT5			0x0D	/* SMI Device Port 5 */
++#define PORT6			0x0E	/* SMI Device Port 6*/
++#define PORT_GLOBAL		0x0F	/* SMI Device Global Port */
++/* Serial Management Interface (SMI) PHY MII Device Address. */
++#define MARVELL_MIIPHY0			0x00	/* SMI MII PHY Device 0 */
++#define MARVELL_MIIPHY1			0x01	/* SMI MII PHY Device 0 */
++#define MARVELL_MIIPHY2			0x02	/* SMI MII PHY Device 0 */
++#define MARVELL_MIIPHY3			0x03	/* SMI MII PHY Device 0 */
++#define MARVELL_MIIPHY4			0x04	/* SMI MII PHY Device 0 */
++/* Marvell Semiconducter MII OUI */
++#define MARVELL_OUI 0x005043
++/* PHY Identifier 1 */
++#define MARVELL_OUIMSB			0x0141	/* Organizationally Unique Identifier */
++/* Switch Port Register. */
++#define MARVELL_PORTSTAT			0x00	/* Port Status Register */
++#define MARVELL_RESERVED1			0x01	/* Reserved Register */
++#define MARVELL_RESERVED2			0x02	/* Reserved Register */
++#define MARVELL_SWITCHID			0x03	/* Switch Identifier Register */
++#define MARVELL_PORTCTRL			0x04	/* Port Control Register */
++#define MARVELL_RESERVED5			0x05	/* Reserved Register */
++#define MARVELL_PORTVLANMAP			0x06	/* Port Based VLAN Map */
++#define MARVELL_PORTVLANID			0x07	/* Default Port VLAN ID & Priority */
++#define MARVELL_RESERVED8			0x08	/* Reserved Register */
++#define MARVELL_RESERVED9			0x09	/* Reserved Register */
++#define MARVELL_RATECTRL			0x0A	/* Rate Control */
++#define MARVELL_PORTASSVECT			0x0B	/* Port Association Vector */
++#define MARVELL_RESERVED12			0x0C	/* Reserved Register */
++#define MARVELL_RESERVED13			0x0D	/* Reserved Register */
++#define MARVELL_RESERVED14			0x0E	/* Reserved Register */
++#define MARVELL_RESERVED15			0x0F	/* Reserved Register */
++#define MARVELL_RXCOUNTER			0x10	/* Rx Counter */
++#define MARVELL_TXCOUNTER			0x11	/* Tx Counter */
++/* Port Status Register */
++#define PORTSTAT_SPEED100		0x0100	/* Speed mode (100MBps) */
++#define PORTSTAT_FULLDUPLEX		0x0200	/* Duplex mode (Full Duplex) */
++#define PORTSTAT_MIIPHYMODE		0x0400	/* PHY mode (MII PHY Mode) */
++#define PORTSTAT_MIIPORTMODE	0x0800	/* Port mode (MII 10/100 or RMII 100Mbps) */
++#define PORTSTAT_LINKUP			0x1000	/* Link Status (Link is UP!) */
++#define PORTSTAT_RESOLVED		0x2000	/* Link Mode is Resolved */
++#define PORTSTAT_MYPAUSE		0x2000	/* My Pause Bit is implemented */
++#define PORTSTAT_LINKPAUSE		0x2000	/* Link Partner's Pause Bit is implemented */
++/* Port Control Register */
++#define PORTCTRL_PORTSTATEDA	0x0000	/* Port State. Disabled = 00 */
++#define PORTCTRL_PORTSTATEBL	0x0001	/* Port State. Blocking/Listening = 01 */
++#define PORTCTRL_PORTSTATELE	0x0002	/* Port State. Learning = 10 */
++#define PORTCTRL_PORTSTATEFW	0x0003	/* Port State. Forwarding = 11 */
++#define PORTCTRL_FORCEFLOW		0x8000	/* Force Flow Control */
++/* Unsorted Registers */
++#define MARVELL_VTU_OPE   0x0005
++#define MARVELL_VTU_VID   0x0006
++#define MARVELL_VTU_DATAL 0x0007
++#define MARVELL_VTU_DATAH 0x0008
++/******************************************************************************/
++struct vlan_ioctl_data {
++	char *cmd;		/* Should be one of the vlan_ioctl_cmds enum above. */
++	int vlan_num;
++	int port;
++};
++
++extern int enableMarvellSwitch(struct mii_if_info *mii) __attribute__ ((weak));
++extern int vlan_mii_ioctl(struct mii_if_info *mii_if,
++			  struct mii_ioctl_data *mii_data,
++			  struct vlan_ioctl_data *vdata, int cmd) __attribute__ ((weak));
++#endif				/* __MV88E6063_H__ */
+Index: linux-2.6.10/arch/mips/vr41xx/vrblade/setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/vr41xx/vrblade/setup.c
++++ linux-2.6.10/arch/mips/vr41xx/vrblade/setup.c
+@@ -78,8 +78,12 @@ static struct mtd_partition vrblade_mtd_
+ 
+ #define VR4133_SCUARBITSELREG	KSEG1ADDR(0x0F00100A)
+ 
++#define VR4133A_WORKAROUND_MASK (WORKAROUND_E21_PAD_BIT | WORKAROUND_E10_VR4133_BIT)
+ static struct nec_candy_platform_data nec_candy0_pdata = {
+ 	.pmd_addr = 0,
++	.platform_id = NEC_VRBLADE_VR4133A_PID | VR4133A_WORKAROUND_MASK,
++	.platform_options.n_marvell_ports = 0,
++	.platform_options.use_tx_ring_buffer = 1,
+ };
+ 
+ static struct platform_device nec_candy0_device = {
+@@ -105,6 +109,9 @@ static struct platform_device nec_candy0
+ 
+ static struct nec_candy_platform_data nec_candy1_pdata = {
+ 	.pmd_addr = 0x10,
++	.platform_id = NEC_VRBLADE_VR4133A_PID | VR4133A_WORKAROUND_MASK,
++	.platform_options.n_marvell_ports = 5,
++	.platform_options.use_tx_ring_buffer = 1,
+ };
+ 
+ static struct platform_device nec_candy1_device = {
+Index: linux-2.6.10/include/linux/nec_candy_pd.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/nec_candy_pd.h
++++ linux-2.6.10/include/linux/nec_candy_pd.h
+@@ -13,8 +13,51 @@
+ 
+ #ifndef NEC_CANDY_PD_H
+ #define NEC_CANDY_PD_H
++#define PLATFORM_ID_MASK 0xF8000000
++#define WORKAROUND_MASK  0x7FFFFFFF
++#define WORKAROUND(pid,wa) ((((pid) & PLATFORM_ID_MASK) == ((wa) & PLATFORM_ID_MASK )) && \
++			   (((pid) & WORKAROUND_MASK) & ((wa) & WORKAROUND_MASK)))
++#define COMMON_WORKAROUND(pid,wa) (((pid) & WORKAROUND_MASK) & ((wa) & WORKAROUND_MASK))
++#define PLATFORM(pid,p) (((pid) & PLATFORM_ID_MASK)==p)
++/***********************************************************************
++ * platforms supported by nec-candy.
++ ***********************************************************************/
++#define NEC_CMB_VR4133_PID 0x08000000
++#define NEC_CMB_VR7701_PID 0x10000000
++#define NEC_VRBLADE_VR4133A_PID 0x18000000
++/***********************************************************************
++ * hardware bug workarounds shifts and masks
++ ***********************************************************************/
++#define WORKAROUND_E7_AFCE_SHIFT 0
++#define WORKAROUND_E8_TX_STALL_SHIFT 1
++#define WORKAROUND_E10_PRM_AMC_SHIFT 2
++#define WORKAROUND_E10_VR4133_SHIFT 3
++#define WORKAROUND_E13_TXFC_SHIFT 4
++#define WORKAROUND_E19_VR4133AR20_SHIFT 5
++#define WORKAROUND_E20_VR4133AR20_SHIFT 6
++#define WORKAROUND_E21_PAD_SHIFT 7
+ 
++#define WORKAROUND_E7_AFCE_BIT (1 << WORKAROUND_E7_AFCE_SHIFT)
++#define WORKAROUND_E8_TX_STALL_BIT (1 << WORKAROUND_E8_TX_STALL_SHIFT)
++#define WORKAROUND_E10_PRM_AMC_BIT (1 << WORKAROUND_E10_PRM_AMC_SHIFT)
++#define WORKAROUND_E10_VR4133_BIT (1 << WORKAROUND_E10_VR4133_SHIFT)
++#define WORKAROUND_E13_TXFC_BIT (1 << WORKAROUND_E13_TXFC_SHIFT)
++/* WORKAROUND_E19_VR4133A and WORKAROUND_E20_VR4133A for restrictions of VR4133A Rev2.0 */
++#define WORKAROUND_E19_VR4133AR20_BIT (1 << WORKAROUND_E19_VR4133AR20_SHIFT)
++#define WORKAROUND_E20_VR4133AR20_BIT (1 << WORKAROUND_E20_VR4133AR20_SHIFT)
++#define WORKAROUND_E21_PAD_BIT (1 << WORKAROUND_E21_PAD_SHIFT)
++
++#define WORKAROUND_E19_VR4133AR20 ( NEC_VRBLADE_VR4133A_PID | WORKAROUND_E19_VR4133AR20_BIT )
++#define WORKAROUND_E20_VR4133AR20 ( NEC_VRBLADE_VR4133A_PID | WORKAROUND_E20_VR4133AR20_BIT )
++
++struct platform_options {
++	unsigned :27;
++	unsigned use_tx_ring_buffer :1;
++	unsigned n_marvell_ports :4;
++};
+ struct nec_candy_platform_data {
++	unsigned platform_id;
++	struct platform_options platform_options;
+ 	unsigned char mac_addr[6];
+ 	unsigned long pmd_addr;
+ };
+Index: linux-2.6.10/mvl_patches/pro-1209.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1209.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1209);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

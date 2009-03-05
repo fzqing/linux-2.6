@@ -1,0 +1,2449 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_spi
+# Date: Mon Mar  6 15:04:39 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 17072
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for SPI IP.
+#     Taken from EDK 7.1i SP2.
+# 
+
+PATCHNUM=359
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 17072
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for SPI IP.
+    Taken from EDK 7.1i SP2.
+
+ drivers/char/xilinx_spi/xspi.c         | 1049 +++++++++++++++++++++++++++++++++
+ drivers/char/xilinx_spi/xspi.h         |  345 ++++++++++
+ drivers/char/xilinx_spi/xspi_i.h       |  142 ++++
+ drivers/char/xilinx_spi/xspi_l.h       |  301 +++++++++
+ drivers/char/xilinx_spi/xspi_options.c |  215 ++++++
+ drivers/char/xilinx_spi/xspi_stats.c   |  127 +++
+ mvl_patches/pro-0359.c                 |   16 
+ 7 files changed, 2195 insertions(+)
+
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi.c
+@@ -0,0 +1,1049 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xspi.c
++*
++* Contains required functions of the XSpi driver component.  See xspi.h for
++* a detailed description of the device and driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  10/11/01 First release
++* 1.00b jhl  03/14/02 Repartitioned driver for smaller files.
++* 1.00b rpm  04/25/02 Collapsed IPIF and reg base addresses into one
++* 1.00b rmm  05/14/03 Fixed diab compiler warnings relating to asserts
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xparameters.h"
++#include "xspi.h"
++#include "xspi_i.h"
++#include "xipif_v1_23_b.h"
++#include "xio.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++static void StubStatusHandler(void *CallBackRef, XStatus StatusEvent,
++			      unsigned int ByteCount);
++
++/************************** Variable Definitions *****************************/
++
++/*****************************************************************************/
++/**
++*
++* Initializes a specific XSpi instance such that the driver is ready to use.
++*
++* The state of the device after initialization is:
++*   - Device is disabled
++*   - Slave mode
++*   - Active high clock polarity
++*   - Clock phase 0
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++* @param    DeviceId is the unique id of the device controlled by this XSpi
++*           instance. Passing in a device id associates the generic XSpi
++*           instance to a specific device, as chosen by the caller or
++*           application developer.
++*
++* @return
++*
++* The return value is XST_SUCCESS if successful.  On error, a code indicating
++* the specific error is returned.  Possible error codes are:
++* - XST_DEVICE_IS_STARTED if the device is started. It must be stopped to
++*   re-initialize.
++* - XST_DEVICE_NOT_FOUND if the device was not found in the configuration such
++*   that initialization could not be accomplished.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XStatus XSpi_Initialize(XSpi * InstancePtr, u16 DeviceId)
++{
++	XSpi_Config *SpiConfigPtr;	/* Pointer to Configuration ROM data */
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/*
++	 * If the device is started, disallow the initialize and return a status
++	 * indicating it is started.  This allows the user to stop the device
++	 * and reinitialize, but prevents a user from inadvertently initializing
++	 */
++	if (InstancePtr->IsStarted == XCOMPONENT_IS_STARTED) {
++		return XST_DEVICE_IS_STARTED;
++	}
++
++	/*
++	 * Lookup the device configuration in the temporary CROM table. Use this
++	 * configuration info down below when initializing this component.
++	 */
++	SpiConfigPtr = XSpi_LookupConfig(DeviceId);
++	if (SpiConfigPtr == NULL) {
++		return XST_DEVICE_NOT_FOUND;
++	}
++
++	/*
++	 * Set some default values
++	 */
++	InstancePtr->IsStarted = 0;
++	InstancePtr->IsBusy = FALSE;
++
++	InstancePtr->BaseAddr = SpiConfigPtr->BaseAddress;
++	InstancePtr->StatusHandler = StubStatusHandler;
++
++	InstancePtr->SendBufferPtr = NULL;
++	InstancePtr->RecvBufferPtr = NULL;
++	InstancePtr->RequestedBytes = 0;
++	InstancePtr->RemainingBytes = 0;
++	InstancePtr->HasFifos = SpiConfigPtr->HasFifos;
++	InstancePtr->SlaveOnly = SpiConfigPtr->SlaveOnly;
++	InstancePtr->NumSlaveBits = SpiConfigPtr->NumSlaveBits;
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++
++	/* Create a slave select mask based on the number of bits that can
++	 * be used to deselect all slaves, initialize the value to put into
++	 * the slave select register to this value
++	 */
++	InstancePtr->SlaveSelectMask = (1 << InstancePtr->NumSlaveBits) - 1;
++	InstancePtr->SlaveSelectReg = InstancePtr->SlaveSelectMask;
++
++	/*
++	 * Clear the statistics for this driver
++	 */
++	XSpi_mClearStats(InstancePtr);
++
++	/*
++	 * Reset the SPI device to get it into its initial state. It is expected
++	 * that device configuration will take place after this initialization is
++	 * done, but before the device is started. Be sure to call the version's
++	 * Reset function since it does not require the IsReady flag to be set yet.
++	 */
++	XSpi_Reset(InstancePtr);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function enables interrupts for the SPI device. It is up to the user to
++* connect the SPI interrupt handler to the interrupt controller before this
++* Start function is called. The GetIntrHandler function is used for that
++* purpose. If the device is configured with FIFOs, the FIFOs are reset at
++* this time.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* XST_SUCCESS if the device is successfully started, or XST_DEVICE_IS_STARTED
++* if the device was already started.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XStatus XSpi_Start(XSpi * InstancePtr)
++{
++	u16 ControlReg;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * If it is already started, return a status indicating so
++	 */
++	if (InstancePtr->IsStarted == XCOMPONENT_IS_STARTED) {
++		return XST_DEVICE_IS_STARTED;
++	}
++
++	/*
++	 * Enable interrupts in the IPIF (connecting to the interrupt controller
++	 * and enabling interrupts there is the responsibility of the caller)
++	 */
++	XIIF_V123B_WRITE_IIER(InstancePtr->BaseAddr, XSP_INTR_DFT_MASK);
++
++	/*
++	 * Indicate that the device is started before we enable the transmitter
++	 * or receiver or interrupts.
++	 */
++	InstancePtr->IsStarted = XCOMPONENT_IS_STARTED;
++
++	/*
++	 * Reset the transmit and receive FIFOs if present. There is a critical
++	 * section here since this register is also modified during interrupt
++	 * context.  So we wait until after the r/m/w of the control register to
++	 * enable the global IPIF interrupt.
++	 */
++	ControlReg = XIo_In16(InstancePtr->BaseAddr + XSP_CR_OFFSET);
++	ControlReg |= XSP_CR_TXFIFO_RESET_MASK | XSP_CR_RXFIFO_RESET_MASK |
++	    XSP_CR_ENABLE_MASK;
++	XIo_Out16(InstancePtr->BaseAddr + XSP_CR_OFFSET, ControlReg);
++
++	/*
++	 * Enable the global IPIF interrupt just after we start.
++	 */
++	XIIF_V123B_GINTR_ENABLE(InstancePtr->BaseAddr);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function stops the SPI device by disabling interrupts and disabling the
++* device itself. Interrupts are disabled only within the device itself. If
++* desired, the caller is responsible for disabling interrupts in the interrupt
++* controller and disconnecting the interrupt handler from the interrupt
++* controller.
++*
++* If the device is in progress of transferring data on the SPI bus, this function
++* returns a status indicating the device is busy. The user will be notified via
++* the status handler when the transfer is complete, and at that time can again
++* try to stop the device. As a master, we do not allow the device to be stopped
++* while a transfer is in progress because the slave may be left in a bad state.
++* As a slave, we do not allow the device to be stopped while a transfer is in
++* progress because the master is not done with its transfer yet.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* XST_SUCCESS if the device is successfully started, or XST_DEVICE_BUSY if a
++* transfer is in progress and cannot be stopped.
++*
++* @note
++*
++* This function makes use of internal resources that are shared between the
++* XSpi_Stop() and XSpi_SetOptions() functions. So if one task might be setting
++* device options options while another is trying to stop the device, the user
++* is required to provide protection of this shared data (typically using a
++* semaphore).
++*
++******************************************************************************/
++XStatus XSpi_Stop(XSpi * InstancePtr)
++{
++	u16 ControlReg;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Do not allow the user to stop the device while a transfer is in progress
++	 */
++	if (InstancePtr->IsBusy) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * Disable the device. First disable the IPIF interrupts since there is a
++	 * critical section here because this register is also modified during
++	 * interrupt context. The device is likely disabled already since there is
++	 * no transfer in progress, but we do it again just to be sure.
++	 */
++	XIIF_V123B_GINTR_DISABLE(InstancePtr->BaseAddr);
++
++	ControlReg = XIo_In16(InstancePtr->BaseAddr + XSP_CR_OFFSET);
++	XIo_Out16(InstancePtr->BaseAddr + XSP_CR_OFFSET,
++		  ControlReg & ~XSP_CR_ENABLE_MASK);
++
++	InstancePtr->IsStarted = 0;
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Resets the SPI device. Reset must only be called after the driver has been
++* initialized. The configuration of the device after reset is the same as its
++* configuration after initialization. Refer to the XSpi_Initialize function
++* for more details. This is a hard reset of the device. Any data transfer that
++* is in progress is aborted.
++*
++* The upper layer software is responsible for re-configuring (if necessary)
++* and restarting the SPI device after the reset.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++* @internal
++*
++* The reset is accomplished by setting the IPIF reset register. This takes
++* care of resetting all hardware blocks, including the SPI device and its FIFOs.
++*
++******************************************************************************/
++void XSpi_Reset(XSpi * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Abort any transfer that is in progress
++	 */
++	XSpi_Abort(InstancePtr);
++
++	/* Reset any values that are not reset by the hardware reset such that
++	 * the software state matches the hardware device
++	 */
++	InstancePtr->IsStarted = 0;
++	InstancePtr->SlaveSelectReg = InstancePtr->SlaveSelectMask;
++
++	/*
++	 * Reset the entire IPIF at once
++	 */
++	XIIF_V123B_RESET(InstancePtr->BaseAddr);
++}
++
++/*****************************************************************************/
++/**
++*
++* Transfers the specified data on the SPI bus. If the SPI device is configured
++* to be a master, this function initiates bus communication and sends/receives
++* the data to/from the selected SPI slave. If the SPI device is configured to
++* be a slave, this function prepares the data to be sent/received when selected
++* by a master. For every byte sent, a byte is received.
++*
++* The caller has the option of providing two different buffers for send and
++* receive, or one buffer for both send and receive, or no buffer for receive.
++* The receive buffer must be at least as big as the send buffer to prevent
++* unwanted memory writes. This implies that the byte count passed in as an
++* argument must be the smaller of the two buffers if they differ in size.
++* Here are some sample usages:
++* <pre>
++*   XSpi_Transfer(InstancePtr, SendBuf, RecvBuf, ByteCount)
++*       The caller wishes to send and receive, and provides two different
++*       buffers for send and receive.
++*
++*   XSpi_Transfer(InstancePtr, SendBuf, NULL, ByteCount)
++*       The caller wishes only to send and does not care about the received
++*       data. The driver ignores the received data in this case.
++*
++*   XSpi_Transfer(InstancePtr, SendBuf, SendBuf, ByteCount)
++*       The caller wishes to send and receive, but provides the same buffer
++*       for doing both. The driver sends the data and overwrites the send
++*       buffer with received data as it transfers the data.
++*
++*   XSpi_Transfer(InstancePtr, RecvBuf, RecvBuf, ByteCount)
++*       The caller wishes to only receive and does not care about sending
++*       data.  In this case, the caller must still provide a send buffer, but
++*       it can be the same as the receive buffer if the caller does not care
++*       what it sends.  The device must send N bytes of data if it wishes to
++*       receive N bytes of data.
++* </pre>
++* Although this function takes a buffer as an argument, the driver can only
++* transfer a limited number of bytes at time. It transfers only one byte at a
++* time if there are no FIFOs, or it can transfer the number of bytes up to the
++* size of the FIFO. A call to this function only starts the transfer, then
++* subsequent transfer of the data is performed by the interrupt service routine
++* until the entire buffer has been transferred. The status callback function is
++* called when the entire buffer has been sent/received.
++*
++* This function is non-blocking. As a master, the SetSlaveSelect function must
++* be called prior to this function.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++* @param    SendBufPtr is a pointer to a buffer of data which is to be sent.
++*           This buffer must not be NULL.
++* @param    RecvBufPtr is a pointer to a buffer which will be filled with
++*           received data. This argument can be NULL if the caller does not
++*           wish to receive data.
++* @param    ByteCount contains the number of bytes to send/receive. The number
++*           of bytes received always equals the number of bytes sent.
++*
++* @return
++*
++* XST_SUCCESS if the buffers are successfully handed off to the driver
++* for transfer. Otherwise, returns:
++* - XST_DEVICE_IS_STOPPED if the device must be started before transferring data.
++* - XST_DEVICE_BUSY indicates that a data transfer is already in progress.
++*   This is determined by the driver.
++* - XST_SPI_NO_SLAVE indicates the device is configured as a master and a
++*   slave has not yet been selected.
++*
++* @notes
++*
++* This function is not thread-safe.  he higher layer software must ensure that
++* no two threads are transferring data on the SPI bus at the same time.
++*
++******************************************************************************/
++XStatus XSpi_Transfer(XSpi * InstancePtr, u8 * SendBufPtr,
++		      u8 * RecvBufPtr, unsigned int ByteCount)
++{
++	u16 ControlReg;
++	u8 StatusReg;
++	u32 IntrEnable;
++
++	/*
++	 * The RecvBufPtr argument can be null
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(SendBufPtr != NULL);
++	XASSERT_NONVOID(ByteCount > 0);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	if (InstancePtr->IsStarted != XCOMPONENT_IS_STARTED) {
++		return XST_DEVICE_IS_STOPPED;
++	}
++
++	/*
++	 * Make sure there is not a transfer already in progress. No need to worry
++	 * about a critical section here. Even if the Isr changes the busy flag
++	 * just after we read it, a busy error is returned and the caller can retry
++	 * when it gets the status handler callback indicating the transfer is done.
++	 */
++	if (InstancePtr->IsBusy) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * Enter a critical section from here to the end of the function since
++	 * state is modified, an interrupt is enabled, and the control register
++	 * is modified (r/m/w).
++	 */
++	XIIF_V123B_GINTR_DISABLE(InstancePtr->BaseAddr);
++
++	ControlReg = XIo_In16(InstancePtr->BaseAddr + XSP_CR_OFFSET);
++
++	/*
++	 * If configured as a master, be sure there is a slave select bit set
++	 * in the slave select register. If no slaves have been selected, the
++	 * value of the register will equal the mask.  When the device is in
++	 * loopback mode, however, no slave selects need be set.
++	 */
++	if (ControlReg & XSP_CR_MASTER_MODE_MASK) {
++		if ((ControlReg & XSP_CR_LOOPBACK_MASK) == 0) {
++			if (InstancePtr->SlaveSelectReg ==
++			    InstancePtr->SlaveSelectMask) {
++				XIIF_V123B_GINTR_ENABLE(InstancePtr->BaseAddr);
++				return XST_SPI_NO_SLAVE;
++			}
++		}
++	}
++
++	/*
++	 * Set the slave select register to select the device on the SPI before
++	 * starting the transfer of data
++	 */
++	XIo_Out32(InstancePtr->BaseAddr + XSP_SSR_OFFSET,
++		  InstancePtr->SlaveSelectReg);
++	/*
++	 * Set the busy flag, which will be cleared in the Isr when the transfer
++	 * is entirely done.
++	 */
++	InstancePtr->IsBusy = TRUE;
++
++	/*
++	 * Set up buffer pointers
++	 */
++	InstancePtr->SendBufferPtr = SendBufPtr;
++	InstancePtr->RecvBufferPtr = RecvBufPtr;
++
++	InstancePtr->RequestedBytes = ByteCount;
++	InstancePtr->RemainingBytes = ByteCount;
++
++	/*
++	 * Fill the DTR/FIFO with as many bytes as it will take (or as many as we
++	 * have to send). We use the full status bit to know if the device can take
++	 * more data. By doing this, the driver does not need to know the size of
++	 * the FIFO or that there even is a FIFO. The downside is that the status
++	 * register must be read each loop iteration.
++	 */
++	StatusReg = XIo_In8(InstancePtr->BaseAddr + XSP_SR_OFFSET);
++
++	while (((StatusReg & XSP_SR_TX_FULL_MASK) == 0) &&
++	       (InstancePtr->RemainingBytes > 0)) {
++		XIo_Out8(InstancePtr->BaseAddr + XSP_DTR_OFFSET,
++			 *InstancePtr->SendBufferPtr);
++
++		InstancePtr->SendBufferPtr++;
++		InstancePtr->RemainingBytes--;
++
++		StatusReg = XIo_In8(InstancePtr->BaseAddr + XSP_SR_OFFSET);
++	}
++
++	/*
++	 * Enable the transmit empty interrupt, which we use to determine
++	 * progress on the transmission.
++	 */
++	IntrEnable = XIIF_V123B_READ_IIER(InstancePtr->BaseAddr);
++	XIIF_V123B_WRITE_IIER(InstancePtr->BaseAddr,
++			      IntrEnable | XSP_INTR_TX_EMPTY_MASK);
++
++	/*
++	 * Start the transfer by no longer inhibiting the transmitter and enabling
++	 * the device. For a master, this will in fact start the transfer, but for
++	 * a slave it only prepares the device for a transfer that must be initiated
++	 * by a master.
++	 */
++	ControlReg &= ~XSP_CR_TRANS_INHIBIT_MASK;
++	XIo_Out16(InstancePtr->BaseAddr + XSP_CR_OFFSET, ControlReg);
++
++	/*
++	 * End critical section
++	 */
++	XIIF_V123B_GINTR_ENABLE(InstancePtr->BaseAddr);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Selects or deselect the slave with which the master communicates. Each slave
++* that can be selected is represented in the slave select register by a bit.
++* The argument passed to this function is the bit mask with a 1 in the bit
++* position of the slave being selected. Only one slave can be selected.
++*
++* The user is not allowed to deselect the slave while a transfer is in progress.
++* If no transfer is in progress, the user can select a new slave, which
++* implicitly deselects the current slave. In order to explicitly deselect the
++* current slave, a zero can be passed in as the argument to the function.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++* @param    SlaveMask is a 32-bit mask with a 1 in the bit position of the slave
++*           being selected. Only one slave can be selected. The SlaveMask can
++*           be zero if the slave is being deselected.
++*
++* @return
++*
++* XST_SUCCESS if the slave is selected or deselected successfully.
++* Otherwise, returns:
++* - XST_DEVICE_BUSY if a transfer is in progress, slave cannot be changed
++* - XST_SPI_TOO_MANY_SLAVES if more than one slave is being selected.
++*
++* @note
++*
++* This function only sets the slave which will be selected when a transfer
++* occurs. The slave is not selected when the SPI is idle. The slave select
++* has no affect when the device is configured as a slave.
++*
++******************************************************************************/
++XStatus XSpi_SetSlaveSelect(XSpi * InstancePtr, u32 SlaveMask)
++{
++	int NumAsserted;
++	int Index;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Do not allow the slave select to change while a transfer is in progress.
++	 * No need to worry about a critical section here since even if the Isr
++	 * changes the busy flag just after we read it, the function will return
++	 * busy and the caller can retry when notified that their current transfer
++	 * is done.
++	 */
++	if (InstancePtr->IsBusy) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * Verify that only one bit in the incoming slave mask is set
++	 */
++	NumAsserted = 0;
++	for (Index = (InstancePtr->NumSlaveBits - 1); Index >= 0; Index--) {
++		if ((SlaveMask >> Index) & 0x1) {
++			/* this bit is asserted */
++			NumAsserted++;
++		}
++	}
++
++	/*
++	 * Return an error if more than one slave is selected
++	 */
++	if (NumAsserted > 1) {
++		return XST_SPI_TOO_MANY_SLAVES;
++	}
++
++	/*
++	 * A single slave is either being selected or the incoming SlaveMask is
++	 * zero, which means the slave is being deselected. Setup the value to be
++	 * written to the slave select register as the inverse of the slave mask.
++	 */
++	InstancePtr->SlaveSelectReg = ~SlaveMask;
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Gets the current slave select bit mask for the SPI device.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* The value returned is a 32-bit mask with a 1 in the bit position of the slave
++* currently selected. The value may be zero if no slaves are selected.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u32 XSpi_GetSlaveSelect(XSpi * InstancePtr)
++{
++	u32 SsReg;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	SsReg = XIo_In32(InstancePtr->BaseAddr + XSP_SSR_OFFSET);
++
++	/*
++	 * Return the inverse of the hardware register and mask it so unimplemented
++	 * bits do not show up as ones
++	 */
++	return ~InstancePtr->SlaveSelectReg;
++}
++
++/*****************************************************************************/
++/**
++*
++* Sets the status callback function, the status handler, which the driver calls
++* when it encounters conditions that should be reported to the higher layer
++* software. The handler executes in an interrupt context, so it must minimize
++* the amount of processing performed such as transferring data to a thread
++* context. One of the following status events is passed to the status handler.
++* <pre>
++*   XST_SPI_MODE_FAULT          A mode fault error occurred, meaning another
++*                               master tried to select this device as a slave
++*                               when this device was configured to be a master.
++*                               Any transfer in progress is aborted.
++*
++*   XST_SPI_TRANSFER_DONE       The requested data transfer is done
++*
++*   XST_SPI_TRANSMIT_UNDERRUN   As a slave device, the master clocked data
++*                               but there were none available in the transmit
++*                               register/FIFO. This typically means the slave
++*                               application did not issue a transfer request
++*                               fast enough, or the processor/driver could not
++*                               fill the transmit register/FIFO fast enough.
++*
++*   XST_SPI_RECEIVE_OVERRUN     The SPI device lost data. Data was received
++*                               but the receive data register/FIFO was full.
++*                               This indicates that the device is receiving data
++*
++*                               faster than the processor/driver can consume it.
++*   XST_SPI_SLAVE_MODE_FAULT    A slave SPI device was selected as a slave while
++*                               it was disabled.  This indicates the master is
++*                               already transferring data (which is being
++*                               dropped until the slave application issues a
++*                               transfer).
++* </pre>
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++* @param    CallBackRef is the upper layer callback reference passed back
++*           when the callback function is invoked.
++* @param    FuncPtr is the pointer to the callback function.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* The handler is called within interrupt context, so it should do its work
++* quickly and queue potentially time-consuming work to a task-level thread.
++*
++******************************************************************************/
++void XSpi_SetStatusHandler(XSpi * InstancePtr, void *CallBackRef,
++			   XSpi_StatusHandler FuncPtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	InstancePtr->StatusHandler = FuncPtr;
++	InstancePtr->StatusRef = CallBackRef;
++}
++
++/*****************************************************************************/
++/**
++*
++* This is a stub for the status callback. The stub is here in case the upper
++* layers forget to set the handler.
++*
++* @param    CallBackRef is a pointer to the upper layer callback reference
++* @param    StatusEvent is the event that just occurred.
++* @param    ByteCount is the number of bytes transferred up until the event
++*           occurred.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void StubStatusHandler(void *CallBackRef, XStatus StatusEvent,
++			      unsigned int ByteCount)
++{
++	XASSERT_VOID_ALWAYS();
++}
++
++/*****************************************************************************/
++/**
++*
++* The interrupt handler for SPI interrupts. This function must be connected
++* by the user to an interrupt source. This function does not save and restore
++* the processor context such that the user must provide this processing.
++*
++* The interrupts that are handled are:
++*
++* - Mode Fault Error. This interrupt is generated if this device is selected
++*   as a slave when it is configured as a master. The driver aborts any data
++*   transfer that is in progress by resetting FIFOs (if present) and resetting
++*   its buffer pointers. The upper layer software is informed of the error.
++*
++* - Data Transmit Register (FIFO) Empty. This interrupt is generated when the
++*   transmit register or FIFO is empty. The driver uses this interrupt during a
++*   transmission to continually send/receive data until there is no more data
++*   to send/receive.
++*
++* - Data Transmit Register (FIFO) Underrun. This interrupt is generated when
++*   the SPI device, when configured as a slave, attempts to read an empty
++*   DTR/FIFO.  An empty DTR/FIFO usually means that software is not giving the
++*   device data in a timely manner. No action is taken by the driver other than
++*   to inform the upper layer software of the error.
++*
++* - Data Receive Register (FIFO) Overrun. This interrupt is generated when the
++*   SPI device attempts to write a received byte to an already full DRR/FIFO.
++*   A full DRR/FIFO usually means software is not emptying the data in a timely
++*   manner.  No action is taken by the driver other than to inform the upper
++*   layer software of the error.
++*
++* - Slave Mode Fault Error. This interrupt is generated if a slave device is
++*   selected as a slave while it is disabled. No action is taken by the driver
++*   other than to inform the upper layer software of the error.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* The slave select register is being set to deselect the slave when a transfer
++* is complete.  This is being done regardless of whether it is a slave or a
++* master since the hardware does not drive the slave select as a slave.
++*
++******************************************************************************/
++void XSpi_InterruptHandler(void *InstancePtr)
++{
++	XSpi *SpiPtr = (XSpi *) InstancePtr;
++	u32 IntrStatus;
++	unsigned int BytesDone;	/* number of bytes done so far */
++
++	XASSERT_VOID(InstancePtr != NULL);
++
++	/*
++	 * Update the stats for the number of interrupts
++	 */
++	SpiPtr->Stats.NumInterrupts++;
++
++	/*
++	 * Get the IPIF IP interrupts. Immediately clear the interrupts in case
++	 * this Isr causes another interrupt to be generated. If we clear at the
++	 * end of the Isr, we may miss this newly generated interrupt. This occurs
++	 * because we transmit from within the Isr, potentially causing another
++	 * TX_EMPTY interrupt.
++	 */
++	IntrStatus = XIIF_V123B_READ_IISR(SpiPtr->BaseAddr);
++	XIIF_V123B_WRITE_IISR(SpiPtr->BaseAddr, IntrStatus);
++
++	/*
++	 * Check for mode fault error. We want to check for this error first,
++	 * before checking for progress of a transfer, since this error needs
++	 * to abort any operation in progress.
++	 */
++	if (IntrStatus & XSP_INTR_MODE_FAULT_MASK) {
++		BytesDone = SpiPtr->RequestedBytes - SpiPtr->RemainingBytes;
++		SpiPtr->Stats.ModeFaults++;
++
++		/*
++		 * Abort any operation currently in progress. This includes clearing
++		 * the mode fault condition by reading the status register. Note that
++		 * the status register should be read after the Abort since reading
++		 * the status register clears the mode fault condition and would
++		 * cause the device to restart any transfer that may be in progress.
++		 */
++		XSpi_Abort(SpiPtr);
++
++		(void)XIo_In8(SpiPtr->BaseAddr + XSP_SR_OFFSET);
++
++		SpiPtr->StatusHandler(SpiPtr->StatusRef, XST_SPI_MODE_FAULT,
++				      BytesDone);
++
++		return;		/* do not continue servicing other interrupts */
++	}
++
++	if (IntrStatus & XSP_INTR_TX_EMPTY_MASK) {
++		u16 ControlReg;
++		u8 StatusReg;
++		u8 TempData;
++
++		/*
++		 * A transmit has just completed. Process received data and check
++		 * for more data to transmit. Always inhibit the transmitter while the
++		 * Isr re-fills the transmit register/FIFO, or make sure it is stopped
++		 * if we're done.
++		 */
++		ControlReg = XIo_In16(SpiPtr->BaseAddr + XSP_CR_OFFSET);
++		XIo_Out16(SpiPtr->BaseAddr + XSP_CR_OFFSET,
++			  ControlReg | XSP_CR_TRANS_INHIBIT_MASK);
++
++		/*
++		 * First get the data received as a result of the transmit that just
++		 * completed.  We get all the data available by reading the status
++		 * register to determine when the receive register/FIFO is empty. Always
++		 * get the received data, but only fill the receive buffer if it points
++		 * to something (the upper layer software may not care to receive data).
++		 */
++		StatusReg = XIo_In8(SpiPtr->BaseAddr + XSP_SR_OFFSET);
++		while ((StatusReg & XSP_SR_RX_EMPTY_MASK) == 0) {
++			SpiPtr->Stats.BytesTransferred++;
++
++			TempData = XIo_In8(SpiPtr->BaseAddr + XSP_DRR_OFFSET);
++			if (SpiPtr->RecvBufferPtr != NULL) {
++				*SpiPtr->RecvBufferPtr++ = TempData;
++			}
++
++			StatusReg = XIo_In8(SpiPtr->BaseAddr + XSP_SR_OFFSET);
++		}
++
++		/*
++		 * See if there is more data to send
++		 */
++		if (SpiPtr->RemainingBytes > 0) {
++			/*
++			 * Fill the DTR/FIFO with as many bytes as it will take (or as many
++			 * as we have to send). We use the full status bit to know if the
++			 * device can take more data. By doing this, the driver does not
++			 * need to know the size of the FIFO or that there even is a FIFO.
++			 * The downside is that the status must be read each loop iteration.
++			 */
++			StatusReg = XIo_In8(SpiPtr->BaseAddr + XSP_SR_OFFSET);
++			while (((StatusReg & XSP_SR_TX_FULL_MASK) == 0) &&
++			       (SpiPtr->RemainingBytes > 0)) {
++				XIo_Out8(SpiPtr->BaseAddr + XSP_DTR_OFFSET,
++					 *SpiPtr->SendBufferPtr);
++
++				SpiPtr->SendBufferPtr++;
++				SpiPtr->RemainingBytes--;
++
++				StatusReg =
++				    XIo_In8(SpiPtr->BaseAddr + XSP_SR_OFFSET);
++			}
++
++			/*
++			 * Start the transfer by not inhibiting the transmitter any longer
++			 */
++			XIo_Out16(SpiPtr->BaseAddr + XSP_CR_OFFSET, ControlReg);
++		} else {
++			u32 IntrEnable;
++
++			/*
++			 * Select the slave on the SPI bus when the transfer is complete,
++			 * this is necessary for some SPI devices, such as serial EEPROMs
++			 * work correctly as chip enable may be connected to slave select
++			 */
++			XIo_Out32(SpiPtr->BaseAddr + XSP_SSR_OFFSET,
++				  SpiPtr->SlaveSelectMask);
++			/*
++			 * No more data to send.  Disable the interrupt and inform the
++			 * upper layer software that the transfer is done. The interrupt
++			 * will be re-enabled when another transfer is initiated.
++			 */
++			IntrEnable = XIIF_V123B_READ_IIER(SpiPtr->BaseAddr);
++			XIIF_V123B_WRITE_IIER(SpiPtr->BaseAddr,
++					      IntrEnable &
++					      ~XSP_INTR_TX_EMPTY_MASK);
++
++			SpiPtr->IsBusy = FALSE;
++
++			SpiPtr->StatusHandler(SpiPtr->StatusRef,
++					      XST_SPI_TRANSFER_DONE,
++					      SpiPtr->RequestedBytes);
++		}
++	}
++
++	/*
++	 * Check for slave mode fault. Simply report the error and bump stats.
++	 */
++	if (IntrStatus & XSP_INTR_SLAVE_MODE_FAULT_MASK) {
++		BytesDone = SpiPtr->RequestedBytes - SpiPtr->RemainingBytes;
++		SpiPtr->Stats.SlaveModeFaults++;
++		SpiPtr->StatusHandler(SpiPtr->StatusRef,
++				      XST_SPI_SLAVE_MODE_FAULT, BytesDone);
++	}
++
++	/*
++	 * Check for overrun and underrun errors, bump stats
++	 */
++	if (IntrStatus & XSP_INTR_RX_OVERRUN_MASK) {
++		BytesDone = SpiPtr->RequestedBytes - SpiPtr->RemainingBytes;
++		SpiPtr->Stats.RecvOverruns++;
++		SpiPtr->StatusHandler(SpiPtr->StatusRef,
++				      XST_SPI_RECEIVE_OVERRUN, BytesDone);
++	}
++
++	if (IntrStatus & XSP_INTR_TX_UNDERRUN_MASK) {
++		BytesDone = SpiPtr->RequestedBytes - SpiPtr->RemainingBytes;
++		SpiPtr->Stats.XmitUnderruns++;
++		SpiPtr->StatusHandler(SpiPtr->StatusRef,
++				      XST_SPI_TRANSMIT_UNDERRUN, BytesDone);
++	}
++}
++
++/*****************************************************************************/
++/**
++*
++* Aborts a transfer in progress by setting the stop bit in the control register,
++* then resetting the FIFOs if present. The byte counts are cleared and the
++* busy flag is set to false.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* This function does a read/modify/write of the control register. The user of
++* this function needs to take care of critical sections.
++*
++******************************************************************************/
++void XSpi_Abort(XSpi * InstancePtr)
++{
++	u16 ControlReg;
++
++	/*
++	 * Deselect the slave on the SPI bus to abort a transfer, this must be
++	 * done before the device is disabled such that the signals which are
++	 * driven by the device are changed without the device enabled
++	 */
++	XIo_Out32(InstancePtr->BaseAddr + XSP_SSR_OFFSET,
++		  InstancePtr->SlaveSelectMask);
++	/*
++	 * Abort the operation currently in progress. Clear the mode
++	 * fault condition by reading the status register (done) then
++	 * writing the control register.
++	 */
++	ControlReg = XIo_In16(InstancePtr->BaseAddr + XSP_CR_OFFSET);
++
++	/*
++	 * Stop any transmit in progress and reset the FIFOs if they exist, don't
++	 * disable the device just inhibit any data from being sent
++	 */
++	ControlReg |= XSP_CR_TRANS_INHIBIT_MASK;
++
++	if (InstancePtr->HasFifos) {
++		ControlReg |= (XSP_CR_TXFIFO_RESET_MASK |
++			       XSP_CR_RXFIFO_RESET_MASK);
++	}
++
++	XIo_Out16(InstancePtr->BaseAddr + XSP_CR_OFFSET, ControlReg);
++
++	InstancePtr->RemainingBytes = 0;
++	InstancePtr->RequestedBytes = 0;
++	InstancePtr->IsBusy = FALSE;
++}
++
++/*****************************************************************************/
++/**
++*
++* Looks up the device configuration based on the unique device ID. A table
++* contains the configuration info for each device in the system.
++*
++* @param    DeviceId contains the ID of the device to look up the configuration
++*           for.
++*
++* @return
++*
++* A pointer to the configuration found or NULL if the specified device ID was
++* not found. See xspi.h for the definition of XSpi_Config.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XSpi_Config *XSpi_LookupConfig(u16 DeviceId)
++{
++	XSpi_Config *CfgPtr = NULL;
++	int i;
++
++	for (i = 0; i < XPAR_XSPI_NUM_INSTANCES; i++) {
++		if (XSpi_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XSpi_ConfigTable[i];
++			break;
++		}
++	}
++
++	return CfgPtr;
++}
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi.h
+@@ -0,0 +1,345 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xspi.h
++*
++* This component contains the implementation of the XSpi component. It is the
++* driver for an SPI master or slave device. User documentation for the driver
++* functions is contained in this file in the form of comment blocks at the
++* front of each function.
++*
++* SPI is a 4-wire serial interface. It is a full-duplex, synchronous bus that
++* facilitates communication between one master and one slave. The device is
++* always full-duplex, which means that for every byte sent, one is received, and
++* vice-versa. The master controls the clock, so it can regulate when it wants
++* to send or receive data. The slave is under control of the master, it must
++* respond quickly since it has no control of the clock and must send/receive
++* data as fast or as slow as the master does.
++*
++* The application software between master and slave must implement a higher
++* layer protocol so that slaves know what to transmit to the master and when.
++*
++* <b>Multiple Masters</b>
++*
++* More than one master can exist, but arbitration is the responsibility of the
++* higher layer software. The device driver does not perform any type of
++* arbitration.
++*
++* <b>Multiple Slaves</b>
++*
++* Multiple slaves are supported by adding additional slave select (SS) signals
++* to each device, one for each slave on the bus. The driver ensures that only
++* one slave can be selected at any one time.
++*
++* <b>FIFOs</b>
++*
++* The SPI hardware is parameterized such that it can be built with or without
++* FIFOs. When using FIFOs, both send and receive must have FIFOs. The driver
++* will not function correctly if one direction has a FIFO but the other
++* direction does not. The frequency of the interrupts which occur is
++* proportional to the data rate such that high data rates without the FIFOs
++* could cause the software to consume large amounts of processing time. The
++* driver is designed to work with or without the FIFOs.
++*
++* <b>Interrupts</b>
++*
++* The user must connect the interrupt handler of the driver,
++* XSpi_InterruptHandler to an interrupt system such that it will be called when
++* an interrupt occurs. This function does not save and restore the processor
++* context such that the user must provide this processing.
++*
++* The driver handles the following interrupts:
++* - Data Transmit Register/FIFO Empty
++* - Data Transmit Register/FIFO Underrun
++* - Data Receive Register/FIFO Overrun
++* - Mode Fault Error
++* - Slave Mode Fault Error
++*
++* The Data Transmit Register/FIFO Empty interrupt indicates that the SPI device
++* has transmitted all the data available to transmit, and now its data register
++* (or FIFO) is empty. The driver uses this interrupt to indicate progress while
++* sending data.  The driver may have more data to send, in which case the data
++* transmit register (or FIFO) is filled for subsequent transmission. When this
++* interrupt arrives and all the data has been sent, the driver invokes the status
++* callback with a value of XST_SPI_TRANSFER_DONE to inform the upper layer
++* software that all data has been sent.
++*
++* The Data Transmit Register/FIFO Underrun interrupt indicates that, as slave,
++* the SPI device was required to transmit but there was no data available to
++* transmit in the transmit register (or FIFO). This may not be an error if the
++* master is not expecting data, but in the case where the master is expecting
++* data this serves as a notification of such a condition. The driver reports
++* this condition to the upper layer software through the status handler.
++*
++* The Data Receive Register/FIFO Overrun interrupt indicates that the SPI device
++* received data and subsequently dropped the data because the data receive
++* register (or FIFO) was full. The interrupt applies to both master and slave
++* operation. The driver reports this condition to the upper layer software
++* through the status handler. This likely indicates a problem with the higher
++* layer protocol, or a problem with the slave performance.
++*
++* The Mode Fault Error interrupt indicates that while configured as a master,
++* the device was selected as a slave by another master. This can be used by the
++* application for arbitration in a multimaster environment or to indicate a
++* problem with arbitration. When this interrupt occurs, the driver invokes the
++* status callback with a status value of XST_SPI_MODE_FAULT. It is up to the
++* application to resolve the conflict.
++*
++* The Slave Mode Fault Error interrupt indicates that a slave device was
++* selected as a slave by a master, but the slave device was disabled.  This can
++* be used during system debugging or by the slave application to learn when the
++* slave application has not prepared for a master operation in a timely fashion.
++* This likely indicates a problem with the higher layer protocol, or a problem
++* with the slave performance.
++*
++* Note that during the FPGA implementation process, the interrupt registers of
++* the IPIF can be parameterized away.  This driver is currently dependent on
++* those interrupt registers and will not function without them.
++*
++* <b>Polled Operation</b>
++*
++* Currently there is no support for polled operation.
++*
++* <b>Device Busy</b>
++*
++* Some operations are disallowed when the device is busy. The driver tracks
++* whether a device is busy. The device is considered busy when a data transfer
++* request is outstanding, and is considered not busy only when that transfer
++* completes (or is aborted with a mode fault error). This applies to both
++* master and slave devices.
++*
++* <b>Device Configuration</b>
++*
++* The device can be configured in various ways during the FPGA implementation
++* process. Configuration parameters are stored in the xspi_g.c file. A table
++* is defined where each entry contains configuration information for an SPI
++* device. This information includes such things as the base address of the
++* memory-mapped device, the base address of the IPIF module within the device,
++* the number of slave select bits in the device, and whether the device has
++* FIFOs and is configured as slave-only.
++*
++* <b>RTOS Independence</b>
++*
++* This driver is intended to be RTOS and processor independent.  It works
++* with physical addresses only.  Any needs for dynamic memory management,
++* threads or thread mutual exclusion, virtual memory, or cache control must
++* be satisfied by the layer above this driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  10/11/01 First release
++* 1.00b jhl  03/14/02 Repartitioned driver for smaller files.
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XSPI_H			/* prevent circular inclusions */
++#define XSPI_H			/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++
++/************************** Constant Definitions *****************************/
++
++/** @name Configuration options
++ *
++ * The following options may be specified or retrieved for the device and
++ * enable/disable additional features of the SPI.  Each of the options
++ * are bit fields, so more than one may be specified.
++ *
++ * @{
++ */
++/**
++ * <pre>
++ * The Master option configures the SPI device as a master. By default, the
++ * device is a slave.
++ *
++ * The Active Low Clock option configures the device's clock polarity. Setting
++ * this option means the clock is active low and the SCK signal idles high. By
++ * default, the clock is active high and SCK idles low.
++ *
++ * The Clock Phase option configures the SPI device for one of two transfer
++ * formats.  A clock phase of 0, the default, means data if valid on the first
++ * SCK edge (rising or falling) after the slave select (SS) signal has been
++ * asserted. A clock phase of 1 means data is valid on the second SCK edge
++ * (rising or falling) after SS has been asserted.
++ *
++ * The Loopback option configures the SPI device for loopback mode.  Data is
++ * looped back from the transmitter to the receiver.
++ *
++ * The Manual Slave Select option, which is default, causes the device not
++ * to automatically drive the slave select.  The driver selects the device
++ * at the start of a transfer and deselects it at the end of a transfer.
++ * If this option is off, then the device automatically toggles the slave
++ * select signal between bytes in a transfer.
++ * </pre>
++ */
++#define XSP_MASTER_OPTION           0x1
++#define XSP_CLK_ACTIVE_LOW_OPTION   0x2
++#define XSP_CLK_PHASE_1_OPTION      0x4
++#define XSP_LOOPBACK_OPTION         0x8
++#define XSP_MANUAL_SSELECT_OPTION   0x10
++/*@}*/
++
++/**************************** Type Definitions *******************************/
++
++/**
++ * The handler data type allows the user to define a callback function to
++ * handle the asynchronous processing of the SPI driver.  The application using
++ * this driver is expected to define a handler of this type to support interrupt
++ * driven mode.  The handler executes in an interrupt context such that minimal
++ * processing should be performed.
++ *
++ *  @param CallBackRef   A callback reference passed in by the upper layer when
++ *                       setting the callback functions, and passed back to the
++ *                       upper layer when the callback is invoked. Its type is
++ *                       unimportant to the driver component, so it is a void
++ *                       pointer.
++ *  @param StatusEvent   Indicates one or more status events that occurred. See
++ *                       the XSpi_SetStatusHandler() for details on the status
++ *                       events that can be passed in the callback.
++ *  @param ByteCount     Indicates how many bytes of data were successfully
++ *                       transferred.  This may be less than the number of bytes
++ *                       requested if the status event indicates an error.
++ */
++typedef void (*XSpi_StatusHandler) (void *CallBackRef, u32 StatusEvent,
++				    unsigned int ByteCount);
++
++/**
++ * XSpi statistics
++ */
++typedef struct {
++	u32 ModeFaults;	    /**< Number of mode fault errors */
++	u32 XmitUnderruns;  /**< Number of transmit underruns */
++	u32 RecvOverruns;   /**< Number of receive overruns */
++	u32 SlaveModeFaults;/**< Number of selects as a slave while disabled */
++	u32 BytesTransferred;
++			    /**< Number of bytes transferred */
++	u32 NumInterrupts;  /**< Number of transmit/receive interrupts */
++} XSpi_Stats;
++
++/**
++ * This typedef contains configuration information for the device.
++ */
++typedef struct {
++	u16 DeviceId;	/**< Unique ID  of device */
++	u32 BaseAddress;/**< Base address of the device */
++
++	/* Device capabilities */
++	u32 HasFifos;  /**< Does device have FIFOs? */
++	u32 SlaveOnly; /**< Is the device slave only? */
++	u8 NumSlaveBits;/**< Number of slave select bits on the device */
++} XSpi_Config;
++
++/**
++ * The XSpi driver instance data. The user is required to allocate a
++ * variable of this type for every SPI device in the system. A pointer
++ * to a variable of this type is then passed to the driver API functions.
++ */
++typedef struct {
++	XSpi_Stats Stats;	/* Statistics */
++	u32 BaseAddr;		/* Base address of device (IPIF) */
++	u32 IsReady;		/* Device is initialized and ready */
++	u32 IsStarted;		/* Device has been started */
++	u32 HasFifos;		/* Device is configured with FIFOs or not */
++	u32 SlaveOnly;		/* Device is configured to be slave only */
++	u8 NumSlaveBits;	/* Number of slave selects for this device */
++	u32 SlaveSelectMask;	/* Mask that matches the number of SS bits */
++	u32 SlaveSelectReg;	/* Slave select register */
++
++	u8 *SendBufferPtr;	/* Buffer to send (state) */
++	u8 *RecvBufferPtr;	/* Buffer to receive (state) */
++	unsigned int RequestedBytes;	/* Number of bytes to transfer (state) */
++	unsigned int RemainingBytes;	/* Number of bytes left to transfer (state) */
++	u32 IsBusy;		/* A transfer is in progress (state) */
++
++	XSpi_StatusHandler StatusHandler;
++	void *StatusRef;	/* Callback reference for status handler */
++
++} XSpi;
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++/*
++ * required functions, in xspi.c
++ */
++XStatus XSpi_Initialize(XSpi * InstancePtr, u16 DeviceId);
++
++XStatus XSpi_Start(XSpi * InstancePtr);
++XStatus XSpi_Stop(XSpi * InstancePtr);
++
++void XSpi_Reset(XSpi * InstancePtr);
++
++XStatus XSpi_SetSlaveSelect(XSpi * InstancePtr, u32 SlaveMask);
++u32 XSpi_GetSlaveSelect(XSpi * InstancePtr);
++
++XStatus XSpi_Transfer(XSpi * InstancePtr, u8 * SendBufPtr, u8 * RecvBufPtr,
++		      unsigned int ByteCount);
++
++void XSpi_SetStatusHandler(XSpi * InstancePtr, void *CallBackRef,
++			   XSpi_StatusHandler FuncPtr);
++void XSpi_InterruptHandler(void *InstancePtr);
++XSpi_Config *XSpi_LookupConfig(u16 DeviceId);
++
++/*
++ * functions for selftest, in xspi_selftest.c
++ */
++XStatus XSpi_SelfTest(XSpi * InstancePtr);
++
++/*
++ * functions for statistics, in xspi_stats.c
++ */
++void XSpi_GetStats(XSpi * InstancePtr, XSpi_Stats * StatsPtr);
++void XSpi_ClearStats(XSpi * InstancePtr);
++
++/*
++ * functions for options, in xspi_options.c
++ */
++XStatus XSpi_SetOptions(XSpi * InstancePtr, u32 Options);
++u32 XSpi_GetOptions(XSpi * InstancePtr);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi_i.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi_i.h
+@@ -0,0 +1,142 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xspi_i.h
++*
++* This header file contains internal identifiers. It is intended for internal
++* use only.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  10/11/01 First release
++* 1.00b jhl  03/14/02 Repartitioned driver for smaller files.
++* 1.00b rpm  04/24/02 Moved register definitions to xspi_l.h
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XSPI_I_H		/* prevent circular inclusions */
++#define XSPI_I_H		/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xspi_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/*
++ * IPIF SPI device interrupt mask. This mask is for the Device Interrupt
++ * Register within the IPIF.
++ */
++#define XSP_IPIF_SPI_MASK   0x4UL
++
++#define XSP_IPIF_DEVICE_INTR_COUNT  3	/* Number of interrupt sources */
++#define XSP_IPIF_IP_INTR_COUNT      6	/* Number of SPI interrupts
++					 * note that there are 7 interrupts in
++					 * the h/w but s/w does not use the
++					 * half empty which only exists when
++					 * there are FIFOs, this allows the IPIF
++					 * self test to pass with or without
++					 * FIFOs */
++/*
++ * IPIF SPI IP interrupt masks. These masks are for the IP Interrupt Register
++ * within the IPIF.
++ */
++#define XSP_INTR_MODE_FAULT_MASK        0x1UL	/* Mode fault error */
++#define XSP_INTR_SLAVE_MODE_FAULT_MASK  0x2UL	/* Selected as slave while
++						 * disabled */
++#define XSP_INTR_TX_EMPTY_MASK          0x4UL	/* DTR/TxFIFO is empty */
++#define XSP_INTR_TX_UNDERRUN_MASK       0x8UL	/* DTR/TxFIFO was underrun */
++#define XSP_INTR_RX_FULL_MASK          0x10UL	/* DRR/RxFIFO is full */
++#define XSP_INTR_RX_OVERRUN_MASK       0x20UL	/* DRR/RxFIFO was overrun */
++#define XSP_INTR_TX_HALF_EMPTY_MASK    0x40UL	/* TxFIFO is half empty */
++
++/*
++ * The interrupts we want at startup. We add the TX_EMPTY interrupt in later
++ * when we're getting ready to transfer data.  The others we don't care
++ * about for now.
++ */
++#define XSP_INTR_DFT_MASK       (XSP_INTR_MODE_FAULT_MASK |     \
++                                 XSP_INTR_TX_UNDERRUN_MASK |    \
++                                 XSP_INTR_RX_OVERRUN_MASK |     \
++                                 XSP_INTR_SLAVE_MODE_FAULT_MASK)
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/*****************************************************************************/
++/*
++*
++* Clear the statistics of the driver instance.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return   None.
++*
++* @note
++*
++* Signature: void XSpi_mClearStats(XSpi *InstancePtr)
++*
++*****************************************************************************/
++#define XSpi_mClearStats(InstancePtr) \
++{                                           \
++    InstancePtr->Stats.ModeFaults = 0;      \
++    InstancePtr->Stats.XmitUnderruns = 0;   \
++    InstancePtr->Stats.RecvOverruns = 0;    \
++    InstancePtr->Stats.SlaveModeFaults = 0; \
++    InstancePtr->Stats.BytesTransferred = 0;\
++    InstancePtr->Stats.NumInterrupts = 0;   \
++}
++
++/************************** Function Prototypes ******************************/
++
++void XSpi_Abort(XSpi * InstancePtr);
++
++/************************** Variable Definitions *****************************/
++
++extern XSpi_Config XSpi_ConfigTable[];
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi_l.h
+@@ -0,0 +1,301 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xspi_l.h
++*
++* This header file contains identifiers and low-level driver functions (or
++* macros) that can be used to access the device.  High-level driver functions
++* are defined in xspi.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00b rpm  04/24/02 First release
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XSPI_L_H		/* prevent circular inclusions */
++#define XSPI_L_H		/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++
++/************************** Constant Definitions *****************************/
++
++/*
++ * Offset from the device base address (IPIF) to the IP registers.
++ */
++#define XSP_REGISTER_OFFSET      0x60
++
++/*
++ * Register offsets for the SPI. Each register except the CR & SSR is 8 bits,
++ * so add 3 to the word-offset to get the LSB (in a big-endian system).
++ */
++#define XSP_CR_OFFSET   (XSP_REGISTER_OFFSET + 0x2)	/* 16-bit Control */
++#define XSP_SR_OFFSET   (XSP_REGISTER_OFFSET + 0x4 + 3)	/* Status */
++#define XSP_DTR_OFFSET  (XSP_REGISTER_OFFSET + 0x8 + 3)	/* Data transmit */
++#define XSP_DRR_OFFSET  (XSP_REGISTER_OFFSET + 0xC + 3)	/* Data receive */
++#define XSP_SSR_OFFSET  (XSP_REGISTER_OFFSET + 0x10)	/* 32-bit slave select */
++#define XSP_TFO_OFFSET  (XSP_REGISTER_OFFSET + 0x14 + 3)	/* Transmit FIFO occupancy */
++#define XSP_RFO_OFFSET  (XSP_REGISTER_OFFSET + 0x18 + 3)	/* Receive FIFO occupancy */
++
++/*
++ * SPI Control Register (CR) masks
++ */
++#define XSP_CR_LOOPBACK_MASK        0x1	/* Local loopback mode */
++#define XSP_CR_ENABLE_MASK          0x2	/* System enable */
++#define XSP_CR_MASTER_MODE_MASK     0x4	/* Enable master mode */
++#define XSP_CR_CLK_POLARITY_MASK    0x8	/* Clock polarity high or low */
++#define XSP_CR_CLK_PHASE_MASK      0x10	/* Clock phase 0 or 1 */
++#define XSP_CR_TXFIFO_RESET_MASK   0x20	/* Reset transmit FIFO */
++#define XSP_CR_RXFIFO_RESET_MASK   0x40	/* Reset receive FIFO */
++#define XSP_CR_MANUAL_SS_MASK      0x80	/* Manual slave select assertion */
++#define XSP_CR_TRANS_INHIBIT_MASK  0x100	/* Master transaction inhibit */
++
++/*
++ * SPI Status Register (SR) masks
++ */
++#define XSP_SR_RX_EMPTY_MASK        0x1	/* Receive register/FIFO is empty */
++#define XSP_SR_RX_FULL_MASK         0x2	/* Receive register/FIFO is full */
++#define XSP_SR_TX_EMPTY_MASK        0x4	/* Transmit register/FIFO is empty */
++#define XSP_SR_TX_FULL_MASK         0x8	/* Transmit register/FIFO is full */
++#define XSP_SR_MODE_FAULT_MASK     0x10	/* Mode fault error */
++
++/*
++ * SPI Transmit FIFO Occupancy (TFO) mask. The binary value plus one yields
++ * the occupancy.
++ */
++#define XSP_TFO_MASK        0x1F
++
++/*
++ * SPI Receive FIFO Occupancy (RFO) mask. The binary value plus one yields
++ * the occupancy.
++ */
++#define XSP_RFO_MASK        0x1F
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/*****************************************************************************
++*
++* Low-level driver macros.  The list below provides signatures to help the
++* user use the macros.
++*
++* void XSpi_mSetControlReg(u32 BaseAddress, u16 Mask)
++* u16 XSpi_mGetControlReg(u32 BaseAddress)
++* u8 XSpi_mGetStatusReg(u32 BaseAddress)
++*
++* void XSpi_mSetSlaveSelectReg(u32 BaseAddress, u32 Mask)
++* u32 XSpi_mGetSlaveSelectReg(u32 BaseAddress)
++*
++* void XSpi_mEnable(u32 BaseAddress)
++* void XSpi_mDisable(u32 BaseAddress)
++*
++* void XSpi_mSendByte(u32 BaseAddress, u8 Data);
++* u8 XSpi_mRecvByte(u32 BaseAddress);
++*
++*****************************************************************************/
++
++/****************************************************************************/
++/**
++*
++* Set the contents of the control register. Use the XSP_CR_* constants defined
++* above to create the bit-mask to be written to the register.
++*
++* @param    BaseAddress is the base address of the device
++* @param    Mask is the 16-bit value to write to the control register
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mSetControlReg(BaseAddress, Mask) \
++                    XIo_Out16((BaseAddress) + XSP_CR_OFFSET, (Mask))
++
++/****************************************************************************/
++/**
++*
++* Get the contents of the control register. Use the XSP_CR_* constants defined
++* above to interpret the bit-mask returned.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   A 16-bit value representing the contents of the control register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mGetControlReg(BaseAddress) \
++                    XIo_In16((BaseAddress) + XSP_CR_OFFSET)
++
++/****************************************************************************/
++/**
++*
++* Get the contents of the status register. Use the XSP_SR_* constants defined
++* above to interpret the bit-mask returned.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   An 8-bit value representing the contents of the status register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mGetStatusReg(BaseAddress) \
++                    XIo_In8((BaseAddress) + XSP_SR_OFFSET)
++
++/****************************************************************************/
++/**
++*
++* Set the contents of the slave select register. Each bit in the mask
++* corresponds to a slave select line. Only one slave should be selected at
++* any one time.
++*
++* @param    BaseAddress is the  base address of the device
++* @param    Mask is the 32-bit value to write to the slave select register
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mSetSlaveSelectReg(BaseAddress, Mask) \
++                    XIo_Out32((BaseAddress) + XSP_SSR_OFFSET, (Mask))
++
++/****************************************************************************/
++/**
++*
++* Get the contents of the slave select register. Each bit in the mask
++* corresponds to a slave select line. Only one slave should be selected at
++* any one time.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   The 32-bit value in the slave select register
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mGetSlaveSelectReg(BaseAddress) \
++                    XIo_In32((BaseAddress) + XSP_SSR_OFFSET)
++
++/****************************************************************************/
++/**
++*
++* Enable the device and uninhibit master transactions. Preserves the current
++* contents of the control register.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mEnable(BaseAddress) \
++{ \
++    u16 Control; \
++    Control = XSpi_mGetControlReg((BaseAddress)); \
++    Control |= XSP_CR_ENABLE_MASK; \
++    Control &= ~XSP_CR_TRANS_INHIBIT_MASK; \
++    XSpi_mSetControlReg((BaseAddress), Control); \
++}
++
++/****************************************************************************/
++/**
++*
++* Disable the device. Preserves the current contents of the control register.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mDisable(BaseAddress) \
++             XSpi_mSetControlReg((BaseAddress), \
++                     XSpi_mGetControlReg((BaseAddress)) & ~XSP_CR_ENABLE_MASK)
++
++/****************************************************************************/
++/**
++*
++* Send one byte to the currently selected slave. The byte that is received
++* from the slave is saved in the receive FIFO/register.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mSendByte(BaseAddress, Data) \
++                XIo_Out8((BaseAddress) + XSP_DTR_OFFSET, (Data))
++
++/****************************************************************************/
++/**
++*
++* Receive one byte from the device's receive FIFO/register. It is assumed
++* that the byte is already available.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   The byte retrieved from the receive FIFO/register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XSpi_mRecvByte(BaseAddress) \
++                XIo_In8((BaseAddress) + XSP_DRR_OFFSET)
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi_options.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi_options.c
+@@ -0,0 +1,215 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xspi_options.c
++*
++* Contains functions for the configuration of the XSpi driver component.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00b jhl  2/27/02  First release
++* 1.00b rpm  04/25/02 Collapsed IPIF and reg base addresses into one
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xspi.h"
++#include "xspi_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++/*
++ * Create the table of options which are processed to get/set the device
++ * options. These options are table driven to allow easy maintenance and
++ * expansion of the options.
++ */
++typedef struct {
++	u32 Option;
++	u16 Mask;
++} OptionsMap;
++
++static OptionsMap OptionsTable[] = {
++	{XSP_LOOPBACK_OPTION, XSP_CR_LOOPBACK_MASK},
++	{XSP_CLK_ACTIVE_LOW_OPTION, XSP_CR_CLK_POLARITY_MASK},
++	{XSP_CLK_PHASE_1_OPTION, XSP_CR_CLK_PHASE_MASK},
++	{XSP_MASTER_OPTION, XSP_CR_MASTER_MODE_MASK},
++	{XSP_MANUAL_SSELECT_OPTION, XSP_CR_MANUAL_SS_MASK}
++};
++
++#define XSP_NUM_OPTIONS      (sizeof(OptionsTable) / sizeof(OptionsMap))
++
++/*****************************************************************************/
++/**
++*
++* This function sets the options for the SPI device driver. The options control
++* how the device behaves relative to the SPI bus. The device must be idle
++* rather than busy transferring data before setting these device options.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++* @param    Options contains the specified options to be set. This is a bit
++*           mask where a 1 means to turn the option on, and a 0 means to turn
++*           the option off. One or more bit values may be contained in the mask.
++*           See the bit definitions named XSP_*_OPTIONS in the file xspi.h.
++*
++* @return
++*
++* XST_SUCCESS if options are successfully set.  Otherwise, returns:
++* - XST_DEVICE_BUSY if the device is currently transferring data. The transfer
++*   must complete or be aborted before setting options.
++* - XST_SPI_SLAVE_ONLY if the caller attempted to configure a slave-only
++*   device as a master.
++*
++* @note
++*
++* This function makes use of internal resources that are shared between the
++* XSpi_Stop() and XSpi_SetOptions() functions. So if one task might be setting
++* device options options while another is trying to stop the device, the user
++* is required to provide protection of this shared data (typically using a
++* semaphore).
++*
++******************************************************************************/
++XStatus XSpi_SetOptions(XSpi * InstancePtr, u32 Options)
++{
++	u16 ControlReg;
++	int Index;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Do not allow the slave select to change while a transfer is in progress.
++	 * No need to worry about a critical section here since even if the Isr
++	 * changes the busy flag just after we read it, the function will return
++	 * busy and the caller can retry when notified that their current transfer
++	 * is done.
++	 */
++	if (InstancePtr->IsBusy) {
++		return XST_DEVICE_BUSY;
++	}
++	/*
++	 * Do not allow master option to be set if the device is slave only
++	 */
++	if ((Options & XSP_MASTER_OPTION) && (InstancePtr->SlaveOnly)) {
++		return XST_SPI_SLAVE_ONLY;
++	}
++
++	ControlReg = XIo_In16(InstancePtr->BaseAddr + XSP_CR_OFFSET);
++
++	/*
++	 * Loop through the options table, turning the option on or off
++	 * depending on whether the bit is set in the incoming options flag.
++	 */
++	for (Index = 0; Index < XSP_NUM_OPTIONS; Index++) {
++		if (Options & OptionsTable[Index].Option) {
++			ControlReg |= OptionsTable[Index].Mask;	/* turn it on */
++		} else {
++			ControlReg &= ~OptionsTable[Index].Mask;	/* turn it off */
++		}
++	}
++
++	/*
++	 * Now write the control register. Leave it to the upper layers
++	 * to restart the device.
++	 */
++	XIo_Out16(InstancePtr->BaseAddr + XSP_CR_OFFSET, ControlReg);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function gets the options for the SPI device. The options control how
++* the device behaves relative to the SPI bus.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* Options contains the specified options to be set. This is a bit mask where a
++* 1 means to turn the option on, and a 0 means to turn the option off. One or
++* more bit values may be contained in the mask. See the bit definitions named
++* XSP_*_OPTIONS in the file xspi.h.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u32 XSpi_GetOptions(XSpi * InstancePtr)
++{
++	u32 OptionsFlag = 0;
++	u16 ControlReg;
++	int Index;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Get the control register to determine which options are currently set.
++	 */
++	ControlReg = XIo_In16(InstancePtr->BaseAddr + XSP_CR_OFFSET);
++
++	/*
++	 * Loop through the options table to determine which options are set
++	 */
++	for (Index = 0; Index < XSP_NUM_OPTIONS; Index++) {
++		if (ControlReg & OptionsTable[Index].Mask) {
++			OptionsFlag |= OptionsTable[Index].Option;
++		}
++	}
++
++	return OptionsFlag;
++}
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi_stats.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi_stats.c
+@@ -0,0 +1,127 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xspi_stats.c
++*
++* This component contains the implementation of statistics functions for the
++* XSpi driver component.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00b jhl  03/14/02 First release
++* 1.00b rpm  04/25/02 Changed macro naming convention
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xspi.h"
++#include "xspi_i.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++/*****************************************************************************/
++/**
++*
++* Gets a copy of the statistics for an SPI device.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++* @param    StatsPtr is a pointer to a XSpi_Stats structure which will get a
++*           copy of current statistics.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSpi_GetStats(XSpi * InstancePtr, XSpi_Stats * StatsPtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(StatsPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	StatsPtr->ModeFaults = InstancePtr->Stats.ModeFaults;
++	StatsPtr->XmitUnderruns = InstancePtr->Stats.XmitUnderruns;
++	StatsPtr->RecvOverruns = InstancePtr->Stats.RecvOverruns;
++	StatsPtr->SlaveModeFaults = InstancePtr->Stats.SlaveModeFaults;
++	StatsPtr->BytesTransferred = InstancePtr->Stats.BytesTransferred;
++	StatsPtr->NumInterrupts = InstancePtr->Stats.NumInterrupts;
++}
++
++/*****************************************************************************/
++/**
++*
++* Clears the statistics for the SPI device.
++*
++* @param    InstancePtr is a pointer to the XSpi instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSpi_ClearStats(XSpi * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	XSpi_mClearStats(InstancePtr);
++}
+Index: linux-2.6.10/mvl_patches/pro-0359.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0359.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(359);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

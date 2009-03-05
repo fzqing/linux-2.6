@@ -1,0 +1,1959 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_ps2
+# Date: Mon Mar  6 15:02:35 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 15265
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for PS/2 IP.
+#     Taken from EDK 7.1i SP2.
+# 
+
+PATCHNUM=335
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 15265
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for PS/2 IP.
+    Taken from EDK 7.1i SP2.
+
+ drivers/input/serio/xilinx_ps2/xps2.c      |  499 +++++++++++++++++++++++++++++
+ drivers/input/serio/xilinx_ps2/xps2.h      |  226 +++++++++++++
+ drivers/input/serio/xilinx_ps2/xps2_i.h    |  105 ++++++
+ drivers/input/serio/xilinx_ps2/xps2_intr.c |  484 ++++++++++++++++++++++++++++
+ drivers/input/serio/xilinx_ps2/xps2_l.c    |  114 ++++++
+ drivers/input/serio/xilinx_ps2/xps2_l.h    |  261 +++++++++++++++
+ mvl_patches/pro-0335.c                     |   16 
+ 7 files changed, 1705 insertions(+)
+
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2.c
+@@ -0,0 +1,499 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++*
++* @file xps2.c
++*
++* This file contains the required functions for the PS/2 driver.
++* Refer to the header file xps2.h for more detailed information.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   06/18/02 First release
++* 1.00a rmm  05/14/03 Fixed diab compiler warnings relating to asserts.
++* </pre>
++*
++*****************************************************************************/
++
++/***************************** Include Files ********************************/
++
++#include "xstatus.h"
++#include "xparameters.h"
++#include "xps2.h"
++#include "xps2_i.h"
++#include "xps2_l.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++/************************** Function Prototypes *****************************/
++
++static void XPs2_StubHandler(void *CallBackRef, u32 Event,
++			     unsigned int ByteCount);
++
++/****************************************************************************/
++/**
++*
++* Initializes a specific PS/2 instance such that it is ready to be used.
++* The default operating mode of the driver is polled mode.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++* @param    DeviceId is the unique id of the device controlled by this
++*           XPs2 instance. Passing in a device id associates the generic
++*           XPs2 instance to a specific device, as chosen by the caller
++*           or application developer.
++*
++* @return
++*
++* - XST_SUCCESS if initialization was successful
++* - XST_DEVICE_NOT_FOUND if the device ID could not be found in the
++*           configuration table
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++XStatus XPs2_Initialize(XPs2 * InstancePtr, u16 DeviceId)
++{
++	XPs2_Config *Ps2ConfigPtr;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/*
++	 * Lookup the device configuration in the temporary CROM table. Use this
++	 * configuration info down below when initializing this component.
++	 */
++	Ps2ConfigPtr = XPs2_LookupConfig(DeviceId);
++
++	if (Ps2ConfigPtr == (XPs2_Config *) NULL) {
++		return XST_DEVICE_NOT_FOUND;
++	}
++
++	/*
++	 * Setup the data that is from the configuration information
++	 */
++	InstancePtr->BaseAddress = Ps2ConfigPtr->BaseAddress;
++
++	/*
++	 * Initialize the instance data to some default values and setup a default
++	 * handler
++	 */
++	InstancePtr->Handler = XPs2_StubHandler;
++
++	InstancePtr->SendBuffer.NextBytePtr = NULL;
++	InstancePtr->SendBuffer.RemainingBytes = 0;
++	InstancePtr->SendBuffer.RequestedBytes = 0;
++
++	InstancePtr->ReceiveBuffer.NextBytePtr = NULL;
++	InstancePtr->ReceiveBuffer.RemainingBytes = 0;
++	InstancePtr->ReceiveBuffer.RequestedBytes = 0;
++
++	/*
++	 * Reset the PS/2 Hardware
++	 */
++	XPs2_mReset(InstancePtr->BaseAddress);
++
++	/*
++	 * Disable all PS/2 interrupts
++	 */
++	XPs2_mDisableIntr(InstancePtr->BaseAddress, XPS2_INT_ALL);
++
++	/*
++	 * Indicate the instance is now ready to use, initialized without error
++	 */
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++
++	return XST_SUCCESS;
++}
++
++/****************************************************************************/
++/**
++*
++* This functions sends the specified buffer of data to the PS/2 port in either
++* polled or interrupt driven modes. This function is non-blocking such that it
++* will return before the data has been sent thorugh PS/2. If the port is busy
++* sending data, it will return and indicate zero bytes were sent.
++*
++* In a polled mode, this function will only send 1 byte which is as much data
++* as the transmitter can buffer. The application may need to call it
++* repeatedly to send a buffer.
++*
++* In interrupt mode, this function will start sending the specified buffer and
++* then the interrupt handler of the driver will continue sending data until the
++* buffer has been sent. A callback function, as specified by the application,
++* will be called to indicate the completion of sending the buffer.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++* @param    BufferPtr is pointer to a buffer of data to be sent.
++* @param    NumBytes contains the number of bytes to be sent. A value of zero
++*           will stop a previous send operation that is in progress in interrupt
++*           mode. Any data that was already put into the transmit FIFO will be
++*           sent.
++*
++* @return
++*
++* The number of bytes actually sent.
++*
++* @note
++*
++* The number of bytes is not asserted so that this function may be called with
++* a value of zero to stop an operation that is already in progress.
++* <br><br>
++* This function modifies shared data such that there may be a need for mutual
++* exclusion in a multithreaded environment
++*
++*****************************************************************************/
++unsigned int XPs2_Send(XPs2 * InstancePtr, u8 * BufferPtr,
++		       unsigned int NumBytes)
++{
++	unsigned int BytesSent;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(BufferPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Enter a critical region by disabling the PS/2 transmit interrupts to
++	 * allow this call to stop a previous operation that may be interrupt
++	 * driven, only stop the transmit interrupt since this critical region is
++	 * not really exited in the normal manner
++	 */
++	XPs2_mDisableIntr(InstancePtr->BaseAddress, XPS2_INT_TX_ALL);
++
++	/*
++	 * Setup the specified buffer to be sent by setting the instance
++	 * variables so it can be sent with polled or interrupt mode
++	 */
++	InstancePtr->SendBuffer.RequestedBytes = NumBytes;
++	InstancePtr->SendBuffer.RemainingBytes = NumBytes;
++	InstancePtr->SendBuffer.NextBytePtr = BufferPtr;
++
++	/*
++	 * Send the buffer and return the number of bytes sent
++	 */
++	BytesSent = XPs2_SendBuffer(InstancePtr);
++
++	/*
++	 * The critical region is not exited in this function because of the way
++	 * the transmit interrupts work. The other function called enables the
++	 * transmit interrupt such that this function can't restore a value to the
++	 * interrupt enable register and does not need to exit the critical region
++	 */
++	return BytesSent;
++}
++
++/****************************************************************************/
++/**
++*
++* This function will attempt to receive a specified number of bytes of data
++* from PS/2 and store it into the specified buffer. This function is
++* designed for either polled or interrupt driven modes. It is non-blocking
++* such that it will return if no data has already received by the PS/2 port.
++*
++* In a polled mode, this function will only receive 1 byte which is as much
++* data as the receiver can buffer. The application may need to call it
++* repeatedly to receive a buffer. Polled mode is the default mode of
++* operation for the driver.
++*
++* In interrupt mode, this function will start receiving and then the interrupt
++* handler of the driver will continue receiving data until the buffer has been
++* received. A callback function, as specified by the application, will be called
++* to indicate the completion of receiving the buffer or when any receive errors
++* or timeouts occur. Interrupt mode must be enabled.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++* @param    BufferPtr is pointer to buffer for data to be received into
++* @param    NumBytes is the number of bytes to be received. A value of zero will
++*           stop a previous receive operation that is in progress in interrupt mode.
++*
++* @return
++*
++* The number of bytes received.
++*
++* @note
++*
++* The number of bytes is not asserted so that this function may be called with
++* a value of zero to stop an operation that is already in progress.
++*
++*****************************************************************************/
++unsigned int XPs2_Recv(XPs2 * InstancePtr, u8 * BufferPtr,
++		       unsigned int NumBytes)
++{
++	unsigned int ReceivedCount;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(BufferPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Setup the specified buffer to be sent by setting the instance
++	 * variables so it can be sent with polled or interrupt mode
++	 */
++	InstancePtr->ReceiveBuffer.RequestedBytes = NumBytes;
++	InstancePtr->ReceiveBuffer.RemainingBytes = NumBytes;
++	InstancePtr->ReceiveBuffer.NextBytePtr = BufferPtr;
++
++	/*
++	 * Receive the data from PS/2 and return the number of bytes
++	 * received
++	 */
++	ReceivedCount = XPs2_ReceiveBuffer(InstancePtr);
++
++	return ReceivedCount;
++}
++
++/****************************************************************************/
++/**
++*
++* This function sends a buffer that has been previously specified by setting
++* up the instance variables of the instance. This function is designed to be
++* an internal function for the XPs2 component such that it may be called
++* from a shell function that sets up the buffer or from an interrupt handler.
++*
++* This function sends the specified buffer of data to the PS/2 port in either
++* polled or interrupt driven modes. This function is non-blocking such that
++* it will return before the data has been sent.
++*
++* In a polled mode, this function will only send 1 byte which is as much data
++* transmitter can buffer. The application may need to call it repeatedly to
++* send a buffer.
++*
++* In interrupt mode, this function will start sending the specified buffer and
++* then the interrupt handler of the driver will continue until the buffer
++* has been sent. A callback function, as specified by the application, will
++* be called to indicate the completion of sending the buffer.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* NumBytes is the number of bytes actually sent
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++unsigned int XPs2_SendBuffer(XPs2 * InstancePtr)
++{
++	unsigned int SentCount = 0;
++
++	/*
++	 * If the transmitter is empty send one byte of data
++	 */
++	if (!XPs2_mIsTransmitFull(InstancePtr->BaseAddress)) {
++		XPs2_SendByte(InstancePtr->BaseAddress,
++			      InstancePtr->SendBuffer.NextBytePtr[SentCount]);
++
++		SentCount = 1;
++	}
++	/*
++	 * Update the buffer to reflect the bytes that were sent
++	 * from it
++	 */
++	InstancePtr->SendBuffer.NextBytePtr += SentCount;
++	InstancePtr->SendBuffer.RemainingBytes -= SentCount;
++
++	/*
++	 * If interrupts are enabled as indicated by the receive interrupt, then
++	 * enable the transmit interrupt
++	 */
++	if (XPs2_mIsIntrEnabled((InstancePtr->BaseAddress), XPS2_INT_RX_FULL)) {
++		XPs2_mEnableIntr(InstancePtr->BaseAddress, XPS2_INT_TX_ALL |
++				 XPS2_INT_WDT_TOUT);
++	}
++
++	return SentCount;
++}
++
++/****************************************************************************/
++/**
++*
++* This function receives a buffer that has been previously specified by setting
++* up the instance variables of the instance. This function is designed to be
++* an internal function for the XPs2 component such that it may be called
++* from a shell function that sets up the buffer or from an interrupt handler.
++*
++* This function will attempt to receive a specified number of bytes of data
++* from PS/2 and store it into the specified buffer. This function is
++* designed for either polled or interrupt driven modes. It is non-blocking
++* such that it will return if there is no data has already received.
++*
++* In a polled mode, this function will only receive 1 byte which is as much
++* data as the receiver can buffer. The application may need to call it
++* repeatedly to receive a buffer. Polled mode is the default mode of operation
++* for the driver.
++*
++* In interrupt mode, this function will start receiving and then the interrupt
++* handler of the driver will continue until the buffer has been received. A
++* callback function, as specified by the application, will be called to indicate
++* the completion of receiving the buffer or when any receive errors or timeouts
++* occur. Interrupt mode must be enabled using the SetOptions function.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* The number of bytes received.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++unsigned int XPs2_ReceiveBuffer(XPs2 * InstancePtr)
++{
++	unsigned int ReceivedCount = 0;
++
++	/*
++	 * Loop until there is no more date buffered by the PS/2 receiver or the
++	 * specified number of bytes has been received
++	 */
++	while (ReceivedCount < InstancePtr->ReceiveBuffer.RemainingBytes) {
++		/*
++		 * If there is data ready to be read , then put the next byte
++		 * read into the specified buffer
++		 */
++		if (!XPs2_mIsReceiveEmpty(InstancePtr->BaseAddress)) {
++			InstancePtr->ReceiveBuffer.
++			    NextBytePtr[ReceivedCount++] =
++			    XPs2_RecvByte(InstancePtr->BaseAddress);
++		}
++
++		/*
++		 * There is no more data buffered, so exit such that this function does
++		 * not block waiting for data
++		 */
++		else {
++			break;
++		}
++	}
++
++	/*
++	 * Update the receive buffer to reflect the number of bytes that was
++	 * received
++	 */
++	InstancePtr->ReceiveBuffer.NextBytePtr += ReceivedCount;
++	InstancePtr->ReceiveBuffer.RemainingBytes -= ReceivedCount;
++
++	return ReceivedCount;
++}
++
++/****************************************************************************/
++/**
++*
++* Looks up the device configuration based on the unique device ID. A table
++* contains the configuration info for each device in the system.
++*
++* @param    DeviceId contains the ID of the device to look up the configuration
++*           for.
++*
++* @return
++*
++* A pointer to the configuration found or NULL if the specified device ID was
++* not found.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XPs2_Config *XPs2_LookupConfig(u16 DeviceId)
++{
++	XPs2_Config *CfgPtr = NULL;
++
++	int i;
++
++	for (i = 0; i < XPAR_XPS2_NUM_INSTANCES; i++) {
++		if (XPs2_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XPs2_ConfigTable[i];
++		}
++	}
++
++	return CfgPtr;
++}
++
++/****************************************************************************/
++/**
++*
++* This function is a stub handler that is the default handler such that if the
++* application has not set the handler when interrupts are enabled, this
++* function will be called. The function interface has to match the interface
++* specified for a handler even though none of the arguments are used.
++*
++* @param    CallBackRef is unused by this function.
++* @param    Event is unused by this function.
++* @param    ByteCount is unused by this function.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void XPs2_StubHandler(void *CallBackRef, u32 Event,
++			     unsigned int ByteCount)
++{
++	/*
++	 * Assert alway occurs since this is a stub and should never be called
++	 */
++	XASSERT_VOID_ALWAYS();
++}
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2.h
+@@ -0,0 +1,226 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++*
++* @file xps2.h
++*
++* This driver supports the following features:
++*
++* - Polled mode
++* - Interrupt driven mode
++*
++* <b>Interrupts</b>
++*
++* The device does not have any way to disable the receiver such that the
++* receiver may contain unwanted data. The IP is reset driver is initialized,
++*
++* The driver defaults to no interrupts at initialization such that interrupts
++* must be enabled if desired. An interrupt is generated for any of the following
++* conditions.
++*
++* - Data in the receiver
++* - Any receive status error detected
++* - Data byte transmitted
++* - Any transmit status error detected
++*
++* The application can control which interrupts are enabled using the SetOptions
++* function.
++*
++* In order to use interrupts, it is necessary for the user to connect the
++* driver interrupt handler, XPs2_InterruptHandler(), to the interrupt system of
++* the application. This function does not save and restore the processor
++* context such that the user must provide it. A handler must be set for the
++* driver such that the handler is called when interrupt events occur. The
++* handler is called from interrupt context and is designed to allow application
++*  specific processing to be performed.
++*
++* The functions, XPs2_Send() and Ps2_Recv(), are provided in the driver to
++* allow data to be sent and received. They are designed to be used in polled
++* or interrupt modes.
++*
++* @note
++*
++* None.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   06/18/02 First release
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XPS2_H			/* prevent circular inclusions */
++#define XPS2_H			/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++#include "xps2_l.h"
++
++/************************** Constant Definitions ****************************/
++
++/*
++ * These constants specify the handler events that are passed to
++ * a handler from the driver. These constants are not bit masks suuch that
++ * only one will be passed at a time to the handler
++ */
++#define XPS2_EVENT_RECV_DATA    1
++#define XPS2_EVENT_RECV_ERROR   2
++#define XPS2_EVENT_RECV_OVF     3
++#define XPS2_EVENT_SENT_DATA    4
++#define XPS2_EVENT_SENT_NOACK   5
++#define XPS2_EVENT_TIMEOUT      6
++
++/*
++ * These constants specify the errors  that may be retrieved from the driver
++ * using the XPs2_GetLastErrors function. All of them are bit masks, except
++ * no error, such that multiple errors may be specified.
++ */
++#define XPS2_ERROR_NONE            0x00
++#define XPS2_ERROR_WDT_TOUT_MASK   0x01
++#define XPS2_ERROR_TX_NOACK_MASK   0x02
++#define XPS2_ERROR_RX_OVF_MASK     0x08
++#define XPS2_ERROR_RX_ERR_MASK     0x10
++
++/**************************** Type Definitions ******************************/
++
++/*
++ * This typedef contains configuration information for the device
++ */
++typedef struct {
++	u16 DeviceId;		/* Unique ID  of device */
++	u32 BaseAddress;	/* Base address of device */
++} XPs2_Config;
++
++/*
++ * The following data type is used to manage the buffers that are handled
++ * when sending and receiving data in the interrupt mode
++ */
++typedef struct {
++	u8 *NextBytePtr;
++	unsigned int RequestedBytes;
++	unsigned int RemainingBytes;
++} XPs2Buffer;
++
++/*
++ * This data type defines a handler which the application must define
++ * when using interrupt mode.  The handler will be called from the driver in an
++ * interrupt context to handle application specific processing.
++ *
++ * @param CallBackRef is a callback reference passed in by the upper layer
++ *        when setting the handler, and is passed back to the upper layer when
++ *        the handler is called.
++ * @param Event contains one of the event constants indicating why the handler
++ *        is being called.
++ * @param EventData contains the number of bytes sent or received at the time
++*         of the call.
++*/
++typedef void (*XPs2_Handler) (void *CallBackRef, u32 Event,
++			      unsigned int EventData);
++/*
++ * PS/2 statistics
++ */
++typedef struct {
++	u16 TransmitInterrupts;
++	u16 ReceiveInterrupts;
++	u16 CharactersTransmitted;
++	u16 CharactersReceived;
++	u16 ReceiveErrors;
++	u16 ReceiveOverflowErrors;
++	u16 TransmitErrors;
++} XPs2Stats;
++
++/*
++ * The PS/2 driver instance data. The user is required to allocate a
++ * variable of this type for every PS/2 device in the system.
++ * If the last byte of a message was received then call the application
++ * handler, this code should not use an else from the previous check of
++ * the number of bytes to receive because the call to receive the buffer
++ * updates the bytes to receive
++ * A pointer to a variable of this type is then passed to the driver API
++ * functions
++ */
++typedef struct {
++	XPs2Stats Stats;	/* Component Statistics */
++	u32 BaseAddress;	/* Base address of device (IPIF) */
++	u32 IsReady;		/* Device is initialized and ready */
++	u8 LastErrors;		/* the accumulated errors */
++
++	XPs2Buffer SendBuffer;
++	XPs2Buffer ReceiveBuffer;
++
++	XPs2_Handler Handler;
++	void *CallBackRef;	/* Callback reference for control handler */
++} XPs2;
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Function Prototypes *****************************/
++
++/*
++ * required functions is xps2.c
++ */
++XStatus XPs2_Initialize(XPs2 * InstancePtr, u16 DeviceId);
++
++unsigned int XPs2_Send(XPs2 * InstancePtr, u8 * BufferPtr,
++		       unsigned int NumBytes);
++unsigned int XPs2_Recv(XPs2 * InstancePtr, u8 * BufferPtr,
++		       unsigned int NumBytes);
++XPs2_Config *XPs2_LookupConfig(u16 DeviceId);
++
++/*
++ * options functions in xps2_options.c
++ */
++u8 XPs2_GetLastErrors(XPs2 * InstancePtr);
++u32 XPs2_IsSending(XPs2 * InstancePtr);
++
++/*
++ * interrupt functions in xps2_intr.c
++ */
++void XPs2_SetHandler(XPs2 * InstancePtr, XPs2_Handler FuncPtr,
++		     void *CallBackRef);
++void XPs2_InterruptHandler(XPs2 * InstancePtr);
++void XPs2_EnableInterrupt(XPs2 * InstancePtr);
++void XPs2_DisableInterrupt(XPs2 * InstancePtr);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_i.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_i.h
+@@ -0,0 +1,105 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++*
++* @file xps2_i.h
++*
++* This header file contains internal identifiers, which are those shared
++* between the files of the driver. It is intended for internal use only.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   06/18/02 First release
++* </pre>
++*
++******************************************************************************/
++#ifndef XPS2_I_H		/* prevent circular inclusions */
++#define XPS2_I_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xps2.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/****************************************************************************
++*
++* This macro clears the statistics of the component instance. The purpose of
++* this macro is to allow common processing between the modules of the
++* component with less overhead than a function in the required module.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XPs2_mClearStats(XPs2 *InstancePtr)
++*
++*****************************************************************************/
++#define XPs2_mClearStats(InstancePtr)                             \
++{                                                                       \
++    InstancePtr->Stats.TransmitInterrupts = 0UL;                        \
++    InstancePtr->Stats.ReceiveInterrupts = 0UL;                         \
++    InstancePtr->Stats.CharactersTransmitted = 0UL;                     \
++    InstancePtr->Stats.CharactersReceived = 0UL;                        \
++    InstancePtr->Stats.ReceiveErrors = 0UL;                             \
++    InstancePtr->Stats.ReceiveOverflowErrors = 0UL;                     \
++    InstancePtr->Stats.TransmitErrors = 0UL;                            \
++}
++
++/************************** Variable Definitions ****************************/
++
++extern XPs2_Config XPs2_ConfigTable[];
++
++/************************** Function Prototypes *****************************/
++
++unsigned int XPs2_SendBuffer(XPs2 * InstancePtr);
++unsigned int XPs2_ReceiveBuffer(XPs2 * InstancePtr);
++
++#endif
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_intr.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_intr.c
+@@ -0,0 +1,484 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++*
++* @file xps2_intr.c
++*
++* This file contains the functions that are related to interrupt processing
++* for the PS/2 driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   06/18/02 First release
++* </pre>
++*
++*****************************************************************************/
++/***************************** Include Files ********************************/
++
++#include "xps2.h"
++#include "xps2_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++typedef void (*Handler) (XPs2 * InstancePtr);
++
++/************************** Function Prototypes *****************************/
++
++static void ReceiveDataHandler(XPs2 * InstancePtr);
++static void ReceiveErrorHandler(XPs2 * InstancePtr);
++static void ReceiveOverflowHandler(XPs2 * InstancePtr);
++static void SendDataHandler(XPs2 * InstancePtr);
++static void SendErrorHandler(XPs2 * InstancePtr);
++static void TimeoutHandler(XPs2 * InstancePtr);
++
++/****************************************************************************/
++/**
++*
++* This function sets the handler that will be called when an event (interrupt)
++* occurs in the driver. The purpose of the handler is to allow application
++* specific processing to be performed.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++* @param    FuncPtr is the pointer to the callback function.
++* @param    CallBackRef is the upper layer callback reference passed back when
++*           the callback function is invoked.
++*
++* @return
++*
++* None.
++*
++* @notes
++*
++* There is no assert on the CallBackRef since the driver doesn't know what it
++* is (nor should it)
++*
++*****************************************************************************/
++void XPs2_SetHandler(XPs2 * InstancePtr, XPs2_Handler FuncPtr,
++		     void *CallBackRef)
++{
++	/*
++	 * Assert validates the input arguments
++	 * CallBackRef not checked, no way to know what is valid
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	InstancePtr->Handler = FuncPtr;
++	InstancePtr->CallBackRef = CallBackRef;
++}
++
++/****************************************************************************/
++/**
++*
++* This function is the interrupt handler for the PS/2 driver.
++* It must be connected to an interrupt system by the user such that it is
++* called when an interrupt for any PS/2 port occurs. This function does
++* not save or restore the processor context such that the user must
++* ensure this occurs.
++*
++* @param    InstancePtr contains a pointer to the instance of the PS/2 port
++*           that the interrupt is for.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XPs2_InterruptHandler(XPs2 * InstancePtr)
++{
++	u8 IntrStatus;
++
++	XASSERT_VOID(InstancePtr != NULL);
++
++	/*
++	 * Read the interrupt status register to determine which
++	 * interrupt is active
++	 */
++	IntrStatus = XPs2_mGetIntrStatus(InstancePtr->BaseAddress);
++
++	if (IntrStatus & XPS2_INT_WDT_TOUT) {
++		TimeoutHandler(InstancePtr);
++	}
++
++	if (IntrStatus & XPS2_INT_RX_ERR) {
++		ReceiveErrorHandler(InstancePtr);
++	}
++
++	if (IntrStatus & XPS2_INT_RX_OVF) {
++		ReceiveOverflowHandler(InstancePtr);
++	}
++
++	if (IntrStatus & XPS2_INT_TX_NOACK) {
++		SendErrorHandler(InstancePtr);
++	}
++
++	if (IntrStatus & XPS2_INT_RX_FULL) {
++		ReceiveDataHandler(InstancePtr);
++	}
++
++	if (IntrStatus & XPS2_INT_TX_ACK) {
++		SendDataHandler(InstancePtr);
++	}
++}
++
++/****************************************************************************/
++/**
++*
++* This function enables the PS/2 interrupts.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++void XPs2_EnableInterrupt(XPs2 * InstancePtr)
++{
++	/*
++	 * ASSERT the arguments
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Enable all receiver interrupts (RX_FULL, RX_ERR, RX_OVF)
++	 * transmitter interrupts are enabled when sending data.
++	 */
++	XPs2_mEnableIntr(InstancePtr->BaseAddress, XPS2_INT_RX_ALL);
++}
++
++/****************************************************************************/
++/**void XPs2_DisableInterrupt
++*
++* This function disables the PS/2 interrupts.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++void XPs2_DisableInterrupt(XPs2 * InstancePtr)
++{
++	/*
++	 * ASSERT the arguments
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Disable all interrupts.
++	 */
++	XPs2_mDisableIntr(InstancePtr->BaseAddress, XPS2_INT_ALL);
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the interrupt when data is received.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void ReceiveDataHandler(XPs2 * InstancePtr)
++{
++	XPs2_mClearIntr(InstancePtr->BaseAddress, XPS2_INT_RX_FULL);
++
++	/*
++	 * If there are bytes still to be received in the specified buffer
++	 * go ahead and receive them
++	 */
++	if (InstancePtr->ReceiveBuffer.RemainingBytes != 0) {
++		XPs2_ReceiveBuffer(InstancePtr);
++	}
++
++	/*
++	 * If the last byte of a message was received then call the application
++	 * handler, this code should not use an else from the previous check of
++	 * the number of bytes to receive because the call to receive the buffer
++	 * updates the bytes to receive
++	 */
++	if (InstancePtr->ReceiveBuffer.RemainingBytes == 0) {
++		InstancePtr->Handler(InstancePtr->CallBackRef,
++				     XPS2_EVENT_RECV_DATA,
++				     InstancePtr->ReceiveBuffer.RequestedBytes -
++				     InstancePtr->ReceiveBuffer.RemainingBytes);
++	}
++
++	/*
++	 * Update the receive stats to reflect the receive interrupt
++	 */
++	InstancePtr->Stats.ReceiveInterrupts++;
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the receive error interrupt.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void ReceiveErrorHandler(XPs2 * InstancePtr)
++{
++	XPs2_mClearIntr(InstancePtr->BaseAddress, XPS2_INT_RX_ERR);
++
++	/*
++	 * Call the application handler with an error code
++	 */
++	InstancePtr->Handler(InstancePtr->CallBackRef, XPS2_EVENT_RECV_ERROR,
++			     InstancePtr->ReceiveBuffer.RequestedBytes -
++			     InstancePtr->ReceiveBuffer.RemainingBytes);
++
++	/*
++	 * Update the LastError variable
++	 */
++	InstancePtr->LastErrors |= XPS2_ERROR_RX_ERR_MASK;
++
++	/*
++	 * Update the receive stats to reflect the receive error interrupt
++	 */
++	InstancePtr->Stats.ReceiveErrors++;
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the receive overflow interrupt.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void ReceiveOverflowHandler(XPs2 * InstancePtr)
++{
++	XPs2_mClearIntr(InstancePtr->BaseAddress, XPS2_INT_RX_OVF);
++
++	/*
++	 * Call the application handler with an error code
++	 */
++	InstancePtr->Handler(InstancePtr->CallBackRef, XPS2_EVENT_RECV_OVF,
++			     InstancePtr->ReceiveBuffer.RequestedBytes -
++			     InstancePtr->ReceiveBuffer.RemainingBytes);
++
++	/*
++	 * Update the LastError variable
++	 */
++	InstancePtr->LastErrors |= XPS2_ERROR_RX_OVF_MASK;
++
++	/*
++	 * Update the receive stats to reflect the receive interrupt
++	 */
++	InstancePtr->Stats.ReceiveOverflowErrors++;
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the interrupt when data has been sent, the transmit
++* transmitter holding register is empty.
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void SendDataHandler(XPs2 * InstancePtr)
++{
++	XPs2_mClearIntr(InstancePtr->BaseAddress, XPS2_INT_TX_ACK);
++
++	/*
++	 * If there are no bytes to be sent from the specified buffer then disable
++	 * the transmit interrupt
++	 */
++	if (InstancePtr->SendBuffer.RemainingBytes == 0) {
++		XPs2_mDisableIntr(InstancePtr->BaseAddress, XPS2_INT_TX_ALL);
++
++		/*
++		 * Call the application handler to indicate the data has been sent
++		 */
++		InstancePtr->Handler(InstancePtr->CallBackRef,
++				     XPS2_EVENT_SENT_DATA,
++				     InstancePtr->SendBuffer.RequestedBytes -
++				     InstancePtr->SendBuffer.RemainingBytes);
++	}
++
++	/*
++	 * Otherwise there is still more data to send in the specified buffer
++	 * so go ahead and send it
++	 */
++	else {
++		XPs2_SendBuffer(InstancePtr);
++	}
++
++	/*
++	 * Update the transmit stats to reflect the transmit interrupt
++	 */
++	InstancePtr->Stats.TransmitInterrupts++;
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the interrupt when a transmit is not acknowledged
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void SendErrorHandler(XPs2 * InstancePtr)
++{
++	XPs2_mClearIntr(InstancePtr->BaseAddress, XPS2_INT_TX_NOACK);
++
++	/*
++	 * Call the application handler
++	 */
++	InstancePtr->Handler(InstancePtr->CallBackRef, XPS2_EVENT_SENT_NOACK,
++			     InstancePtr->SendBuffer.RequestedBytes -
++			     InstancePtr->SendBuffer.RemainingBytes);
++
++	/*
++	 * Update the LastError variable
++	 */
++	InstancePtr->LastErrors |= XPS2_ERROR_TX_NOACK_MASK;
++
++	/*
++	 * Update the transmit stats to reflect the transmit interrupt
++	 */
++	InstancePtr->Stats.TransmitErrors++;
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the interrupt when timeout occurrs
++*
++* @param    InstancePtr is a pointer to the XPs2 instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void TimeoutHandler(XPs2 * InstancePtr)
++{
++	XPs2_mClearIntr(InstancePtr->BaseAddress, XPS2_INT_WDT_TOUT);
++
++	/*
++	 * Call the application handler
++	 */
++	InstancePtr->Handler(InstancePtr->CallBackRef, XPS2_EVENT_TIMEOUT,
++			     InstancePtr->SendBuffer.RequestedBytes -
++			     InstancePtr->SendBuffer.RemainingBytes);
++
++	/*
++	 * Update the LastError variable
++	 */
++	InstancePtr->LastErrors |= XPS2_ERROR_WDT_TOUT_MASK;
++
++	/*
++	 * Update the transmit stats to reflect the transmit interrupt
++	 */
++	InstancePtr->Stats.TransmitErrors++;
++}
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_l.c
+@@ -0,0 +1,114 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++*
++* @file xps2_l.c
++*
++* This file contains low-level driver functions that can be used to access the
++* device.  The user should refer to the hardware device specification for more
++* details of the device operation.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   06/18/02 First release
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xps2_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++/****************************************************************************/
++/**
++*
++* This function sends a data byte to PS/2. This function operates in the
++* polling mode and blocks until the data has been put into the transmit
++* holding register.
++*
++* @param    BaseAddress contains the base address of the PS/2 port.
++* @param    Data contains the data byte to be sent.
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++
++void XPs2_SendByte(u32 BaseAddress, u8 Data)
++{
++	while (XPs2_mIsTransmitFull(BaseAddress)) {
++	}
++
++	XIo_Out8(BaseAddress + XPS2_TX_REG_OFFSET, Data);
++}
++
++/****************************************************************************/
++/**
++*
++* This function receives a byte from PS/2. It operates in the polling mode
++* and blocks until a byte of data is received.
++*
++* @param    BaseAddress contains the base address of the PS/2 port.
++*
++* @return   The data byte received by PS/2.
++*
++* @note     None.
++*
++*****************************************************************************/
++u8 XPs2_RecvByte(u32 BaseAddress)
++{
++	while (XPs2_mIsReceiveEmpty(BaseAddress)) {
++	}
++
++	return (u8) XIo_In8(BaseAddress + XPS2_RX_REG_OFFSET);
++}
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/xps2_l.h
+@@ -0,0 +1,261 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++*
++* @file xps2_l.h
++*
++* This header file contains identifiers and low-level driver functions (or
++* macros) that can be used to access the device.  The user should refer to the
++* hardware device specification for more details of the device operation.
++* High-level driver functions are defined in xps2.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   06/18/02 First release
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XPS2_L_H		/* prevent circular inclusions */
++#define XPS2_L_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/* PS/2 register offsets */
++#define XPS2_RESET_OFFSET            0	/* reset register, write only */
++#define XPS2_STATUS_OFFSET           4	/* status register, read only */
++#define XPS2_RX_REG_OFFSET           8	/* receive register, read only */
++#define XPS2_TX_REG_OFFSET           12	/* transmit register, write only */
++#define XPS2_INTSTA_REG_OFFSET       16	/* int status register, read only */
++#define XPS2_INTCLR_REG_OFFSET       20	/* int clear register, write only */
++#define XPS2_INTMSET_REG_OFFSET      24	/* mask set register, read/write */
++#define XPS2_INTMCLR_REG_OFFSET      28	/* mask clear register, write only */
++
++/* reset register bit positions */
++#define XPS2_CLEAR_RESET             0x00
++#define XPS2_RESET                   0x01
++
++/* status register bit positions */
++#define XPS2_ST_RX_FULL              0x01
++#define XPS2_ST_TX_FULL              0x02
++
++/* interrupt register bit positions */
++/* used for the INTSTA, INTCLR, INTMSET, INTMCLR register */
++#define XPS2_INT_WDT_TOUT            0x01
++#define XPS2_INT_TX_NOACK            0x02
++#define XPS2_INT_TX_ACK              0x04
++#define XPS2_INT_TX_ALL              0x06
++#define XPS2_INT_RX_OVF              0x08
++#define XPS2_INT_RX_ERR              0x10
++#define XPS2_INT_RX_FULL             0x20
++#define XPS2_INT_RX_ALL              0x38
++#define XPS2_INT_ALL                 0x3f
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/*****************************************************************************
++*
++* Low-level driver macros.  The list below provides signatures to help the
++* user use the macros.
++*
++* void XPs2_mReset(u32 BaseAddress)
++* u8 XPs2_mGetStatus(u32 BaseAddress)
++*
++* u8 XPs2_mGetIntrStatus(u32 BaseAddress)
++* void XPs2_mClearIntr(u32 BaseAddress, u8 ClearMask)
++* u32 XPs2_mIsIntrEnabled(u32 BaseAddress, u8 EnabledMask)
++* void XPs2_mEnableIntr(u32 BaseAddress, u8 EnableMask)
++* void XPs2_mDisableIntr(u32 BaseAddress, u8 DisableMask)
++*
++* u32 XPs2_mIsReceiveEmpty(u32 BaseAddress)
++* u32 XPs2_mIsTransmitFull(u32 BaseAddress)
++*
++*****************************************************************************/
++
++/****************************************************************************/
++/**
++* Reset the PS/2 port.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mReset(BaseAddress) \
++            XIo_Out8(((BaseAddress) + XPS2_RESET_OFFSET), XPS2_RESET); \
++            XIo_Out8(((BaseAddress) + XPS2_RESET_OFFSET), XPS2_CLEAR_RESET)
++
++/****************************************************************************/
++/**
++* Read the PS/2 status register.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   The value read from the register.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mGetStatus(BaseAddress) \
++            (XIo_In8((BaseAddress) + XPS2_STATUS_OFFSET))
++
++/****************************************************************************/
++/**
++* Read the interrupt status register.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   The value read from the register.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mGetIntrStatus(BaseAddress) \
++            (XIo_In8((BaseAddress) + XPS2_INTSTA_REG_OFFSET))
++
++/****************************************************************************/
++/**
++* Clear pending interrupts.
++*
++* @param    BaseAddress contains the base address of the device.
++*           Bitmask for interrupts to be cleared. A "1" clears the interrupt.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mClearIntr(BaseAddress, ClearMask) \
++            XIo_Out8((BaseAddress) + XPS2_INTCLR_REG_OFFSET, (ClearMask))
++
++/****************************************************************************/
++/**
++* Check for enabled interrupts.
++*
++* @param    BaseAddress contains the base address of the device.
++*           Bitmask for interrupts to be checked.
++*
++* @return   TRUE if the interrupt is enabled, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mIsIntrEnabled(BaseAddress, EnabledMask) \
++            (XIo_In8((BaseAddress) + XPS2_INTMSET_REG_OFFSET) & (EnabledMask))
++
++/****************************************************************************/
++/**
++* Enable Interrupts.
++*
++* @param    BaseAddress contains the base address of the device.
++*           Bitmask for interrupts to be enabled.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mEnableIntr(BaseAddress, EnableMask) \
++            XIo_Out8((BaseAddress) + XPS2_INTMSET_REG_OFFSET, (EnableMask))
++
++/****************************************************************************/
++/**
++* Disable Interrupts.
++*
++* @param    BaseAddress contains the base address of the device.
++*           Bitmask for interrupts to be disabled.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mDisableIntr(BaseAddress, DisableMask) \
++            XIo_Out8((BaseAddress) + XPS2_INTMCLR_REG_OFFSET, (DisableMask))
++
++/****************************************************************************/
++/**
++* Determine if there is receive data in the receiver.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   TRUE if there is receive data, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mIsReceiveEmpty(BaseAddress) \
++            (!(XPs2_mGetStatus(BaseAddress) & XPS2_ST_RX_FULL))
++
++/****************************************************************************/
++/**
++* Determine if a byte of data can be sent with the transmitter.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   TRUE if a byte can be sent, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XPs2_mIsTransmitFull(BaseAddress) \
++            (XPs2_mGetStatus(BaseAddress) & XPS2_ST_TX_FULL)
++
++/************************** Variable Definitions ****************************/
++
++/************************** Function Prototypes *****************************/
++
++void XPs2_SendByte(u32 BaseAddress, u8 Data);
++u8 XPs2_RecvByte(u32 BaseAddress);
++
++/****************************************************************************/
++
++#endif
+Index: linux-2.6.10/mvl_patches/pro-0335.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0335.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(335);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,2368 @@
+#! /usr/bin/env bash
+# Patch: -pro_sh_sh7780_video
+# Date: Fri May  4 10:08:13 2007
+# Source: MontaVista Software, Inc.
+# MR: 20464
+# Type: Enhancement
+# Disposition: needs submitting to open-source
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	Implementation of framebuffer drivers for various SuperH LCD controllers
+# 
+
+PATCHNUM=1322
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 20464
+Type: Enhancement
+Disposition: needs submitting to open-source
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	Implementation of framebuffer drivers for various SuperH LCD controllers
+
+Index: linux-2.6.10/drivers/video/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/video/Kconfig
++++ linux-2.6.10/drivers/video/Kconfig
+@@ -443,6 +443,82 @@ config FB_EPSON1355
+ 	  framebuffer.  Product specs at
+ 	  <http://www.erd.epson.com/vdc/html/products.htm>.
+ 
++config FB_SH_LCDC
++       bool "SuperH internal LCD Controller support"
++       depends on FB && (CPU_SUBTYPE_SH7720 || CPU_SUBTYPE_SH7727)
++       help
++         Build in support for the Renesas HD6417720,HD6417727(SH7720,SH7727)
++         internal LCD/CRT Controller as a framebuffer.
++
++config MSTLCD01
++       bool " MSTLCD01 connected with SuperH LCDC"
++       depends on FB_SH_LCDC && (SH_SOLUTION_ENGINE_2ND || SH_SOLUTION_ENGINE_LIGHT)
++       help
++         Select LCD panel for SolutionEngineLight/2ND.
++
++choice
++       prompt "  MSTLCD01 display size select"
++       depends on MSTLCD01
++
++config MSTLCD01_QVGA
++       bool "QVGA"
++
++config MSTLCD01_VGA
++       bool "VGA"
++
++endchoice
++
++config SH_LCDC_FB_SIZE
++       hex "SuperH LCDC Framebuffer Size"
++       depends on FB_SH_LCDC
++       default "0x00028000" if (SH_SOLUTION_ENGINE_LIGHT || SH_SOLUTION_ENGINE_2ND)
++       default "0x00100000" if !(SH_SOLUTION_ENGINE_LIGHT || SH_SOLUTION_ENGINE_2ND)
++
++config FB_YGV619
++       bool "Yamaha YGV619 support"
++       depends on FB && SUPERH
++       help
++         Build in support for the Yamaha YGV619 as a framebuffer.
++config YGV619_FB_BASE
++       hex "Framebuffer Base Address"
++       depends on FB_YGV619
++       default "0xa8000000"
++
++config YGV619_NTSC
++       bool " NTSCmode in YGV619"
++       depends on FB_YGV619
++       default n
++
++config FB_S1D13806
++       bool "Epson S1D13806 support"
++       depends on FB && SUPERH
++       help
++         Build in support for the Epson S1D13806 as a framebuffer.
++
++config S1D13806_FB_BASE
++       hex "Framebuffer Base Address"
++       depends on FB_S1D13806
++       default "0xa2c00000" if (SH_MSSECSH)
++       default "0xa8000000" if !(SH_MSSECSH)
++
++choice
++       prompt " S1D13806 mode select"
++       depends on FB_S1D13806
++
++config S1D13806_LCD
++       bool "LCD"
++       depends on FB_S1D13806
++
++config S1D13806_RGB
++       bool "Analog RGB"
++       depends on FB_S1D13806
++
++config S1D13806_NTSC
++       bool "NTSC"
++       depends on FB_S1D13806
++
++endchoice
++
+ config FB_RIVA
+ 	tristate "nVidia Riva support"
+ 	depends on FB && PCI
+Index: linux-2.6.10/drivers/video/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/video/Makefile
++++ linux-2.6.10/drivers/video/Makefile
+@@ -98,6 +98,9 @@ obj-$(CONFIG_FB_TX3912)		  += tx3912fb.o
+ obj-$(CONFIG_FB_AU1100)		  += au1100fb.o fbgen.o
+ obj-$(CONFIG_FB_AU1200)		  += au1200fb.o cfbfillrect.o cfbcopyarea.o cfbimgblt.o
+ obj-$(CONFIG_FB_XILINX)		  += xilinxfb.o cfbfillrect.o cfbcopyarea.o cfbimgblt.o
++obj-$(CONFIG_FB_SH_LCDC)         += sh_lcdc.o cfbimgblt.o cfbcopyarea.o cfbfillrect.o
++obj-$(CONFIG_FB_YGV619)                  += ygv619fb.o cfbimgblt.o cfbcopyarea.o cfbfillrect.o
++obj-$(CONFIG_FB_S1D13806)        += s1d13806fb.o cfbimgblt.o cfbcopyarea.o cfbfillrect.o
+ obj-$(CONFIG_FB_INTEL_VR)	  += vmlfb.o cfbimgblt.o cfbcopyarea.o cfbfillrect.o
+ obj-$(CONFIG_FB_INTEL_CR)	  += crvml.o
+ 
+Index: linux-2.6.10/drivers/video/s1d13806fb.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/video/s1d13806fb.c
+@@ -0,0 +1,751 @@
++/*
++ * s1d13806fb.c,v 0.9 2002/09/05
++ *  S1D13806 video device driver for Super-H
++ *
++ *   Copyright (C) 2002/08/20 Mitsuharu Takei(takei-mitsuharu@hitachi-ul.co.jp)
++ *   Copyright(C) 2004/10/13 Mitsuharu Takei(takei-mitsuharu@hitachi-ul.co.jp)
++ *    Modified to support kernel version 2.6
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/tty.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/fb.h>
++#include <linux/init.h>
++
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/pgtable.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++
++#include "s1d13806.h"
++
++struct s1d13806fb_par {
++
++	/* struct about register */
++	u8 hdisp;
++	u8 hblank;
++	u8 hstart;
++	u8 hsw;
++
++	u16 vdisp;
++	u8 vblank;
++	u8 vstart;
++	u8 vsw;
++
++	u16 x_vir;
++	u16 y_vir;
++
++} s1d13806_par;
++
++static int pseudo_palette[16];
++
++/*
++ * Here we define the default structs fb_fix_screeninfo and fb_var_screeninfo
++ * if we don't use modedb. If we do use modedb see xxxfb_init how to use it
++ * to get a fb_var_screeninfo. Otherwise define a default var as well.
++ */
++static struct fb_fix_screeninfo s1d13806fb_fix __initdata = {
++	.id = "s1d13806",
++	.smem_start = S1D13806_FB_PHYS,	/* Top addr of frame Buffer */
++	.smem_len = S1D13806_FB_PHYS_LEN,	/* Length of frame buffer */
++	.type = FB_TYPE_PACKED_PIXELS,
++	.visual = FB_VISUAL_TRUECOLOR,
++	.xpanstep = 1,
++	.ypanstep = 1,
++	.ywrapstep = 0,
++	.line_length = 240 * 2,	/* xres_virtual*(16bit/8) */
++	.accel = FB_ACCEL_NONE,
++};
++
++#ifdef CONFIG_S1D13806_NTSC
++static struct fb_var_screeninfo s1d13806fb_default = {
++	/* 16 bpp */
++	.xres = 640,
++	.yres = 480,
++	.xres_virtual = 640,
++	.yres_virtual = 480,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = S1D13806_PIXCLOCK_14_318,
++	.left_margin = 189,
++	.right_margin = 73,
++	.upper_margin = 28,
++	.lower_margin = 1,
++	.hsync_len = 1,
++	.vsync_len = 1,
++	.vmode = FB_VMODE_INTERLACED,
++};
++#elif defined(CONFIG_S1D13806_LCD)
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++static struct fb_var_screeninfo s1d13806fb_default = {
++	/* 16 bpp */
++	.xres = 240,
++	.yres = 320,
++	.xres_virtual = 240,
++	.yres_virtual = 320,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = S1D13806_PIXCLOCK_5_6448,
++	.left_margin = 10,
++	.right_margin = 6,
++	.upper_margin = 5,
++	.lower_margin = 1,
++	.hsync_len = 32,
++	.vsync_len = 6,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#else
++static struct fb_var_screeninfo s1d13806fb_default = {
++	/* 16 bpp */
++	.xres = 640,
++	.yres = 480,
++	.xres_virtual = 640,
++	.yres_virtual = 480,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = S1D13806_PIXCLOCK_25_175,
++	.left_margin = 50,
++	.right_margin = 14,
++	.upper_margin = 31,
++	.lower_margin = 12,
++	.hsync_len = 96,
++	.vsync_len = 2,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#endif
++#else
++static struct fb_var_screeninfo s1d13806fb_default = {
++	/* 16 bpp */
++	.xres = 640,
++	.yres = 480,
++	.xres_virtual = 640,
++	.yres_virtual = 480,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = S1D13806_PIXCLOCK_25_175,
++	.left_margin = 24,
++	.right_margin = 40,
++	.upper_margin = 18,
++	.lower_margin = 25,
++	.hsync_len = 96,
++	.vsync_len = 2,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#endif
++
++static struct fb_info info;
++
++int s1d13806fb_init(void);
++int s1d13806fb_setup(char *);
++
++/**
++ *      xxxxfb_open - Optional function. Called when the framebuffer is
++ *                   first accessed.
++ *      @info: frame buffer structure that represents a single frame buffer
++ *      @user: tell us if the userland (value=1) or the console is accessing
++ *             the framebuffer.
++ *
++ *      This function is the first function called in the framebuffer api.
++ *      Usually you don't need to provide this function. The case where it
++ *      is used is to change from a text mode hardware state to a graphics
++ *      mode state.
++ */
++static int s1d13806fb_open(const struct fb_info *info, int user)
++{
++	return 0;
++}
++
++/**
++ *      xxxxfb_release - Optional function. Called when the framebuffer
++ *                      device is closed.
++ *      @info: frame buffer structure that represents a single frame buffer
++ *      @user: tell us if the userland (value=1) or the console is accessing
++ *             the framebuffer.
++ *
++ *      Thus function is called when we close /dev/fb or the framebuffer
++ *      console system is released. Usually you don't need this function.
++ *      The case where it is usually used is to go from a graphics state
++ *      to a text mode state.
++ */
++static int s1d13806fb_release(const struct fb_info *info, int user)
++{
++	return 0;
++}
++
++/**
++ *      xxxfb_check_var - Optional function. Validates a var passed in.
++ *      @var: frame buffer variable screen structure
++ *      @info: frame buffer structure that represents a single frame buffer
++ *
++ */
++static int s1d13806fb_check_var(struct fb_var_screeninfo *var,
++				struct fb_info *info)
++{
++	u32 xres, right, hslen, left;
++	u32 yres, lower, vslen, upper;
++	u32 vxres, xoffset, vyres, yoffset;
++
++	xres = (var->xres + 7) & ~7;
++	vxres = (var->xres_virtual + 0xF) & ~0xF;
++	xoffset = (var->xoffset + 7) & ~7;
++	left = (var->left_margin + 7) & ~7;
++	right = (var->right_margin + 7) & ~7;
++	hslen = (var->hsync_len + 7) & ~7;
++
++	if (vxres < xres)
++		vxres = xres;
++	if (xres + xoffset > vxres)
++		xoffset = vxres - xres;
++
++	var->xres = xres;
++	var->right_margin = right;
++	var->hsync_len = hslen;
++	var->left_margin = left;
++	var->xres_virtual = vxres;
++	var->xoffset = xoffset;
++
++	yres = var->yres;
++	lower = var->lower_margin;
++	vslen = var->vsync_len;
++	upper = var->upper_margin;
++	vyres = var->yres_virtual;
++	yoffset = var->yoffset;
++
++	if (yres > vyres)
++		vyres = yres;
++	if (yoffset + yres > vyres)
++		yoffset = vyres - yres;
++	var->yres = yres;
++	var->lower_margin = lower;
++	var->vsync_len = vslen;
++	var->upper_margin = upper;
++	var->yres_virtual = vyres;
++	var->yoffset = yoffset;
++
++	var->red.msb_right = 0;
++	var->green.msb_right = 0;
++	var->blue.msb_right = 0;
++
++	switch (var->bits_per_pixel) {
++	case 8:		/* PSEUDOCOLOUR, 256 */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 0;
++		var->red.length = 8;
++		var->green.offset = 0;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		var->blue.length = 8;
++		break;
++
++	case 16:		/* TRUECOLOR(?), 64k */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 11;
++		var->red.length = 5;
++		var->green.offset = 5;
++		var->green.length = 6;
++		var->blue.offset = 0;
++		var->blue.length = 5;
++		break;
++
++	case 24:		/* TRUECOLOUR, 16m */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 16;
++		var->red.length = 8;
++		var->green.offset = 8;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		break;
++
++	default:
++		printk(KERN_WARNING "s1d13806fb: no support for %dbpp\n",
++		       var->bits_per_pixel);
++		return -EINVAL;
++	}
++
++	var->activate = FB_ACTIVATE_NOW;
++	var->height = -1;
++	var->width = -1;
++	var->accel_flags = FB_ACCELF_TEXT;
++	return 0;
++}
++
++/**
++ *      xxxfb_setcolreg - Optional function. Sets a color register.
++ *      @regno: Which register in the CLUT we are programming
++ *      @red: The red value which can be up to 16 bits wide
++ *      @green: The green value which can be up to 16 bits wide
++ *      @blue:  The blue value which can be up to 16 bits wide.
++ *      @transp: If supported the alpha value which can be up to 16 bits wide.
++
++ *      @info: frame buffer info structure
++ *
++ *      Set a single color register. The values supplied have a 16 bit
++ *      magnitude which needs to be scaled in this function for the hardware.
++ *      Things to take into consideration are how many color registers, if
++ *      any, are supported with the current color visual. With truecolor mode
++ *      no color palettes are supported. Here a psuedo palette is created
++ *      which we store the value in pseudo_palette in struct fb_info. For
++ *      pseudocolor mode we have a limited color palette. To deal with this
++ *      we can program what color is displayed for a particular pixel value.
++ *      DirectColor is similar in that we can program each color field. If
++ *      we have a static colormap we don't need to implement this function.
++ *
++ *      Returns negative errno on error, or zero on success.
++ */
++static int s1d13806fb_setcolreg(unsigned regno, unsigned red, unsigned green,
++				unsigned blue, unsigned transp,
++				const struct fb_info *info)
++{
++	if (regno > 255)
++		return 1;
++
++	/* grayscale works only partially under directcolor */
++	if (info->var.grayscale) {
++		/* grayscale = 0.30*R + 0.59*G + 0.11*B */
++		red = green = blue = (red * 77 + green * 151 + blue * 28) >> 8;
++	}
++
++	/* Directcolor:
++	 *   var->{color}.offset contains start of bitfield
++	 *   var->{color}.length contains length of bitfield
++	 *   {hardwarespecific} contains width of DAC
++	 *   cmap[X] is programmed to (X << red.offset) | (X << green.offset) | (X <<blue.offset)
++	 *   RAMDAC[X] is programmed to (red, green, blue)
++	 *
++	 * Pseudocolor:
++	 *    uses offset = 0 && length = DAC register width.
++	 *    var->{color}.offset is 0
++	 *    var->{color}.length contains widht of DAC
++	 *    cmap is not used
++	 *    DAC[X] is programmed to (red, green, blue)
++	 * Truecolor:
++	 *    does not use RAMDAC (usually has 3 of them).
++	 *    var->{color}.offset contains start of bitfield
++	 *    var->{color}.length contains length of bitfield
++	 *    cmap is programmed to (red << red.offset) | (green << green.offset) |
++	 *                      (blue << blue.offset) | (transp << transp.offset)
++	 *    RAMDAC does not exist
++	 */
++#define CNVT_TOHW(val,width) ((((val)<<(width))+0x7FFF-(val))>>16)
++	switch (info->fix.visual) {
++	case FB_VISUAL_TRUECOLOR:
++	case FB_VISUAL_PSEUDOCOLOR:
++		red = CNVT_TOHW(red, info->var.red.length);
++		green = CNVT_TOHW(green, info->var.green.length);
++		blue = CNVT_TOHW(blue, info->var.blue.length);
++		transp = CNVT_TOHW(transp, info->var.transp.length);
++		break;
++	case FB_VISUAL_DIRECTCOLOR:
++		/* example here assumes 8 bit DAC. Might be different
++		 * for your hardware */
++		red = CNVT_TOHW(red, 8);
++		green = CNVT_TOHW(green, 8);
++		blue = CNVT_TOHW(blue, 8);
++		/* hey, there is bug in transp handling... */
++		transp = CNVT_TOHW(transp, 8);
++		break;
++	}
++#undef CNVT_TOHW
++	/* Truecolor has hardware independent palette */
++	if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
++		u32 v;
++
++		if (regno >= 16)
++			return 1;
++
++		v = (red << info->var.red.offset) |
++		    (green << info->var.green.offset) |
++		    (blue << info->var.blue.offset) |
++		    (transp << info->var.transp.offset);
++
++		switch (info->var.bits_per_pixel) {
++		case 8:
++			/* Yes some hand held devices have this. */
++			((u8 *) (info->pseudo_palette))[regno] = v;
++			break;
++		case 16:
++			((u16 *) (info->pseudo_palette))[regno] = v;
++			break;
++		case 24:
++		case 32:
++			((u32 *) (info->pseudo_palette))[regno] = v;
++			break;
++		}
++		return 0;
++	}
++
++	if (info->fix.visual == FB_VISUAL_PSEUDOCOLOR) {
++
++		if (regno >= 256)
++			return 1;
++
++		writeb(0x00, S1D13806_R(0x1e0));
++		writeb(regno, S1D13806_R(0x1e2));
++
++		writeb(red << 4, S1D13806_R(0x1e4));
++		writeb(green << 4, S1D13806_R(0x1e4));
++		writeb(blue << 4, S1D13806_R(0x1e4));
++	}
++	return 0;
++}
++
++static int s1d13806fb_blank(int blank, struct fb_info *info)
++{
++	if (blank) {
++#ifdef CONFIG_S1D13806_LCD
++		writeb((readb(S1D13806_R(0x040)) | 0x80), S1D13806_R(0x040));	/* LCD */
++#else
++		writeb((readb(S1D13806_R(0x060)) | 0x80), S1D13806_R(0x060));
++#endif
++	} else {
++#ifdef CONFIG_S1D13806_LCD
++		writeb((readb(S1D13806_R(0x040)) & ~0x80), S1D13806_R(0x040));	/* LCD */
++#else
++		writeb((readb(S1D13806_R(0x060)) & ~0x80), S1D13806_R(0x060));
++#endif
++	}
++	return 0;
++}
++
++void s1d13806fb_ini_reg(struct s1d13806fb_par *par)
++{
++	/* initializing */
++	writeb(0x00, S1D13806_R(0x001));
++	writeb(0x00, S1D13806_R(0x1fc));	/* display disable */
++
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb(0x07, S1D13806_R(0x004));
++#else
++	writeb(0x03, S1D13806_R(0x004));
++#endif
++	writeb(0x00, S1D13806_R(0x005));
++#ifdef CONFIG_S1D13806_NTSC
++	writeb(0x02, S1D13806_R(0x008));
++#else
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb(0x00, S1D13806_R(0x008));	/* GPIO0(DON) OutPut low */
++#else
++	writeb(0x00, S1D13806_R(0x008));	/* LCD/CRT=0x00 NTSC/PAL=0x02 */
++#endif
++#endif
++	writeb(0x00, S1D13806_R(0x009));
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb(0x00, S1D13806_R(0x010));	/* memory clock=CLKI(48Mhz) */
++	writeb(0x12, S1D13806_R(0x014));	/* LCD clock=CLKI2/2(5.6448Mhz) */
++#else
++	writeb(0x02, S1D13806_R(0x010));	/* memory clock=CLKI3 */
++	writeb(0x02, S1D13806_R(0x014));	/* LCD clock=CLKI2(25.175Mhz) */
++#endif
++#if defined(CONFIG_S1D13806_NTSC) || defined(CONFIG_S1D13806_LCD)
++	writeb(0x82, S1D13806_R(0x018));	/* LCD/TV:0x82(with ff) */
++#else
++	writeb(0x02, S1D13806_R(0x018));	/* CRT:0x02(CLKI2(1:1)) */
++#endif
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb(0x02, S1D13806_R(0x01e));	/* CPU wait MCLK-4ns > BCLK */
++#else
++	writeb(0x01, S1D13806_R(0x01e));	/* CPU wait 2xMCLK-4ns > BCLK */
++#endif
++
++	writeb(0x80, S1D13806_R(0x020));	/* SDRAM initalize */
++	writeb(0x03, S1D13806_R(0x021));	/* SDRAM reflesh rate */
++	writeb(0x00, S1D13806_R(0x02a));	/* SDRAM timing0 */
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb(0x01, S1D13806_R(0x02b));	/* SDRAM timing1 */
++#else
++	writeb(0x12, S1D13806_R(0x02b));	/* SDRAM timing1 */
++#endif
++
++	writeb(0x21, S1D13806_R(0x030));	/* LCD type (TFT color 16bitbus) */
++	writeb(0x00, S1D13806_R(0x031));	/* MOD rate */
++
++	/* LCD setting */
++	writeb(par->hdisp, S1D13806_R(0x032));	/* LCD disp width */
++	writeb(par->hblank, S1D13806_R(0x034));	/* LCD blank width */
++	writeb(par->hstart, S1D13806_R(0x035));	/* LCD FPLINE start */
++	writeb(par->hsw, S1D13806_R(0x036));	/* FPLINE width */
++	writeb(par->vdisp & 0xff, S1D13806_R(0x038));	/* LCD disp height0 */
++	writeb(par->vdisp >> 8, S1D13806_R(0x039));	/* LCD disp height1 */
++	writeb(par->vblank, S1D13806_R(0x03a));	/* LCD blank height */
++	writeb(par->vstart, S1D13806_R(0x03b));	/* LCD FPFRAME start */
++	writeb(par->vsw, S1D13806_R(0x03c));	/* FPFRAME height */
++
++	writeb(0x05, S1D13806_R(0x040));	/* LCD mode 16bpp */
++	writeb(0x00, S1D13806_R(0x041));	/* 64k color mode */
++	writeb(0x00, S1D13806_R(0x042));	/* LCD display memory start address0 */
++	writeb(0x00, S1D13806_R(0x043));	/* LCD display memory start address1 */
++	writeb(0x00, S1D13806_R(0x044));	/* LCD display memory start address2 */
++	writeb(0xf0 & 0xff, S1D13806_R(0x046));	/* memory address offset0(virtual width) */
++	writeb(0x00, S1D13806_R(0x047));	/* memory address offset1(virtual width) */
++
++	writeb(0x00, S1D13806_R(0x048));	/* pan controll */
++	writeb(0x00, S1D13806_R(0x04a));
++	writeb(0x00, S1D13806_R(0x04b));
++
++	/* CRT setting */
++	writeb(par->hdisp, S1D13806_R(0x050));	/* CRT disp width */
++	writeb(par->hblank, S1D13806_R(0x052));	/* CRT blank width */
++	writeb(par->hstart, S1D13806_R(0x053));	/* CRT HRTC start */
++	writeb(par->hsw, S1D13806_R(0x054));	/* HRTC width */
++	writeb(par->vdisp & 0xff, S1D13806_R(0x056));	/* CRT disp width0 */
++	writeb(par->vdisp >> 8, S1D13806_R(0x057));	/* CRT disp width1 */
++	writeb(par->vblank, S1D13806_R(0x058));	/* CRT blank height */
++	writeb(par->vstart, S1D13806_R(0x059));	/* CRT VRTC start */
++	writeb(par->vsw, S1D13806_R(0x05a));	/* VRTC height */
++
++#ifdef CONFIG_S1D13806_NTSC
++	writeb(0x30, S1D13806_R(0x05b));
++#else
++	writeb(0x00, S1D13806_R(0x05b));
++#endif
++	writeb(0x05, S1D13806_R(0x060));	/* 16bpp */
++	writeb(0x00, S1D13806_R(0x062));	/* CRT/TV display memory start address0 */
++	writeb(0x00, S1D13806_R(0x063));	/* CRT/TV display memory start address1 */
++	writeb(0x00, S1D13806_R(0x064));	/* CRT/TV display memory start address2 */
++	writeb(par->x_vir & 0xff, S1D13806_R(0x066));	/* memory address offset0(virtual width) */
++	writeb(par->x_vir >> 8, S1D13806_R(0x067));	/* memory address offset1(virtual width) */
++	writeb(0x00, S1D13806_R(0x068));	/* pan controll */
++	writeb(0x00, S1D13806_R(0x06a));
++	writeb(0x00, S1D13806_R(0x06b));
++
++	writeb(0x10, S1D13806_R(0x1f0));	/* power save disable */
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb(0x00, S1D13806_R(0x1f4));	/* WatchDogTimer Disable */
++#endif
++
++#ifdef CONFIG_S1D13806_NTSC
++	writeb(0x06, S1D13806_R(0x1fc));	/* display enable(TV Flicker on) */
++#elif defined(CONFIG_S1D13806_LCD)
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	writeb((readb(S1D13806_R(0x008))) | 0x07, S1D13806_R(0x008));	/* GPIO0(DON) OutPut High */
++#endif
++	writeb(0x01, S1D13806_R(0x1fc));	/* display enable(LCD only) */
++#else
++	writeb(0x02, S1D13806_R(0x1fc));	/* display enable(CRT only) */
++#endif
++}
++
++static int s1d13806fb_decode_var(const struct fb_var_screeninfo *var,
++				 struct s1d13806fb_par *par,
++				 const struct fb_info *info)
++{
++	/* data convert from var to par */
++
++	par->hdisp = (var->xres) / 8 ? ((var->xres) / 8 - 1) : 0;
++#ifdef CONFIG_S1D13806_NTSC
++	par->hblank =
++	    (var->hsync_len + var->left_margin + var->right_margin - 6) / 8 >
++	    0 ? (var->hsync_len + var->left_margin + var->right_margin -
++		 6) / 8 : 0;
++	if (8 == var->bits_per_pixel)
++		par->hstart =
++		    ((var->right_margin) + 7) / 8 >
++		    1 ? ((var->right_margin) + 7) / 8 - 1 : 0;
++	else
++		par->hstart =
++		    ((var->right_margin) + 5) / 8 >
++		    1 ? ((var->right_margin) + 5) / 8 - 1 : 0;
++#else
++	par->hblank =
++	    (var->hsync_len + var->left_margin + var->right_margin) / 8 >
++	    1 ? ((var->hsync_len + var->left_margin + var->right_margin) / 8) -
++	    1 : 0;
++#ifdef CONFIG_S1D13806_LCD
++	if (8 == var->bits_per_pixel)
++		par->hstart =
++		    (var->right_margin - 5) / 8 >
++		    0 ? ((var->right_margin - 5) / 8) : 0;
++	else
++		par->hstart =
++		    (var->right_margin - 6) / 8 >
++		    0 ? ((var->right_margin - 6) / 8) : 0;
++#else
++	if (8 == var->bits_per_pixel)
++		par->hstart =
++		    (var->right_margin - 4) / 8 >
++		    0 ? ((var->right_margin - 4) / 8) : 0;
++	else
++		par->hstart =
++		    (var->right_margin - 5) / 8 >
++		    0 ? ((var->right_margin - 5) / 8) : 0;
++#endif
++#endif
++	par->hsw = (var->hsync_len) / 8 > 1 ? ((var->hsync_len) / 8) - 1 : 0;
++
++	par->vdisp = var->yres - 1;
++	par->vblank =
++	    var->vsync_len + var->upper_margin + var->lower_margin - 1;
++	par->vstart = var->lower_margin - 1;
++	par->vsw = var->vsync_len - 1;
++
++	/* virtual display */
++	par->x_vir = var->xres_virtual;
++	par->y_vir = var->yres_virtual;
++
++	return 0;
++}
++
++static int s1d13806fb_encode_var(struct fb_var_screeninfo *var,
++				 struct s1d13806fb_par *par)
++{
++	struct fb_info info;
++
++	*var = s1d13806fb_default;
++
++	s1d13806fb_check_var(var, &info);
++
++#ifdef CONFIG_S1D13806_NTSC
++	var->pixclock = S1D13806_PIXCLOCK_14_318;
++#elif defined(CONFIG_S1D13806_LCD)
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	var->pixclock = S1D13806_PIXCLOCK_5_6448;
++#else
++	var->pixclock = S1D13806_PIXCLOCK_25_175;
++#endif
++#else
++	var->pixclock = S1D13806_PIXCLOCK_25_175;
++#endif
++
++	var->activate = 0;
++	return 0;
++
++}
++
++static struct fb_ops s1d13806fb_ops = {
++	.owner = THIS_MODULE,
++	.fb_open = s1d13806fb_open,
++	.fb_release = s1d13806fb_release,
++	.fb_check_var = s1d13806fb_check_var,
++	.fb_setcolreg = s1d13806fb_setcolreg,
++	.fb_blank = s1d13806fb_blank,
++	.fb_fillrect = cfb_fillrect,	/* Needed !!! */
++	.fb_copyarea = cfb_copyarea,	/* Needed !!! */
++	.fb_imageblit = cfb_imageblit,	/* Needed !!! */
++	.fb_cursor = soft_cursor,	/* Needed !!! */
++};
++
++int __init s1d13806fb_init(void)
++{
++	int cmap_len = 16;
++	int retval;
++
++	/*
++	 * Here we set the screen_base to the vitrual memory address
++	 * for the framebuffer. Usually we obtain the resource address
++	 * from the bus layer and then translate it to virtual memory
++	 * space via ioremap. Consult ioport.h.
++	 */
++	 /**/ info.node = -1;
++	info.screen_base = (char *)S1D13806_FB_PHYS;
++	info.fbops = &s1d13806fb_ops;
++	info.fix = s1d13806fb_fix;
++	info.pseudo_palette = pseudo_palette;
++
++	info.par = &s1d13806_par;
++
++	s1d13806fb_decode_var(&s1d13806fb_default, &s1d13806_par, &info);
++	s1d13806fb_encode_var(&s1d13806fb_default, &s1d13806_par);
++
++	s1d13806fb_ini_reg(&s1d13806_par);
++
++	/*
++	 * Set up flags to indicate what sort of acceleration your
++	 * driver can provide (pan/wrap/copyarea/etc.) and whether it
++	 * is a module -- see FBINFO_* in include/linux/fb.h
++	 */
++	info.flags = FBINFO_DEFAULT;
++
++	/*
++	 * This should give a reasonable default video mode. The following is
++	 * done when we can set a video mode.
++	 */
++
++	retval = fb_find_mode(&info.var, &info, "240x320@60", NULL, 0, NULL, 8);
++
++	if (!retval || retval == 4)
++		return -EINVAL;
++
++	/* This has to been done !!! */
++	fb_alloc_cmap(&info.cmap, cmap_len, 0);
++
++	/*
++	 * The following is done in the case of having hardware with a static
++	 * mode. If we are setting the mode ourselves we don't call this.
++	 */
++	info.var = s1d13806fb_default;
++
++	if (register_framebuffer(&info) < 0)
++		return -EINVAL;
++	printk(KERN_INFO "fb%d: %s frame buffer device\n", info.node,
++	       info.fix.id);
++	return 0;
++}
++
++/*
++ *  Cleanup
++ */
++
++static void __exit s1d13806fb_cleanup(void)
++{
++	/*
++	 *  If your driver supports multiple boards, you should unregister and
++	 *  clean up all instances.
++	 */
++
++	unregister_framebuffer(&info);
++	/* ... */
++}
++
++/*
++ *  Setup
++ */
++
++/*
++ * Only necessary if your driver takes special options,
++ * otherwise we fall back on the generic fb_setup().
++ */
++int __init s1d13806fb_setup(char *options)
++{
++
++	char *this_opt;
++
++	if (!options || !*options)
++		return 0;
++
++	while ((this_opt = strsep(&options, ",")) != NULL) {
++		if (!*this_opt)
++			continue;
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------------------- */
++
++/*
++ *  Frame buffer operations
++ */
++
++/* ------------------------------------------------------------------------- */
++
++module_init(s1d13806fb_init);
++module_exit(s1d13806fb_cleanup);
++
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/video/sh_lcdc.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/video/sh_lcdc.c
+@@ -0,0 +1,604 @@
++/*
++ *  SH LCD control device driver (16bit color only)
++ *
++ *   Copyright(C) 2002/06/05 Mitsuharu Takei(takei-mitsuharu@hitachi-ul.co.jp)
++ *	Modified to support SH7727 LCDC
++ *   Copyright(C) 2004/01/22 Takashi Kusuda
++ *	Modified to support SH7720 LCDC
++ *   Copyright(C) 2004/11/25 Takashi Kusuda
++ *	Modified to support kernel 2.6
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/tty.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/fb.h>
++#include <linux/init.h>
++
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/pgtable.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++
++#include "sh_lcdc.h"
++
++struct sh_lcdcfb_par {
++	u16 htcn;
++	u16 hdcn;
++	u16 hsynp;
++	u16 hsynw;
++
++	u16 vtln;
++	u16 vdln;
++	u16 vsynp;
++	u16 vsynw;
++
++	u32 vxres;
++	u32 vyres;
++} sh_lcdc_par;
++
++static int pseudo_palette[16];
++
++#if defined(CONFIG_SH_SOLUTION_ENGINE_2ND) || defined(CONFIG_SH_SOLUTION_ENGINE_LIGHT)
++#if defined(CONFIG_MSTLCD01)	/* MSTLCD01 version */
++
++#if defined(CONFIG_MSTLCD01_QVGA)	/* QVGA */
++/* size=240x320, color=16bit */
++static struct fb_fix_screeninfo sh_lcdcfb_fix __initdata = {
++	.id = "SuperH LCDC",
++	.smem_start = SH_LCDC_FB_PHYS,	/* Top addr of frame Buffer */
++	.smem_len = SH_LCDC_FB_PHYS_LEN,	/* Length of frame buffer */
++	.type = FB_TYPE_PACKED_PIXELS,
++	.visual = FB_VISUAL_TRUECOLOR,
++	.xpanstep = 1,
++	.ypanstep = 1,
++	.ywrapstep = 0,
++	.line_length = 240 * 2,	/* xres_virtual*(16bit/8) */
++	.accel = FB_ACCEL_NONE,
++};
++static struct fb_var_screeninfo sh_lcdcfb_default = {
++	.xres = 240,
++	.yres = 320,
++	.xres_virtual = 240,
++	.yres_virtual = 320,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = SH_LCDC_PIXCLOCK_25_175,
++	.left_margin = 32,
++	.right_margin = 40,
++	.upper_margin = 1,
++	.lower_margin = 1,
++	.hsync_len = 8,
++	.vsync_len = 2,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#else				/* VGA */
++/* size=480x640, color=16bit */
++static struct fb_fix_screeninfo sh_lcdcfb_fix __initdata = {
++	.id = "SuperH LCDC",
++	.smem_start = SH_LCDC_FB_PHYS,	/* Top addr of frame Buffer */
++	.smem_len = SH_LCDC_FB_PHYS_LEN,	/* Length of frame buffer */
++	.type = FB_TYPE_PACKED_PIXELS,
++	.visual = FB_VISUAL_TRUECOLOR,
++	.xpanstep = 1,
++	.ypanstep = 1,
++	.ywrapstep = 0,
++	.line_length = 480 * 2,	/* xres_virtual*(16bit/8) */
++	.accel = FB_ACCEL_NONE,
++};
++static struct fb_var_screeninfo sh_lcdcfb_default = {
++	.xres = 480,
++	.yres = 640,
++	.xres_virtual = 480,
++	.yres_virtual = 640,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = SH_LCDC_PIXCLOCK_25_175,
++	.left_margin = 64,
++	.right_margin = 88,
++	.upper_margin = 0,
++	.lower_margin = 5,
++	.hsync_len = 16,
++	.vsync_len = 3,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#endif
++
++#else				/* !CONFIG_MSTLCD01 */
++/* size=240x320, color=16bit */
++static struct fb_fix_screeninfo sh_lcdcfb_fix __initdata = {
++	.id = "SuperH LCDC",
++	.smem_start = SH_LCDC_FB_PHYS,	/* Top addr of frame Buffer */
++	.smem_len = SH_LCDC_FB_PHYS_LEN,	/* Length of frame buffer */
++	.type = FB_TYPE_PACKED_PIXELS,
++	.visual = FB_VISUAL_TRUECOLOR,
++	.xpanstep = 1,
++	.ypanstep = 1,
++	.ywrapstep = 0,
++	.line_length = 240 * 2,	/* xres_virtual*(16bit/8) */
++	.accel = FB_ACCEL_NONE,
++};
++
++static struct fb_var_screeninfo sh_lcdcfb_default = {
++	.xres = 240,
++	.yres = 320,
++	.xres_virtual = 240,
++	.yres_virtual = 320,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = SH_LCDC_PIXCLOCK_25_175,
++	.left_margin = 8,
++	.right_margin = 8,
++	.upper_margin = 8,
++	.lower_margin = 2,
++	.hsync_len = 8,
++	.vsync_len = 2,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#endif
++
++#else				/* !CONFIG_SH_SOLUTION_ENGINE_2ND && !CONFIG_SH_SOLUTION_ENGINE_LIGHT */
++/* Default size=640x480, color=16bit */
++static struct fb_fix_screeninfo sh_lcdcfb_fix __initdata = {
++	.id = "SuperH LCDC",
++	.smem_start = SH_LCDC_FB_PHYS,	/* Top addr of frame Buffer */
++	.smem_len = SH_LCDC_FB_PHYS_LEN,	/* Length of frame buffer */
++	.type = FB_TYPE_PACKED_PIXELS,
++	.visual = FB_VISUAL_TRUECOLOR,
++	.xpanstep = 1,
++	.ypanstep = 1,
++	.ywrapstep = 0,
++	.line_length = 640 * 2,	/* xres_virtual*(16bit/8) */
++	.accel = FB_ACCEL_NONE,
++};
++static struct fb_var_screeninfo sh_lcdcfb_default = {
++	/* 16 bpp */
++	.xres = 640,
++	.yres = 480,
++	.xres_virtual = 640,
++	.yres_virtual = 480,
++	.bits_per_pixel = 16,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = SH_LCDC_PIXCLOCK_25_175,
++	.left_margin = 144,
++	.right_margin = 8,
++	.upper_margin = 23,
++	.lower_margin = 16,
++	.hsync_len = 8,
++	.vsync_len = 6,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#endif
++
++static struct fb_info sh_lcdcfb_info;
++
++int sh_lcdcfb_init(void);
++int sh_lcdcfb_setup(char *);
++
++static int sh_lcdcfb_open(const struct fb_info *info, int user)
++{
++	return 0;
++}
++
++static int sh_lcdcfb_release(const struct fb_info *info, int user)
++{
++	return 0;
++}
++
++static int sh_lcdcfb_check_var(struct fb_var_screeninfo *var,
++			       struct fb_info *info)
++{
++	u32 xres, right, hslen, left;
++	u32 yres, lower, vslen, upper;
++	u32 vxres, xoffset, vyres, yoffset;
++
++	xres = (var->xres + 7) & ~7;
++	vxres = (var->xres_virtual + 0xF) & ~0xF;
++	xoffset = (var->xoffset + 7) & ~7;
++	left = (var->left_margin + 7) & ~7;
++	right = (var->right_margin + 7) & ~7;
++	hslen = (var->hsync_len + 7) & ~7;
++
++	if (vxres < xres)
++		vxres = xres;
++	if (xres + xoffset > vxres)
++		xoffset = vxres - xres;
++
++	var->xres = xres;
++	var->right_margin = right;
++	var->hsync_len = hslen;
++	var->left_margin = left;
++	var->xres_virtual = vxres;
++	var->xoffset = xoffset;
++
++	yres = var->yres;
++	lower = var->lower_margin;
++	vslen = var->vsync_len;
++	upper = var->upper_margin;
++	vyres = var->yres_virtual;
++	yoffset = var->yoffset;
++
++	if (yres > vyres)
++		vyres = yres;
++	if (yoffset + yres > vyres)
++		yoffset = vyres - yres;
++	var->yres = yres;
++	var->lower_margin = lower;
++	var->vsync_len = vslen;
++	var->upper_margin = upper;
++	var->yres_virtual = vyres;
++	var->yoffset = yoffset;
++
++	var->red.msb_right = 0;
++	var->green.msb_right = 0;
++	var->blue.msb_right = 0;
++
++	switch (var->bits_per_pixel) {
++	case 8:		/* PSEUDOCOLOUR, 256 */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 0;
++		var->red.length = 8;
++		var->green.offset = 0;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		var->blue.length = 8;
++		break;
++
++	case 16:		/* TRUECOLOR(?), 64k */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 11;
++		var->red.length = 5;
++		var->green.offset = 5;
++		var->green.length = 6;
++		var->blue.offset = 0;
++		var->blue.length = 5;
++		break;
++
++	case 24:		/* TRUECOLOUR, 16m */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 16;
++		var->red.length = 8;
++		var->green.offset = 8;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		break;
++
++	default:
++		printk(KERN_WARNING "sh_lcdcfb: no support for %dbpp\n",
++		       var->bits_per_pixel);
++		return -EINVAL;
++	}
++
++	var->activate = FB_ACTIVATE_NOW;
++	var->height = -1;
++	var->width = -1;
++	var->accel_flags = FB_ACCELF_TEXT;
++
++	return 0;
++}
++
++static int sh_lcdcfb_setcolreg(unsigned regno, unsigned red, unsigned green,
++			       unsigned blue, unsigned transp,
++			       const struct fb_info *info)
++{
++	if (regno > 255)
++		return 1;
++
++	/* grayscale works only partially under directcolor */
++	if (info->var.grayscale) {
++		/* grayscale = 0.30*R + 0.59*G + 0.11*B */
++		red = green = blue = (red * 77 + green * 151 + blue * 28) >> 8;
++	}
++
++	/* Directcolor:
++	 *   var->{color}.offset contains start of bitfield
++	 *   var->{color}.length contains length of bitfield
++	 *   {hardwarespecific} contains width of DAC
++	 *   cmap[X] is programmed to (X << red.offset) | (X << green.offset) | (X <<blue.offset)
++	 *   RAMDAC[X] is programmed to (red, green, blue)
++	 *
++	 * Pseudocolor:
++	 *    uses offset = 0 && length = DAC register width.
++	 *    var->{color}.offset is 0
++	 *    var->{color}.length contains widht of DAC
++	 *    cmap is not used
++	 *    DAC[X] is programmed to (red, green, blue)
++	 * Truecolor:
++	 *    does not use RAMDAC (usually has 3 of them).
++	 *    var->{color}.offset contains start of bitfield
++	 *    var->{color}.length contains length of bitfield
++	 *    cmap is programmed to (red << red.offset) | (green << green.offset) |
++	 *                      (blue << blue.offset) | (transp << transp.offset)
++	 *    RAMDAC does not exist
++	 */
++#define CNVT_TOHW(val,width) ((((val)<<(width))+0x7FFF-(val))>>16)
++	switch (info->fix.visual) {
++	case FB_VISUAL_TRUECOLOR:
++	case FB_VISUAL_PSEUDOCOLOR:
++		red = CNVT_TOHW(red, info->var.red.length);
++		green = CNVT_TOHW(green, info->var.green.length);
++		blue = CNVT_TOHW(blue, info->var.blue.length);
++		transp = CNVT_TOHW(transp, info->var.transp.length);
++		break;
++	case FB_VISUAL_DIRECTCOLOR:
++		/* example here assumes 8 bit DAC. Might be different
++		 * for your hardware */
++		red = CNVT_TOHW(red, 8);
++		green = CNVT_TOHW(green, 8);
++		blue = CNVT_TOHW(blue, 8);
++		/* hey, there is bug in transp handling... */
++		transp = CNVT_TOHW(transp, 8);
++		break;
++	}
++#undef CNVT_TOHW
++	/* Truecolor has hardware independent palette */
++	if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
++		u32 v;
++
++		if (regno >= 16)
++			return 1;
++
++		v = (red << info->var.red.offset) |
++		    (green << info->var.green.offset) |
++		    (blue << info->var.blue.offset) |
++		    (transp << info->var.transp.offset);
++
++		switch (info->var.bits_per_pixel) {
++		case 8:
++			/* Yes some hand held devices have this. */
++			((u8 *) (info->pseudo_palette))[regno] = v;
++			break;
++		case 16:
++			((u16 *) (info->pseudo_palette))[regno] = v;
++			break;
++		case 24:
++		case 32:
++			((u32 *) (info->pseudo_palette))[regno] = v;
++			break;
++		}
++		return 0;
++	}
++
++	if (info->fix.visual == FB_VISUAL_PSEUDOCOLOR) {
++		if (regno >= 256)
++			return 1;
++	}
++
++	return 0;
++}
++
++static int sh_lcdcfb_blank(int blank, struct fb_info *info)
++{
++	if (blank)
++		writew(0x0, SH_LCDC_LDCNTR);
++	else
++		writew(0x11, SH_LCDC_LDCNTR);
++	return 0;
++}
++
++void sh_lcdcfb_regs_init(struct sh_lcdcfb_par *par)
++{
++	/* multiplex initialize */
++#if defined(CONFIG_CPU_SUBTYPE_SH7720)
++	writew(0x0000, PORT_PCCR);
++	writew(0x0000, PORT_PDCR);
++	writew(0xA800, PORT_PECR);
++	writew(0x0000, PORT_PVCR);
++#elif defined(CONFIG_CPU_SUBTYPE_SH7727)
++	writew(0x0000, PORT_PCCR);
++	writew((readw(PORT_PDCR)) & 0x0300, PORT_PDCR);
++	writew((readw(PORT_PECR)) & 0xcf3f, PORT_PECR);
++	writew((readw(PORT_PHCR)) & 0x3fff, PORT_PHCR);
++	writew((readw(PORT_PMCR)) & 0xff00, PORT_PMCR);
++#endif
++
++#if defined(CONFIG_MSTLCD01)	/* MSTLCD01 version */
++	writew(0xc02b, SH_LCDC_LDMTR);
++	writew(0x012d, SH_LCDC_LDDFR);	/* little endian, 16bit-color(5-6-5) */
++	writew(0x0200, SH_LCDC_LDSMR);	/* rotate disable, 16burst */
++	writew(0x0, SH_LCDC_LDPALCR);	/* palette control display mode(default) */
++#if defined(CONFIG_MSTLCD01_QVGA)	/* QVGA */
++	writew(0x0108, SH_LCDC_LDICKR);	/* use CKIO, CKIO/8 */
++#else				/* VGA */
++	writew(0x0102, SH_LCDC_LDICKR);	/* use CKIO, CKIO/2 */
++#endif
++	writew(par->vxres * 2, SH_LCDC_LDLAOR);
++	writew((par->hdcn << 8) | (par->htcn & 0xff), SH_LCDC_LDHCNR);
++	writew((par->hsynw << 12) | (par->hsynp & 0xff), SH_LCDC_LDHSYNR);
++	writew(par->vdln, SH_LCDC_LDVDLNR);
++	writew(par->vtln, SH_LCDC_LDVTLNR);
++	writew((par->vsynw << 12) | (par->vsynp & 0x7ff), SH_LCDC_LDVSYNR);
++
++	writel(SH_LCDC_FB_PHYS & 0x3ffffff, SH_LCDC_LDSARU);
++	writel(SH_LCDC_FB_PHYS & 0x3ffffff, SH_LCDC_LDSARL);	/* if TFT or STN, not use */
++	writew(0x000c, SH_LCDC_LDACLNR);
++	writew(0x0000, SH_LCDC_LDINTR);
++	writew(0xff70, SH_LCDC_LDPMMR);
++	writew(0x0500, SH_LCDC_LDPSPR);
++
++	writew(0x0011, SH_LCDC_LDCNTR);
++#else				/* old type LCD */
++	/* LCD CONTROL registers */
++	writew(0x0108, SH_LCDC_LDICKR);	/* 33Mhz/8? */
++	writew(0xc02b, SH_LCDC_LDMTR);
++	writew(0x012d, SH_LCDC_LDDFR);
++	writew(0x0200, SH_LCDC_LDSMR);
++	writel(SH_LCDC_FB_PHYS & 0x3ffffff, SH_LCDC_LDSARU);
++	writel(SH_LCDC_FB_PHYS & 0x3ffffff, SH_LCDC_LDSARL);
++	writew(par->vxres * 2, SH_LCDC_LDLAOR);
++	writew(0x0, SH_LCDC_LDPALCR);
++	writew((par->hdcn << 8) | (par->htcn & 0xff), SH_LCDC_LDHCNR);
++	writew((par->hsynw << 12) | (par->hsynp & 0xff), SH_LCDC_LDHSYNR);
++	writew(par->vdln, SH_LCDC_LDVDLNR);
++	writew(par->vtln, SH_LCDC_LDVTLNR);
++	writew((par->vsynw << 12) | (par->vsynp & 0x7ff), SH_LCDC_LDVSYNR);
++	writew(0x000c, SH_LCDC_LDACLNR);
++	writew(0x0000, SH_LCDC_LDINTR);
++	writew(0xff70, SH_LCDC_LDPMMR);
++	writew(0x0500, SH_LCDC_LDPSPR);
++	writew(0x0011, SH_LCDC_LDCNTR);
++#endif
++}
++
++static int sh_lcdcfb_decode_var(const struct fb_var_screeninfo *var,
++				struct sh_lcdcfb_par *par,
++				const struct fb_info *info)
++{
++	par->hdcn = var->xres > 7 ? var->xres / 8 - 1 : 0;
++	par->hsynp =
++	    var->xres + var->right_margin >
++	    7 ? (var->xres + var->right_margin) / 8 - 1 : 0;
++	par->hsynw = var->hsync_len > 7 ? var->hsync_len / 8 - 1 : 0;
++	par->htcn =
++	    var->xres + var->right_margin + var->hsync_len + var->left_margin >
++	    7 ? (var->xres + var->right_margin + var->hsync_len +
++		 var->left_margin) / 8 - 1 : 0;
++
++	par->vdln = var->yres - 1;
++	par->vsynp = var->yres + var->lower_margin - 1;
++	par->vsynw = var->vsync_len - 1;
++	par->vtln =
++	    var->yres + var->lower_margin + var->vsync_len + var->upper_margin -
++	    2;
++
++	par->vxres = var->xres_virtual;
++	par->vyres = var->yres_virtual;
++
++	return 0;
++}
++
++static int sh_lcdcfb_encode_var(struct fb_var_screeninfo *var,
++				struct sh_lcdcfb_par *par)
++{
++	struct fb_info info;
++
++	*var = sh_lcdcfb_default;
++
++	sh_lcdcfb_check_var(var, &info);
++
++	var->pixclock = SH_LCDC_PIXCLOCK_25_175;
++	var->activate = 0;
++
++	return 0;
++}
++
++static struct fb_ops sh_lcdcfb_ops = {
++	.owner = THIS_MODULE,
++	.fb_open = sh_lcdcfb_open,
++	.fb_release = sh_lcdcfb_release,
++	.fb_check_var = sh_lcdcfb_check_var,
++	.fb_setcolreg = sh_lcdcfb_setcolreg,
++	.fb_blank = sh_lcdcfb_blank,
++	.fb_fillrect = cfb_fillrect,
++	.fb_copyarea = cfb_copyarea,
++	.fb_imageblit = cfb_imageblit,
++	.fb_cursor = soft_cursor,
++};
++
++int __init sh_lcdcfb_init(void)
++{
++	int cmap_len = 16;
++	int retval;
++
++	/*
++	 * Here we set the screen_base to the vitrual memory address
++	 * for the framebuffer. Usually we obtain the resource address
++	 * from the bus layer and then translate it to virtual memory
++	 * space via ioremap. Consult ioport.h.
++	 */
++	 /**/ sh_lcdcfb_info.node = -1;
++	sh_lcdcfb_info.screen_base = (char *)SH_LCDC_FB_PHYS;
++	sh_lcdcfb_info.fbops = &sh_lcdcfb_ops;
++	sh_lcdcfb_info.fix = sh_lcdcfb_fix;
++	sh_lcdcfb_info.pseudo_palette = pseudo_palette;
++
++	sh_lcdcfb_info.par = &sh_lcdc_par;
++
++	sh_lcdcfb_decode_var(&sh_lcdcfb_default, &sh_lcdc_par, &sh_lcdcfb_info);
++	sh_lcdcfb_encode_var(&sh_lcdcfb_default, &sh_lcdc_par);
++	sh_lcdcfb_regs_init(&sh_lcdc_par);
++
++	/*
++	 * Set up flags to indicate what sort of acceleration your
++	 * driver can provide (pan/wrap/copyarea/etc.) and whether it
++	 * is a module -- see FBINFO_* in include/linux/fb.h
++	 */
++	sh_lcdcfb_info.flags = FBINFO_DEFAULT;
++
++	/*
++	 * This should give a reasonable default video mode. The following is
++	 * done when we can set a video mode.
++	 */
++#if defined(CONFIG_SH_SOLUTION_ENGINE_LIGHT) || defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++	retval =
++	    fb_find_mode(&sh_lcdcfb_info.var, &sh_lcdcfb_info, "240x320@60",
++			 NULL, 0, NULL, 8);
++#else
++	retval =
++	    fb_find_mode(&sh_lcdcfb_info.var, &sh_lcdcfb_info, "640x480@60",
++			 NULL, 0, NULL, 8);
++#endif
++
++	if (!retval || retval == 4)
++		return -EINVAL;
++
++	/* This has to been done !!! */
++	fb_alloc_cmap(&sh_lcdcfb_info.cmap, cmap_len, 0);
++
++	/*
++	 * The following is done in the case of having hardware with a static
++	 * mode. If we are setting the mode ourselves we don't call this.
++	 */
++	sh_lcdcfb_info.var = sh_lcdcfb_default;
++
++	if (register_framebuffer(&sh_lcdcfb_info) < 0)
++		return -EINVAL;
++	printk(KERN_INFO "fb%d: %s frame buffer device\n", sh_lcdcfb_info.node,
++	       sh_lcdcfb_info.fix.id);
++	return 0;
++}
++
++static void __exit sh_lcdcfb_cleanup(void)
++{
++	/*
++	 *  If your driver supports multiple boards, you should unregister and
++	 *  clean up all instances.
++	 */
++
++	unregister_framebuffer(&sh_lcdcfb_info);
++}
++
++int __init sh_lcdcfb_setup(char *options)
++{
++
++	char *this_opt;
++
++	if (!options || !*options)
++		return 0;
++
++	while ((this_opt = strsep(&options, ",")) != NULL) {
++		if (!*this_opt)
++			continue;
++	}
++	return 0;
++}
++
++module_init(sh_lcdcfb_init);
++module_exit(sh_lcdcfb_cleanup);
+Index: linux-2.6.10/drivers/video/sh_lcdc.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/video/sh_lcdc.h
+@@ -0,0 +1,57 @@
++/*
++ * sh_lcdc.h: SH LCD control device driver (16bit color only)
++ *
++ *   Copyright(C) 2002/05/20 Mitsuharu Takei(takei-mitsuharu@hitachi-ul.co.jp)
++ *   Copyright(C) 2004/11/26 Takashi Kusuda
++ *        Modified to supoort SH7720 and kernel 2.6
++ */
++
++#ifndef __LINUX_VIDEO_SH_LCDC_H
++#define __LINUX_VIDEO_SH_LCDC_H
++
++#include <linux/config.h>
++
++#define SH_LCDC_PIXCLOCK_25_175 39722 /* 25.175Mhz=39722ps */
++
++#define SH_LCDC_FB_PHYS P2SEGADDR(CONFIG_MEMORY_START+CONFIG_MEMORY_SIZE-CONFIG_SH_LCDC_FB_SIZE) /* start add. of FB */
++#define SH_LCDC_FB_PHYS_LEN	CONFIG_SH_LCDC_FB_SIZE
++
++
++/* Regiseters */
++#if defined(CONFIG_CPU_SUBTYPE_SH7720)
++#define SH_LCDC_REG_BASE 0xA4400400
++#define SH_LCDC_LDPR(x)  (0xA4400000 + (x)*4) /* Color Palette Reg(256col) */
++#elif defined(CONFIG_CPU_SUBTYPE_SH7727)
++#define SH_LCDC_REG_BASE 0xA4000C00
++#define SH_LCDC_LDPR(x)  (0xA4000800 + (x)*4) /* Color Palette Reg(256col) */
++#else
++#error "What CPU is this ?"
++#endif
++
++
++#define SH_LCDC_LDICKR		(SH_LCDC_REG_BASE + 0x0)
++#define SH_LCDC_LDMTR		(SH_LCDC_REG_BASE + 0x2)
++#define SH_LCDC_LDDFR		(SH_LCDC_REG_BASE + 0x4)
++#define SH_LCDC_LDSMR		(SH_LCDC_REG_BASE + 0x6)
++#define SH_LCDC_LDSARU		(SH_LCDC_REG_BASE + 0x8)
++#define SH_LCDC_LDSARL		(SH_LCDC_REG_BASE + 0xC)
++#define SH_LCDC_LDLAOR		(SH_LCDC_REG_BASE + 0x10)
++#define SH_LCDC_LDPALCR		(SH_LCDC_REG_BASE + 0x12)
++#define SH_LCDC_LDHCNR		(SH_LCDC_REG_BASE + 0x14)
++#define SH_LCDC_LDHSYNR		(SH_LCDC_REG_BASE + 0x16)
++#define SH_LCDC_LDVDLNR		(SH_LCDC_REG_BASE + 0x18)
++#define SH_LCDC_LDVTLNR		(SH_LCDC_REG_BASE + 0x1A)
++#define SH_LCDC_LDVSYNR		(SH_LCDC_REG_BASE + 0x1C)
++#define SH_LCDC_LDACLNR		(SH_LCDC_REG_BASE + 0x1E)
++#define SH_LCDC_LDINTR		(SH_LCDC_REG_BASE + 0x20)
++#define SH_LCDC_LDPMMR		(SH_LCDC_REG_BASE + 0x24)
++#define SH_LCDC_LDPSPR		(SH_LCDC_REG_BASE + 0x26)
++#define SH_LCDC_LDCNTR		(SH_LCDC_REG_BASE + 0x28)
++
++#if defined(CONFIG_CPU_SUBTYPE_SH7720)
++#define SH_LCDC_LDUINTR		(SH_LCDC_REG_BASE + 0x34)
++#define SH_LCDC_LDUINTLNR	(SH_LCDC_REG_BASE + 0x36)
++#define SH_LCDC_LDLIRNR		(SH_LCDC_REG_BASE + 0x40)
++#endif
++
++#endif /* __LINUX_VIDEO_SH_LCDC_H */
+Index: linux-2.6.10/drivers/video/ygv619.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/video/ygv619.h
+@@ -0,0 +1,29 @@
++/*
++ * ygv619.h,v 0.8 2001/02/16
++ *  YGV619 video device driver for Super-H
++ *
++ *   Copyright (C) 2001/02/16 Mitsuharu Takei(takei-mitsuharu@hitachi-ul.co.jp)
++ */
++
++#ifndef __LINUX_VIDEO_YGV619_H
++#define __LINUX_VIDEO_YGV619_H
++
++#include <linux/config.h>
++
++#define YGV619_PIXCLOCK_78_8 12690	/* 78.8Mhz=12690ps */
++#define YGV619_PIXCLOCK_25_175 39722	/* 25.175Mhz=39722ps */
++#define YGV619_PIXCLOCK_12_272 81486	/* 12.272Mhz=81486ps */
++
++#define YGV619_FB_PHYS (CONFIG_YGV619_FB_BASE + 0x00000000UL)	/* FB base address */
++#define YGV619_FB_PHYS_LEN 0x00200000UL	/* FB length */
++
++#define YGV619_REG (CONFIG_YGV619_FB_BASE + 0x01000000UL)
++#define YGV619_R(x) (YGV619_REG + (x))
++
++#define YGV619_PA1_OFF 0x00200000UL
++#define YGV619_PA1_R(x) (CONFIG_YGV619_FB_BASE + YGV619_PA1_OFF + (x))
++
++#define YGV619_PAL_OFF 0x00200020UL
++#define YGV619_PAL(x) (CONFIG_YGV619_FB_BASE + YGV619_PAL_OFF + (x))
++
++#endif				/* __LINUX_VIDEO_YGV619_H */
+Index: linux-2.6.10/drivers/video/ygv619fb.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/video/ygv619fb.c
+@@ -0,0 +1,572 @@
++/*
++ * ygv619fb.c,v 0.8 2001/02/16
++ *  YGV619 video device driver for Super-H
++ *
++ *   Copyright (C) 2001/02/16 Mitsuharu Takei(takei-mitsuharu@hitachi-ul.co.jp)
++ *   Copyright (C) Takashi Kusuda (Dec 1, 2004)
++ *    Modified to support kernel 2.6.x
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/tty.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/fb.h>
++#include <linux/init.h>
++
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/pgtable.h>
++#include <asm/io.h>
++
++#include "ygv619.h"
++
++static struct fb_info ygv619fb_info;	/* use fb_info.fontname in ygv619fb_setup */
++static int pseudo_palette[16];
++
++struct ygv619fb_par {
++	u32 htl;
++	u32 dsc;
++	u32 dec;
++	u32 hsw;
++
++	u32 vtl;
++	u32 dsr;
++	u32 der;
++	u32 vsw;
++
++	u32 x_vir;
++	u32 y_vir;
++} ygv619_par;
++
++static struct fb_fix_screeninfo ygv619fb_fix __initdata = {
++	.id = "Yamaha YGV619",
++	.smem_start = YGV619_FB_PHYS,	/* Top addr of frame Buffer */
++	.smem_len = YGV619_FB_PHYS_LEN,	/* Length of frame buffer */
++	.type = FB_TYPE_PACKED_PIXELS,
++	.visual = FB_VISUAL_TRUECOLOR,
++	.xpanstep = 1,
++	.ypanstep = 1,
++	.ywrapstep = 0,
++	.line_length = 640 * 1,	/* xres_virtual*(8bit/8) */
++	.accel = FB_ACCEL_NONE,
++};
++
++#ifdef CONFIG_YGV619_NTSC
++static struct fb_var_screeninfo ygv619fb_default = {
++	.xres = 576,
++	.yres = 432,
++	.xres_virtual = 576,
++	.yres_virtual = 432,
++	.bits_per_pixel = 8,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = YGV619_PIXCLOCK_12_272,
++	.left_margin = 92,
++	.right_margin = 49,
++	.upper_margin = 55,
++	.lower_margin = 36,
++	.hsync_len = 63,
++	.vsync_len = 3,
++	.vmode = FB_VMODE_INTERLACED,
++};
++#else
++static struct fb_var_screeninfo ygv619fb_default = {
++	.xres = 640,
++	.yres = 480,
++	.xres_virtual = 640,
++	.yres_virtual = 480,
++	.bits_per_pixel = 8,
++	.activate = 0,
++	.height = -1,
++	.width = -1,
++	.pixclock = YGV619_PIXCLOCK_25_175,
++	.left_margin = 24,
++	.right_margin = 40,
++	.upper_margin = 18,
++	.lower_margin = 25,
++	.hsync_len = 96,
++	.vsync_len = 2,
++	.vmode = FB_VMODE_NONINTERLACED,
++};
++#endif
++
++int ygv619fb_init(void);
++int ygv619fb_setup(char *);
++
++static int ygv619fb_open(struct fb_info *info, int user)
++{
++	return 0;
++}
++
++static int ygv619fb_release(struct fb_info *info, int user)
++{
++	return 0;
++}
++
++static int ygv619fb_check_var(struct fb_var_screeninfo *var,
++			      struct fb_info *info)
++{
++	u32 xres, right, hslen, left;
++	u32 yres, lower, vslen, upper;
++	u32 vxres, xoffset, vyres, yoffset;
++
++	xres = (var->xres + 7) & ~7;
++	vxres = (var->xres_virtual + 0xF) & ~0xF;
++	xoffset = (var->xoffset + 7) & ~7;
++	left = (var->left_margin + 7) & ~7;
++	right = (var->right_margin + 7) & ~7;
++	hslen = (var->hsync_len + 7) & ~7;
++
++	if (vxres < xres)
++		vxres = xres;
++	if (xres + xoffset > vxres)
++		xoffset = vxres - xres;
++
++	var->xres = xres;
++	var->right_margin = right;
++	var->hsync_len = hslen;
++	var->left_margin = left;
++	var->xres_virtual = vxres;
++	var->xoffset = xoffset;
++
++	yres = var->yres;
++	lower = var->lower_margin;
++	vslen = var->vsync_len;
++	upper = var->upper_margin;
++	vyres = var->yres_virtual;
++	yoffset = var->yoffset;
++
++	if (yres > vyres)
++		vyres = yres;
++	if (yoffset + yres > vyres)
++		yoffset = vyres - yres;
++	var->yres = yres;
++	var->lower_margin = lower;
++	var->vsync_len = vslen;
++	var->upper_margin = upper;
++	var->yres_virtual = vyres;
++	var->yoffset = yoffset;
++
++	var->red.msb_right = 0;
++	var->green.msb_right = 0;
++	var->blue.msb_right = 0;
++
++	switch (var->bits_per_pixel) {
++	case 8:		/* PSEUDOCOLOUR, 256 */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 0;
++		var->red.length = 8;
++		var->green.offset = 0;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		var->blue.length = 8;
++		break;
++
++	case 16:		/* TRUECOLOR(?), 64k */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 11;
++		var->red.length = 5;
++		var->green.offset = 5;
++		var->green.length = 6;
++		var->blue.offset = 0;
++		var->blue.length = 5;
++		break;
++
++	case 24:		/* TRUECOLOUR, 16m */
++		var->transp.offset = 0;
++		var->transp.length = 0;
++		var->red.offset = 16;
++		var->red.length = 8;
++		var->green.offset = 8;
++		var->green.length = 8;
++		var->blue.offset = 0;
++		break;
++
++	default:
++		printk(KERN_WARNING "ygv619fb: no support for %dbpp\n",
++		       var->bits_per_pixel);
++		return -EINVAL;
++	}
++
++	var->activate = FB_ACTIVATE_NOW;
++	var->height = -1;
++	var->width = -1;
++	var->accel_flags = FB_ACCELF_TEXT;
++
++	return 0;
++}
++
++static int ygv619fb_setcolreg(u_int regno, u_int red, u_int green,
++			      u_int blue, u_int transp, struct fb_info *info)
++{
++	if (regno > 255)
++		return 1;
++	/* grayscale works only partially under directcolor */
++	if (info->var.grayscale) {
++		/* grayscale = 0.30*R + 0.59*G + 0.11*B */
++		red = green = blue = (red * 77 + green * 151 + blue * 28) >> 8;
++	}
++	/* Directcolor:
++	 *   var->{color}.offset contains start of bitfield
++	 *   var->{color}.length contains length of bitfield
++	 *   {hardwarespecific} contains width of DAC
++	 *   cmap[X] is programmed to (X << red.offset) | (X << green.offset) | (X <<blue.offset)
++	 *   RAMDAC[X] is programmed to (red, green, blue)
++	 *
++	 * Pseudocolor:
++	 *    uses offset = 0 && length = DAC register width.
++	 *    var->{color}.offset is 0
++	 *    var->{color}.length contains widht of DAC
++	 *    cmap is not used
++	 *    DAC[X] is programmed to (red, green, blue)
++	 * Truecolor:
++	 *    does not use RAMDAC (usually has 3 of them).
++	 *    var->{color}.offset contains start of bitfield
++	 *    var->{color}.length contains length of bitfield
++	 *    cmap is programmed to (red << red.offset) | (green << green.offset) |
++	 *                      (blue << blue.offset) | (transp << transp.offset)
++	 *    RAMDAC does not exist
++	 */
++#define CNVT_TOHW(val,width) ((((val)<<(width))+0x7FFF-(val))>>16)
++	switch (info->fix.visual) {
++	case FB_VISUAL_TRUECOLOR:
++	case FB_VISUAL_PSEUDOCOLOR:
++		red = CNVT_TOHW(red, info->var.red.length);
++		green = CNVT_TOHW(green, info->var.green.length);
++		blue = CNVT_TOHW(blue, info->var.blue.length);
++		transp = CNVT_TOHW(transp, info->var.transp.length);
++		break;
++	case FB_VISUAL_DIRECTCOLOR:
++		/* example here assumes 8 bit DAC. Might be different
++		 * for your hardware */
++		red = CNVT_TOHW(red, 8);
++		green = CNVT_TOHW(green, 8);
++		blue = CNVT_TOHW(blue, 8);
++		/* hey, there is bug in transp handling... */
++		transp = CNVT_TOHW(transp, 8);
++		break;
++	}
++#undef CNVT_TOHW
++	/* Truecolor has hardware independent palette */
++	if (info->fix.visual == FB_VISUAL_TRUECOLOR) {
++		u32 v;
++
++		if (regno >= 16)
++			return 1;
++
++		v = (red << info->var.red.offset) |
++		    (green << info->var.green.offset) |
++		    (blue << info->var.blue.offset) |
++		    (transp << info->var.transp.offset);
++
++		switch (info->var.bits_per_pixel) {
++		case 8:
++			/* Yes some hand held devices have this. */
++			((u8 *) (info->pseudo_palette))[regno] = v;
++			break;
++		case 16:
++			((u16 *) (info->pseudo_palette))[regno] = v;
++			break;
++		case 24:
++		case 32:
++			((u32 *) (info->pseudo_palette))[regno] = v;
++			break;
++		}
++		return 0;
++	}
++
++	if (info->fix.visual == FB_VISUAL_PSEUDOCOLOR) {
++		if (regno >= 256)
++			return 1;
++	}
++
++	return 0;
++}
++
++static int ygv619fb_blank(int blank, struct fb_info *info)
++{
++	if (blank)
++		writel((readl(YGV619_R(0x04)) | 0x80000000), YGV619_R(0x04));
++	else
++		writel((readl(YGV619_R(0x04)) & ~0x80000000), YGV619_R(0x04));
++	return 0;
++}
++
++static int ygv619fb_decode_var(const struct fb_var_screeninfo *var,
++			       struct ygv619fb_par *par,
++			       const struct fb_info *info)
++{
++	par->vtl =
++	    var->vsync_len + var->upper_margin + var->yres + var->lower_margin -
++	    5;
++	par->htl =
++	    var->hsync_len + var->left_margin + var->xres + var->right_margin -
++	    3;
++
++	par->dsr = var->vsync_len + var->upper_margin - 1;
++	par->dsc = var->hsync_len + var->left_margin - 12;
++
++	par->der = var->vsync_len + var->upper_margin + var->yres - 1 - 1;
++	par->dec = var->hsync_len + var->left_margin + var->xres - 12 - 1;
++
++	par->vsw = var->vsync_len - 1;
++	par->hsw = var->hsync_len - 1;
++
++	par->x_vir = var->xres_virtual;
++	par->y_vir = var->yres_virtual;
++
++	return 0;
++}
++
++static int ygv619fb_encode_var(struct fb_var_screeninfo *var,
++			       struct ygv619fb_par *par)
++{
++	var->xres = par->dec - par->dsc + 1;
++	var->yres = par->der - par->dsr + 1;
++	var->xres_virtual = par->x_vir;
++	var->yres_virtual = par->y_vir;
++	var->xoffset = 0;
++	var->yoffset = 0;
++
++	var->grayscale = 0;
++	var->bits_per_pixel = 8;
++
++	var->red.offset = 0;
++	var->red.length = 8;
++	var->red.msb_right = 0;
++	var->blue = var->green = var->red;
++
++#ifdef CONFIG_YGV619_NTSC
++	var->pixclock = YGV619_PIXCLOCK_12_272;	/* type NTSC */
++#else
++	var->pixclock = YGV619_PIXCLOCK_25_175;	/* type 640x480 */
++#endif
++
++	var->activate = 0;
++	return 0;
++
++}
++
++static struct fb_ops ygv619fb_ops = {
++	.owner = THIS_MODULE,
++	.fb_open = ygv619fb_open,
++	.fb_release = ygv619fb_release,
++	.fb_check_var = ygv619fb_check_var,
++	.fb_setcolreg = ygv619fb_setcolreg,
++	.fb_blank = ygv619fb_blank,
++	.fb_fillrect = cfb_fillrect,
++	.fb_copyarea = cfb_copyarea,
++	.fb_imageblit = cfb_imageblit,
++	.fb_cursor = soft_cursor,
++};
++
++int ygv619fb_setup(char *options)
++{
++
++	char *this_opt;
++
++	if (!options || !*options)
++		return 0;
++
++	while ((this_opt = strsep(&options, ",")) != NULL) {
++		if (!*this_opt)
++			continue;
++	}
++
++	return 0;
++}
++
++void delay(void)
++{
++	volatile unsigned short trash;
++	trash = *(volatile unsigned short *)0xa0000000;
++}
++
++static void delay10000(void)
++{
++	int i;
++	for (i = 0; i < 10000; i++)
++		delay();
++}
++
++void ygv619fb_ini_reg(struct ygv619fb_par *par)
++{
++	/* set PLL */
++	do {
++#ifdef CONFIG_YGV619_NTSC
++		writel(0x90000100, YGV619_R(0x30));
++	} while (readl(YGV619_R(0x30)) != 0x90000100);	/* type NTSC */
++#else
++		writel(0x90000112, YGV619_R(0x30));
++	} while (readl(YGV619_R(0x30)) != 0x90000112);	/* type 640x480 */
++#endif
++
++#ifdef CONFIG_YGV619_NTSC
++	writel(0x06430760, YGV619_R(0x34));	/* type NTSC */
++#else
++	writel(0x06430fd3, YGV619_R(0x34));	/* type 640x480 */
++#endif
++	writel(0x00000000, YGV619_R(0x38));
++
++	/* delay for SDRAM reset(3/15) */
++	delay10000();
++	delay10000();
++	delay10000();
++
++	/* VRAM Control */
++	writel(0x000000dc, YGV619_R(0x00));	/* 3/14 change MPRF RFRSH */
++	do {
++		delay10000();
++	} while (readl(YGV619_R(0x00)) & 0x8);
++
++	/* Header Start Address */
++	writel((YGV619_PA1_OFF) & ~0xff000000, YGV619_R(0x04));
++
++	/* Data Format Control */
++#ifdef CONFIG_YGV619_NTSC
++	writel(0x09800000, YGV619_R(0x14));	/* type NTSC */
++#else
++	/*(3/15 GCKOH PCKH CVT4H=ALL 1 critical!! */
++	writel(0x7c800000, YGV619_R(0x14));	/* type 640x480 */
++#endif
++
++	/* CPU I/F: Interrupt Enable & Status (3/14) */
++
++	writel(0x00000003, YGV619_R(0x5c));
++	do {
++		delay10000();
++	} while (readl(YGV619_R(0x5c)) & 0x8);
++
++	/* set display size */
++#ifdef CONFIG_YGV619_NTSC
++	writel((((par->vtl << 15 & 0xfff0000) - 0x20000) | (par->htl -
++							    1)) | 0x80004000,
++	       YGV619_R(0x3c));
++	writel(((par->der + 1) << 15) | (par->dec + 1), YGV619_R(0x40));	/* blank start =disp end + 1 */
++	writel(((par->dsr - 1) << 15) | (par->dsc), YGV619_R(0x44));	/* blank end = disp start - 1 */
++	writel( /* (par->dsr <<15 ) | (par->dsc +8) */ 0x0, YGV619_R(0x48));
++	writel( /*(par->der <<15 ) | (par->dec +8) */ 0x0, YGV619_R(0x4c));
++	writel(0x00001000 | (par->vsw << 8) | par->hsw, YGV619_R(0x50));	/* change 3/14 TRES */
++#else
++	writel(((par->vtl << 16) | par->htl) & ~0x80000000, YGV619_R(0x3c));
++	writel(((par->der + 1) << 16) | (par->dec + 1), YGV619_R(0x40));	/* blank start =disp end + 1 */
++	writel(((par->dsr - 1) << 16) | (par->dsc - 1), YGV619_R(0x44));	/* blank end = disp start - 1 */
++	writel((par->dsr << 16) | (par->dsc + 8), YGV619_R(0x48));
++	writel((par->der << 16) | (par->dec + 8), YGV619_R(0x4c));
++	writel(0x80001000 | (par->vsw << 8) | par->hsw, YGV619_R(0x50));	/* change 3/14 TRES */
++#endif
++
++	/* Interrupt Enable & Status */
++	writel(0x0, YGV619_R(0x5c));
++
++	/* Drawing Processor Unit */
++	writel(0x00000800, YGV619_R(0x88));
++
++	/* Header Data Format & Description */
++#ifdef CONFIG_YGV619_NTSC
++	writel((par->dsr << 16) | par->dsc, YGV619_PA1_R(0x00));
++	writel(((par->der + 1) << 16) | (par->dec + 1), YGV619_PA1_R(0x04));
++	writel(par->x_vir, YGV619_PA1_R(0x08));
++	writel(0x62000000, YGV619_PA1_R(0x0c));
++	writel(YGV619_REG & 0xffffff, YGV619_PA1_R(0x10));
++	writel(0x0, YGV619_PA1_R(0x14));
++	writel(0x80000000 | YGV619_PAL_OFF, YGV619_PA1_R(0x18));
++	writel(0x80000000, YGV619_PA1_R(0x1c));
++#else
++	writel((par->dsr << 16) | par->dsc, YGV619_PA1_R(0x00));
++	writel(((par->der + 1) << 16) | (par->dec + 1), YGV619_PA1_R(0x04));
++	writel(par->x_vir, YGV619_PA1_R(0x08));
++	writel(0x20000000, YGV619_PA1_R(0x0c));
++	writel(0x0, YGV619_PA1_R(0x10));
++	writel(0x0, YGV619_PA1_R(0x14));
++	writel(0x80000000 | YGV619_PAL_OFF, YGV619_PA1_R(0x18));
++	writel(0x80000000, YGV619_PA1_R(0x1c));
++#endif
++
++	/* Drawing Processor Unit (add 3/14) */
++	writel(0x00000000, YGV619_R(0x88));
++
++}
++
++int __init ygv619fb_init(void)
++{
++	int retval;
++	int cmap_len = 16;
++
++	/*
++	 * Here we set the screen_base to the vitrual memory address
++	 * for the framebuffer. Usually we obtain the resource address
++	 * from the bus layer and then translate it to virtual memory
++	 * space via ioremap. Consult ioport.h.
++	 */
++	/* set fb_info */
++	ygv619fb_info.node = -1;
++	ygv619fb_info.screen_base = (char *)YGV619_FB_PHYS;
++	ygv619fb_info.fbops = &ygv619fb_ops;
++	ygv619fb_info.fix = ygv619fb_fix;
++	ygv619fb_info.pseudo_palette = pseudo_palette;
++
++	ygv619fb_info.par = &ygv619_par;
++
++	ygv619fb_decode_var(&ygv619fb_default, &ygv619_par, &ygv619fb_info);
++	ygv619fb_encode_var(&ygv619fb_default, &ygv619_par);
++	ygv619fb_ini_reg(&ygv619_par);
++
++	/*
++	 * Set up flags to indicate what sort of acceleration your
++	 * driver can provide (pan/wrap/copyarea/etc.) and whether it
++	 * is a module -- see FBINFO_* in include/linux/fb.h
++	 */
++	ygv619fb_info.flags = FBINFO_DEFAULT;
++
++	/*
++	 * This should give a reasonable default video mode. The following is
++	 * done when we can set a video mode.
++	 */
++	retval =
++	    fb_find_mode(&ygv619fb_info.var, &ygv619fb_info, "640x480@60", NULL,
++			 0, NULL, 8);
++
++	if (!retval || retval == 4)
++		return -EINVAL;
++
++	/* This has to been done !!! */
++	fb_alloc_cmap(&ygv619fb_info.cmap, cmap_len, 0);
++
++	/*
++	 * The following is done in the case of having hardware with a static
++	 * mode. If we are setting the mode ourselves we don't call this.
++	 */
++	ygv619fb_info.var = ygv619fb_default;
++
++	if (register_framebuffer(&ygv619fb_info) < 0) {
++		printk(KERN_ERR "ygv619fb.c: register_framebuffer failed\n");
++		return -EINVAL;
++	}
++
++	printk(KERN_INFO "fb%d: %s frame buffer device\n", ygv619fb_info.node,
++	       ygv619fb_info.fix.id);
++
++	return 0;
++}
++
++static void __exit ygv619fb_cleanup(void)
++{
++	/*
++	 *  If your driver supports multiple boards, you should unregister and
++	 *  clean up all instances.
++	 */
++
++	unregister_framebuffer(&ygv619fb_info);
++}
++
++module_init(ygv619fb_init);
++module_exit(ygv619fb_cleanup);
+Index: linux-2.6.10/mvl_patches/pro-1322.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1322.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1322);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

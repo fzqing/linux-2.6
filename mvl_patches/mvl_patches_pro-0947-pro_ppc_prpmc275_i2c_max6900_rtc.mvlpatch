@@ -1,0 +1,575 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc_prpmc275_i2c_max6900_rtc
+# Date: Wed Oct 11 21:58:58 2006
+# Source: MontaVista Software, Inc.
+# MR: 19269
+# Type: Enhancement
+# Disposition: needs submitting to lm-sensors
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+#     MAX6900 I2C RTC client driver
+# 
+#  drivers/i2c/chips/Kconfig   |    9 +
+#  drivers/i2c/chips/Makefile  |    1 
+#  drivers/i2c/chips/max6900.c |  298 ++++++++++++++++++++++++++++++++++++++++++++
+#  3 files changed, 308 insertions(+)
+# 
+
+PATCHNUM=947
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 19269
+Type: Enhancement
+Disposition: needs submitting to lm-sensors
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+    MAX6900 I2C RTC client driver
+
+ drivers/i2c/chips/Kconfig   |    9 +
+ drivers/i2c/chips/Makefile  |    1 
+ drivers/i2c/chips/max6900.c |  298 ++++++++++++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0947.c      |   16 ++
+ 4 files changed, 324 insertions(+)
+
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -387,6 +387,15 @@ config SENSORS_M41T00
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called m41t00.
+ 
++config SENSORS_MAX6900
++	tristate "DS MAX6900 RTC chip"
++	depends on I2C && PPC32
++	help
++	  If you say yes here you get support for the DS MAX6900 RTC chip.
++
++	  This driver can also be built as a module.  If so, the module
++	  will be called max6900.
++
+ config TPS65010
+ 	tristate "TPS65010 Power management chip"
+ 	depends on I2C
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -27,6 +27,7 @@ obj-$(CONFIG_SENSORS_LM85)	+= lm85.o
+ obj-$(CONFIG_SENSORS_LM87)	+= lm87.o
+ obj-$(CONFIG_SENSORS_LM90)	+= lm90.o
+ obj-$(CONFIG_SENSORS_MAX1619)	+= max1619.o
++obj-$(CONFIG_SENSORS_MAX6900)	+= max6900.o
+ obj-$(CONFIG_SENSORS_M41T00)	+= m41t00.o
+ obj-$(CONFIG_SENSORS_PC87360)	+= pc87360.o
+ obj-$(CONFIG_SENSORS_PCF8574)	+= pcf8574.o
+Index: linux-2.6.10/drivers/i2c/chips/max6900.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/max6900.c
+@@ -0,0 +1,298 @@
++/*
++ * drivers/i2c/chips/max6900.c
++ *
++ * I2C client/driver for the DS-MAXIM MAX6900 Real-Time Clock chip.
++ *
++ * Author: Vladimir A. Barinov <vbarinov@ru.mvista.com>
++ * 
++ * Based on the m41t00.c by Mark Greer <mgreer@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++/*
++ * This i2c client/driver wedges between the drivers/char/genrtc.c RTC
++ * interface and the SMBus interface of the i2c subsystem.
++ * It would be more efficient to use i2c msgs/i2c_transfer directly but, as
++ * recommened in .../Documentation/i2c/writing-clients section
++ * "Sending and receiving", using SMBus level communication is preferred.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/rtc.h>
++#include <linux/bcd.h>
++
++#include <asm/time.h>
++#include <asm/rtc.h>
++
++#define	MAX6900_DRV_NAME		"max6900"
++
++static DECLARE_MUTEX(max6900_mutex);
++
++static struct i2c_driver max6900_driver;
++static struct i2c_client *save_client;
++
++static unsigned short ignore[] = { I2C_CLIENT_END };
++static unsigned short normal_addr[] = { 0x50, I2C_CLIENT_END };
++
++static struct i2c_client_address_data addr_data = {
++	.normal_i2c		= normal_addr,
++	.normal_i2c_range	= ignore,
++	.probe			= ignore,
++	.probe_range		= ignore,
++	.ignore			= ignore,
++	.ignore_range		= ignore,
++	.force			= ignore,
++};
++
++/*
++ * While the MAX6900 has a nice Clock Burst Read/Write command,
++ * we can't use it, since some I2C controllers do not support
++ * anything other than single-byte transfers
++ */
++
++#define MAX6900_REG_SECOND              0x80
++#define MAX6900_REG_MINUTE              0x82
++#define MAX6900_REG_HOUR                0x84
++#define MAX6900_REG_DATE                0x86
++#define MAX6900_REG_MONTH               0x88
++#define MAX6900_REG_DAY                 0x8a
++#define MAX6900_REG_YEAR                0x8c
++#define MAX6900_REG_CONTROL             0x8e
++#define MAX6900_REG_CENTURY             0x92
++#define MAX6900_REG_CLK_BURST           0xbe
++
++#define MAX6900_SECOND_MASK             0x7f
++#define MAX6900_MINUTE_MASK             0x7f
++#define MAX6900_HOUR_MASK             	0x3f
++#define MAX6900_DATE_MASK               0x3f
++#define MAX6900_MONTH_MASK              0x1f
++#define MAX6900_YEAR_MASK		0xff
++#define MAX6900_CENTURY_MASK		0xff
++#define MAX6900_CONTROL_WP              (1 << 7)
++
++ulong
++max6900_get_rtc_time(void)
++{
++	s32	sec, min, hour, day, mon, year, century;
++	s32	sec1, min1, hour1, day1, mon1, year1, century1;
++	ulong	limit = 10;
++
++	sec = min = hour = day = mon = year = century = 0;
++	sec1 = min1 = hour1 = day1 = mon1 = year1 = century1 = 0;
++
++
++	down(&max6900_mutex);
++	do {
++		if (((sec = i2c_smbus_read_byte_data(save_client, MAX6900_REG_SECOND + 1)) >= 0)
++			&& ((min = i2c_smbus_read_byte_data(save_client, MAX6900_REG_MINUTE + 1))
++				>= 0)
++			&& ((hour = i2c_smbus_read_byte_data(save_client, MAX6900_REG_HOUR + 1))
++				>= 0)
++			&& ((day = i2c_smbus_read_byte_data(save_client, MAX6900_REG_DATE + 1))
++				>= 0)
++			&& ((mon = i2c_smbus_read_byte_data(save_client, MAX6900_REG_MONTH + 1))
++				>= 0)
++			&& ((year = i2c_smbus_read_byte_data(save_client, MAX6900_REG_YEAR + 1))
++				>= 0)
++			&& ((century = i2c_smbus_read_byte_data(save_client, MAX6900_REG_CENTURY + 1))
++				>= 0)
++			&& ((sec == sec1) && (min == min1) && (hour == hour1)
++				&& (day == day1) && (mon == mon1)
++				&& (year == year1) && (century == century1)))
++
++				break;
++
++		sec1 = sec;
++		min1 = min;
++		hour1 = hour;
++		day1 = day;
++		mon1 = mon;
++		year1 = year;
++		century1 = century;
++	} while (--limit > 0);
++	up(&max6900_mutex);
++
++	if (limit == 0) {
++		dev_warn(&save_client->dev,
++			"max6900: can't read rtc chip\n");
++		sec = min = hour = day = mon = year = century = 0;
++	}
++
++	sec &= MAX6900_SECOND_MASK;
++	min &= MAX6900_MINUTE_MASK;
++        hour &= MAX6900_HOUR_MASK;
++	day &= MAX6900_DATE_MASK;
++	mon &= MAX6900_MONTH_MASK;
++	year &= MAX6900_YEAR_MASK;
++	century &= MAX6900_CENTURY_MASK;
++
++	BCD_TO_BIN(sec);
++	BCD_TO_BIN(min);
++	BCD_TO_BIN(hour);
++	BCD_TO_BIN(day);
++	BCD_TO_BIN(mon);
++	BCD_TO_BIN(year);
++	BCD_TO_BIN(century);
++
++	year += century * 100;
++
++	return mktime(year, mon, day, hour, min, sec);
++}
++
++static void
++max6900_set_tlet(ulong arg)
++{
++	struct rtc_time	tm;
++	ulong	nowtime = *(ulong *)arg;
++	int tm_century;
++
++	 /* Start by clearing the control register's write-protect bit. */
++	if (i2c_smbus_write_byte_data(save_client, MAX6900_REG_CONTROL, 0) < 0)
++		dev_warn(&save_client->dev,"max6900: can't write to rtc chip\n");
++
++	to_tm(nowtime, &tm);
++	tm_century = (tm.tm_year) / 100;
++	tm.tm_year = (tm.tm_year) % 100;
++
++	BIN_TO_BCD(tm.tm_sec);
++	BIN_TO_BCD(tm.tm_min);
++	BIN_TO_BCD(tm.tm_hour);
++	BIN_TO_BCD(tm.tm_mon);
++	BIN_TO_BCD(tm.tm_mday);
++	BIN_TO_BCD(tm.tm_year);
++	BIN_TO_BCD(tm_century);
++
++	down(&max6900_mutex);
++	if ((i2c_smbus_write_byte_data(save_client, MAX6900_REG_SECOND, tm.tm_sec) < 0)
++		|| (i2c_smbus_write_byte_data(save_client, MAX6900_REG_MINUTE, tm.tm_min)
++			< 0)
++		|| (i2c_smbus_write_byte_data(save_client, MAX6900_REG_HOUR, tm.tm_hour)
++			< 0)
++		|| (i2c_smbus_write_byte_data(save_client, MAX6900_REG_DATE, tm.tm_mday)
++			< 0)
++		|| (i2c_smbus_write_byte_data(save_client, MAX6900_REG_MONTH, tm.tm_mon)
++			< 0)
++		|| (i2c_smbus_write_byte_data(save_client, MAX6900_REG_YEAR, tm.tm_year)
++			< 0)
++		|| (i2c_smbus_write_byte_data(save_client, MAX6900_REG_CENTURY, tm_century)
++			< 0))
++		dev_warn(&save_client->dev,"max6900: can't write to rtc chip\n");
++	up(&max6900_mutex);
++
++	/* Finish by setting the control register's write-protect bit. */
++	if (i2c_smbus_write_byte_data(save_client, MAX6900_REG_CONTROL,  MAX6900_CONTROL_WP) < 0)
++		dev_warn(&save_client->dev,"max6900: can't write to rtc chip\n");
++
++	return;
++}
++
++ulong	new_time;
++
++DECLARE_TASKLET_DISABLED(max6900_tasklet, max6900_set_tlet, (ulong)&new_time);
++
++int
++max6900_set_rtc_time(ulong nowtime)
++{
++	new_time = nowtime;
++
++	if (in_interrupt())
++		tasklet_schedule(&max6900_tasklet);
++	else
++		max6900_set_tlet((ulong)&new_time);
++
++	return 0;
++}
++
++/*
++ *****************************************************************************
++ *
++ *	Driver Interface
++ *
++ *****************************************************************************
++ */
++static int
++max6900_probe(struct i2c_adapter *adap, int addr, int kind)
++{
++	struct i2c_client *client;
++	int rc;
++
++	client = kmalloc(sizeof(struct i2c_client), GFP_KERNEL);
++	if (!client)
++		return -ENOMEM;
++
++	memset(client, 0, sizeof(struct i2c_client));
++	strncpy(client->name, MAX6900_DRV_NAME, I2C_NAME_SIZE);
++	client->id = max6900_driver.id;
++	client->flags = I2C_DF_NOTIFY;
++	client->addr = addr;
++	client->adapter = adap;
++	client->driver = &max6900_driver;
++
++	if ((rc = i2c_attach_client(client)) != 0) {
++		kfree(client);
++		return rc;
++	}
++
++	save_client = client;
++
++	return 0;
++}
++
++static int
++max6900_attach(struct i2c_adapter *adap)
++{
++	return i2c_probe(adap, &addr_data, max6900_probe);
++}
++
++static int
++max6900_detach(struct i2c_client *client)
++{
++	int	rc;
++
++	if ((rc = i2c_detach_client(client)) == 0) {
++		kfree(i2c_get_clientdata(client));
++		tasklet_kill(&max6900_tasklet);
++	}
++	return rc;
++}
++
++static struct i2c_driver max6900_driver = {
++	.owner		= THIS_MODULE,
++	.name		= MAX6900_DRV_NAME,
++	.id		= I2C_DRIVERID_MAX6900,
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter	= max6900_attach,
++	.detach_client	= max6900_detach,
++};
++
++static int __init
++max6900_init(void)
++{
++printk("RTC MAX6900 driver init\n");
++	return i2c_add_driver(&max6900_driver);
++}
++
++static void __exit
++max6900_exit(void)
++{
++	i2c_del_driver(&max6900_driver);
++	return;
++}
++
++/* 
++ * we use subsys_initcall time for this module since
++ * the MAX6900 I2C device address conflicts with 
++ * i2c eeprom scan address series
++ */
++subsys_initcall(max6900_init);
++module_exit(max6900_exit);
++
++MODULE_AUTHOR("Vladimir A. Barinov <vbarinov@ru.mvista.com>");
++MODULE_DESCRIPTION("DS-MAXIM MAX6900 RTC I2C Client Driver");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/mvl_patches/pro-0947.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0947.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(947);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

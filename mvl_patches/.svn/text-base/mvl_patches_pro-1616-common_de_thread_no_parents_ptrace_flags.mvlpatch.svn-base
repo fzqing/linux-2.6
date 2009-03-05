@@ -1,0 +1,368 @@
+#! /usr/bin/env bash
+# Patch: -common_de_thread_no_parents_ptrace_flags
+# Date: Mon Jan 21 23:01:04 2008
+# MR: 18690
+# 
+# [PATCH] de_thread: Don't change our parents and ptrace flags.
+# 
+# This is two distinct changes.
+#  - Not changing our real parents.
+#  - Not changing our ptrace parents.
+# 
+# Not changing our real parents is trivially correct because both tasks
+# have the same real parents as they are part of a thread group.  Now that
+# we demote the leader to a thread there is no longer any reason to change
+# it's parentage.
+# 
+# Not changing our ptrace parents is a user visible change if someone
+# looks hard enough.  I don't think user space applications will care or
+# even notice.
+# 
+# In the practical and I think common case a debugger will have attached
+# to all of the threads using the same ptrace flags.  From my quick skim
+# of strace and gdb that appears to be the case.  Which if true means
+# debuggers will not notice a change.
+# 
+# Before this point we have already generated a ptrace event in do_exit
+# that reports the leaders pid has died so de_thread is visible to a
+# debugger.  Which means attempting to hide this case by copying flags
+# around appears excessive.
+# 
+# By not doing anything it avoids all of the weird locking issues between
+# de_thread and ptrace attach, and removes one case from consideration for
+# fixing the ptrace locking.
+# 
+# This only addresses Oleg's first concern with ptrace_attach, that of the
+# problems caused by reparenting.  Oleg's second concern is essentially a
+# race between ptrace_attach and release_task that causes an oops when we
+# get to force_sig_specific.  There is nothing special about de_thread
+# with respect to that race.
+# 
+# Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# 
+# commit c06511d12d720b23c8dffff23004f0a888698f20
+# tree 96916946cd8374821b10316c8f5fabc4917a38d6
+# parent 0e5e24bf64b755a034d8294303bc61d8f40ebeaf
+# author Eric W. Biederman <ebiederm@xmission.com> Fri, 14 Apr 2006 04:05:55 -0600
+# committer Linus Torvalds <torvalds@g5.osdl.org> Fri, 14 Apr 2006 08:49:19 -0700
+# 
+#  fs/exec.c |   28 +---------------------------
+#  1 file changed, 1 insertion(+), 27 deletions(-)
+# 
+
+PATCHNUM=1616
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18690
+
+[PATCH] de_thread: Don't change our parents and ptrace flags.
+
+This is two distinct changes.
+ - Not changing our real parents.
+ - Not changing our ptrace parents.
+
+Not changing our real parents is trivially correct because both tasks
+have the same real parents as they are part of a thread group.  Now that
+we demote the leader to a thread there is no longer any reason to change
+it's parentage.
+
+Not changing our ptrace parents is a user visible change if someone
+looks hard enough.  I don't think user space applications will care or
+even notice.
+
+In the practical and I think common case a debugger will have attached
+to all of the threads using the same ptrace flags.  From my quick skim
+of strace and gdb that appears to be the case.  Which if true means
+debuggers will not notice a change.
+
+Before this point we have already generated a ptrace event in do_exit
+that reports the leaders pid has died so de_thread is visible to a
+debugger.  Which means attempting to hide this case by copying flags
+around appears excessive.
+
+By not doing anything it avoids all of the weird locking issues between
+de_thread and ptrace attach, and removes one case from consideration for
+fixing the ptrace locking.
+
+This only addresses Oleg's first concern with ptrace_attach, that of the
+problems caused by reparenting.  Oleg's second concern is essentially a
+race between ptrace_attach and release_task that causes an oops when we
+get to force_sig_specific.  There is nothing special about de_thread
+with respect to that race.
+
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+
+commit c06511d12d720b23c8dffff23004f0a888698f20
+tree 96916946cd8374821b10316c8f5fabc4917a38d6
+parent 0e5e24bf64b755a034d8294303bc61d8f40ebeaf
+author Eric W. Biederman <ebiederm@xmission.com> Fri, 14 Apr 2006 04:05:55 -0600
+committer Linus Torvalds <torvalds@g5.osdl.org> Fri, 14 Apr 2006 08:49:19 -0700
+
+ fs/exec.c              |   28 +---------------------------
+ mvl_patches/pro-1616.c |   16 ++++++++++++++++
+ 2 files changed, 17 insertions(+), 27 deletions(-)
+
+diff --git a/fs/exec.c b/fs/exec.c
+index 3234a0c..4121bb5 100644
+Index: linux-2.6.10/fs/exec.c
+===================================================================
+--- linux-2.6.10.orig/fs/exec.c
++++ linux-2.6.10/fs/exec.c
+@@ -655,9 +655,8 @@ static inline int de_thread(struct task_
+ 	 * and to assume its PID:
+ 	 */
+ 	if (!thread_group_leader(current)) {
+-		struct task_struct *parent;
+ 		struct dentry *proc_dentry1, *proc_dentry2;
+-		unsigned long exit_state, ptrace;
++		unsigned long exit_state;
+ 
+ 		/*
+ 		 * Wait for the thread group leader to be a zombie.
+@@ -684,36 +683,11 @@ static inline int de_thread(struct task_
+ 		 * two threads with a switched PID, and release
+ 		 * the former thread group leader:
+ 		 */
+-		ptrace = leader->ptrace;
+-		parent = leader->parent;
+-		if (unlikely(ptrace) && unlikely(parent == current)) {
+-			/*
+-			 * Joker was ptracing his own group leader,
+-			 * and now he wants to be his own parent!
+-			 * We can't have that.
+-			 */
+-			ptrace = 0;
+-		}
+-
+-		ptrace_unlink(current);
+-		ptrace_unlink(leader);
+-		remove_parent(current);
+-		remove_parent(leader);
+-
+ 		switch_exec_pids(leader, current);
+ 
+-		current->parent = current->real_parent = leader->real_parent;
+-		leader->parent = leader->real_parent = child_reaper;
+ 		current->group_leader = current;
+ 		leader->group_leader = leader;
+ 
+-		add_parent(current, current->parent);
+-		add_parent(leader, leader->parent);
+-		if (ptrace) {
+-			current->ptrace = ptrace;
+-			__ptrace_link(current, parent);
+-		}
+-
+ 		list_del(&current->tasks);
+ 		list_add_tail(&current->tasks, &init_task.tasks);
+ 		current->exit_signal = SIGCHLD;
+Index: linux-2.6.10/mvl_patches/pro-1616.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1616.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1616);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

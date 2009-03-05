@@ -1,0 +1,472 @@
+#! /usr/bin/env bash
+# Patch: -sd_scr_register
+# Date: Thu Jul  6 17:33:21 2006
+# MR: 18881
+# Disposition: merged fromkernel.org
+# Description:
+# Commit: b57c43ad81602589afca3948a5a7121e40026e17
+# Author: Pierre Ossman <drzeus-list@drzeus.cx>
+# Date:   Tue Sep 6 15:18:53 2005 -0700
+# 
+#     [PATCH] sd: SCR register
+# 
+#     Read the SD specific SCR register from the card.
+# 
+#     Signed-off-by: Pierre Ossman <drzeus@drzeus.cx>
+#     Cc: Russell King <rmk@arm.linux.org.uk>
+#     Cc: David Brownell <david-b@pacbell.net>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+#  
+
+PATCHNUM=758
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18881
+Disposition: merged fromkernel.org
+Description:
+Commit: b57c43ad81602589afca3948a5a7121e40026e17
+Author: Pierre Ossman <drzeus-list@drzeus.cx>
+Date:   Tue Sep 6 15:18:53 2005 -0700
+
+    [PATCH] sd: SCR register
+
+    Read the SD specific SCR register from the card.
+
+    Signed-off-by: Pierre Ossman <drzeus@drzeus.cx>
+    Cc: Russell King <rmk@arm.linux.org.uk>
+    Cc: David Brownell <david-b@pacbell.net>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+ 
+Index: linux-2.6.10/drivers/mmc/mmc.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc.c
++++ linux-2.6.10/drivers/mmc/mmc.c
+@@ -16,6 +16,8 @@
+ #include <linux/delay.h>
+ #include <linux/pagemap.h>
+ #include <linux/err.h>
++#include <asm/scatterlist.h>
++#include <linux/scatterlist.h>
+ 
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/host.h>
+@@ -246,6 +248,8 @@ int mmc_wait_for_app_cmd(struct mmc_host
+ 
+ EXPORT_SYMBOL(mmc_wait_for_app_cmd);
+ 
++static int mmc_select_card(struct mmc_host *host, struct mmc_card *card);
++
+ /**
+  *	__mmc_claim_host - exclusively claim a host
+  *	@host: mmc host to claim
+@@ -278,16 +282,10 @@ int __mmc_claim_host(struct mmc_host *ho
+ 	spin_unlock_irqrestore(&host->lock, flags);
+ 	remove_wait_queue(&host->wq, &wait);
+ 
+-	if (card != (void *)-1 && host->card_selected != card) {
+-		struct mmc_command cmd;
+-
+-		host->card_selected = card;
+-
+-		cmd.opcode = MMC_SELECT_CARD;
+-		cmd.arg = card->rca << 16;
+-		cmd.flags = MMC_RSP_R1;
+-
+-		err = mmc_wait_for_cmd(host, &cmd, CMD_RETRIES);
++	if (card != (void *)-1) {
++		err = mmc_select_card(host, card);
++		if (err != MMC_ERR_NONE)
++			return err;
+ 	}
+ 
+ 	return err;
+@@ -317,6 +315,29 @@ void mmc_release_host(struct mmc_host *h
+ 
+ EXPORT_SYMBOL(mmc_release_host);
+ 
++static int mmc_select_card(struct mmc_host *host, struct mmc_card *card)
++{
++	int err;
++	struct mmc_command cmd;
++
++	BUG_ON(host->card_busy == NULL);
++
++	if (host->card_selected == card)
++		return MMC_ERR_NONE;
++
++	host->card_selected = card;
++
++	cmd.opcode = MMC_SELECT_CARD;
++	cmd.arg = card->rca << 16;
++	cmd.flags = MMC_RSP_R1;
++
++	err = mmc_wait_for_cmd(host, &cmd, CMD_RETRIES);
++	if (err != MMC_ERR_NONE)
++		return err;
++
++	return MMC_ERR_NONE;
++}
++
+ /*
+  * Ensure that no card is selected.
+  */
+@@ -526,6 +547,32 @@ static void mmc_decode_csd(struct mmc_ca
+ }
+ 
+ /*
++ * Given a 64-bit response, decode to our card SCR structure.
++ */
++static void mmc_decode_scr(struct mmc_card *card)
++{
++	struct sd_scr *scr = &card->scr;
++	unsigned int scr_struct;
++	u32 resp[4];
++
++	BUG_ON(!mmc_card_sd(card));
++
++	resp[3] = card->raw_scr[1];
++	resp[2] = card->raw_scr[0];
++
++	scr_struct = UNSTUFF_BITS(resp, 60, 4);
++	if (scr_struct != 0) {
++		printk("%s: unrecognised SCR structure version %d\n",
++			mmc_hostname(card->host), scr_struct);
++		mmc_card_set_bad(card);
++		return;
++	}
++
++	scr->sda_vsn = UNSTUFF_BITS(resp, 56, 4);
++	scr->bus_widths = UNSTUFF_BITS(resp, 48, 4);
++}
++
++/*
+  * Locate a MMC card on this MMC host given a raw CID.
+  */
+ static struct mmc_card *mmc_find_card(struct mmc_host *host, u32 *raw_cid)
+@@ -789,6 +836,79 @@ static void mmc_read_csds(struct mmc_hos
+ 	}
+ }
+ 
++static void mmc_read_scrs(struct mmc_host *host)
++{
++	int err;
++	struct mmc_card *card;
++
++	struct mmc_request mrq;
++	struct mmc_command cmd;
++	struct mmc_data data;
++
++	struct scatterlist sg;
++
++	list_for_each_entry(card, &host->cards, node) {
++		if (card->state & (MMC_STATE_DEAD|MMC_STATE_PRESENT))
++			continue;
++		if (!mmc_card_sd(card))
++			continue;
++
++		err = mmc_select_card(host, card);
++		if (err != MMC_ERR_NONE) {
++			mmc_card_set_dead(card);
++			continue;
++		}
++
++		memset(&cmd, 0, sizeof(struct mmc_command));
++
++		cmd.opcode = MMC_APP_CMD;
++		cmd.arg = card->rca << 16;
++		cmd.flags = MMC_RSP_R1;
++
++		err = mmc_wait_for_cmd(host, &cmd, 0);
++		if ((err != MMC_ERR_NONE) || !(cmd.resp[0] & R1_APP_CMD)) {
++			mmc_card_set_dead(card);
++			continue;
++		}
++
++		memset(&cmd, 0, sizeof(struct mmc_command));
++
++		cmd.opcode = SD_APP_SEND_SCR;
++		cmd.arg = 0;
++		cmd.flags = MMC_RSP_R1;
++
++		memset(&data, 0, sizeof(struct mmc_data));
++
++		data.timeout_ns = card->csd.tacc_ns * 10;
++		data.timeout_clks = card->csd.tacc_clks * 10;
++		data.blksz_bits = 3;
++		data.blocks = 1;
++		data.flags = MMC_DATA_READ;
++		data.sg = &sg;
++		data.sg_len = 1;
++
++		memset(&mrq, 0, sizeof(struct mmc_request));
++
++		mrq.cmd = &cmd;
++		mrq.data = &data;
++
++		sg_init_one(&sg, (u8*)card->raw_scr, 8);
++
++		err = mmc_wait_for_req(host, &mrq);
++		if (err != MMC_ERR_NONE) {
++			mmc_card_set_dead(card);
++			continue;
++		}
++
++		card->raw_scr[0] = ntohl(card->raw_scr[0]);
++		card->raw_scr[1] = ntohl(card->raw_scr[1]);
++
++		mmc_decode_scr(card);
++	}
++
++	mmc_deselect_cards(host);
++}
++
+ static unsigned int mmc_calculate_clock(struct mmc_host *host)
+ {
+ 	struct mmc_card *card;
+@@ -912,6 +1032,9 @@ static void mmc_setup(struct mmc_host *h
+ 	host->ops->set_ios(host, &host->ios);
+ 
+ 	mmc_read_csds(host);
++
++	if (host->mode == MMC_MODE_SD)
++		mmc_read_scrs(host);
+ }
+ 
+ 
+Index: linux-2.6.10/include/linux/mmc/card.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/card.h
++++ linux-2.6.10/include/linux/mmc/card.h
+@@ -33,6 +33,13 @@ struct mmc_csd {
+ 	unsigned int		capacity;
+ };
+ 
++struct sd_scr {
++	unsigned char		sda_vsn;
++	unsigned char		bus_widths;
++#define SD_SCR_BUS_WIDTH_1	(1<<0)
++#define SD_SCR_BUS_WIDTH_4	(1<<2)
++};
++
+ struct mmc_host;
+ 
+ /*
+@@ -51,8 +58,10 @@ struct mmc_card {
+ #define MMC_STATE_READONLY	(1<<4)		/* card is read-only */
+ 	u32			raw_cid[4];	/* raw card CID */
+ 	u32			raw_csd[4];	/* raw card CSD */
++	u32			raw_scr[2];	/* raw card SCR */
+ 	struct mmc_cid		cid;		/* card identification */
+ 	struct mmc_csd		csd;		/* card specific */
++	struct sd_scr		scr;		/* extra SD information */
+ };
+ 
+ #define mmc_card_present(c)	((c)->state & MMC_STATE_PRESENT)
+Index: linux-2.6.10/mvl_patches/pro-0758.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0758.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(758);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

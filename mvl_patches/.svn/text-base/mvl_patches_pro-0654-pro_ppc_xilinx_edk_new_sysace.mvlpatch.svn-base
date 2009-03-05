@@ -1,0 +1,884 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc_xilinx_edk_new_sysace
+# Date: Thu Jun 22 21:15:20 2006
+# Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+# MR: 19052
+# Type: Integration
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Description:
+#     Xilinx EDK drivers for SystemACE - The newer Xilinx drivers for ML40x board 
+#     with the CfgInitialize() routine. Xilinx re-newed their drivers quite recently, 
+#     so it's going as a different patch.
+# 
+
+PATCHNUM=654
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+MR: 19052
+Type: Integration
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Description:
+    Xilinx EDK drivers for SystemACE - The newer Xilinx drivers for ML40x board 
+    with the CfgInitialize() routine. Xilinx re-newed their drivers quite recently, 
+    so it's going as a different patch.
+
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace.c
+===================================================================
+--- linux-2.6.10.orig/drivers/block/xilinx_sysace/xsysace.c
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace.c
+@@ -27,7 +27,7 @@
+ *     expressly prohibited.
+ *
+ *
+-*     (c) Copyright 2002 Xilinx Inc.
++*     (c) Copyright 2002-2005 Xilinx Inc.
+ *     All rights reserved.
+ *
+ *
+@@ -53,13 +53,21 @@
+ * ----- ---- -------- -----------------------------------------------
+ * 1.00a rpm  06/17/02 work in progress
+ * 1.00a rmm  05/14/03 Fixed diab compiler warnings relating to asserts
++* 1.01a jvb  12/13/05 I changed Initialize() into CfgInitialize(), and made
++*                     CfgInitialize() take a pointer to a config structure
++*                     instead of a device id. I moved Initialize() into
++*                     xgpio_sinit.c, and had Initialize() call CfgInitialize()
++*                     after it retrieved the config structure using the device
++*                     id. I removed include of xparameters.h along with any
++*                     dependencies on xparameters.h and the _g.c config table.
++*                     The dependency on XPAR_XSYSACE_MEM_WIDTH still remains.
++*
+ * </pre>
+ *
+ ******************************************************************************/
+ 
+ /***************************** Include Files *********************************/
+ 
+-#include "xparameters.h"
+ #include "xsysace.h"
+ #include "xsysace_l.h"
+ 
+@@ -78,48 +86,49 @@ static void StubEventHandler(void *CallB
+ /*****************************************************************************/
+ /**
+ *
+-* Initialize a specific XSysAce instance. The configuration information for
+-* the given device ID is found and the driver instance data is initialized
++* Initialize a specific XSysAce instance. The configuration information is
++* passed in as an argument and the driver instance data is initialized
+ * appropriately.
+ *
+ * @param InstancePtr is a pointer to the XSysAce instance to be worked on.
+-* @param DeviceId is the unique id of the device controlled by this XSysAce
+-*        instance.
++* @param Config is a reference to a structure containing information about a
++*        specific SysAce device. This function initializes an InstancePtr object
++*        for a specific device specified by the contents of Config. This function
++*        can initialize multiple instance objects with the use of multiple calls
++*        giving different Config information on each call.
++* @param EffectiveAddr is the device base address in the virtual memory address
++*        space. The caller is responsible for keeping the address mapping
++*        from EffectiveAddr to the device physical base address unchanged
++*        once this function is invoked. Unexpected errors may occur if the
++*        address mapping changes after this function is called. If address
++*        translation is not used, use Config->BaseAddress for this parameters,
++*        passing the physical address instead.
+ *
+ * @return
+ *
+-* XST_SUCCESS if successful, or XST_DEVICE_NOT_FOUND if the device was not
+-* found in the configuration table in xsysace_g.c.
++* XST_SUCCESS if successful.
+ *
+ * @note
+ *
+ * We do not want to reset the configuration controller here since this could
+ * cause a reconfiguration of the JTAG target chain, depending on how the
+ * CFGMODEPIN of the device is wired.
++* <br><br>
++* The Config pointer argument is not used by this function, but is provided
++* to keep the function signature consistent with other drivers.
+ *
+ ******************************************************************************/
+-XStatus XSysAce_Initialize(XSysAce * InstancePtr, u16 DeviceId)
++XStatus XSysAce_CfgInitialize(XSysAce * InstancePtr, XSysAce_Config * Config,
++			      u32 EffectiveAddr)
+ {
+-	XSysAce_Config *ConfigPtr;
+-
+ 	XASSERT_NONVOID(InstancePtr != NULL);
+ 
+ 	InstancePtr->IsReady = 0;
+ 
+ 	/*
+-	 * Lookup configuration data in the device configuration table.
+-	 * Use this configuration info down below when initializing this component.
+-	 */
+-	ConfigPtr = XSysAce_LookupConfig(DeviceId);
+-
+-	if (ConfigPtr == (XSysAce_Config *) NULL) {
+-		return XST_DEVICE_NOT_FOUND;
+-	}
+-
+-	/*
+ 	 * Set some default values for the instance data
+ 	 */
+-	InstancePtr->BaseAddress = ConfigPtr->BaseAddress;
++	InstancePtr->BaseAddress = EffectiveAddr;
+ 	InstancePtr->EventHandler = StubEventHandler;
+ 	InstancePtr->NumRequested = 0;
+ 	InstancePtr->NumRemaining = 0;
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace.h
+===================================================================
+--- linux-2.6.10.orig/drivers/block/xilinx_sysace/xsysace.h
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace.h
+@@ -27,7 +27,7 @@
+ *     expressly prohibited.
+ *
+ *
+-*     (c) Copyright 2002 Xilinx Inc.
++*     (c) Copyright 2002-2005 Xilinx Inc.
+ *     All rights reserved.
+ *
+ *
+@@ -54,6 +54,25 @@
+ * configuring the FPGA devices via the MPU port and the configuration JTAG
+ * port of the controller.
+ *
++* <b>Initialization & Configuration</b>
++*
++* The XSysAce_Config structure is used by the driver to configure itself. This
++* configuration structure is typically created by the tool-chain based on HW
++* build properties.
++*
++* To support multiple runtime loading and initialization strategies employed
++* by various operating systems, the driver instance can be initialized in one
++* of the following ways:
++*
++*   - XSysAce_Initialize(InstancePtr, DeviceId) - The driver looks up its own
++*     configuration structure created by the tool-chain based on an ID provided
++*     by the tool-chain.
++*
++*   - XSysAce_CfgInitialize(InstancePtr, CfgPtr, EffectiveAddr) - Uses a
++*     configuration structure provided by the caller. If running in a system
++*     with address translation, the provided virtual memory base address
++*     replaces the physical address present in the configuration structure.
++*
+ * <b>Bus Mode</b>
+ *
+ * The System ACE device supports both 8-bit and 16-bit access to its registers.
+@@ -157,6 +176,11 @@
+ * Ver   Who  Date     Changes
+ * ----- ---- -------- -----------------------------------------------
+ * 1.00a rpm  06/17/02 work in progress
++* 1.01a jvb  12/14/05 I separated dependency on the static config table and
++*                     xparameters.h from the driver initialization by moving
++*                     _Initialize and _LookupConfig to _sinit.c. I also added
++*                     the new _CfgInitialize routine. (The dependency on
++*                     XPAR_XSYSACE_MEM_WIDTH still remains.)
+ * </pre>
+ *
+ ******************************************************************************/
+@@ -164,6 +188,10 @@
+ #ifndef XSYSACE_H		/* prevent circular inclusions */
+ #define XSYSACE_H		/* by using protection macros */
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ /***************************** Include Files *********************************/
+ 
+ #include "xbasic_types.h"
+@@ -195,50 +223,68 @@
+  * Typedef for CompactFlash identify drive parameters. Use XSysAce_IdentifyCF()
+  * to retrieve this information from the CompactFlash storage device.
+  */
+-typedef struct {
+-	u16 Signature;	    /**< CompactFlash signature is 0x848a */
+-	u16 NumCylinders;   /**< Default number of cylinders */
+-	u16 Reserved;
+-	u16 NumHeads;	    /**< Default number of heads */
+-	u16 NumBytesPerTrack;
++	typedef struct {
++		u16 Signature;
++			    /**< CompactFlash signature is 0x848a */
++		u16 NumCylinders;
++			    /**< Default number of cylinders */
++		u16 Reserved;
++		u16 NumHeads;
++			    /**< Default number of heads */
++		u16 NumBytesPerTrack;
+ 			    /**< Number of unformatted bytes per track */
+-	u16 NumBytesPerSector;
++		u16 NumBytesPerSector;
+ 			    /**< Number of unformatted bytes per sector */
+-	u16 NumSectorsPerTrack;
++		u16 NumSectorsPerTrack;
+ 			    /**< Default number of sectors per track */
+-	u32 NumSectorsPerCard;
++		u32 NumSectorsPerCard;
+ 			    /**< Default number of sectors per card */
+-	u16 VendorUnique;   /**< Vendor unique */
+-	u8 SerialNo[20];    /**< ASCII serial number */
+-	u16 BufferType;	    /**< Buffer type */
+-	u16 BufferSize;	    /**< Buffer size in 512-byte increments */
+-	u16 NumEccBytes;    /**< Number of ECC bytes on R/W Long cmds */
+-	u8 FwVersion[8];    /**< ASCII firmware version */
+-	u8 ModelNo[40];	    /**< ASCII model number */
+-	u16 MaxSectors;	    /**< Max sectors on R/W Multiple cmds */
+-	u16 DblWord;	    /**< Double Word not supported */
+-	u16 Capabilities;   /**< Device capabilities */
+-	u16 Reserved2;
+-	u16 PioMode;	    /**< PIO data transfer cycle timing mode */
+-	u16 DmaMode;	    /**< DMA data transfer cycle timing mode */
+-	u16 TranslationValid;
++		u16 VendorUnique;
++			    /**< Vendor unique */
++		u8 SerialNo[20];
++			    /**< ASCII serial number */
++		u16 BufferType;
++			    /**< Buffer type */
++		u16 BufferSize;
++			    /**< Buffer size in 512-byte increments */
++		u16 NumEccBytes;
++			    /**< Number of ECC bytes on R/W Long cmds */
++		u8 FwVersion[8];
++			    /**< ASCII firmware version */
++		u8 ModelNo[40];
++			    /**< ASCII model number */
++		u16 MaxSectors;
++			    /**< Max sectors on R/W Multiple cmds */
++		u16 DblWord;/**< Double Word not supported */
++		u16 Capabilities;
++			    /**< Device capabilities */
++		u16 Reserved2;
++		u16 PioMode;/**< PIO data transfer cycle timing mode */
++		u16 DmaMode;/**< DMA data transfer cycle timing mode */
++		u16 TranslationValid;
+ 			    /**< Translation parameters are valid */
+-	u16 CurNumCylinders;/**< Current number of cylinders */
+-	u16 CurNumHeads;    /**< Current number of heads */
+-	u16 CurSectorsPerTrack;
++		u16 CurNumCylinders;
++			    /**< Current number of cylinders */
++		u16 CurNumHeads;
++			    /**< Current number of heads */
++		u16 CurSectorsPerTrack;
+ 			    /**< Current number of sectors per track */
+-	u32 CurSectorsPerCard;
++		u32 CurSectorsPerCard;
+ 			    /**< Current capacity in sectors */
+-	u16 MultipleSectors;/**< Multiple sector setting */
+-	u32 LbaSectors;	    /**< Number of addressable sectors in LBA mode */
+-	u8 Reserved3[132];
+-	u16 SecurityStatus; /**< Security status */
+-	u8 VendorUniqueBytes[62];
++		u16 MultipleSectors;
++			    /**< Multiple sector setting */
++		u32 LbaSectors;
++			    /**< Number of addressable sectors in LBA mode */
++		u8 Reserved3[132];
++		u16 SecurityStatus;
++			    /**< Security status */
++		u8 VendorUniqueBytes[62];
+ 			      /**< Vendor unique bytes */
+-	u16 PowerDesc;	    /**< Power requirement description */
+-	u8 Reserved4[190];
++		u16 PowerDesc;
++			    /**< Power requirement description */
++		u8 Reserved4[190];
+ 
+-} XSysAce_CFParameters;
++	} XSysAce_CFParameters;
+ 
+ /**
+  * Callback when an asynchronous event occurs during interrupt mode.
+@@ -250,16 +296,18 @@ typedef struct {
+  *        identifiers prefixed with XSA_EVENT_* for a description of possible
+  *        events.
+  */
+-typedef void (*XSysAce_EventHandler) (void *CallBackRef, int Event);
++	typedef void (*XSysAce_EventHandler) (void *CallBackRef, int Event);
+ 
+ /**
+  * This typedef contains configuration information for the device.
+  */
+-typedef struct {
+-	u16 DeviceId;	/**< Unique ID  of device */
+-	u32 BaseAddress;/**< Register base address */
++	typedef struct {
++		u16 DeviceId;
++			/**< Unique ID  of device */
++		u32 BaseAddress;
++			/**< Register base address */
+ 
+-} XSysAce_Config;
++	} XSysAce_Config;
+ 
+ /**
+  * The XSysAce driver instance data. The user is required to allocate a
+@@ -267,71 +315,82 @@ typedef struct {
+  * pointer to a variable of this type is then passed to the driver API
+  * functions.
+  */
+-typedef struct {
+-	u32 BaseAddress;	/* Base address of ACE device */
+-	u32 IsReady;		/* Device is initialized and ready */
+-
+-	/* interrupt-related data */
+-	int NumRequested;	/* Number of bytes to read/write */
+-	int NumRemaining;	/* Number of bytes left to read/write */
+-	u8 *BufferPtr;		/* Buffer being read/written */
+-	XSysAce_EventHandler EventHandler;	/* Callback for asynchronous events */
+-	void *EventRef;		/* Callback reference */
++	typedef struct {
++		u32 BaseAddress;	/* Base address of ACE device */
++		u32 IsReady;	/* Device is initialized and ready */
++
++		/* interrupt-related data */
++		int NumRequested;	/* Number of bytes to read/write */
++		int NumRemaining;	/* Number of bytes left to read/write */
++		u8 *BufferPtr;	/* Buffer being read/written */
++		XSysAce_EventHandler EventHandler;	/* Callback for asynchronous events */
++		void *EventRef;	/* Callback reference */
+ 
+-} XSysAce;
++	} XSysAce;
+ 
+ /***************** Macros (Inline Functions) Definitions *********************/
+ 
+ /************************** Function Prototypes ******************************/
+ 
+ /*
++ * Initialization functions in xsysace_sinit.c
++ */
++	XStatus XSysAce_Initialize(XSysAce * InstancePtr, u16 DeviceId);
++	XSysAce_Config *XSysAce_LookupConfig(u16 DeviceId);
++
++/*
+  * Required functions in xsysace.c
+  */
+-XStatus XSysAce_Initialize(XSysAce * InstancePtr, u16 DeviceId);
+-XStatus XSysAce_Lock(XSysAce * InstancePtr, u32 Force);
+-void XSysAce_Unlock(XSysAce * InstancePtr);
+-u32 XSysAce_GetErrors(XSysAce * InstancePtr);
+-XSysAce_Config *XSysAce_LookupConfig(u16 DeviceId);
++	XStatus XSysAce_CfgInitialize(XSysAce * InstancePtr,
++				      XSysAce_Config * Config,
++				      u32 EffectiveAddr);
++	XStatus XSysAce_Lock(XSysAce * InstancePtr, u32 Force);
++	void XSysAce_Unlock(XSysAce * InstancePtr);
++	u32 XSysAce_GetErrors(XSysAce * InstancePtr);
+ 
+ /*
+  * CompactFlash access functions in xsysace_compactflash.c
+  */
+-XStatus XSysAce_ResetCF(XSysAce * InstancePtr);
+-XStatus XSysAce_AbortCF(XSysAce * InstancePtr);
+-XStatus XSysAce_IdentifyCF(XSysAce * InstancePtr,
+-			   XSysAce_CFParameters * ParamPtr);
+-u32 XSysAce_IsCFReady(XSysAce * InstancePtr);
+-XStatus XSysAce_SectorRead(XSysAce * InstancePtr, u32 StartSector,
+-			   int NumSectors, u8 * BufferPtr);
+-XStatus XSysAce_SectorWrite(XSysAce * InstancePtr, u32 StartSector,
+-			    int NumSectors, u8 * BufferPtr);
+-u16 XSysAce_GetFatStatus(XSysAce * InstancePtr);
++	XStatus XSysAce_ResetCF(XSysAce * InstancePtr);
++	XStatus XSysAce_AbortCF(XSysAce * InstancePtr);
++	XStatus XSysAce_IdentifyCF(XSysAce * InstancePtr,
++				   XSysAce_CFParameters * ParamPtr);
++	u32 XSysAce_IsCFReady(XSysAce * InstancePtr);
++	XStatus XSysAce_SectorRead(XSysAce * InstancePtr, u32 StartSector,
++				   int NumSectors, u8 * BufferPtr);
++	XStatus XSysAce_SectorWrite(XSysAce * InstancePtr, u32 StartSector,
++				    int NumSectors, u8 * BufferPtr);
++	u16 XSysAce_GetFatStatus(XSysAce * InstancePtr);
+ 
+ /*
+  * JTAG configuration interface functions in xsysace_jtagcfg.c
+  */
+-void XSysAce_ResetCfg(XSysAce * InstancePtr);
+-void XSysAce_SetCfgAddr(XSysAce * InstancePtr, unsigned int Address);
+-void XSysAce_SetStartMode(XSysAce * InstancePtr, u32 ImmedOnReset,
+-			  u32 SetStart);
+-u32 XSysAce_IsCfgDone(XSysAce * InstancePtr);
+-u32 XSysAce_GetCfgSector(XSysAce * InstancePtr);
+-XStatus XSysAce_ProgramChain(XSysAce * InstancePtr, u8 * BufferPtr,
+-			     int NumBytes);
++	void XSysAce_ResetCfg(XSysAce * InstancePtr);
++	void XSysAce_SetCfgAddr(XSysAce * InstancePtr, unsigned int Address);
++	void XSysAce_SetStartMode(XSysAce * InstancePtr, u32 ImmedOnReset,
++				  u32 SetStart);
++	u32 XSysAce_IsCfgDone(XSysAce * InstancePtr);
++	u32 XSysAce_GetCfgSector(XSysAce * InstancePtr);
++	XStatus XSysAce_ProgramChain(XSysAce * InstancePtr, u8 * BufferPtr,
++				     int NumBytes);
+ 
+ /*
+  * General interrupt-related functions in xsysace_intr.c
+  */
+-void XSysAce_EnableInterrupt(XSysAce * InstancePtr);
+-void XSysAce_DisableInterrupt(XSysAce * InstancePtr);
+-void XSysAce_SetEventHandler(XSysAce * InstancePtr,
+-			     XSysAce_EventHandler FuncPtr, void *CallBackRef);
+-void XSysAce_InterruptHandler(void *InstancePtr);	/* interrupt handler */
++	void XSysAce_EnableInterrupt(XSysAce * InstancePtr);
++	void XSysAce_DisableInterrupt(XSysAce * InstancePtr);
++	void XSysAce_SetEventHandler(XSysAce * InstancePtr,
++				     XSysAce_EventHandler FuncPtr,
++				     void *CallBackRef);
++	void XSysAce_InterruptHandler(void *InstancePtr);	/* interrupt handler */
+ 
+ /*
+  * Diagnostic functions in xsysace_selftest.c
+  */
+-XStatus XSysAce_SelfTest(XSysAce * InstancePtr);
+-u16 XSysAce_GetVersion(XSysAce * InstancePtr);
++	XStatus XSysAce_SelfTest(XSysAce * InstancePtr);
++	u16 XSysAce_GetVersion(XSysAce * InstancePtr);
+ 
++#ifdef __cplusplus
++}
++#endif
+ #endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_compactflash.c
+===================================================================
+--- linux-2.6.10.orig/drivers/block/xilinx_sysace/xsysace_compactflash.c
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_compactflash.c
+@@ -27,7 +27,7 @@
+ *     expressly prohibited.
+ *
+ *
+-*     (c) Copyright 2002-2004 Xilinx Inc.
++*     (c) Copyright 2002 Xilinx Inc.
+ *     All rights reserved.
+ *
+ *
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.c
+===================================================================
+--- linux-2.6.10.orig/drivers/block/xilinx_sysace/xsysace_l.c
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.c
+@@ -27,7 +27,7 @@
+ *     expressly prohibited.
+ *
+ *
+-*     (c) Copyright 2002-2004 Xilinx Inc.
++*     (c) Copyright 2002 Xilinx Inc.
+ *     All rights reserved.
+ *
+ *
+@@ -61,7 +61,6 @@
+ 
+ /***************************** Include Files *********************************/
+ 
+-#include "xparameters.h"
+ #include "xsysace_l.h"
+ 
+ /************************** Constant Definitions *****************************/
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.h
+===================================================================
+--- linux-2.6.10.orig/drivers/block/xilinx_sysace/xsysace_l.h
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.h
+@@ -58,8 +58,17 @@
+ #ifndef XSYSACE_L_H		/* prevent circular inclusions */
+ #define XSYSACE_L_H		/* by using protection macros */
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ /***************************** Include Files *********************************/
+ 
++#ifdef EXT_CONFIG
++#define XPAR_XSYSACE_MEM_WIDTH 8
++#else
++#include "xparameters.h"
++#endif
+ #include "xbasic_types.h"
+ #include "xio.h"
+ 
+@@ -475,18 +484,23 @@
+ 
+ /************************** Function Prototypes ******************************/
+ 
+-int XSysAce_ReadSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr);
+-int XSysAce_WriteSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr);
++	int XSysAce_ReadSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr);
++	int XSysAce_WriteSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr);
+ 
+ /*
+  * Utility functions to read and write registers and data buffer
+  */
+-u32 XSysAce_RegRead32(u32 Address);
+-u16 XSysAce_RegRead16(u32 Address);
+-void XSysAce_RegWrite32(u32 Address, u32 Data);
+-void XSysAce_RegWrite16(u32 Address, u16 Data);
+-
+-int XSysAce_ReadDataBuffer(u32 BaseAddress, u8 * BufferPtr, int NumBytes);
+-int XSysAce_WriteDataBuffer(u32 BaseAddress, u8 * BufferPtr, int NumBytes);
++	u32 XSysAce_RegRead32(u32 Address);
++	u16 XSysAce_RegRead16(u32 Address);
++	void XSysAce_RegWrite32(u32 Address, u32 Data);
++	void XSysAce_RegWrite16(u32 Address, u16 Data);
++
++	int XSysAce_ReadDataBuffer(u32 BaseAddress, u8 * BufferPtr,
++				   int NumBytes);
++	int XSysAce_WriteDataBuffer(u32 BaseAddress, u8 * BufferPtr,
++				    int NumBytes);
+ 
++#ifdef __cplusplus
++}
++#endif
+ #endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/block/xilinx_sysace/adapter.c
+===================================================================
+--- linux-2.6.10.orig/drivers/block/xilinx_sysace/adapter.c
++++ linux-2.6.10/drivers/block/xilinx_sysace/adapter.c
+@@ -95,31 +95,6 @@ static char *req_str;
+  ******************************************************************************/
+ 
+ static DECLARE_MUTEX(cfg_sem);
+-static XSysAce_Config * p_xsysace_cfg;
+-
+-/*
+- * Lookup the device configuration based on the unique device ID.
+- * Prototyped in xsysace.h.
+- * We rely on that p_xsysace_cfg is set properly right before
+- * XSysAce_Initialize() calls XSysAce_LookupConfig().
+- */
+-XSysAce_Config * XSysAce_LookupConfig(u16 DeviceId)
+-{
+-	return p_xsysace_cfg;
+-}
+-
+-static XStatus XSysAce_CfgInitialize(XSysAce * InstancePtr,
+-				     XSysAce_Config * CfgPtr)
+-{
+-	XStatus retval;
+-
+-	down(&cfg_sem);
+-	p_xsysace_cfg = CfgPtr;
+-	retval = XSysAce_Initialize(InstancePtr, 0);
+-	up(&cfg_sem);
+-
+-	return retval;
+-}
+ 
+ /*
+  * The following block of code implements the reset handling.  The first
+@@ -212,7 +187,7 @@ static void proc_cleanup(void)
+ 	if (xsysace_dir)
+ 		remove_proc_entry(MAJOR_NAME, NULL);
+ }
+-#endif	/* CONFIG_PROC_FS */
++#endif				/* CONFIG_PROC_FS */
+ 
+ static void xsysace_restart(char *cmd)
+ {
+@@ -285,7 +260,7 @@ static void do_read_write(void *data)
+ 		return;
+ 
+ 	/* We have a request. */
+-	while ((stat = XSysAce_Lock(&SysAce, 0)) == XST_DEVICE_BUSY){
++	while ((stat = XSysAce_Lock(&SysAce, 0)) == XST_DEVICE_BUSY) {
+ 		msleep_interruptible(1);
+ 	}
+ 	if (stat != XST_SUCCESS) {
+@@ -486,13 +461,17 @@ static int xsysace_probe(struct device *
+ 	}
+ 
+ 	/* Tell the Xilinx code to bring this SystemACE interface up. */
+-	if (XSysAce_CfgInitialize(&SysAce, &xsysace_cfg) != XST_SUCCESS) {
++	down(&cfg_sem);
++	if (XSysAce_CfgInitialize
++	    (&SysAce, &xsysace_cfg, xsysace_cfg.BaseAddress) != XST_SUCCESS) {
++		up(&cfg_sem);
+ 		printk(KERN_ERR
+ 		       "%s #%d: Could not initialize device.\n",
+ 		       DRIVER_NAME, pdev->id);
+ 		retval = -ENODEV;
+ 		goto failed3;
+ 	}
++	up(&cfg_sem);
+ 
+ 	retval = request_irq(xsa_irq, xsysace_interrupt, 0, DEVICE_NAME, NULL);
+ 	if (retval) {
+@@ -566,25 +545,25 @@ static int xsysace_probe(struct device *
+ 
+ 	add_disk(xsa_gendisk);
+ 
+-	return 0;	/* success */
++	return 0;		/* success */
+ 
+-failed6:
++      failed6:
+ 	unregister_blkdev(xsa_major, MAJOR_NAME);
+ 
+-failed5:
++      failed5:
+ 	blk_cleanup_queue(xsysace_queue);
+ 
+-failed4:
++      failed4:
+ 	XSysAce_DisableInterrupt(&SysAce);
+ 	free_irq(xsa_irq, NULL);
+ 
+-failed3:
+-	iounmap((void *) (xsysace_cfg.BaseAddress));
++      failed3:
++	iounmap((void *)(xsysace_cfg.BaseAddress));
+ 
+-failed2:
++      failed2:
+ 	release_mem_region(regs_res->start, remap_size);
+ 
+-failed1:
++      failed1:
+ 	return retval;
+ }
+ 
+@@ -598,23 +577,22 @@ static int xsysace_remove(struct device 
+ 	if (old_restart)
+ 		ppc_md.restart = old_restart;
+ 
+-
+ 	unregister_blkdev(xsa_major, MAJOR_NAME);
+ 	del_gendisk(xsa_gendisk);
+ 	blk_cleanup_queue(xsysace_queue);
+ 	XSysAce_DisableInterrupt(&SysAce);
+ 	free_irq(xsa_irq, NULL);
+-	iounmap((void *) (SysAce.BaseAddress));
++	iounmap((void *)(SysAce.BaseAddress));
+ 	release_mem_region(xsa_phys_addr, xsa_remap_size);
+ 
+-	return 0;	/* success */
++	return 0;		/* success */
+ }
+ 
+ static struct device_driver xsysace_driver = {
+-	.name		= DRIVER_NAME,
+-	.bus		= &platform_bus_type,
+-	.probe		= xsysace_probe,
+-	.remove		= xsysace_remove
++	.name = DRIVER_NAME,
++	.bus = &platform_bus_type,
++	.probe = xsysace_probe,
++	.remove = xsysace_remove
+ };
+ 
+ static int __init xsysace_init(void)
+@@ -634,4 +612,3 @@ MODULE_AUTHOR
+     ("Dmitry Chigirev  <chigirev@ru.mvista.com>, Sergey Podstavin <spodstavin@ru.mvista.com>");
+ MODULE_DESCRIPTION("Xilinx System ACE block driver");
+ MODULE_LICENSE("GPL2");
+-
+Index: linux-2.6.10/mvl_patches/pro-0654.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0654.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(654);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

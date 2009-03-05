@@ -1,0 +1,1 @@
+#define CONFIG_OABI_COMPAT 1

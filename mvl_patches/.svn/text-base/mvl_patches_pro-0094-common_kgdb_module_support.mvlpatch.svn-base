@@ -1,0 +1,376 @@
+#! /usr/bin/env bash
+# Patch: -common_kgdb_module_support
+# Date: Wed Dec 28 14:57:35 2005
+# Source: Externa, kgdb.sf.net CVS
+# MR: 14304
+# Type: Defect Fix | Enhancement
+# Disposition: merged from CVS as of 2.6.13-rc6 (CVS date 2005-08-16 23:02:47).
+# Signed-off-by: Tom Rini <trini@mvista.com>
+# Description:
+# 	This is a backport of the current module.patch file from
+# 	upstream KGDB.
+# 
+
+PATCHNUM=94
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Externa, kgdb.sf.net CVS
+MR: 14304
+Type: Defect Fix | Enhancement
+Disposition: merged from CVS as of 2.6.13-rc6 (CVS date 2005-08-16 23:02:47).
+Signed-off-by: Tom Rini <trini@mvista.com>
+Description:
+	This is a backport of the current module.patch file from
+	upstream KGDB.
+
+Index: linux-2.6.10/include/linux/module.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/module.h
++++ linux-2.6.10/include/linux/module.h
+@@ -220,8 +220,17 @@ enum module_state
+ 	MODULE_STATE_LIVE,
+ 	MODULE_STATE_COMING,
+ 	MODULE_STATE_GOING,
++ 	MODULE_STATE_GONE,
+ };
+ 
++#ifdef CONFIG_KGDB
++#define MAX_SECTNAME 31
++struct mod_section {
++       void *address;
++       char name[MAX_SECTNAME + 1];
++};
++#endif
++
+ /* Similar stuff for section attributes. */
+ #define MODULE_SECT_NAME_LEN 32
+ struct module_sect_attr
+@@ -249,6 +258,13 @@ struct module
+ 	/* Unique handle for this module */
+ 	char name[MODULE_NAME_LEN];
+ 
++#ifdef CONFIG_KGDB
++	/* keep kgdb info at the begining so that gdb doesn't have a chance to
++	 * miss out any fields */
++	unsigned long num_sections;
++	struct mod_section *mod_sections;
++#endif
++
+ 	/* Sysfs stuff. */
+ 	struct module_kobject *mkobj;
+ 	struct param_kobject *params_kobject;
+Index: linux-2.6.10/kernel/module.c
+===================================================================
+--- linux-2.6.10.orig/kernel/module.c
++++ linux-2.6.10/kernel/module.c
+@@ -590,6 +590,12 @@ sys_delete_module(const char __user *nam
+ 	if (ret != 0)
+ 		goto out;
+ 
++	down(&notify_mutex);
++	notifier_call_chain(&module_notify_list, MODULE_STATE_GOING,
++        			mod);
++	up(&notify_mutex);
++
++
+ 	/* Never wait if forced. */
+ 	if (!forced && module_refcount(mod) != 0)
+ 		wait_for_zero_refcount(mod);
+@@ -602,6 +608,11 @@ sys_delete_module(const char __user *nam
+ 	}
+ 	free_module(mod);
+ 
++	down(&notify_mutex);
++	notifier_call_chain(&module_notify_list, MODULE_STATE_GONE,
++			NULL);
++	up(&notify_mutex);
++
+  out:
+ 	up(&module_mutex);
+ 	return ret;
+@@ -1119,6 +1130,11 @@ static void free_module(struct module *m
+ 	/* Arch-specific cleanup. */
+ 	module_arch_cleanup(mod);
+ 
++#ifdef CONFIG_KGDB
++	/* kgdb info */
++	vfree(mod->mod_sections);
++#endif
++
+ 	/* Module unload stuff */
+ 	module_unload_free(mod);
+ 
+@@ -1336,6 +1352,31 @@ static char *get_modinfo(Elf_Shdr *sechd
+ 	return NULL;
+ }
+ 
++#ifdef CONFIG_KGDB
++int add_modsects (struct module *mod, Elf_Ehdr *hdr, Elf_Shdr *sechdrs, const
++                char *secstrings)
++{
++        int i;
++
++        mod->num_sections = hdr->e_shnum - 1;
++        mod->mod_sections = vmalloc((hdr->e_shnum - 1)*
++		sizeof (struct mod_section));
++
++        if (mod->mod_sections == NULL) {
++                return -ENOMEM;
++        }
++
++        for (i = 1; i < hdr->e_shnum; i++) {
++                mod->mod_sections[i - 1].address = (void *)sechdrs[i].sh_addr;
++                strncpy(mod->mod_sections[i - 1].name, secstrings +
++                                sechdrs[i].sh_name, MAX_SECTNAME);
++                mod->mod_sections[i - 1].name[MAX_SECTNAME] = '\0';
++	}
++
++	return 0;
++}
++#endif
++
+ #ifdef CONFIG_KALLSYMS
+ int is_exported(const char *name, const struct module *mod)
+ {
+@@ -1698,6 +1739,12 @@ static struct module *load_module(void _
+ 
+ 	add_kallsyms(mod, sechdrs, symindex, strindex, secstrings);
+ 
++#ifdef CONFIG_KGDB
++        if ((err = add_modsects(mod, hdr, sechdrs, secstrings)) < 0) {
++                goto nomodsectinfo;
++        }
++#endif
++
+ 	err = module_finalize(hdr, sechdrs, mod);
+ 	if (err < 0)
+ 		goto cleanup;
+@@ -1742,6 +1789,11 @@ static struct module *load_module(void _
+  arch_cleanup:
+ 	module_arch_cleanup(mod);
+  cleanup:
++
++#ifdef CONFIG_KGDB
++nomodsectinfo:
++       vfree(mod->mod_sections);
++#endif
+ 	module_unload_free(mod);
+ 	module_free(mod, mod->module_init);
+  free_core:
+@@ -1814,6 +1866,10 @@ sys_init_module(void __user *umod,
+ 		/* Init routine failed: abort.  Try to protect us from
+                    buggy refcounters. */
+ 		mod->state = MODULE_STATE_GOING;
++		down(&notify_mutex);
++		notifier_call_chain(&module_notify_list, MODULE_STATE_GOING,
++				mod);
++		up(&notify_mutex);
+ 		synchronize_kernel();
+ 		if (mod->unsafe)
+ 			printk(KERN_ERR "%s: module is now stuck!\n",
+Index: linux-2.6.10/mvl_patches/pro-0094.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0094.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(94);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

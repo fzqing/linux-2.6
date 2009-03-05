@@ -1,0 +1,1 @@
+#undef CONFIG_TPS65010

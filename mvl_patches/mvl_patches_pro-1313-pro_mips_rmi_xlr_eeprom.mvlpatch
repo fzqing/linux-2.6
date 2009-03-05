@@ -1,0 +1,489 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_rmi_xlr_eeprom
+# Date: Thu May  3 22:20:06 2007
+# Source: RMI Electronics
+# MR: 22935
+# Type: Enhancement 
+# Disposition: MontaVista
+# Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+# Description:
+# 
+# Support for Atmel 24c02 eeprom chip
+# 
+#  drivers/i2c/chips/Kconfig   |    6 +
+#  drivers/i2c/chips/Makefile  |    1 
+#  drivers/i2c/chips/at24c02.c |  213 ++++++++++++++++++++++++++++++++++++++++++++
+#  3 files changed, 220 insertions(+)
+# 
+
+PATCHNUM=1313
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: RMI Electronics
+MR: 22935
+Type: Enhancement 
+Disposition: MontaVista
+Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+Description:
+
+Support for Atmel 24c02 eeprom chip
+
+ drivers/i2c/chips/Kconfig   |    6 +
+ drivers/i2c/chips/Makefile  |    1 
+ drivers/i2c/chips/at24c02.c |  213 ++++++++++++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-1313.c      |   16 +++
+ 4 files changed, 236 insertions(+)
+
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -400,6 +400,12 @@ config ISP1301_OMAP
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called isp1301_omap.
+ 
++config	AT24C02_EEPROM
++	tristate "Atmel 24c02 eeprom chip"
++	depends on RMI_PHOENIX && I2C && EXPERIMENTAL
++	help
++	  Driver for the I2C-based eeprom Chip on the XLR Reference boards
++
+ config SENSORS_M41T00
+ 	tristate "ST M41T00 RTC chip"
+ 	depends on I2C && PPC32
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -39,6 +39,7 @@ obj-$(CONFIG_SENSORS_VIA686A)	+= via686a
+ obj-$(CONFIG_SENSORS_W83L785TS)	+= w83l785ts.o
+ obj-$(CONFIG_TPS65010)		+= tps65010.o
+ obj-$(CONFIG_ISP1301_OMAP)	+= isp1301_omap.o
++obj-$(CONFIG_AT24C02_EEPROM)	+= at24c02.o
+ obj-$(CONFIG_SENSORS_TLV320AIC23) += tlv320aic23.o
+ obj-$(CONFIG_SENSORS_TLV320AIC33) += tlv320aic33.o
+ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_expander_omap.o
+Index: linux-2.6.10/drivers/i2c/chips/at24c02.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/at24c02.c
+@@ -0,0 +1,213 @@
++/*
++ * Copyright © 2005-2007 Raza Microelectronics, Inc. (.RMI.)
++ *
++ * This program is free software.  You may use it, redistribute it
++ * and/or modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version two of the
++ * License or (at your option) any later version.
++ *
++ * This program is distributed in the hope that you will find it useful.
++ * Notwithstanding the foregoing, you understand and agree that this program
++ * is provided by RMI .as is,. and without any warranties, whether express,
++ * implied or statutory, including without limitation any implied warranty of
++ * non-infringement, merchantability or fitness for a particular purpose.
++ * In no event will RMI be liable for any loss of data, lost profits, cost
++ * of procurement of substitute technology or services or for any direct,
++ * indirect, incidental, consequential or special damages arising from the
++ * use of this program, however caused.  Your unconditional agreement to
++ * these terms and conditions is an express condition to, and shall be deemed
++ * to occur upon, your use, redistribution and/or modification of this program.
++ *
++ * See the GNU General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/jiffies.h>
++#include <linux/i2c.h>
++
++static unsigned short ignore[] = { I2C_CLIENT_END };
++static unsigned short normal_addr[] = { 0x50, I2C_CLIENT_END };
++
++static struct i2c_client_address_data addr_data = {
++	.normal_i2c = normal_addr,
++	.probe = ignore,
++	.ignore = ignore,
++	.probe_range = ignore,
++	.ignore_range = ignore,
++	.force = ignore,
++	.normal_i2c_range = ignore,
++};
++
++/* Size of EEPROM in bits */
++#define EEPROM_SIZE 256
++
++
++struct chip_desc {
++	char		name[10];
++	u32		byte_len;		/* of 1..8 i2c addrs, total */
++	u16		page_size;		/* for writes */
++};
++
++static ssize_t
++at24c_read(struct kobject *kobj, char *buf, loff_t off, size_t count);
++
++static struct bin_attribute at24c_attr = {
++	.attr = {
++		.name = "24c02",
++		.mode = S_IRUGO,
++		.owner = THIS_MODULE,
++	},
++	.size = EEPROM_SIZE,
++	.read = at24c_read
++};
++
++
++/* Each client has this additional data */
++struct at24c_data {
++	struct i2c_client client;
++	struct semaphore update_lock;
++	u8 valid;			/* bitfield, bit!=0 if slice is valid */
++	unsigned long last_updated[8];	/* In jiffies, 8 slices */
++	u8 data[EEPROM_SIZE];		/* Register values */
++	struct chip_desc	chip;
++	struct bin_attribute    bin;
++};
++
++
++static int at24c_attach_adapter(struct i2c_adapter *adapter);
++static int at24c_detect(struct i2c_adapter *adapter, int address, int kind);
++static int at24c_detach_client(struct i2c_client *client);
++
++/* This is the driver that will be inserted */
++static struct i2c_driver at24c_driver = {
++	.owner		= THIS_MODULE,
++	.name		= "at24c",
++	.id		= I2C_DRIVERID_AT24Cxx,
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter	= at24c_attach_adapter,
++	.detach_client	= at24c_detach_client,
++};
++
++static ssize_t
++at24c_read(struct kobject *kobj, char *buf, loff_t off, size_t count)
++{
++	struct i2c_client	*client;
++	struct at24c_data	*at24c;
++	int i = 0, j = 0x0;
++	uint32_t offset;
++	unsigned char value;
++	struct i2c_msg msg;
++	ssize_t status;
++
++	offset = (uint32_t)off;
++
++	client = to_i2c_client(container_of(kobj, struct device, kobj));
++	at24c = i2c_get_clientdata(client);
++
++	if (unlikely(off >= at24c->bin.size))
++		return 0;
++	if ((off + count) > at24c->bin.size)
++		count = at24c->bin.size - off;
++	if (unlikely(!count))
++		return count;
++
++        /* read full and manage the offset later */
++	msg.addr = client->addr;
++	msg.len = 1;
++	msg.buf = &value;
++	msg.flags = I2C_M_RD;
++
++	for(j = offset; j < (offset + count); j++)  {
++		msg.buf[0] = j;
++	  	status = i2c_transfer(client->adapter, &msg, 1);
++		if(status < 0) {
++			printk("\n\rI2c eeprom error in tx\n");
++			return status;
++		}
++		    buf[i++] = value;
++  	}
++
++	return i;
++}
++
++
++static int at24c_attach_adapter(struct i2c_adapter *adapter)
++{
++	return i2c_probe(adapter, &addr_data, at24c_detect);
++}
++
++/* This function is called by i2c_probe */
++int at24c_detect(struct i2c_adapter *adapter, int address, int kind)
++{
++	struct i2c_client *new_client;
++	struct at24c_data *data;
++	int err = 0;
++
++	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_EMUL))
++		goto exit;
++
++	if (!(data = kmalloc(sizeof(struct at24c_data), GFP_KERNEL))) {
++		err = -ENOMEM;
++		goto exit;
++	}
++	memset(data, 0, sizeof(struct at24c_data));
++	data->bin = at24c_attr;
++
++	new_client = &data->client;
++	memset(data->data, 0xff, EEPROM_SIZE);
++	i2c_set_clientdata(new_client, data);
++	new_client->addr = address;
++	new_client->adapter = adapter;
++	new_client->driver = &at24c_driver;
++	new_client->flags = 0;
++      
++
++	/* Fill in the remaining client fields */
++	strlcpy(new_client->name, "at24c", I2C_NAME_SIZE);
++	data->valid = 0;
++	init_MUTEX(&data->update_lock);
++
++	/* Tell the I2C layer a new client has arrived */
++	if ((err = i2c_attach_client(new_client)))
++		goto exit_kfree;
++
++	/* create the sysfs at24c file */
++	sysfs_create_bin_file(&new_client->dev.kobj, &data->bin);
++
++	return 0;
++
++exit_kfree:
++	kfree(data);
++exit:
++	return err;
++}
++
++static int at24c_detach_client(struct i2c_client *client)
++{
++	int err;
++
++	err = i2c_detach_client(client);
++	if (err)
++		return err;
++
++	kfree(i2c_get_clientdata(client));
++
++	return 0;
++}
++
++static int __init at24c_init(void)
++{
++	return i2c_add_driver(&at24c_driver);
++}
++
++static void __exit at24c_exit(void)
++{
++	i2c_del_driver(&at24c_driver);
++}
++
++module_init(at24c_init);
++module_exit(at24c_exit);
+Index: linux-2.6.10/mvl_patches/pro-1313.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1313.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1313);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,548 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_dm355_i2c
+# Date: Mon Jan 21 23:06:03 2008
+# Source: MontaVista Software, Inc.
+# MR: 25654
+# Type: Enhancement
+# Disposition: local
+# Signed-off-by: Steve Chen <schen@mvista.com>
+# Description:
+# Add support for DM355 and DM6467.
+# 
+# Patches updated are
+#  pro_arm_davinci_dm6467-ea2-video.patch
+#  pro_arm_davinci_cpu_id_update.patch
+#  pro_arm_davinci_4457-2-GPIO-support-user.patch
+# 
+# Patches obsoleted are
+#  pro_arm_davinci_mach_i2c_expander_op.patch
+#  pro_arm_davinci_i2c.patch
+# 
+
+PATCHNUM=1677
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 25654
+Type: Enhancement
+Disposition: local
+Signed-off-by: Steve Chen <schen@mvista.com>
+Description:
+Add support for DM355 and DM6467.
+
+Patches updated are
+ pro_arm_davinci_dm6467-ea2-video.patch
+ pro_arm_davinci_cpu_id_update.patch
+ pro_arm_davinci_4457-2-GPIO-support-user.patch
+
+Patches obsoleted are
+ pro_arm_davinci_mach_i2c_expander_op.patch
+ pro_arm_davinci_i2c.patch
+
+Index: linux-2.6.10/drivers/i2c/busses/i2c-davinci.c
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/i2c-davinci.c
++++ linux-2.6.10/drivers/i2c/busses/i2c-davinci.c
+@@ -42,6 +42,7 @@
+ #include <linux/errno.h>
+ #include <linux/sched.h>
+ #include <asm/arch/hardware.h>
++#include <asm/arch/i2c-client.h>
+ #include <linux/interrupt.h>
+ #include <linux/moduleparam.h>
+ #include <linux/err.h>
+@@ -49,6 +50,8 @@
+ #include <linux/sysctl.h>
+ #include <linux/wait.h>
+ #include <asm/arch/irqs.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/gio.h>
+ #include <asm/mach-types.h>
+ #include "i2c-davinci.h"
+ 
+@@ -92,9 +95,12 @@ static int i2c_davinci_debug = 0;
+ 
+ /* Following are the default values for the module parameters */
+ 
++/* Default: Fast Mode = 400 KHz, Standard Mode = 100 KHz */
++static int i2c_davinci_busFreq = 400;
++
++/* I2C input clock frequency in Hz */
++static unsigned long i2c_davinci_inputClock;
+ 
+-static int i2c_davinci_busFreq = 400;	/* Default: Fast Mode = 400 KHz, Standard Mode = 100 KHz */
+-static unsigned long i2c_davinci_inputClock;	/* For I2C on DaVinci, the input clock frequency has been fixed at 27 MHz */
+ static int i2c_davinci_own_addr = 0x1;	/* Randomly assigned own address */
+ 
+ /* Instance of the private I2C device structure */
+@@ -103,12 +109,78 @@ static struct i2c_davinci_device i2c_dav
+ static struct clk *i2c_clock;
+ 
+ #define PINMUX1		__REG(0x01c40004)
++#define PINMUX3		__REG(0x01c4000c)
+ #define GPIO		__REG(0x01C67000)
+ #define GPIO23_DIR	__REG(0x01C67038)
+ #define GPIO23_SET	__REG(0x01C67040)
+ #define GPIO23_CLR	__REG(0x01C67044)
+ 
+ /*
++ * Choose 12Mhz as the targeted I2C clock frequency after the prescaler.
++*/
++#define I2C_PRESCALED_CLOCK 12000000UL
++
++/*
++ * Configure the I2C data pin as a GPIO input and the I2C clock pin as a
++ * high GPIO output.
++ */
++static void disable_i2c_pins(void)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++
++	if (cpu_is_davinci_dm644x()) {
++		/* I2C clock on GPIO43, I2C data on GPIO44 */
++		gpio_set_direction(44, GIO_DIR_INPUT);
++		gpio_set_direction(43, GIO_DIR_OUTPUT);
++		gpio_set_value(43, GIO_STATE_HIGH);
++		PINMUX1 &= ~(1 << 7);
++	} else if (cpu_is_davinci_dm355()) {
++		/* I2C clock on GPIO14, I2C data on GPIO15 */
++		gpio_set_direction(15, GIO_DIR_INPUT);
++		gpio_set_direction(14, GIO_DIR_OUTPUT);
++		gpio_set_value(14, GIO_STATE_HIGH);
++		PINMUX3 &= ~((1 << 20) | (1 << 19));
++	}
++
++	local_irq_restore(flags);
++}
++
++/* Connect the I2C pins to the I2C controller. */
++static void enable_i2c_pins(void)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++
++	if (cpu_is_davinci_dm644x())
++		PINMUX1 |= (1 << 7);
++	else if (cpu_is_davinci_dm355())
++		PINMUX3 |= ((1 << 20) | (1 << 19));
++
++	local_irq_restore(flags);
++}
++
++/* Generate a pulse on the I2C clock pin. */
++static void pulse_i2c_clock(void)
++{
++	if (cpu_is_davinci_dm644x()) {
++		/* I2C clock on GPIO43 */
++		gpio_set_value(43, GIO_STATE_LOW);
++		udelay(20);
++		gpio_set_value(43, GIO_STATE_HIGH);
++		udelay(20);
++	} else if (cpu_is_davinci_dm355()) {
++		/* I2C clock on GPIO14 */
++		gpio_set_value(14, GIO_STATE_LOW);
++		udelay(20);
++		gpio_set_value(14, GIO_STATE_HIGH);
++		udelay(20);
++	}
++}
++
++/*
+  * This functions configures I2C and brings I2C out of reset.
+  * This function is called during I2C init function. This function
+  * also gets called if I2C encounetrs any errors. Clock calculation portion
+@@ -116,8 +188,7 @@ static struct clk *i2c_clock;
+  */
+ static int i2c_davinci_reset(struct i2c_davinci_device *dev)
+ {
+-	u16 psc;
+-	u32 clk;
++	u32 psc, d, div, clk;
+ 
+         DEB1("i2c: reset called");
+ 
+@@ -141,15 +212,33 @@ static int i2c_davinci_reset(struct i2c_
+  	 *       if PSC > 1 , d = 5
+  	 */
+ 
+-	psc = 26; /* To get 1MHz clock */
++	/*
++	 * Choose PSC to get a 12MHz or lower clock frequency after the
++	 * prescaler.
++	 */
++	psc = (i2c_davinci_inputClock + (I2C_PRESCALED_CLOCK - 1)) /
++		I2C_PRESCALED_CLOCK - 1;
++
++	if (psc == 0)
++		d = 7;
++	else if (psc == 1)
++		d = 6;
++	else
++		d = 5;
+ 
+-        clk = ((i2c_davinci_inputClock/(psc + 1)) / (i2c_davinci_busFreq * 1000)) - 10;
++	div = 2*(psc + 1)*i2c_davinci_busFreq*1000;
++	clk = (i2c_davinci_inputClock + div - 1)/div;
++	if (clk >= d)
++		clk -= d;
++	else
++		clk = 0;
+ 
+ 	dev->regs->icpsc = psc;
+-	dev->regs->icclkh = (50 * clk) / 100; /* duty cycle should be 50% */
+-	dev->regs->icclkl = (clk - dev->regs->icclkh);
++	dev->regs->icclkh = clk; /* duty cycle should be 50% */
++	dev->regs->icclkl = clk;
+ 
+-	DEB1("CLK  = %d", clk);
++	DEB1("CLK = %ld KHz",
++		i2c_davinci_inputClock / (2 * (psc + 1) * (clk + d) * 1000));
+ 	DEB1("PSC  = %d", dev->regs->icpsc);
+ 	DEB1("CLKL = %d", dev->regs->icclkl);
+ 	DEB1("CLKH = %d", dev->regs->icclkh);
+@@ -160,6 +249,8 @@ static int i2c_davinci_reset(struct i2c_
+ 	/* Enable interrupts */
+ 	dev->regs->icimr = I2C_DAVINCI_INTR_ALL;
+ 
++	enable_i2c_pins();
++
+ 	/* Take the I2C module out of reset: */
+ 	dev->regs->icmdr |= DAVINCI_I2C_ICMDR_IRS_MASK;
+ 
+@@ -184,29 +275,22 @@ static int i2c_davinci_wait_for_bb(char 
+ 				to_cnt ++;
+ 				return -ETIMEDOUT;
+ 			}
+-		}
+-		else {
++		} else if (cpu_is_davinci_dm644x() || cpu_is_davinci_dm355()) {
++
+ 			to_cnt = 0;
+ 			/* Send the NACK to the slave */
+ 			dev->regs->icmdr |= DAVINCI_I2C_ICMDR_NACKMOD_MASK;
+ 			/* Disable I2C */
+-			PINMUX1 &= (~(1 << 7));
+-
+-			/* Set the GPIO direction register */
+-			GPIO23_DIR &= ~0x0800;
++			disable_i2c_pins();
+ 			
+-			/* Send high and low on the SCL line */
+-			for (i = 0; i < 10; i++) {
+-				GPIO23_SET |= 0x0800;
+-				udelay(25);
+-				GPIO23_CLR |= 0x0800;
+-				udelay(25);
+-			}
+-			/* Re-enable I2C */
+-			PINMUX1 |= (1 << 7);
++			for (i = 0; i < 10; i++)
++				pulse_i2c_clock();
+ 
++			/* Re-enable I2C */
++			enable_i2c_pins();
+ 			i2c_davinci_reset(dev);
+ 			dev->cmd_complete = 0;
++			return -ETIMEDOUT;
+ 		}
+ 		if (allow_sleep)
+ 			schedule_timeout(1);
+@@ -231,7 +315,7 @@ i2c_davinci_xfer_msg(struct i2c_adapter 
+ 	     msg->addr, msg->len, msg->flags, stop);
+ 
+ 	/* Introduce a 100musec delay.  Required for Davinci EVM board only */
+-	if (machine_is_davinci_evm())
++	if (cpu_is_davinci_dm644x())
+ 		udelay(100);
+ 
+ 	/* set the slave address */
+@@ -291,23 +375,21 @@ i2c_davinci_xfer_msg(struct i2c_adapter 
+ 			  icstr = 0x%x\n", dev->cmd_complete,
+ 			  dev->regs->icstr);
+ 
+-		/* Send the NACK to the slave */
+-		dev->regs->icmdr |= DAVINCI_I2C_ICMDR_NACKMOD_MASK;
+-		/* Disable I2C */
+-		PINMUX1 &= (~(1 << 7));
++		if (cpu_is_davinci_dm644x() || cpu_is_davinci_dm355()) {
++			/* Send the NACK to the slave */
++			dev->regs->icmdr |= DAVINCI_I2C_ICMDR_NACKMOD_MASK;
++			/* Disable I2C */
++			disable_i2c_pins();
+ 
+-		/* Set the GPIO direction register */
+-		GPIO23_DIR &= ~0x0800;
+-			
+-		/* Send high and low on the SCL line */
+-		for (i = 0; i < 10; i++) {
+-			GPIO23_SET |= 0x0800;
+-			udelay(25);
+-			GPIO23_CLR |= 0x0800;
+-			udelay(25);
++			/* Send high and low on the SCL line */
++			for (i = 0; i < 10; i++)
++				pulse_i2c_clock();
++
++			/* Re-enable I2C */
++			enable_i2c_pins();
+ 		}
+-		/* Re-enable I2C */
+-		PINMUX1 |= (1 << 7);
++
++
+ 		i2c_davinci_reset(dev);
+ 		dev->cmd_complete = 0;
+ 		return -ETIMEDOUT;
+@@ -535,6 +617,9 @@ static int __init i2c_davinci_init(void)
+ 
+ 	DEB1("i2c_davinci_init()");
+ 
++	if (cpu_is_davinci_dm6467())
++		davinci_i2c_expander_op (0x3A, I2C_INT_DM646X, 0);
++
+         /* 
+ 	 * NOTE: On DaVinci EVM, the i2c bus frequency is set to 20kHz
+ 	 *       so that the MSP430, which is doing software i2c, has
+@@ -542,7 +627,8 @@ static int __init i2c_davinci_init(void)
+ 	 */
+ 	if (machine_is_davinci_evm())
+ 		i2c_davinci_busFreq = 20;
+-
++	else if (machine_is_davinci_dm6467_evm())
++		i2c_davinci_busFreq = 100;
+ 	else if (i2c_davinci_busFreq > 200)
+ 		i2c_davinci_busFreq = 400;	/*Fast mode */
+ 	else
+Index: linux-2.6.10/drivers/i2c/chips/tlv320aic33.c
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/tlv320aic33.c
++++ linux-2.6.10/drivers/i2c/chips/tlv320aic33.c
+@@ -31,6 +31,7 @@
+ 
+ #include <linux/proc_fs.h>
+ #include <linux/sysctl.h>
++#include <asm/arch/cpu.h>
+ 
+ 
+ #define I2C_AIC33_REG_SIZE                102
+@@ -157,7 +158,10 @@ static int
+ aic33_i2c_probe_adapter(struct i2c_adapter *adap)
+ {
+ 	/* i2c client can be up to 4 devices with device addresses 0x18, 0x19, 0x1A, 0x1B*/
+-	return aic33_i2c_attach_client(adap, 0x1B);
++	if (cpu_is_davinci_dm6467())
++		return aic33_i2c_attach_client(adap, 0x18);
++	else
++		return aic33_i2c_attach_client(adap, 0x1B);
+ }
+ 
+ static int
+Index: linux-2.6.10/mvl_patches/pro-1677.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1677.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1677);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,407 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_cavium_2Gmem_setup
+# Date: Tue Feb  6 08:15:00 2007
+# Source: MontaVista Software, Inc.
+# MR:19143
+# Type: Defect Fix
+# Disposition: needs submitting to community
+# Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+# Description:
+# 1. Get_system_type returns string from bootloader instead of hardcoded one.
+# 2. Use octeon_hal_init instead of octeon_led_init.
+# 3. Fix mem_alloc_size calculation.
+# 4. Remove octeon_boot_desc_ptr check and octeon_bootinfo assigment. It is done in hal.c now.
+# 5. Use special routines for getting arguments from bootloader.
+# 6. Use special routines for getting clock rate.
+# 7. Fix boot  memory allocation.
+# 
+
+PATCHNUM=1060
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR:19143
+Type: Defect Fix
+Disposition: needs submitting to community
+Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+Description:
+1. Get_system_type returns string from bootloader instead of hardcoded one.
+2. Use octeon_hal_init instead of octeon_led_init.
+3. Fix mem_alloc_size calculation.
+4. Remove octeon_boot_desc_ptr check and octeon_bootinfo assigment. It is done in hal.c now.
+5. Use special routines for getting arguments from bootloader.
+6. Use special routines for getting clock rate.
+7. Fix boot  memory allocation.
+
+Index: linux-2.6.10/arch/mips/cavium-octeon/setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/cavium-octeon/setup.c
++++ linux-2.6.10/arch/mips/cavium-octeon/setup.c
+@@ -35,11 +35,6 @@
+ #include <octeon-app-init.h>
+ #include <hal.h>
+ 
+-extern void *octeon_reserve32_memory;
+-octeon_bootinfo_t *octeon_bootinfo;
+-/* Set to non-zero, so it is not in .bss section and is not zeroed */
+-volatile octeon_boot_descriptor_t *octeon_boot_desc_ptr = (void *)0xEADBEEFULL;
+-
+ #define MAX_MEMORY          ((512ull) << 20)
+ 
+ //#define ECC_REPORT_SINGLE_BIT_ERRORS
+@@ -566,7 +561,7 @@ static irqreturn_t octeon_ecc_interrupt(
+  */
+ const char *get_system_type(void)
+ {
+-	return "Octeon";
++	return octeon_board_type_string();
+ }
+ 
+ /**
+@@ -585,13 +580,13 @@ void arch_init_irq(void)
+  */
+ void prom_init(void)
+ {
+-	uint64_t mem_alloc_size = 1024 << 20;
++	uint64_t mem_alloc_size = 4 << 20;
+ 	uint64_t total = 0;
+ 	uint64_t coreid;
+ 	int count = 0;
+ 	int i;
+ 
+-	octeon_led_init();
++	octeon_hal_init();
+ 	octeon_check_cpu_bist();
+ 
+ 	coreid = octeon_get_core_num();
+@@ -604,22 +599,10 @@ void prom_init(void)
+ 
+ 	printk("Cavium Networks Version: %s\n", get_version());
+ 
+-	/* Make sure we got the boot descriptor block */
+-	if ((octeon_boot_desc_ptr == (void *)0xEADBEEFULL))
+-		panic("Boot descriptor block wasn't passed properly\n");
+-
+-	octeon_bootinfo =
+-	    octeon_phys_to_ptr(octeon_boot_desc_ptr->cvmx_desc_vaddr);
+-
+-	if (octeon_bootinfo->board_type == 2
+-	    && octeon_bootinfo->board_rev_major < 2)
+-		octeon_write_lcd("Linx");
+-	else
+ 		octeon_write_lcd("LinuxSMP");
+ 
+-	for (i = 0; i < octeon_boot_desc_ptr->argc; i++) {
+-		char *arg;
+-		arg = octeon_phys_to_ptr(octeon_boot_desc_ptr->argv[i]);
++	for (i = 0; i < octeon_get_boot_num_arguments(); i++) {
++		const char *arg = octeon_get_boot_argument(i);
+ 		if (strlen(arcs_cmdline) + strlen(arg) + 1 <
+ 		    sizeof(arcs_cmdline) - 1) {
+ 			strcat(arcs_cmdline, " ");
+@@ -627,20 +610,12 @@ void prom_init(void)
+ 		}
+ 	}
+ 
+-	if ((octeon_bootinfo->eclock_hz < 300000000) ||
+-	    (octeon_bootinfo->eclock_hz > 800000000)) {
+-		printk
+-		    ("Clock speed from bootloader (%dMhz) is out of range. Assuming 500Mhz\n",
+-		     octeon_bootinfo->eclock_hz / 1000000);
+-		octeon_bootinfo->eclock_hz = 500000000;
+-	}
+-
+ 	/* you should these macros defined in include/asm/bootinfo.h */
+ 	mips_machgroup = MACH_GROUP_CAVIUM;
+ 	mips_machtype = MACH_CAVIUM_OCTEON;
+ 
+ 	board_timer_setup = octeon_timer_setup;
+-	mips_hpt_frequency = octeon_bootinfo->eclock_hz;
++	mips_hpt_frequency = octeon_get_clock_rate();
+ #ifndef CONFIG_CPU_TIMER
+ 	mips_hpt_read = octeon_hpt_read;
+ 	mips_hpt_init = octeon_hpt_init;
+@@ -679,12 +654,6 @@ void prom_init(void)
+ #endif
+ 
+ 	}
+-	/* Ignore invalid values of CONFIG_CAVIUM_RESERVE32 */
+-	if (CONFIG_CAVIUM_RESERVE32 == 512 || CONFIG_CAVIUM_RESERVE32 == 1024)
+-		octeon_reserve32_memory =
+-		    (void *)(0x80000000 - (CONFIG_CAVIUM_RESERVE32 << 20));
+-	else
+-		octeon_reserve32_memory = NULL;
+ 
+ 	if (mem_alloc_size > MAX_MEMORY)
+ 		mem_alloc_size = MAX_MEMORY;
+@@ -692,41 +661,22 @@ void prom_init(void)
+ 	while ((count < BOOT_MEM_MAP_MAX) && (mem_alloc_size >= (1 << 20)) &&
+ 	       (total < MAX_MEMORY)) {
+ 		uint64_t memory;
+-		if (!octeon_reserve32_memory) {
+-			memory =
+-			    octeon_ptr_to_phys(octeon_bootmem_alloc
+-					       (mem_alloc_size, 0x10000));
+-		} else {
+-			/* If a 32 bit memory region has been set up, we want to avoid allocating kernel memory
+-			 ** from that region.  To do this, we will allocate from the ranges above and below the 32 bit region.
+-			 ** First allocate from the range above 32 bit space (this is likely to have larger chunks available,
+-			 ** and try the lower range when the upper range fails.  This should result in alloc size backoff only
+-			 ** when both ranges fail to alloc a given size. */
+-			memory =
+-			    octeon_ptr_to_phys(octeon_bootmem_alloc_range
+-					       (mem_alloc_size, 0x10000,
+-						0x80000000, 0x3ffffffffull));
+-			if (!memory)
+-				memory =
+-				    octeon_ptr_to_phys
+-				    (octeon_bootmem_alloc_range
+-				     (mem_alloc_size, 0x10000, 0,
+-				      (uint64_t) octeon_reserve32_memory - 1));
+-		}
+ 
++		memory = octeon_ptr_to_phys(octeon_bootmem_alloc(mem_alloc_size, 0x10000));
+ 		if (memory) {
+-			memset(octeon_phys_to_ptr(memory), 0, mem_alloc_size);
+ 			add_memory_region(memory, mem_alloc_size, BOOT_MEM_RAM);
+ 			total += mem_alloc_size;
+-			count++;
+-		} else {
+-			mem_alloc_size /= 2;
+-		}
++		} else
++			break;
++
+ 	}
+ 
+ 	if (total == 0)
+ 		panic("Unable to allocate memory from octeon_bootmem_alloc\n");
+ 
++	octeon_hal_setup_reserved32();
++	octeon_user_io_init();
++
+ 	set_c0_status(0xff << 8);	/* Enable core interrupt processing */
+ 
+ }
+@@ -735,10 +685,6 @@ unsigned long prom_free_prom_memory(void
+ {
+ 	uint64_t mem_cfg0, l2t_err, l2d_err, pow_ecc;
+ 
+-#ifdef CONFIG_CAVIUM_OCTEON_USER_MEM
+-	octeon_user_io_init();
+-#endif
+-
+ 	/* Add an interrupt handler for ECC failures. Will also check ECC
+ 	   status on any interrupt on this line */
+ 	request_irq(8 + 46, octeon_ecc_interrupt, SA_SHIRQ, "ECC",
+@@ -814,4 +760,3 @@ void __init plat_setup(void)
+ 	/* Currently nothing to do here... */
+ }
+ 
+-EXPORT_SYMBOL(octeon_bootinfo);
+Index: linux-2.6.10/mvl_patches/pro-1060.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1060.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1060);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

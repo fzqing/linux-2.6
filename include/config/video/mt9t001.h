@@ -1,0 +1,1 @@
+#define CONFIG_VIDEO_MT9T001 1

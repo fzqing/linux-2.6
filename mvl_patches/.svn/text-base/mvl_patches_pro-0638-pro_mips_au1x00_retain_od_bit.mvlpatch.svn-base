@@ -1,0 +1,332 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_au1x00_retain_od_bit
+# Date: Tue Jun 20 13:37:31 2006
+# Source: MontaVista Software, Inc.
+# MR: 15734
+# Type: Defect Fix
+# Disposition: accepted into 2.6.17-rc6
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+# Description:
+# 
+# [MIPS] Save write-only Config.OD from being clobbered
+# 
+# Save the Config.OD bit from being clobbered by coherency_setup(). This
+# bit, when set, fixes various errata in the early steppings of Au1x00
+# SOCs.  Unfortunately, the bit was write-only on the most early of them.
+# In addition, also restore the bit after a wakeup from sleep.
+# 
+# commit 9370b35175ca43fad7d24bc7b391473f3becbee8
+# tree 4d1f3e7a0708c86da26720288711f8702b00b601
+# parent cac4bcbce0e800f2219a27b66aaeb4a33f2e3dbc
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Fri, 26 May 2006 19:44:54 +0400
+# committer Ralf Baechle <ralf@linux-mips.org> Tue, 06 Jun 2006 00:15:13 +0100
+# 
+#  arch/mips/au1000/common/sleeper.S |    5 +++++
+#  arch/mips/mm/c-r4k.c              |   34 ++++++++++++++++++++++++++++++++++
+#  2 files changed, 39 insertions(+)
+# 
+
+PATCHNUM=638
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15734
+Type: Defect Fix
+Disposition: accepted into 2.6.17-rc6
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+Description:
+
+[MIPS] Save write-only Config.OD from being clobbered
+
+Save the Config.OD bit from being clobbered by coherency_setup(). This
+bit, when set, fixes various errata in the early steppings of Au1x00
+SOCs.  Unfortunately, the bit was write-only on the most early of them.
+In addition, also restore the bit after a wakeup from sleep.
+
+commit 9370b35175ca43fad7d24bc7b391473f3becbee8
+tree 4d1f3e7a0708c86da26720288711f8702b00b601
+parent cac4bcbce0e800f2219a27b66aaeb4a33f2e3dbc
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Fri, 26 May 2006 19:44:54 +0400
+committer Ralf Baechle <ralf@linux-mips.org> Tue, 06 Jun 2006 00:15:13 +0100
+
+ arch/mips/au1000/common/sleeper.S |    5 +++++
+ arch/mips/mm/c-r4k.c              |   34 ++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0638.c            |   16 ++++++++++++++++
+ 3 files changed, 55 insertions(+)
+
+Index: linux-2.6.10/arch/mips/au1000/common/sleeper.S
+===================================================================
+--- linux-2.6.10.orig/arch/mips/au1000/common/sleeper.S
++++ linux-2.6.10/arch/mips/au1000/common/sleeper.S
+@@ -113,6 +113,11 @@ sdsleep:
+ 	mtc0	k0, CP0_PAGEMASK
+ 	lw	k0, 0x14(sp)
+ 	mtc0	k0, CP0_CONFIG
++
++	/* We need to catch the ealry Alchemy SOCs with
++	 * the write-only Config[OD] bit and set it back to one...
++	 */
++	jal	au1x00_fixup_config_od
+ 	lw	$1, PT_R1(sp)
+ 	lw	$2, PT_R2(sp)
+ 	lw	$3, PT_R3(sp)
+Index: linux-2.6.10/arch/mips/mm/c-r4k.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/c-r4k.c
++++ linux-2.6.10/arch/mips/mm/c-r4k.c
+@@ -1177,6 +1177,31 @@ static void __init setup_scache(void)
+ 	c->options |= MIPS_CPU_SUBSET_CACHES;
+ }
+ 
++void au1x00_fixup_config_od(void)
++{
++	/*
++	 * c0_config.od (bit 19) was write only (and read as 0)
++	 * on the early revisions of Alchemy SOCs.  It disables the bus
++	 * transaction overlapping and needs to be set to fix various errata.
++	 */
++	switch (read_c0_prid()) {
++	case 0x00030100: /* Au1000 DA */
++	case 0x00030201: /* Au1000 HA */
++	case 0x00030202: /* Au1000 HB */
++	case 0x01030200: /* Au1500 AB */
++	/*
++	 * Au1100 errata actually keeps silence about this bit, so we set it
++	 * just in case for those revisions that require it to be set according
++	 * to arch/mips/au1000/common/cputable.c
++	 */
++	case 0x02030200: /* Au1100 AB */
++	case 0x02030201: /* Au1100 BA */
++	case 0x02030202: /* Au1100 BC */
++		set_c0_config(1 << 19);
++		break;
++	}
++}
++
+ static inline void coherency_setup(void)
+ {
+ 	change_c0_config(CONF_CM_CMASK, CONF_CM_DEFAULT);
+@@ -1197,6 +1222,15 @@ static inline void coherency_setup(void)
+ 	case CPU_R4400MC:
+ 		clear_c0_config(CONF_CU);
+ 		break;
++	/*
++	 * We need to catch the ealry Alchemy SOCs with
++	 * the write-only co_config.od bit and set it back to one...
++	 */
++	case CPU_AU1000: /* rev. DA, HA, HB */
++	case CPU_AU1100: /* rev. AB, BA, BC ?? */
++	case CPU_AU1500: /* rev. AB */
++		au1x00_fixup_config_od();
++		break;
+ 	}
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-0638.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0638.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(638);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

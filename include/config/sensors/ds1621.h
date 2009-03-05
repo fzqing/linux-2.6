@@ -1,0 +1,1 @@
+#undef CONFIG_SENSORS_DS1621

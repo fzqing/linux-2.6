@@ -1,0 +1,539 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_fb_Overlay2_YUV_and_errata_fixes
+# Date: Fri Dec  7 11:53:28 2007
+# Source: MontaVista Software, Inc.
+# MR: 23361
+# Type: Defect Fix 
+# Disposition: local
+# Signed-off-by: Alexey Lugovskoy <lugovskoy@ru.mvista.com>
+# Description:
+#     This patch introduces additional fixes to correctly enable frame buffer 
+#     on PXA3xx. It fixes the following: correctly ifdef's PXA27x errata code,
+#     initialization code has been re-worked a little bit, fixes YUV mode for
+#     Overlay2. The fix has been tested using Marvell's video decoding test
+#     case. It decodes video on frame buffer device using Overlay2 in YUV mode.
+#     Also the patch has been quickly tested on PXA27x. It does not break
+#     existing functionality on PXA27x.
+# 
+# 
+
+PATCHNUM=1456
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 23361
+Type: Defect Fix 
+Disposition: local
+Signed-off-by: Alexey Lugovskoy <lugovskoy@ru.mvista.com>
+Description:
+    This patch introduces additional fixes to correctly enable frame buffer 
+    on PXA3xx. It fixes the following: correctly ifdef's PXA27x errata code,
+    initialization code has been re-worked a little bit, fixes YUV mode for
+    Overlay2. The fix has been tested using Marvell's video decoding test
+    case. It decodes video on frame buffer device using Overlay2 in YUV mode.
+    Also the patch has been quickly tested on PXA27x. It does not break
+    existing functionality on PXA27x.
+
+
+Index: linux-2.6.10/drivers/video/pxafb.c
+===================================================================
+--- linux-2.6.10.orig/drivers/video/pxafb.c
++++ linux-2.6.10/drivers/video/pxafb.c
+@@ -74,8 +74,13 @@ static int overlay1fb_open(struct fb_inf
+ static int overlay2fb_enable(struct overlayfb_info *fbi);
+ static int overlay2fb_open(struct fb_info *info, int user);
+ static int overlay2fb_release(struct fb_info *info, int user);
++#ifdef CONFIG_PXA27x
+ static int overlay2fb_enable_RGB(struct fb_info *info);
++static int overlay2fb_disable_RGB(struct fb_info *info);
+ static int overlay2fb_YUV420_workaround(struct fb_info *info);
++static int overlay2fb_enable_YUV420(struct overlayfb_info *fbi);
++static int overlay2fb_disable_YUV420(struct fb_info *info);
++#endif
+ static int overlay2fb_activate_var(struct fb_var_screeninfo *var,
+ 				   struct fb_info *info);
+ static int cursorfb_enable(struct fb_info *info);
+@@ -84,9 +89,6 @@ static int cursorfb_setcolreg(u_int regn
+ 			      u_int trans, struct fb_info *info);
+ static int cursorfb_activate_var(struct fb_var_screeninfo *var,
+ 				 struct fb_info *info);
+-static int overlay2fb_disable_YUV420(struct fb_info *info);
+-static int overlay2fb_enable_YUV420(struct overlayfb_info *fbi);
+-static int overlay2fb_disable_RGB(struct fb_info *info);
+ 
+ static void overlay1fb_blank(int blank, struct fb_info *info);
+ static void overlay2fb_blank(int blank, struct fb_info *info);
+@@ -112,9 +114,12 @@ static void pxafb_init_unchangeable_vars
+ 				      struct device *dev);
+ 
+ #if defined(CONFIG_PXA27x) || defined(CONFIG_PXA3xx)
+-static int yuv420_enabled = 0;
+ static int directfb = 0;
+ #endif
++#if defined(CONFIG_PXA27x)
++static int yuv420_enabled = 0;
++#endif
++
+ static struct device *my_device;	/* We preserve reference to the device here */
+ static struct device_driver pxafb_driver;
+ static struct pxafb_info *pxafbi;
+@@ -1161,9 +1166,10 @@ static int pxafb_activate_var(struct fb_
+ 
+ 	new_regs.lccr0 = fbi->lccr0 |
+ 		(LCCR0_LDM | LCCR0_SFM | LCCR0_IUM | LCCR0_EFM |
+-                 LCCR0_QDM | LCCR0_BM | LCCR0_OUM |
+-                 LCCR0_OUC	/*overlays above base plane */
+-	    );
++#if defined(CONFIG_PXA27x) || defined(CONFIG_PXA3xx) /* Enable overlay for PXA27x */
++		 LCCR0_OUC | LCCR0_CMDIM | LCCR0_RDSTM |
++#endif
++                 LCCR0_QDM | LCCR0_BM );
+ 
+ 	new_regs.lccr1 =
+ 		LCCR1_DisWdth(var->xres_virtual) +
+@@ -1202,16 +1208,14 @@ static int pxafb_activate_var(struct fb_
+ 	local_irq_save(flags);
+ 
+ 	/* setup dma descriptors */
+-	fbi->dmadesc_fblow_cpu = (struct pxafb_dma_descriptor *)
+-		((unsigned int)fbi->palette_cpu - 3*16);
+-	fbi->dmadesc_fbhigh_cpu = (struct pxafb_dma_descriptor *)
+-		((unsigned int)fbi->palette_cpu - 2*16);
+-	fbi->dmadesc_palette_cpu = (struct pxafb_dma_descriptor *)
+-		((unsigned int)fbi->palette_cpu - 1*16);
+-
+-	fbi->dmadesc_fblow_dma = fbi->palette_dma - 3*16;
+-	fbi->dmadesc_fbhigh_dma = fbi->palette_dma - 2*16;
+-	fbi->dmadesc_palette_dma = fbi->palette_dma - 1*16;
++
++	fbi->dmadesc_palette_cpu = (struct pxafb_dma_descriptor *)(fbi->map_cpu);
++	fbi->dmadesc_fbhigh_cpu  = (struct pxafb_dma_descriptor *)(fbi->map_cpu) + 1;
++	fbi->dmadesc_fblow_cpu   = (struct pxafb_dma_descriptor *)(fbi->map_cpu) + 2;
++
++	fbi->dmadesc_palette_dma = fbi->map_dma;
++	fbi->dmadesc_fbhigh_dma  = fbi->map_dma + 1 * sizeof(struct pxafb_dma_descriptor);
++	fbi->dmadesc_fblow_dma   = fbi->map_dma + 2 * sizeof(struct pxafb_dma_descriptor);
+ 
+ #define BYTES_PER_PANEL (lines_per_panel * fbi->fb.fix.line_length)
+ 
+@@ -1365,6 +1369,9 @@ static void pxafb_enable_controller(stru
+ 	DPRINTK("reg_lccr2 0x%08x\n", (unsigned int) fbi->reg_lccr2);
+ 	DPRINTK("reg_lccr3 0x%08x\n", (unsigned int) fbi->reg_lccr3);
+ 
++	/* disable LCD controller clock */
++	pxa_set_cken(CKEN16_LCD, 0);
++
+ #ifdef CONFIG_PXA27x
+ 	/* workaround for insight 41187 */
+ 	OVL1C2 = 0;
+@@ -1396,9 +1403,22 @@ static void pxafb_enable_controller(stru
+ 
+ 	FDADR0 = fbi->fdadr0;
+ 	FDADR1 = fbi->fdadr1;
+-	LCCR0 |= LCCR0_ENB;
+ #endif
+ 
++	LCCR4 |= (1 << 31);
++#ifdef CONFIG_PXA27x
++	LCCR4 |= (5 << 17);
++#endif
++
++#ifdef CONFIG_PXA3xx
++	LCCR4 = LCCR4 | LCCR4_REOFM0 | LCCR4_REOFM1 | LCCR4_REOFM2 |
++		LCCR4_REOFM3 | LCCR4_REOFM4 | LCCR4_REOFM5 |
++		LCCR4_REOFM6;
++#endif
++	LCCR0 |= LCCR0_ENB;
++	/* enable LCD controller clock */
++	pxa_set_cken(CKEN16_LCD, 1);
++
+ 	DPRINTK("FDADR0 0x%08x\n", (unsigned int) FDADR0);
+ 	DPRINTK("FDADR1 0x%08x\n", (unsigned int) FDADR1);
+ 	DPRINTK("LCCR0 0x%08x\n", (unsigned int) LCCR0);
+@@ -2103,6 +2123,7 @@ overlay2fb_activate_var(struct fb_var_sc
+ 	}
+ 
+       out1:
++#ifdef CONFIG_PXA27x
+ 	/* FIXME : sighting #49219, #56573
+ 	 * 
+ 	 * Enable RGB mode before entering YUV420
+@@ -2110,6 +2131,7 @@ overlay2fb_activate_var(struct fb_var_sc
+ 	if ((format == 0x4) &&
+ 	    ((fbi->state == C_DISABLE) || (fbi->format != format)))
+ 		overlay2fb_YUV420_workaround(info);
++#endif
+ 
+ 	/* update var_screeninfo fields */
+ 	dvar->nonstd = var->nonstd;
+@@ -2146,11 +2168,11 @@ static int  overlay1fb_disable(struct ov
+ 	fbi->state = C_DISABLE;
+ 
+ 	/* clear O1EN */
+-	OVL1C1 &= ~(0x1 << 31);
++	OVL1C1 &= ~OVL1C1_O1EN;
+ 
+ 	CLEAR_LCD_INTR(LCSR1, LCSR1_BS1);
+-	FBR1 = 0x03;
+-	done = WAIT_FOR_LCD_INTR(LCSR1, LCSR1_BS1, 10);
++	FBR1 = FDADR1 | 0x03;
++	done = WAIT_FOR_LCD_INTR(LCSR1, LCSR1_BS1, 100);
+ 
+ 	if (!done) {
+ 		DPRINTK(KERN_INFO "%s: timeout\n", __FUNCTION__);
+@@ -2289,7 +2311,8 @@ static int overlay1fb_enable(struct over
+ 	}
+ 
+ 	/* enable overlay 1 window */
+-	OVL1C1 |= (1 << 31);
++
++	OVL1C1 |= OVL1C1_O1EN;
+ 
+ 	fbi->state = C_ENABLE;
+ 
+@@ -2653,9 +2676,6 @@ static int overlay2fb_enable(struct over
+ 		return -EINVAL;
+ 	}
+ 
+-	xres = fbi->fb.fix.line_length;
+-	yres = fbi->fb.var.yres;
+-
+ 	DPRINTK("FB2, enable: %dx%d, bpp %x, format %d, xpos %d, ypos %d\n",
+ 		xres, yres, bpp2, fbi->format, fbi->xpos, fbi->ypos);
+ 
+@@ -2665,11 +2685,14 @@ static int overlay2fb_enable(struct over
+ 		  LCCR5_EOFM4 | LCCR5_EOFM3 | LCCR5_EOFM2 |
+ 		  LCCR5_SOFM4 | LCCR5_SOFM3 | LCCR5_SOFM2);
+ 
+-	OVL2C2 = (fbi->format << 20) | (fbi->ypos << 10) | fbi->xpos;
+-	OVL2C1 = (bpp2 << 20) | ((yres - 1) << 10) | (xres - 1);
+-	/*FIXME: workaround for sightings ? */
+-
+ 	if (fbi->format == 0) {
++		/* overlay2 RGB resolution, RGB and YUV have different xres value*/
++		xres = fbi->fb.var.xres;
++		yres = fbi->fb.var.yres;
++
++		OVL2C2 = (fbi->format << 20) | (fbi->ypos << 10) | fbi->xpos;
++		OVL2C1 = (bpp2 << 20) | ((yres-1)<<10) | (xres-1);
++
+ 		DPRINTK("Setup RGB DMA...\n");
+ 		/* setup RGB DMA */
+ 		if (fbi->state == C_DISABLE)
+@@ -2677,18 +2700,31 @@ static int overlay2fb_enable(struct over
+ 		else
+ 			FBR2 = fbi->dma2->fdadr | 0x1;
+ 	} else {
+-		/* FIXME */
++		/* overlay2 YUV resolution */
++		xres = fbi->fb.fix.line_length;
++		yres = fbi->fb.var.yres;
++
++		OVL2C2 = (fbi->format << 20) | (fbi->ypos << 10) | fbi->xpos;
++		OVL2C1 = (bpp2 << 20) | ((yres-1)<<10) | (xres-1);
++#ifdef CONFIG_PXA27x
++		/* FIXME PXA27x E25 */
+ 		if (fbi->format == 4) {
+ 			overlay2fb_enable_RGB((struct fb_info *)fbi);
+ 			overlay2fb_disable_RGB((struct fb_info *)fbi);
+ 			overlay2fb_enable_YUV420(fbi);
+ 			yuv420_enabled = 1;
+ 		}
++#endif
++		if (fbi->state == C_DISABLE){
++			FDADR2 = fbi->dma2->fdadr;
++			FDADR3 = fbi->dma3->fdadr;
++			FDADR4 = fbi->dma4->fdadr;
++		} else {
++			FBR2 = fbi->dma2->fdadr | 0x01;
++			FBR3 = fbi->dma3->fdadr | 0x01;
++			FBR4 = fbi->dma4->fdadr | 0x01;
++		}
+ 
+-
+-		FDADR2 = fbi->dma2->fdadr;
+-		FDADR3 = fbi->dma3->fdadr;
+-		FDADR4 = fbi->dma4->fdadr;
+ 	}
+ 
+ 	OVL2C1 |= OVL2C1_O2EN;
+@@ -2719,8 +2755,10 @@ static int overlay2fb_disable(struct fb_
+ 		FBR4 = 0x3;
+ 	}
+ 
++#ifdef CONFIG_PXA27x
+ 	if (yuv420_enabled && fbi->format == 0x4)
+ 		overlay2fb_disable_YUV420(info);
++#endif
+ 
+ 	done = WAIT_FOR_LCD_INTR(LCSR1, LCSR1_BS2, 100);
+ 
+@@ -2756,6 +2794,7 @@ static void overlay2fb_blank(int blank, 
+ 	}
+ }
+ 
++#ifdef CONFIG_PXA27x
+ /* set xpos, ypos, PPL and LP to 0 */
+ static int overlay2fb_YUV420_workaround(struct fb_info *info)
+ {
+@@ -2929,7 +2968,7 @@ static int overlay2fb_disable_YUV420(str
+ 
+ 	return 0;
+ }
+-
++#endif
+ #endif
+ 
+ #ifdef CONFIG_FB_PXA_PARAMETERS
+Index: linux-2.6.10/include/asm-arm/arch-pxa/pxa-regs.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-pxa/pxa-regs.h
++++ linux-2.6.10/include/asm-arm/arch-pxa/pxa-regs.h
+@@ -2225,6 +2225,7 @@
+ 
+ /* Clock Enable Register (CLKEN) Enum */
+ #define	CKEN_LCD	1	/* < LCD Clock Enable */
++#define CKEN16_LCD CKEN_LCD
+ #define	CKEN_USBH	2	/* < USB host clock enable */
+ #define	CKEN_CAMERA	3	/* < Camera interface clock enable */
+ #define	CKEN_NAND	4	/* < NAND Flash Controller Clock Enable */
+@@ -2635,6 +2636,14 @@
+ #define LCCR3_VrtSnchL  (LCCR3_VSP*1)   /*  Vertical Synchronization pulse */
+                                         /*  active Low                     */
+ 
++#define LCCR4_REOFM0	(1 << 9)
++#define LCCR4_REOFM1	(1 << 10)
++#define LCCR4_REOFM2	(1 << 11)
++#define LCCR4_REOFM3	(1 << 12)
++#define LCCR4_REOFM4	(1 << 13)
++#define LCCR4_REOFM5	(1 << 14)
++#define LCCR4_REOFM6	(1 << 26)
++
+ #if defined (CONFIG_PXA27x) || defined (CONFIG_PXA3xx)
+ #define LCCR5_SOFM1     (1<<0)          /* Start Of Frame Mask for Overlay 1 (channel 1) */
+ #define LCCR5_SOFM2     (1<<1)          /* Start Of Frame Mask for Overlay 2 (channel 2) */
+Index: linux-2.6.10/drivers/video/oledfb.h
+===================================================================
+--- linux-2.6.10.orig/drivers/video/oledfb.h
++++ linux-2.6.10/drivers/video/oledfb.h
+@@ -40,14 +40,6 @@
+ 
+ #define CMDCR_SYNC_CNT(n)		((n))
+ 
+-#define LCCR4_REOFM0		(0x1u<<9)
+-#define LCCR4_REOFM1		(0x1u<<10)
+-#define LCCR4_REOFM2		(0x1u<<11)
+-#define LCCR4_REOFM3		(0x1u<<12)
+-#define LCCR4_REOFM4		(0x1u<<13)
+-#define LCCR4_REOFM5		(0x1u<<14)
+-#define LCCR4_REOFM6		(0x1u<<26)
+-
+ #define LCSR0_LDD		0x00000001
+ #define LCSR0_SOF0		0x00000002
+ #define LCSR0_BER		0x00000004
+Index: linux-2.6.10/mvl_patches/pro-1456.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1456.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1456);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

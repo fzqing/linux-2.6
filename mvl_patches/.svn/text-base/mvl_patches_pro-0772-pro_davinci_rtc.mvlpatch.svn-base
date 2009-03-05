@@ -1,0 +1,512 @@
+#! /usr/bin/env bash
+# Patch: -pro_davinci_rtc
+# Date: Thu Jul  6 19:20:10 2006
+# Source: MontaVista Software, Inc.
+# MR: 15605
+# Type: Integration
+# Disposition: MontaVista
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+#     Integration of TI DaVinci 0.5.2 drop from TI
+
+PATCHNUM=772
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15605
+Type: Integration
+Disposition: MontaVista
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+    Integration of TI DaVinci 0.5.2 drop from TI
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -852,6 +852,12 @@ config S3C2410_RTC
+ 	  Samsung S3C2410. This can provide periodic interrupt rates
+ 	  from 1Hz to 64Hz for user programs, and wakeup from Alarm.
+ 
++config DAVINCI_RTC
++	bool "TI DaVinci Real Time Clock"
++	depends on ARCH_DAVINCI && MACH_DAVINCI_EVM && I2C_DAVINCI
++	help
++	  Support for TI DaVinci RTC
++
+ config COBALT_LCD
+ 	bool "Support for Cobalt LCD"
+ 	depends on MIPS_COBALT
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -103,6 +103,7 @@ obj-$(CONFIG_PCMCIA) += pcmcia/
+ obj-$(CONFIG_IPMI_HANDLER) += ipmi/
+ 
+ obj-$(CONFIG_HANGCHECK_TIMER) += hangcheck-timer.o
++obj-$(CONFIG_DAVINCI_RTC) += davinci-rtc.o
+ 
+ # Files generated that shall be removed upon make clean
+ clean-files := consolemap_deftbl.c defkeymap.c qtronixmap.c ibm_workpad_keymap.c
+Index: linux-2.6.10/drivers/char/davinci-rtc.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/davinci-rtc.c
+@@ -0,0 +1,251 @@
++/*
++ *  linux/drivers/char/rtc.c
++ *
++ * Copyright (C) 2004 Texas Instruments Inc
++ *
++ * ----------------------------------------------------------------------------
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ * ----------------------------------------------------------------------------
++ Modifications:
++ ver. 1.0: Jan 2006, Swaminathan S
++ -
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/proc_fs.h>
++#include <linux/ctype.h>
++#include <linux/delay.h>
++#include <linux/rtc.h>
++#include <linux/bcd.h>
++#include <asm/rtc.h>
++#include <asm/arch/i2c-client.h>
++
++static unsigned char am;
++
++static void rtc_read_time(struct rtc_time *tm);
++static int rtc_set_time(struct rtc_time *tm);
++static void am_or_pm (void);
++
++static struct rtc_ops davinci_rtc_ops = {
++        .owner          = THIS_MODULE,
++        .read_time      = rtc_read_time,
++        .set_time       = rtc_set_time,
++};
++
++static unsigned long epoch = 1900;      /* year corresponding to 0x00   */
++
++static const unsigned char days_in_mo[] =
++{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
++
++static void rtc_read_time(struct rtc_time *tm)
++{
++	char rtcdata [9] = { 2, 1, 0, 0, 0, 0,
++			     0, 0, 0 };
++
++	davinci_i2c_write (2, rtcdata, 0x23);
++	udelay (1000);
++	davinci_i2c_read (9, rtcdata, 0x23);
++	udelay (1000);
++
++	tm->tm_year = BCD_TO_BIN (rtcdata[3]) * 100 + BCD_TO_BIN (rtcdata[2]) - 1900;
++	tm->tm_mon = BCD_TO_BIN (rtcdata[4]);
++	tm->tm_mday = BCD_TO_BIN (rtcdata[5]);
++	tm->tm_hour = BCD_TO_BIN (rtcdata[6]);
++	tm->tm_min = BCD_TO_BIN (rtcdata[7]);
++	tm->tm_sec = BCD_TO_BIN (rtcdata[8]);
++}
++
++static int rtc_set_time(struct rtc_time *tm)
++{
++	char rtcdata [9];
++	char ampmdata [9];
++	struct timespec tv;
++	unsigned char mon, day, hrs = 0, min, sec, leap_yr;
++	unsigned char yr_low, yr_high;
++	unsigned int yrs;
++
++	am_or_pm ();
++
++	yrs = tm->tm_year + 1900;
++	yr_high = yrs/100;
++	yr_low = (yrs) % 100;
++
++	mon = tm->tm_mon;
++	hrs = tm->tm_hour;
++	day = tm->tm_mday;
++	min = tm->tm_min;
++	sec = tm->tm_sec;
++
++	if (yrs < 1970 || yrs > 2037)
++                return -EINVAL;
++
++        leap_yr = ((!(yrs % 4) && (yrs % 100)) || !(yrs % 400));
++
++	if ((mon > 11) || (day == 0))
++                return -EINVAL;
++
++        if (day > (days_in_mo[mon] + ((mon == 1) && leap_yr)))
++                return -EINVAL;
++
++        if ((hrs >= 24) || (min >= 60) || (sec >= 60))
++                return -EINVAL;
++
++        if ((yrs -= epoch) > 255) {    /* They are unsigned */
++                return -EINVAL;
++        }
++
++	if (am == 1 && tm->tm_hour <= 12) {
++		hrs = tm->tm_hour;
++		if (tm->tm_hour == 0)
++			hrs = tm->tm_hour + 12;
++	}
++
++	else if ((am == 1 && tm->tm_hour > 12) ||
++	    	 (am == 0 && tm->tm_hour < 12)) {
++		unsigned char mon1 = mon, day1 = day, hrs1 = 11, min1 = 59, sec1 = 59;
++		unsigned char yr_low1 = yr_low, yr_high1 = yr_high;
++
++		ampmdata [0] = 9;
++		ampmdata [1] = 0;
++		ampmdata [2] = BIN_TO_BCD(yr_low1);
++		ampmdata [3] = BIN_TO_BCD(yr_high1);
++		ampmdata [4] = BIN_TO_BCD(mon1);
++		ampmdata [5] = BIN_TO_BCD(day1);
++		ampmdata [6] = BIN_TO_BCD(hrs1);
++		ampmdata [7] = BIN_TO_BCD(min1);
++		ampmdata [8] = BIN_TO_BCD(sec1);
++		davinci_i2c_write (9, ampmdata, 0x23);
++		udelay (1000);
++		mdelay (1000);
++		am = (am == 1) ? 0 : 1;
++
++		if (!am)
++			hrs = tm->tm_hour - 12;
++		else if (tm->tm_hour == 0)
++			hrs = tm->tm_hour + 12;
++	}
++
++	else if (am == 0 && tm->tm_hour > 12) {
++		hrs = tm->tm_hour - 12;
++	}
++
++	rtcdata [0] = 9;
++	rtcdata [1] = 0;
++	rtcdata [2] = BIN_TO_BCD(yr_low);
++	rtcdata [3] = BIN_TO_BCD(yr_high);
++	rtcdata [4] = BIN_TO_BCD(mon);
++	rtcdata [5] = BIN_TO_BCD(day);
++	rtcdata [6] = BIN_TO_BCD(hrs);
++	rtcdata [7] = BIN_TO_BCD(min);
++	rtcdata [8] = BIN_TO_BCD(sec);
++	davinci_i2c_write (9, rtcdata, 0x23);
++	udelay (1000);
++
++	tv.tv_nsec = 0;
++        tv.tv_sec = mktime (tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
++				tm->tm_hour, tm->tm_min, tm->tm_sec+2);
++        do_settimeofday (&tv);
++
++	return 0;
++}
++
++static void am_or_pm (void)
++{
++	char rtcdata [9];
++	struct rtc_time tm, time, temp;
++	unsigned char mon, day, hrs, min, sec;
++	unsigned char yr_low, yr_high;
++	unsigned int yrs;
++
++	rtc_read_time (&tm);
++
++	temp = tm;
++
++	yrs = temp.tm_year + 1900;
++	yr_high = yrs/100;
++	yr_low = (yrs) % 100;
++
++	mon = temp.tm_mon + 1;
++	day = temp.tm_mday;
++	min = 59;
++	sec = 59;
++	hrs = 11;
++
++	rtcdata [0] = 9;
++	rtcdata [1] = 0;
++	rtcdata [2] = BIN_TO_BCD(yr_low);
++	rtcdata [3] = BIN_TO_BCD(yr_high);
++	mon--;
++	rtcdata [4] = BIN_TO_BCD(mon);
++	rtcdata [5] = BIN_TO_BCD(day);
++	rtcdata [6] = BIN_TO_BCD(hrs);
++	rtcdata [7] = BIN_TO_BCD(min);
++	rtcdata [8] = BIN_TO_BCD(sec);
++	davinci_i2c_write (9, rtcdata, 0x23);
++	udelay (1000);
++	mdelay (1000);
++	rtc_read_time (&time);
++
++	if (time.tm_mday == temp.tm_mday)
++		am = 1;
++	else
++		am = 0;
++
++	davinci_i2c_write (9, rtcdata, 0x23);
++	udelay (1000);
++	mdelay (1000);
++
++	yrs = tm.tm_year + 1900;
++	yr_high = yrs/100;
++	yr_low = (yrs) % 100;
++
++	mon = tm.tm_mon + 1;
++	day = tm.tm_mday;
++	min = tm.tm_min;
++	hrs = tm.tm_hour;
++	if (tm.tm_sec < 58)
++	{
++		sec = tm.tm_sec + 2;
++	} else {
++		sec = 59;
++	}
++
++	davinci_i2c_write (9, rtcdata, 0x23);
++	udelay (1000);
++}
++
++static int __init davinci_rtc_init(void)
++{
++	struct timespec tv;
++	struct rtc_time tm;
++        register_rtc (&davinci_rtc_ops);
++
++	am_or_pm ();
++
++	rtc_read_time (&tm);
++
++        tv.tv_nsec = 0;
++        tv.tv_sec = mktime (tm.tm_year + 1900, tm.tm_mon + 1 , tm.tm_mday,
++				tm.tm_hour, tm.tm_min, tm.tm_sec);
++        do_settimeofday (&tv);
++
++	return 0;
++}
++
++module_init(davinci_rtc_init);
+Index: linux-2.6.10/mvl_patches/pro-0772.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0772.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(772);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

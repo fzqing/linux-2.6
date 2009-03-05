@@ -1,0 +1,1011 @@
+#! /usr/bin/env bash
+# Patch: -common_ppc_440ep_mtd
+# Date: Wed Dec 28 14:59:13 2005
+# Source: MontaVista Software, Inc. 
+# MR: 142994
+# Type: Enhancement
+# Disposition: submitted to linux-mtd mailing list
+# Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+# Description:
+# 	This adds MTD support for the AMCC 440EP Eval Board.
+# 
+
+PATCHNUM=141
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 142994
+Type: Enhancement
+Disposition: submitted to linux-mtd mailing list
+Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+Description:
+	This adds MTD support for the AMCC 440EP Eval Board.
+
+Index: linux-2.6.10/drivers/mtd/maps/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Kconfig
++++ linux-2.6.10/drivers/mtd/maps/Kconfig
+@@ -427,6 +427,13 @@ config MTD_OCOTEA
+ 	  This enables access routines for the flash chips on the IBM 440GX
+ 	  Ocotea board. If you have one of these boards and would like to
+ 	  use the flash chips on it, say 'Y'.
++config MTD_BAMBOO
++	tristate "Flash devices mapped on IBM 440EP Bamboo"
++	depends on MTD_CFI && PPC32 && 44x && BAMBOO
++	help
++	  This enables access routined for the flash chips on the IBM 440EP
++	  Bamboo board.  If you have one of these boards and would like to
++	  use the flash chips on it, say 'Y'.
+ 
+ config MTD_REDWOOD
+ 	tristate "CFI Flash devices mapped on IBM Redwood"
+Index: linux-2.6.10/drivers/mtd/maps/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Makefile
++++ linux-2.6.10/drivers/mtd/maps/Makefile
+@@ -58,6 +58,7 @@ obj-$(CONFIG_MTD_NETtel)	+= nettel.o
+ obj-$(CONFIG_MTD_SCB2_FLASH)	+= scb2_flash.o
+ obj-$(CONFIG_MTD_EBONY)		+= ebony.o
+ obj-$(CONFIG_MTD_OCOTEA)	+= ocotea.o
++obj-$(CONFIG_MTD_BAMBOO)	+= bamboo.o
+ obj-$(CONFIG_MTD_BEECH)		+= beech-mtd.o
+ obj-$(CONFIG_MTD_ARCTIC)	+= arctic-mtd.o
+ obj-$(CONFIG_MTD_WALNUT)        += walnut.o
+Index: linux-2.6.10/drivers/mtd/maps/bamboo.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/maps/bamboo.c
+@@ -0,0 +1,245 @@
++/*
++ * Mapping for Bamboo user flash
++ *
++ * Wade Farnsworth <wfarnsworth@mvista.com>
++ *
++ * Copyright 2005 MontaVista Software Inc.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/map.h>
++#include <linux/mtd/partitions.h>
++#include <linux/config.h>
++#include <asm/io.h>
++#include <asm/ibm44x.h>
++#include <platforms/4xx/bamboo.h>
++
++static struct mtd_info *small_flash, *large_flash, *sram;
++
++static struct map_info bamboo_small_map = {
++	.name = "Bamboo small flash",
++	.size = BAMBOO_SMALL_FLASH_SIZE,
++	.bankwidth = 1,
++};
++
++static struct map_info bamboo_large_map = {
++	.name = "Bamboo large flash",
++	.size = BAMBOO_LARGE_FLASH_SIZE,
++	.bankwidth = 2,
++};
++
++static struct map_info bamboo_sram_map = {
++	.name = "Bamboo SRAM",
++	.size = BAMBOO_SRAM_SIZE,
++	.bankwidth = 2,
++};
++
++static struct mtd_partition bamboo_small_partitions[] = {
++	{
++		.name = "pibs",
++		.offset = 0x0,
++		.size = 0x100000,
++		.mask_flags = MTD_WRITEABLE,
++	}
++};
++
++static struct mtd_partition bamboo_large_partitions[] = {
++	{
++	 	.name = "filesystem",
++	 	.offset = 0x0,
++	 	.size = 0x400000,
++	}
++};
++
++static struct mtd_partition bamboo_sram_partitions[] = {
++	{
++	 	.name = "sram",
++	 	.offset = 0x0,
++	 	.size = 0x100000,
++	}
++};
++
++int __init
++init_bamboo(void)
++{
++	u8 setting_reg;
++	u8 *setting_adr;
++	unsigned long small_flash_base, large_flash_base, sram_base;
++	unsigned long *gpio_base;
++
++	setting_adr = ioremap64(BAMBOO_FPGA_SETTING_REG_ADDR, 8);
++	if (!setting_adr)
++		return -ENOMEM;
++	setting_reg = readb(setting_adr);
++	iounmap(setting_adr);
++
++	/* 
++	 * Some versions of PIBS don't set up the GPIO controller
++	 * for the devices on chip select 4 (large flash and sram).
++	 */
++	gpio_base = ioremap64(0x0EF600B00ULL, 0x80);
++	if (!gpio_base) {
++		printk("Failed to ioremap GPIO\n");
++		return -ENOMEM;
++	}
++	* (gpio_base + 0x02) |= 0x00001000;
++	* (gpio_base + 0x04) |= 0x00001000;
++	iounmap((void *) gpio_base);
++
++	/* 
++	 * Use the values in the FPGA Setting Register to determine where
++	 * each flash bank is located.
++	 */
++	if (!BAMBOO_BOOT_NAND_FLASH(setting_reg)) {
++		if (BAMBOO_BOOT_SMALL_FLASH(setting_reg)) {
++			small_flash_base = BAMBOO_SMALL_FLASH_HIGH;
++		} else {
++			small_flash_base = BAMBOO_SMALL_FLASH_LOW;
++		}
++
++		bamboo_small_map.phys = small_flash_base;
++		bamboo_small_map.virt = 
++			(ulong *) ioremap64(small_flash_base, 
++					    bamboo_small_map.size);
++		if (!bamboo_small_map.virt) {
++			printk("Failed to ioremap flash\n");
++			return -EIO;
++		}
++
++		simple_map_init(&bamboo_small_map);
++
++		small_flash = do_map_probe("jedec_probe", &bamboo_small_map);
++		if (small_flash) {
++			small_flash->owner = THIS_MODULE;
++			add_mtd_partitions(small_flash, bamboo_small_partitions,
++					   ARRAY_SIZE(bamboo_small_partitions));
++		} else {
++			printk(KERN_INFO
++			       "small flash disabled: Probe failed due to probable hardware issue\n");
++			iounmap((void *) bamboo_small_map.virt);
++			bamboo_small_map.virt = 0;
++		}
++	} else
++		bamboo_small_map.virt = 0;
++
++	/* 
++	 * Wiring to the large flash on the Rev 0 Bamboo is incorrect, so 
++	 * this should fail.
++	 *
++	 * This has been fixed on the Rev 1.
++	 */
++	if (BAMBOO_BOOT_NAND_FLASH(setting_reg) ||
++	    BAMBOO_BOOT_SMALL_FLASH(setting_reg))
++		large_flash_base = BAMBOO_LARGE_FLASH_LOW;
++	else if (BAMBOO_LARGE_FLASH_EN(setting_reg))
++		large_flash_base = BAMBOO_LARGE_FLASH_HIGH1;
++	else
++		large_flash_base = BAMBOO_LARGE_FLASH_HIGH2;
++	bamboo_large_map.phys = large_flash_base;
++	bamboo_large_map.virt = (ulong *) ioremap64(large_flash_base, 
++						    bamboo_large_map.size);
++	if (!bamboo_large_map.virt) {
++		printk("Failed to ioremap flash\n");
++		return -EIO;
++	}
++
++	simple_map_init(&bamboo_large_map);
++	large_flash = do_map_probe("cfi_probe", &bamboo_large_map);
++	if (large_flash) {
++		large_flash->owner = THIS_MODULE;
++		add_mtd_partitions(large_flash, bamboo_large_partitions,
++				   ARRAY_SIZE(bamboo_large_partitions));
++	} else {
++		printk(KERN_INFO
++		       "large flash disabled: Probe failed due to probable hardware issue\n");
++		iounmap((void *) bamboo_large_map.virt);
++		bamboo_large_map.virt = 0;
++	}
++
++	if (BAMBOO_BOOT_NAND_FLASH(setting_reg) ||
++	    BAMBOO_BOOT_SMALL_FLASH(setting_reg))
++		sram_base = BAMBOO_SRAM_LOW;
++	else if (BAMBOO_LARGE_FLASH_EN(setting_reg))
++		sram_base = BAMBOO_SRAM_HIGH2;
++	else
++		sram_base = BAMBOO_SRAM_HIGH1;
++
++	bamboo_sram_map.phys = sram_base;
++	bamboo_sram_map.virt = (ulong *) ioremap64(sram_base, 
++						   bamboo_sram_map.size);
++	if (!bamboo_sram_map.virt) {
++		printk("Failed to ioremap flash \n");
++		return -EIO;
++	}
++
++	simple_map_init(&bamboo_sram_map);
++
++	sram = do_map_probe("map_ram", &bamboo_sram_map);
++	if (sram) {
++		sram->owner = THIS_MODULE;
++		sram->erasesize = 0x10;
++		add_mtd_partitions(sram, bamboo_sram_partitions,
++				   ARRAY_SIZE(bamboo_sram_partitions));
++	} else {
++		printk(KERN_INFO
++		       "sram disabled: Probe failed due to probable hardware issue\n");
++		iounmap((void *) bamboo_sram_map.virt);
++		bamboo_sram_map.virt = 0;
++	}
++
++	if (!(small_flash || large_flash || sram))
++		return -ENXIO;
++
++	return 0;
++}
++
++static void __exit
++cleanup_bamboo(void)
++{
++	if (small_flash) {
++		del_mtd_partitions(small_flash);
++		map_destroy(small_flash);
++	}
++
++	if (large_flash) {
++		del_mtd_partitions(large_flash);
++		map_destroy(large_flash);
++	}
++
++	if (sram) {
++		del_mtd_partitions(sram);
++		map_destroy(sram);
++	}
++
++	if (bamboo_small_map.virt) {
++		iounmap((void *) bamboo_small_map.virt);
++		bamboo_small_map.virt = 0;
++	}
++
++	if (bamboo_large_map.virt) {
++		iounmap((void *) bamboo_large_map.virt);
++		bamboo_large_map.virt = 0;
++	}
++
++	if (bamboo_sram_map.virt) {
++		iounmap((void *) bamboo_sram_map.virt);
++		bamboo_sram_map.virt = 0;
++	}
++}
++
++module_init(init_bamboo);
++module_exit(cleanup_bamboo);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Wade Farnsworth <wfarnsworth@mvista.com>");
++MODULE_DESCRIPTION("MTD map and partitions for IBM 440EP Bamboo boards");
+Index: linux-2.6.10/drivers/mtd/nand/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/nand/Kconfig
++++ linux-2.6.10/drivers/mtd/nand/Kconfig
+@@ -136,6 +136,13 @@ config MTD_NAND_S3C2410_HWECC
+ 	  currently not be able to switch to software, as there is no
+ 	  implementation for ECC method used by the S3C2410
+ 
++config MTD_NAND_BAMBOO
++	tristate "NAND flash support on IBM/AMCC 440EP Eval Board (Bamboo)"
++	depends on BAMBOO && MTD_NAND
++	help
++	  This enables the NAND flash driver on the IBM/AMCC 440EP Eval Board
++	  (Bamboo).
++
+ config MTD_NAND_DISKONCHIP
+ 	tristate "DiskOnChip 2000, Millennium and Millennium Plus (NAND reimplementation) (EXPERIMENTAL)"
+ 	depends on MTD_NAND && EXPERIMENTAL
+Index: linux-2.6.10/drivers/mtd/nand/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/nand/Makefile
++++ linux-2.6.10/drivers/mtd/nand/Makefile
+@@ -15,6 +15,7 @@ obj-$(CONFIG_MTD_NAND_TX4938NDFMC)	+= tx
+ obj-$(CONFIG_MTD_NAND_AU1550)		+= au1550nd.o
+ obj-$(CONFIG_MTD_NAND_PPCHAMELEONEVB)	+= ppchameleonevb.o
+ obj-$(CONFIG_MTD_NAND_S3C2410)		+= s3c2410.o
++obj-$(CONFIG_MTD_NAND_BAMBOO)		+= bamboo_nand.o
+ obj-$(CONFIG_MTD_NAND_DISKONCHIP)	+= diskonchip.o
+ obj-$(CONFIG_MTD_NAND_H1900)		+= h1910.o
+ obj-$(CONFIG_MTD_NAND_RTC_FROM4)	+= rtc_from4.o
+Index: linux-2.6.10/drivers/mtd/nand/bamboo_nand.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/nand/bamboo_nand.c
+@@ -0,0 +1,467 @@
++/*
++ *  drivers/mtd/bamboo_nand.c
++ *
++ *  Overview:
++ *   This is a device driver for the NAND flash devices found on the
++ *   IBM 440EP Evaluation Board (Bamboo).
++ *
++ *  Author: Wade Farnsworth <wfarnsworth@mvista.com>
++ *
++ *  Copyright 2005 MontaVista Software Inc.
++ *
++ *  This program is free software; you can redistribute  it and/or modify it
++ *  under  the terms of  the GNU General  Public License as published by the
++ *  Free Software Foundation;  either version 2 of the  License, or (at your
++ *  option) any later version.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/nand_ecc.h>
++#include <linux/mtd/partitions.h>
++#include <linux/config.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <asm/io.h>
++#include <asm/ibm44x.h>
++#include <platforms/4xx/bamboo.h>
++
++struct ppc440ep_ndfc_regs {
++	uint cmd;
++	uint addr;
++	uint data;
++	uint reserved1;
++	uint ecc0;
++	uint ecc1;
++	uint ecc2;
++	uint ecc3;
++	uint ecc4;
++	uint ecc5;
++	uint ecc6;
++	uint ecc7;
++	uint b0cr;
++	uint b1cr;
++	uint b2cr;
++	uint b3cr;
++	uint cr;
++	uint sr;
++	uint hwctl;
++	uint reserved2;
++	uint revid;
++};
++
++static struct mtd_info *bamboo_nand0_mtd;
++static struct mtd_info *bamboo_nand1_mtd;
++static u8 hwctl;
++static struct ppc440ep_ndfc_regs *bamboo_ndfc;
++
++#define NAND0_NUM_PARTITIONS 1
++static struct mtd_partition nand0_partition_info[] = {
++	{
++	 	.name = "filesystem",
++	 	.offset = 0x0,
++	 	.size = 0x4000000,
++	 },
++};
++
++#define NAND1_NUM_PARTITIONS 1
++static struct mtd_partition nand1_partition_info[] = {
++	{
++		.name = "filesystem",
++		.offset = 0x0,
++		.size = 0x10000000,
++	}
++};
++
++/* 
++ * The 440EP has a NAND Flash Controller (NDFC) that handles all accesses to 
++ * the NAND devices.  The NDFC has command, address and data registers that 
++ * when accessed will set up the NAND flash pins appropriately.  We'll use the 
++ * hwcontrol function to save the configuration in a global variable.  
++ * We can then use this information in the read and write functions to 
++ * determine which NDFC register to access. For the NCE commands, we'll just
++ * set or clear the Bank Enable bit in the NDFC Bank Config registers.
++ *
++ * There are 2 NAND devices on the board, a Samsung K9F1208U0A (64 MB) and a
++ * Samsung K9K2G08U0M (256 MB).
++ */
++static void
++bamboo_hwcontrol(struct mtd_info *mtd, int cmd)
++{
++	switch (cmd) {
++	case NAND_CTL_SETCLE:
++		hwctl |= 0x1;
++		break;
++	case NAND_CTL_CLRCLE:
++		hwctl &= ~0x1;
++		break;
++	case NAND_CTL_SETALE:
++		hwctl |= 0x2;
++		break;
++	case NAND_CTL_CLRALE:
++		hwctl &= ~0x2;
++		break;
++	}
++}
++
++static void
++bamboo_nand0_hwcontrol(struct mtd_info *mtd, int cmd)
++{
++	switch(cmd) {
++	case NAND_CTL_SETNCE:
++		bamboo_ndfc->b1cr |= 0x80000000;
++		break;
++	case NAND_CTL_CLRNCE:
++		bamboo_ndfc->b1cr &= ~0x80000000;
++		break;
++	default:
++		bamboo_hwcontrol(mtd, cmd);
++	}
++}
++
++static void
++bamboo_nand1_hwcontrol(struct mtd_info *mtd, int cmd)
++{
++	switch(cmd) {
++	case NAND_CTL_SETNCE:
++		bamboo_ndfc->b2cr |= 0x80000000;
++		break;
++	case NAND_CTL_CLRNCE:
++		bamboo_ndfc->b2cr &= ~0x80000000;
++		break;
++	default:
++		bamboo_hwcontrol(mtd, cmd);
++	}
++}
++
++static void
++bamboo_nand0_enable(void)
++{
++	bamboo_ndfc->cr = 0x01001000;
++}
++
++static void
++bamboo_nand1_enable(void)
++{
++	bamboo_ndfc->cr = 0x02003000;
++}
++
++static void
++bamboo_write_byte(struct mtd_info *mtd, u_char byte)
++{
++	if (hwctl & 0x1)
++		writeb(byte, &(bamboo_ndfc->cmd));
++	else if (hwctl & 0x2)
++		writeb(byte, &(bamboo_ndfc->addr));
++	else
++		writeb(byte, &(bamboo_ndfc->data));
++}
++
++static void
++bamboo_nand0_write_byte(struct mtd_info *mtd, u_char byte)
++{
++	bamboo_nand0_enable();
++	bamboo_write_byte(mtd, byte);
++}
++
++static void
++bamboo_nand1_write_byte(struct mtd_info *mtd, u_char byte)
++{
++	bamboo_nand1_enable();
++	bamboo_write_byte(mtd,byte);
++}
++
++static u_char
++bamboo_read_byte(struct mtd_info *mtd)
++{
++	u_char retval;
++	if (hwctl & 0x1)
++		retval = readb(&(bamboo_ndfc->cmd));
++	else if (hwctl & 0x2)
++		retval = readb(&(bamboo_ndfc->addr));
++	else
++		retval = readb(&(bamboo_ndfc->data));
++	return retval;
++}
++
++static u_char
++bamboo_nand0_read_byte(struct mtd_info *mtd)
++{
++	bamboo_nand0_enable();
++	return bamboo_read_byte(mtd);
++}
++
++static u_char
++bamboo_nand1_read_byte(struct mtd_info *mtd)
++{
++	bamboo_nand1_enable();
++	return bamboo_read_byte(mtd);
++}
++
++static void
++bamboo_nand_write_buf(struct mtd_info *mtd, const u_char * buf, int len)
++{
++	int i;
++	for (i = 0; i < len; i++) {
++		if (hwctl & 0x1)
++			writeb(buf[i], &(bamboo_ndfc->cmd));
++		else if (hwctl & 0x2)
++			writeb(buf[i], &(bamboo_ndfc->addr));
++		else
++			writeb(buf[i], &(bamboo_ndfc->data));
++	}
++}
++
++static void
++bamboo_nand0_write_buf(struct mtd_info *mtd, const u_char * buf, int len)
++{
++	bamboo_nand0_enable();
++	bamboo_nand_write_buf(mtd, buf, len);
++}
++
++static void
++bamboo_nand1_write_buf(struct mtd_info *mtd, const u_char * buf, int len)
++{
++	bamboo_nand1_enable();
++	bamboo_nand_write_buf(mtd, buf, len);
++}
++
++static void
++bamboo_nand_read_buf(struct mtd_info *mtd, u_char * buf, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++) {
++		if (hwctl & 0x1)
++			buf[i] = readb(&(bamboo_ndfc->cmd));
++		else if (hwctl & 0x2)
++			buf[i] = readb(&(bamboo_ndfc->addr));
++		else
++			buf[i] = readb(&(bamboo_ndfc->data));
++	}
++}
++
++static void
++bamboo_nand0_read_buf(struct mtd_info *mtd, u_char * buf, int len)
++{
++	bamboo_nand0_enable();
++	bamboo_nand_read_buf(mtd, buf, len);
++}
++
++static void
++bamboo_nand1_read_buf(struct mtd_info *mtd, u_char * buf, int len)
++{
++	bamboo_nand1_enable();
++	bamboo_nand_read_buf(mtd, buf, len);
++}
++
++static int
++bamboo_nand_verify_buf(struct mtd_info *mtd, const u_char * buf, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++) {
++		if (hwctl & 0x1) {
++			if (buf[i] != readb(&(bamboo_ndfc->cmd)))
++				return i;
++		} else if (hwctl & 0x2) {
++			if (buf[i] != readb(&(bamboo_ndfc->addr)))
++				return i;
++		} else {
++			if (buf[i] != readb(&(bamboo_ndfc->data)))
++				return i;
++		}
++
++	}
++
++	return 0;
++}
++
++static int
++bamboo_nand0_verify_buf(struct mtd_info *mtd, const u_char * buf, int len)
++{
++	bamboo_nand0_enable();
++	return bamboo_nand_verify_buf(mtd, buf, len);
++}
++
++static int
++bamboo_nand1_verify_buf(struct mtd_info *mtd, const u_char *buf, int len)
++{
++	bamboo_nand1_enable();
++	return bamboo_nand_verify_buf(mtd, buf, len);
++}
++
++static int
++bamboo_dev_ready(struct mtd_info *mtd)
++{
++	return ((bamboo_ndfc->sr) & 0x01000000) ? 1 : 0; 
++}
++
++int __init
++bamboo_init(void)
++{
++	struct nand_chip *this;
++	uint * selection1_base, * gpio_base;
++	u8 selection1_val;
++	int err = 0;
++	
++	hwctl = 0;
++
++	/* 
++	 * Bank 0 was set up by the firmware already.  Bank 1 wasn't, so set it
++	 * up now. 
++	 */
++
++	selection1_base = ioremap64(BAMBOO_FPGA_SELECTION1_REG_ADDR, 8);
++	if(!selection1_base){
++		printk("Ioremap to access FPGA Selection Register 1 failed \n");
++		err = -EIO;
++		goto out;
++	}
++	selection1_val = readb(selection1_base);
++	selection1_val |= 0x02;
++	writeb(selection1_val, selection1_base);
++	iounmap((void *)(selection1_base));
++
++	SDR_WRITE(DCRN_SDR_CUST0, SDR_READ(DCRN_SDR_CUST0) | 0x2);
++
++	gpio_base = ioremap64(0x0EF600B00ULL, 0x80);
++	if(!gpio_base) {
++		printk("Ioremap to access GPIO Registers failed \n");
++		err = -EIO;
++		goto out;
++	}
++	*(uint *) (gpio_base + 0x2) |= 0x00010000;
++	*(uint *) (gpio_base + 0x4) |= 0x00010000;
++	iounmap((void *) gpio_base);
++	
++	bamboo_nand0_mtd = kmalloc(sizeof(struct mtd_info) +
++				   sizeof(struct nand_chip),
++				   GFP_KERNEL);
++	
++	bamboo_nand1_mtd = kmalloc(sizeof (struct mtd_info) +
++				   sizeof (struct nand_chip),
++				   GFP_KERNEL);
++	if (!bamboo_nand1_mtd) {
++		printk("Unable to allocate NAND 1 MTD device structure.\n");
++		err = -ENOMEM;
++		goto out_mtd0;
++	}
++
++	bamboo_ndfc = ioremap64(BAMBOO_NAND_FLASH_REG_ADDR, 
++			        BAMBOO_NAND_FLASH_REG_SIZE); 
++	if (!bamboo_ndfc) {
++		printk("Ioremap to access NDFC Registers failed \n");
++		err = -EIO;
++		goto out_mtd1;
++	}
++	bamboo_ndfc->b2cr = 0xC0007777;
++
++	/* Initialize structures */
++	memset((char *) bamboo_nand0_mtd, 0,
++	       sizeof (struct mtd_info) + sizeof (struct nand_chip));
++
++	memset((char *) bamboo_nand1_mtd, 0,
++	       sizeof (struct mtd_info) + sizeof (struct nand_chip));
++
++	/* Get pointer to private data */
++	this = (struct nand_chip *) (&bamboo_nand0_mtd[1]);
++	/* Link the private data with the MTD structure */
++	bamboo_nand0_mtd->priv = this;
++
++	/* Set address of NAND IO lines (Using Linear Data Access Region) */
++	this->IO_ADDR_R = (void __iomem *) ((ulong) bamboo_ndfc + 0x1000);
++	this->IO_ADDR_W = (void __iomem *) ((ulong) bamboo_ndfc + 0x1000);
++	/* Reference hardware control function */
++	this->hwcontrol  = bamboo_nand0_hwcontrol;
++	/* Set command delay time */
++	this->chip_delay = 12;
++	this->eccmode    = NAND_ECC_SOFT;
++	this->write_byte = bamboo_nand0_write_byte;
++	this->read_byte  = bamboo_nand0_read_byte;
++	this->write_buf  = bamboo_nand0_write_buf;
++	this->read_buf   = bamboo_nand0_read_buf;
++	this->verify_buf = bamboo_nand0_verify_buf;
++	this->dev_ready  = bamboo_dev_ready;
++
++	/* Scan to find existance of the device */
++	if (nand_scan(bamboo_nand0_mtd, 1)) {
++		err = -ENXIO;
++		goto out_ior;
++	}
++
++	/* Get pointer to private data */
++	this = (struct nand_chip *) (&bamboo_nand1_mtd[1]);
++	/* Link the private data with the MTD structure */
++	bamboo_nand1_mtd->priv = this;
++
++	/* Set address of NAND IO lines (Using Linear Data Access Region) */
++	this->IO_ADDR_R = (void __iomem *) ((ulong) bamboo_ndfc + 0x1000);
++	this->IO_ADDR_W = (void __iomem *) ((ulong) bamboo_ndfc + 0x1000);
++	/* Reference hardware control function */
++	this->hwcontrol  = bamboo_nand1_hwcontrol;
++	/* Set command delay time */
++	this->chip_delay = 25;
++	this->eccmode    = NAND_ECC_SOFT;
++	this->write_byte = bamboo_nand1_write_byte;
++	this->read_byte  = bamboo_nand1_read_byte;
++	this->write_buf  = bamboo_nand1_write_buf;
++	this->read_buf   = bamboo_nand1_read_buf;
++	this->verify_buf = bamboo_nand1_verify_buf;
++	this->dev_ready  = NULL;
++
++	/* Scan to find existance of the device */
++	if (nand_scan(bamboo_nand1_mtd, 1)) {
++		err = -ENXIO;
++		goto out_ior;
++	}
++
++	
++	add_mtd_partitions(bamboo_nand0_mtd, nand0_partition_info, 
++			   NAND0_NUM_PARTITIONS);
++
++	add_mtd_partitions(bamboo_nand1_mtd, nand1_partition_info, 
++			   NAND1_NUM_PARTITIONS);
++	goto out;
++
++out_ior:
++	iounmap((void *)bamboo_ndfc);
++out_mtd1:
++	kfree(bamboo_nand1_mtd);
++out_mtd0:
++	kfree(bamboo_nand0_mtd);
++out:
++	return err;
++}
++
++static void __exit
++bamboo_cleanup(void)
++{
++	/* Unregister partitions */
++	del_mtd_partitions(bamboo_nand0_mtd);
++	del_mtd_partitions(bamboo_nand1_mtd);
++
++	/* Release resources, unregister device */
++	del_mtd_device(bamboo_nand0_mtd);
++	del_mtd_device(bamboo_nand1_mtd);
++
++	/* unmap physical address */
++	iounmap((void *) bamboo_ndfc);
++
++	/* Free the MTD device structure */
++	kfree(bamboo_nand0_mtd);
++	kfree(bamboo_nand1_mtd);
++}
++
++module_init(bamboo_init);
++module_exit(bamboo_cleanup);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Wade Farnsworth <wfarnsworth@mvista.com>");
++MODULE_DESCRIPTION
++    ("Board-specific glue layer for NAND flash on IBM 440EP eval board");
+Index: linux-2.6.10/mvl_patches/pro-0141.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0141.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(141);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

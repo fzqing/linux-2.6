@@ -1,0 +1,1025 @@
+#! /usr/bin/env bash
+# Patch: -xtensa_kgdb_more_fixups
+# Date: Fri Feb 16 17:25:34 2007
+# Source: Tensilica
+# MR: 21408
+# Type: Defect Fix
+# Disposition: MontaVista
+# Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+# Description:
+# 
+# This the the KGDB code fixups for Tensilica Diamond:
+# 
+#  arch/xtensa/kernel/kgdb.c                |  371 +++++++++++++------------------
+#  arch/xtensa/kernel/longjmp.S             |    4 
+#  arch/xtensa/kernel/ptrace.c              |    1 
+#  arch/xtensa/kernel/setjmp.S              |    5 
+#  arch/xtensa/mm/init.c                    |    3 
+#  include/asm-xtensa/config-linux_be/gdb.h |  110 +++++++++
+#  include/asm-xtensa/config-linux_le/gdb.h |  110 +++++++++
+#  include/asm-xtensa/kgdb.h                |    5 
+#  8 files changed, 395 insertions(+), 214 deletions(-)
+# 
+
+PATCHNUM=1109
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Tensilica
+MR: 21408
+Type: Defect Fix
+Disposition: MontaVista
+Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+Description:
+
+This the the KGDB code fixups for Tensilica Diamond:
+
+ arch/xtensa/kernel/kgdb.c                |  371 +++++++++++++------------------
+ arch/xtensa/kernel/longjmp.S             |    4 
+ arch/xtensa/kernel/ptrace.c              |    1 
+ arch/xtensa/kernel/setjmp.S              |    5 
+ arch/xtensa/mm/init.c                    |    3 
+ include/asm-xtensa/config-linux_be/gdb.h |  110 +++++++++
+ include/asm-xtensa/config-linux_le/gdb.h |  110 +++++++++
+ include/asm-xtensa/kgdb.h                |    5 
+ mvl_patches/pro-1109.c                   |   16 +
+ 9 files changed, 411 insertions(+), 214 deletions(-)
+
+Index: linux-2.6.10/arch/xtensa/kernel/kgdb.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/kgdb.c
++++ linux-2.6.10/arch/xtensa/kernel/kgdb.c
+@@ -84,6 +84,7 @@
+ #include <asm/system.h>
+ #include <asm/ptrace.h>
+ #include <asm/cacheflush.h>
++#include <asm/kgdb.h>
+ 
+ /*
+  * breakpoint and test functions
+@@ -97,8 +98,164 @@ extern void init_IRQ(void);
+  */
+ void handle_exception(struct pt_regs *regs);
+ 
++/*
++ * local functions
++ */
++
++/* Use EPS[DEBUGLEVEL]. */
++
++static inline unsigned long get_ps(void)
++{
++	unsigned long ps;
++	__asm__ __volatile__ (" rsr %0, "__stringify(EPS)
++			      "+"__stringify(XCHAL_DEBUGLEVEL)
++			      : "=a" (ps));
++	return ps;
++}
++
++static inline void set_ps(unsigned long ps)
++{
++	__asm__ __volatile__ (" wsr %0, "__stringify(EPS)
++			      "+"__stringify(XCHAL_DEBUGLEVEL)
++			      : : "a" (ps));
++}
++
++static inline unsigned long get_excsave(void)
++{
++	unsigned long excsave;
++	__asm__ __volatile__ (" rsr %0, "__stringify(EXCSAVE)
++			      "+"__stringify(XCHAL_DEBUGLEVEL)
++			      : "=a" (excsave));
++	return excsave;
++}
++static inline void set_excsave(unsigned long excsave)
++{
++	__asm__ __volatile__ (" wsr %0, "__stringify(EXCSAVE)
++			      "+"__stringify(XCHAL_DEBUGLEVEL)
++			      : : "a" (excsave));
++}
++
++void regs_to_gdb_regs(unsigned long *gdb_regs, struct pt_regs *regs)
++{
++	struct xtensa_gdb_registers *gregs;
++	int reg;
++
++	gregs = (struct xtensa_gdb_registers*)gdb_regs;
++
++	/* Clear gdb register structure. */
++
++	memset(gregs, sizeof (gregs), 0);
++
++	/* Copy address register values. */
++
++	if (user_mode(regs)) {
++
++		unsigned long *areg = &gregs->ar0;
++		unsigned long wb = regs->windowbase;
++		const int frames = regs->wmask >> 4;
++
++		/* Copy the current 16 registers */
++		
++		for (reg = 0; reg < 16; reg++) {
++			int idx = (reg + wb * 4) & (XCHAL_NUM_AREGS - 1);
++			areg[idx] = regs->areg[reg];
++		}
++
++		/* Copy the remaining registers. */
++
++		for (reg = 1; reg <= frames * 4; reg++) {
++			int idx = (wb * 4 - reg) & (XCHAL_NUM_AREGS - 1);
++			areg[idx] = regs->areg[XCHAL_NUM_AREGS - reg];
++		}
++
++		gregs->windowbase = regs->windowbase;
++		gregs->windowstart = regs->windowstart;
++
++	} else {
++
++		/*
++		 * All register windows have been flushd, 
++		 * so we only have to copy 16 regs.
++		 * Windowsbase and windowstart weren't saved.
++		 */
++
++	 	unsigned long *areg = &gregs->ar0;
++
++		for (reg = 0; reg < 16; reg++)
++			areg[reg] = regs->areg[reg];
++		gregs->windowbase = 0;
++		gregs->windowstart = 1;
++	}
++
++	gregs->lbeg = regs->lbeg;
++	gregs->lend = regs->lend;
++	gregs->lcount = regs->lcount;
++
++	gregs->exccause = get_excsave();
++	gregs->depc = regs->depc;
++	gregs->excvaddr = regs->excvaddr;
++	gregs->sar = regs->sar;
++
++	gregs->pc = regs->pc;
++	gregs->ps = get_ps();
++
++	return;
++}
++
+ void gdb_regs_to_regs(unsigned long *gdb_regs, struct pt_regs *regs)
+ {
++	struct xtensa_gdb_registers *gregs;
++	int reg;
++
++	gregs = (struct xtensa_gdb_registers*)gdb_regs;
++
++	/* Copy address register values. */
++	
++	if (user_mode(regs)) {
++
++		unsigned long *areg = &gregs->ar0;
++		unsigned long wb = gregs->windowbase;
++
++		/* Copy all registers */
++		
++		for (reg = 0; reg < XCHAL_NUM_AREGS; reg++) {
++			int idx = (reg + wb *4) & (XCHAL_NUM_AREGS - 1);
++			regs->areg[reg] = areg[idx];
++		}
++
++		regs->windowbase = gregs->windowbase;
++		regs->windowstart = gregs->windowstart;
++
++	} else {
++
++		/*
++		 * All register windows have been flushd, 
++		 * so we only have to copy 16 regs.
++		 * Windowsbase and windowstart weren't saved.
++		 */
++
++	 	unsigned long *areg = &gregs->ar0;
++
++		for (reg = 0; reg < 16; reg++)
++			regs->areg[reg] = areg[reg];
++	}
++
++	regs->lbeg = gregs->lbeg;
++	regs->lend = gregs->lend;
++	regs->lcount = gregs->lcount;
++
++	regs->exccause = gregs->exccause;
++	regs->depc = gregs->depc;
++	regs->excvaddr = gregs->excvaddr;
++	regs->sar = gregs->sar;
++
++	regs->pc = gregs->pc;
++	set_ps(gregs->ps);
++
++	return;
++
++
++#if 0
+ 	unsigned long *ptr = gdb_regs;
+ 	int reg = 0;
+ 
+@@ -142,6 +299,7 @@ void gdb_regs_to_regs(unsigned long *gdb
+ 		ptr++;
+ 
+ 	return;
++#endif
+ }
+ 
+ int kgdb_fault_setjmp(unsigned long *curr_context)
+@@ -159,7 +317,7 @@ int kgdb_read_reg(unsigned long regno, c
+ 
+ 	switch(regno) {
+ 		case REG_GDB_AR_BASE ... REG_GDB_AR_BASE + XCHAL_NUM_AREGS - 1:
+-                     ar_reg = ((regno - regs->windowbase - REG_GDB_AR_BASE) & (XCHAL_NUM_AREGS - 1));
++                     ar_reg = ((regno - regs->windowbase * 4 - REG_GDB_AR_BASE) & (XCHAL_NUM_AREGS - 1));
+ 
+                                 kgdb_mem2hex((char *)&(regs->areg[ar_reg]),
+                                         output_buffer, 4);
+@@ -172,7 +330,7 @@ int kgdb_read_reg(unsigned long regno, c
+                 case REG_GDB_PS:
+ 			/* Re-create PS, set WOE and keep PS.CALLING */
+ 			{
+-                            unsigned int ps = (1<<18) | ((regs->ps) & 0x30000);
++                            unsigned long ps = get_ps();
+ 			    kgdb_mem2hex((char *)&ps, output_buffer, 4);
+ 			}
+                         break;
+@@ -217,6 +375,7 @@ int kgdb_read_reg(unsigned long regno, c
+                         break;
+               }
+ 
++	output_buffer[0] = 0;
+ 	return -1;
+ }
+ 		
+@@ -224,213 +383,14 @@ int kgdb_read_reg(unsigned long regno, c
+ void sleeping_thread_to_gdb_regs(unsigned long *gdb_regs, struct task_struct *p)
+ {
+ 	unsigned long tos;
+-	unsigned long *ptr = gdb_regs;
+ 	struct pt_regs *regs;
+-	int reg = 0;
+ 
+ 	tos = (unsigned long)p->thread_info + THREAD_SIZE;
+ 	regs = (struct pt_regs*)tos - 1;
+ 
+-	for (reg = 0; reg <= 63 ; reg++)
+-                *(ptr++) = regs->areg[reg];
+-
+-	*(ptr++) = regs->lbeg;
+-	*(ptr++) = regs->lend;
+-	*(ptr++) = regs->lcount;
+-
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-
+-	*(ptr++) = regs->exccause;
+-	*(ptr++) = regs->depc;
+-	*(ptr++) = regs->excvaddr;
+-	*(ptr++) = regs->windowbase;
+-	*(ptr++) = regs->windowstart;
+-	*(ptr++) = regs->sar;
+-	*(ptr++) = 0;
+-
+-        *(ptr++) = regs->ps;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-	*(ptr++) = regs->icountlevel;
+-	*(ptr++) = regs->debugcause;
+-	*(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-	*(ptr++) = regs->pc;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-	return;
++	regs_to_gdb_regs(gdb_regs, regs);
+ }
+-void regs_to_gdb_regs(unsigned long *gdb_regs, struct pt_regs *regs)
+-{
+-	unsigned long *ptr = gdb_regs;
+-	int reg = 0;
+ 
+-	for (reg = 0; reg <= 15 ; reg++)
+-                *(ptr++) = regs->areg[reg];
+-
+-	for (reg = 16; reg <= 63; reg++)
+-		*(ptr++) = 0;
+-
+-	*(ptr++) = regs->lbeg;
+-	*(ptr++) = regs->lend;
+-	*(ptr++) = regs->lcount;
+-
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-	*(ptr++) = 0;
+-
+-        *(ptr++) = regs->exccause;
+-	*(ptr++) = regs->depc;
+-	*(ptr++) = regs->excvaddr;
+-	*(ptr++) = regs->windowbase;
+-	*(ptr++) = regs->windowstart;
+-	*(ptr++) = regs->sar;
+-	*(ptr++) = 0;
+-
+-        *(ptr++) = regs->ps;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-	*(ptr++) = regs->icountlevel;
+-	*(ptr++) = regs->debugcause;
+-	*(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-	*(ptr++) = regs->pc;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-        *(ptr++) = 0;
+-
+-	return;
+-}
+ 
+ /*
+  * Set up exception handlers for tracing and breakpoints
+@@ -442,9 +402,6 @@ void set_debug_traps(void)
+ {
+ 	unsigned long flags;
+ 
+-#if 0
+-	printk("in set_debug_traps\n");
+-#endif
+ 	save_and_cli(flags);
+ 
+ 	restore_flags(flags);
+@@ -520,7 +477,7 @@ int kgdb_arch_handle_exception(int vecto
+                         if (kgdb_contthread)
+                              atomic_set(&cpu_doing_single_step, cpu);
+ 
+-			regs->icountlevel = 1;
++			regs->icountlevel = (regs->ps & 0xf) + 1;
+ 
+ 			return 0;
+ 
+@@ -531,7 +488,7 @@ int kgdb_arch_handle_exception(int vecto
+ 
+ 			return ret;
+ 	}
+-
++	output_buffer[0] = 0;
+ 	return -1;
+ }
+ 
+Index: linux-2.6.10/arch/xtensa/kernel/longjmp.S
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/longjmp.S
++++ linux-2.6.10/arch/xtensa/kernel/longjmp.S
+@@ -20,6 +20,7 @@
+    write to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+    Boston, MA 02111-1307, USA.  */
+ 
++#include <linux/linkage.h>
+ #include <asm/regs.h>
+ #include <asm/processor.h>
+ #include <asm/ptrace.h>
+@@ -28,8 +29,7 @@
+ 
+ #define _SETJMP_H
+ 
+-	.globl kgdb_longjmp
+-kgdb_longjmp:
++ENTRY(kgdb_longjmp)
+ 
+ 	entry	sp, 32
+ 
+Index: linux-2.6.10/arch/xtensa/kernel/setjmp.S
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/setjmp.S
++++ linux-2.6.10/arch/xtensa/kernel/setjmp.S
+@@ -21,14 +21,15 @@
+    write to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+    Boston, MA 02111-1307, USA.  */
+ 
++#include <linux/linkage.h>
+ #include <asm/regs.h>
+ #include <asm/ptrace.h>
+ #include <asm/processor.h>
+ #include <asm/config/core.h>
+ #include <asm/xtensa/coreasm.h>
+ 
+-	.globl kgdb_fault_setjmp_aux
+-kgdb_fault_setjmp_aux:
++ENTRY(kgdb_fault_setjmp_aux)
++
+ 	entry   sp, 16
+ 
+ 	movi    a5, PS_EXCM_MASK | LOCKLEVEL
+Index: linux-2.6.10/arch/xtensa/mm/init.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/mm/init.c
++++ linux-2.6.10/arch/xtensa/mm/init.c
+@@ -216,7 +216,8 @@ void __init init_mmu (void)
+ 
+ 	/* Set rasid register to a known value. */
+ 
+-	set_rasid_register (ASID_USER_FIRST);
++	set_rasid_register (ASID_INSERT(ASID_USER_FIRST));
++
+ 
+ 	/* Set PTEVADDR special register to the start of the page
+ 	 * table, which is in kernel mappable space (ie. not
+Index: linux-2.6.10/include/asm-xtensa/config-linux_be/gdb.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-xtensa/config-linux_be/gdb.h
+@@ -0,0 +1,110 @@
++/*
++ * include/asm-xtensa/core/gdb.h
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2006 Tensilica Inc.
++ */
++
++#ifndef _XTENSA_CORE_GDB_H
++#define _XTENSA_CORE_GDB_H
++
++struct xtensa_gdb_registers {
++	unsigned long ar0;
++	unsigned long ar1;
++	unsigned long ar2;
++	unsigned long ar3;
++	unsigned long ar4;
++	unsigned long ar5;
++	unsigned long ar6;
++	unsigned long ar7;
++	unsigned long ar8;
++	unsigned long ar9;
++	unsigned long ar10;
++	unsigned long ar11;
++	unsigned long ar12;
++	unsigned long ar13;
++	unsigned long ar14;
++	unsigned long ar15;
++	unsigned long ar16;
++	unsigned long ar17;
++	unsigned long ar18;
++	unsigned long ar19;
++	unsigned long ar20;
++	unsigned long ar21;
++	unsigned long ar22;
++	unsigned long ar23;
++	unsigned long ar24;
++	unsigned long ar25;
++	unsigned long ar26;
++	unsigned long ar27;
++	unsigned long ar28;
++	unsigned long ar29;
++	unsigned long ar30;
++	unsigned long ar31;
++	unsigned long lbeg;
++	unsigned long lend;
++	unsigned long lcount;
++	unsigned long ptevaddr;
++	unsigned long mmid;
++	unsigned long ddr;
++	unsigned long interrupt;
++	unsigned long intset;
++	unsigned long intclear;
++	unsigned long ccount;
++	unsigned long icount;
++	unsigned long ccompare0;
++	unsigned long ccompare1;
++	unsigned long ccompare2;
++	unsigned long epc1;
++	unsigned long epc2;
++	unsigned long epc3;
++	unsigned long epc4;
++	unsigned long epc5;
++	unsigned long epc6;
++	unsigned long epc7;
++	unsigned long excsave1;
++	unsigned long excsave2;
++	unsigned long excsave3;
++	unsigned long excsave4;
++	unsigned long excsave5;
++	unsigned long excsave6;
++	unsigned long excsave7;
++	unsigned long eps2;
++	unsigned long eps3;
++	unsigned long eps4;
++	unsigned long eps5;
++	unsigned long eps6;
++	unsigned long eps7;
++	unsigned long exccause;
++	unsigned long depc;
++	unsigned long excvaddr;
++	unsigned long windowbase;
++	unsigned long windowstart;
++	unsigned long sar;
++	unsigned long litbase;
++	unsigned long ps;
++	unsigned long misc0;
++	unsigned long misc1;
++	unsigned long intenable;
++	unsigned long dbreaka0;
++	unsigned long dbreakc0;
++	unsigned long dbreaka1;
++	unsigned long dbreakc1;
++	unsigned long ibreaka0;
++	unsigned long ibreaka1;
++	unsigned long ibreakenable;
++	unsigned long icountlevel;
++	unsigned long debugcause;
++	unsigned long rasid;
++	unsigned long itlbcfg;
++	unsigned long dtlbcfg;
++	unsigned long threadptr;
++	unsigned long pc;
++};
++
++#define XTENSA_GDB_REGISTERS_SIZE	(91 * 4)
++
++#endif /* _XTENSA_CORE_GDB_H */
+Index: linux-2.6.10/include/asm-xtensa/config-linux_le/gdb.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-xtensa/config-linux_le/gdb.h
+@@ -0,0 +1,110 @@
++/*
++ * include/asm-xtensa/core/gdb.h
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2006 Tensilica Inc.
++ */
++
++#ifndef _XTENSA_CORE_GDB_H
++#define _XTENSA_CORE_GDB_H
++
++struct xtensa_gdb_registers {
++	unsigned long ar0;
++	unsigned long ar1;
++	unsigned long ar2;
++	unsigned long ar3;
++	unsigned long ar4;
++	unsigned long ar5;
++	unsigned long ar6;
++	unsigned long ar7;
++	unsigned long ar8;
++	unsigned long ar9;
++	unsigned long ar10;
++	unsigned long ar11;
++	unsigned long ar12;
++	unsigned long ar13;
++	unsigned long ar14;
++	unsigned long ar15;
++	unsigned long ar16;
++	unsigned long ar17;
++	unsigned long ar18;
++	unsigned long ar19;
++	unsigned long ar20;
++	unsigned long ar21;
++	unsigned long ar22;
++	unsigned long ar23;
++	unsigned long ar24;
++	unsigned long ar25;
++	unsigned long ar26;
++	unsigned long ar27;
++	unsigned long ar28;
++	unsigned long ar29;
++	unsigned long ar30;
++	unsigned long ar31;
++	unsigned long lbeg;
++	unsigned long lend;
++	unsigned long lcount;
++	unsigned long ptevaddr;
++	unsigned long mmid;
++	unsigned long ddr;
++	unsigned long interrupt;
++	unsigned long intset;
++	unsigned long intclear;
++	unsigned long ccount;
++	unsigned long icount;
++	unsigned long ccompare0;
++	unsigned long ccompare1;
++	unsigned long ccompare2;
++	unsigned long epc1;
++	unsigned long epc2;
++	unsigned long epc3;
++	unsigned long epc4;
++	unsigned long epc5;
++	unsigned long epc6;
++	unsigned long epc7;
++	unsigned long excsave1;
++	unsigned long excsave2;
++	unsigned long excsave3;
++	unsigned long excsave4;
++	unsigned long excsave5;
++	unsigned long excsave6;
++	unsigned long excsave7;
++	unsigned long eps2;
++	unsigned long eps3;
++	unsigned long eps4;
++	unsigned long eps5;
++	unsigned long eps6;
++	unsigned long eps7;
++	unsigned long exccause;
++	unsigned long depc;
++	unsigned long excvaddr;
++	unsigned long windowbase;
++	unsigned long windowstart;
++	unsigned long sar;
++	unsigned long litbase;
++	unsigned long ps;
++	unsigned long misc0;
++	unsigned long misc1;
++	unsigned long intenable;
++	unsigned long dbreaka0;
++	unsigned long dbreakc0;
++	unsigned long dbreaka1;
++	unsigned long dbreakc1;
++	unsigned long ibreaka0;
++	unsigned long ibreaka1;
++	unsigned long ibreakenable;
++	unsigned long icountlevel;
++	unsigned long debugcause;
++	unsigned long rasid;
++	unsigned long itlbcfg;
++	unsigned long dtlbcfg;
++	unsigned long threadptr;
++	unsigned long pc;
++};
++
++#define XTENSA_GDB_REGISTERS_SIZE	(91 * 4)
++
++#endif /* _XTENSA_CORE_GDB_H */
+Index: linux-2.6.10/include/asm-xtensa/kgdb.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/kgdb.h
++++ linux-2.6.10/include/asm-xtensa/kgdb.h
+@@ -10,11 +10,12 @@
+ #define _ASM_KGDB_H_
+ 
+ #include <asm-generic/kgdb.h>
++#include <asm/config/gdb.h>
+ 
+ #ifndef __ASSEMBLY__
+ #define BUFMAX			2048
+-#define NUMREGBYTES		(90*(BITS_PER_LONG/8))
+-#define NUMCRITREGBYTES		(90*sizeof(long))
++#define NUMREGBYTES		XTENSA_GDB_REGISTERS_SIZE
++#define NUMCRITREGBYTES		XTENSA_GDB_REGISTERS_SIZE
+ #if XCHAL_HAVE_DENSITY
+ #define BREAK_INSTR_SIZE       2
+ #define BREAKPOINT()           __asm__ __volatile__ (          \
+Index: linux-2.6.10/arch/xtensa/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/ptrace.c
++++ linux-2.6.10/arch/xtensa/kernel/ptrace.c
+@@ -139,6 +139,7 @@ long arch_ptrace(struct task_struct *chi
+ 
+ 	case PTRACE_POKETEXT: /* write the word at location addr. */
+ 	case PTRACE_POKEDATA:
++		ret = 0;
+ 		if (access_process_vm(child, addr, &data, sizeof(data), 1)
+ 		    == sizeof(data))
+ 			break;
+Index: linux-2.6.10/mvl_patches/pro-1109.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1109.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1109);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

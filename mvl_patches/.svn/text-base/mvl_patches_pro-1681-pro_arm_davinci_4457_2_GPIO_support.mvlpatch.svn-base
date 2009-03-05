@@ -1,0 +1,811 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_4457_2_GPIO_support
+# Date: Mon Jan 21 23:06:25 2008
+# Source: Vladimir Barinov <vbarinov@ru.mvista.com>
+# MR: 25937
+# Disposition: backport from 2.6.22-rc1
+# Description:
+# 
+# author	Vladimir Barinov <vbarinov@ru.mvista.com>
+# 	Tue, 10 Jul 2007 12:03:43 +0000 (13:03 +0100)
+# committer	Russell King <rmk+kernel@arm.linux.org.uk>
+# 	Thu, 12 Jul 2007 08:57:09 +0000 (09:57 +0100)
+# commit	3d9edf09d4525dad95f98b31f31aa86b8071fab9
+# tree	e923d8ff8c71e83ed4edf97f7f52a95c34da2683	tree | snapshot
+# parent	3e062b07ada88edb9ffdd147e39c7df4b4418f64
+# 
+# Support GPIO driver for TI DaVinci SoC.  Originally, this patch contains
+# the new gpio driver as well as client updates to use the new gpio.  The
+# client code is moved to pro_arm_davinci_4457-2-GPIO-support.patch.  Only
+# core driver and associated updates remained in this patch.
+# 
+# Signed-off-by: Vladimir Barinov <vbarino@ru.mvista.com>
+# Signed-off-by: Steve Chen <schen@mvista.com>
+# Acked-by: David Brownell <david-b@pacbell.net>
+# Acked-by: Kevin Hilman <khilman@mvista.com>
+# Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+
+PATCHNUM=1681
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Vladimir Barinov <vbarinov@ru.mvista.com>
+MR: 25937
+Disposition: backport from 2.6.22-rc1
+Description:
+
+author	Vladimir Barinov <vbarinov@ru.mvista.com>
+	Tue, 10 Jul 2007 12:03:43 +0000 (13:03 +0100)
+committer	Russell King <rmk+kernel@arm.linux.org.uk>
+	Thu, 12 Jul 2007 08:57:09 +0000 (09:57 +0100)
+commit	3d9edf09d4525dad95f98b31f31aa86b8071fab9
+tree	e923d8ff8c71e83ed4edf97f7f52a95c34da2683	tree | snapshot
+parent	3e062b07ada88edb9ffdd147e39c7df4b4418f64
+
+Support GPIO driver for TI DaVinci SoC.  Originally, this patch contains
+the new gpio driver as well as client updates to use the new gpio.  The
+client code is moved to pro_arm_davinci_4457-2-GPIO-support.patch.  Only
+core driver and associated updates remained in this patch.
+
+Signed-off-by: Vladimir Barinov <vbarino@ru.mvista.com>
+Signed-off-by: Steve Chen <schen@mvista.com>
+Acked-by: David Brownell <david-b@pacbell.net>
+Acked-by: Kevin Hilman <khilman@mvista.com>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+Index: linux-2.6.10/arch/arm/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/arm/Kconfig
++++ linux-2.6.10/arch/arm/Kconfig
+@@ -178,6 +178,7 @@ config ARCH_H720X
+ 
+ config ARCH_DAVINCI
+ 	bool "TI DaVinci"
++	select GENERIC_GPIO
+ 
+ endchoice
+ 
+Index: linux-2.6.10/arch/arm/mach-davinci/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/Makefile
++++ linux-2.6.10/arch/arm/mach-davinci/Makefile
+@@ -5,7 +5,9 @@
+ 
+ 
+ # Common objects
+- obj-y                         := time.o irq.o dma.o serial.o clock.o gio.o io.o id.o
++obj-y                                 := time.o irq.o dma.o serial.o clock.o  io.o \
++                                       id.o gpio.o pinmux.o video_hdevm.o
++
+ 
+ 
+ # Board specific
+Index: linux-2.6.10/arch/arm/mach-davinci/clock.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/clock.c
++++ linux-2.6.10/arch/arm/mach-davinci/clock.c
+@@ -296,6 +296,11 @@ static struct clk davinci_dm644x_clks[] 
+ 		.lpsc = DAVINCI_LPSC_SPI,
+ 	},
+ 	{
++		.name = "gpio",
++		.rate = &commonrate,
++		.lpsc = DAVINCI_LPSC_GPIO,
++	},
++	{
+ 		.name = "AEMIFCLK",
+ 		.rate = &commonrate,
+ 		.lpsc = DAVINCI_LPSC_AEMIF,
+Index: linux-2.6.10/arch/arm/mach-davinci/gpio.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-davinci/gpio.c
+@@ -0,0 +1,323 @@
++/*
++ * TI DaVinci GPIO Support
++ *
++ * Copyright (c) 2006 David Brownell
++ * Copyright (c) 2007, MontaVista Software, Inc. <source@mvista.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/err.h>
++#include <linux/bitops.h>
++
++#include <asm/irq.h>
++#include <asm/io.h>
++#include <asm/hardware/clock.h>
++
++#include <asm/arch/irqs.h>
++#include <asm/arch/hardware.h>
++#include <asm/arch/gpio.h>
++
++#include <asm/mach/irq.h>
++
++static DEFINE_SPINLOCK(gpio_lock);
++static DECLARE_BITMAP(gpio_in_use, DAVINCI_N_GPIO);
++
++int gpio_request(unsigned gpio, const char *tag)
++{
++	if (gpio >= DAVINCI_N_GPIO)
++		return -EINVAL;
++
++	if (test_and_set_bit(gpio, gpio_in_use))
++		return -EBUSY;
++
++	return 0;
++}
++EXPORT_SYMBOL(gpio_request);
++
++void gpio_free(unsigned gpio)
++{
++	if (gpio >= DAVINCI_N_GPIO)
++		return;
++
++	clear_bit(gpio, gpio_in_use);
++}
++EXPORT_SYMBOL(gpio_free);
++
++/* create a non-inlined version */
++static struct gpio_controller *__iomem gpio2controller(unsigned gpio)
++{
++	return __gpio_to_controller(gpio);
++}
++
++/*
++ * Assuming the pin is muxed as a gpio output, set its output value.
++ */
++void __gpio_set(unsigned gpio, int value)
++{
++	struct gpio_controller *__iomem g = gpio2controller(gpio);
++
++	__raw_writel(__gpio_mask(gpio), value ? &g->set_data : &g->clr_data);
++}
++EXPORT_SYMBOL(__gpio_set);
++
++
++/*
++ * Read the pin's value (works even if it's set up as output);
++ * returns zero/nonzero.
++ *
++ * Note that changes are synched to the GPIO clock, so reading values back
++ * right after you've set them may give old values.
++ */
++int __gpio_get(unsigned gpio)
++{
++	struct gpio_controller *__iomem g = gpio2controller(gpio);
++
++	return !!(__gpio_mask(gpio) & __raw_readl(&g->in_data));
++}
++EXPORT_SYMBOL(__gpio_get);
++
++
++/*--------------------------------------------------------------------------*/
++
++/*
++ * board setup code *MUST* set PINMUX0 and PINMUX1 as
++ * needed, and enable the GPIO clock.
++ */
++
++int gpio_direction_input(unsigned gpio)
++{
++	struct gpio_controller *__iomem g = gpio2controller(gpio);
++	u32 temp;
++	u32 mask;
++
++	if (!g)
++		return -EINVAL;
++
++	spin_lock(&gpio_lock);
++	mask = __gpio_mask(gpio);
++	temp = __raw_readl(&g->dir);
++	temp |= mask;
++	__raw_writel(temp, &g->dir);
++	spin_unlock(&gpio_lock);
++	return 0;
++}
++EXPORT_SYMBOL(gpio_direction_input);
++
++int gpio_direction_output(unsigned gpio, int value)
++{
++	struct gpio_controller *__iomem g = gpio2controller(gpio);
++	u32 temp;
++	u32 mask;
++
++	if (!g)
++		return -EINVAL;
++
++	spin_lock(&gpio_lock);
++	mask = __gpio_mask(gpio);
++	temp = __raw_readl(&g->dir);
++	temp &= ~mask;
++	__raw_writel(mask, value ? &g->set_data : &g->clr_data);
++	__raw_writel(temp, &g->dir);
++	spin_unlock(&gpio_lock);
++	return 0;
++}
++EXPORT_SYMBOL(gpio_direction_output);
++
++void gpio_set_value(unsigned gpio, int value)
++{
++	if (__builtin_constant_p(value)) {
++		struct gpio_controller *__iomem g;
++		u32 mask;
++
++		if (gpio >= DAVINCI_N_GPIO)
++			__error_inval_gpio();
++
++		g = __gpio_to_controller(gpio);
++		mask = __gpio_mask(gpio);
++		if (value)
++			__raw_writel(mask, &g->set_data);
++		else
++			__raw_writel(mask, &g->clr_data);
++		return;
++	}
++
++	__gpio_set(gpio, value);
++}
++EXPORT_SYMBOL(gpio_set_value);
++
++int gpio_get_value(unsigned gpio)
++{
++	struct gpio_controller *__iomem g;
++
++	if (!__builtin_constant_p(gpio))
++		return __gpio_get(gpio);
++
++	if (gpio >= DAVINCI_N_GPIO)
++		return __error_inval_gpio();
++
++	g = __gpio_to_controller(gpio);
++	return !!(__gpio_mask(gpio) & __raw_readl(&g->in_data));
++}
++EXPORT_SYMBOL(gpio_get_value);
++
++/*
++ * We expect irqs will normally be set up as input pins, but they can also be
++ * used as output pins ... which is convenient for testing.
++ *
++ * NOTE:  GPIO0..GPIO7 also have direct INTC hookups, which work in addition
++ * to their GPIOBNK0 irq (but with a bit less overhead).  But we don't have
++ * a good way to hook those up ...
++ *
++ * All those INTC hookups (GPIO0..GPIO7 plus five IRQ banks) can also
++ * serve as EDMA event triggers.
++ */
++
++static void gpio_irq_disable(unsigned irq)
++{
++	struct gpio_controller *__iomem g = get_irq_chipdata(irq);
++	u32 mask = __gpio_mask(irq_to_gpio(irq));
++
++	__raw_writel(mask, &g->clr_falling);
++	__raw_writel(mask, &g->clr_rising);
++}
++
++static void gpio_irq_enable(unsigned irq)
++{
++	struct gpio_controller *__iomem g = get_irq_chipdata(irq);
++	u32 mask = __gpio_mask(irq_to_gpio(irq));
++
++	if (irq_desc[irq].status & IRQT_FALLING)
++		__raw_writel(mask, &g->set_falling);
++	if (irq_desc[irq].status & IRQT_RISING)
++		__raw_writel(mask, &g->set_rising);
++}
++
++static int gpio_irq_type(unsigned irq, unsigned trigger)
++{
++	struct gpio_controller *__iomem g = get_irq_chipdata(irq);
++	u32 mask = __gpio_mask(irq_to_gpio(irq));
++
++	if (trigger & ~(IRQT_FALLING | IRQT_RISING))
++		return -EINVAL;
++
++	irq_desc[irq].status &= ~IRQT_BOTHEDGE;
++	irq_desc[irq].status |= trigger;
++
++	__raw_writel(mask, (trigger & IRQT_FALLING)
++		     ? &g->set_falling : &g->clr_falling);
++	__raw_writel(mask, (trigger & IRQT_RISING)
++		     ? &g->set_rising : &g->clr_rising);
++	return 0;
++}
++
++static struct irqchip gpio_irqchip = {
++	.unmask		= gpio_irq_enable,
++	.mask		= gpio_irq_disable,
++	.type		= gpio_irq_type,
++};
++
++static void
++gpio_irq_handler(unsigned irq, struct irqdesc *desc, struct pt_regs *regs)
++{
++	struct gpio_controller *__iomem g = get_irq_chipdata(irq);
++	u32 mask = 0xffff;
++
++	/* we only care about one bank */
++	if (irq & 1)
++		mask <<= 16;
++
++	/* temporarily mask (level sensitive) parent IRQ */
++	desc->chip->ack(irq);
++	while (1) {
++		u32		status;
++		struct irqdesc	*gpio;
++		int		n;
++		int		res;
++
++		/* ack any irqs */
++		status = __raw_readl(&g->intstat) & mask;
++		if (!status)
++			break;
++		__raw_writel(status, &g->intstat);
++		if (irq & 1)
++			status >>= 16;
++
++		/* now demux them to the right lowlevel handler */
++		n = (int)get_irq_data(irq);
++		gpio = &irq_desc[n];
++		while (status) {
++			res = ffs(status);
++			n += res;
++			gpio += res;
++			desc_handle_irq(n - 1, gpio - 1, regs);
++			status >>= res;
++		}
++	}
++	desc->chip->unmask(irq);
++	/* now it may re-trigger */
++}
++
++/*
++ * NOTE:  for suspend/resume, probably best to make a sysdev (and class)
++ * with its suspend/resume calls hooking into the results of the set_wake()
++ * calls ... so if no gpios are wakeup events the clock can be disabled,
++ * with outputs left at previously set levels, and so that VDD3P3V.IOPWDN0
++ * can be set appropriately for GPIOV33 pins.
++ */
++
++
++int __init davinci_gpio_irq_setup(void)
++{
++	unsigned	gpio, irq, bank;
++	struct clk	*clk;
++
++	clk = clk_get(NULL, "gpio");
++	if (IS_ERR(clk)) {
++		printk(KERN_ERR "Error %ld getting gpio clock?\n",
++		       PTR_ERR(clk));
++		return 0;
++	}
++
++	clk_enable(clk);
++
++	for (gpio = 0, irq = gpio_to_irq(0), bank = IRQ_GPIOBNK0;
++	     gpio < DAVINCI_N_GPIO; bank++) {
++		struct gpio_controller	*__iomem g = gpio2controller(gpio);
++		unsigned		i;
++
++		__raw_writel(~0, &g->clr_falling);
++		__raw_writel(~0, &g->clr_rising);
++
++		/* set up all irqs in this bank */
++		set_irq_chained_handler(bank, gpio_irq_handler);
++		set_irq_chipdata(bank, g);
++		set_irq_data(bank, (void *)irq);
++
++		for (i = 0; i < 16 && gpio < DAVINCI_N_GPIO;
++		     i++, irq++, gpio++) {
++			set_irq_chip(irq, &gpio_irqchip);
++			set_irq_chipdata(irq, g);
++			set_irq_handler(irq, do_simple_IRQ);
++			set_irq_flags(irq, IRQF_VALID);
++		}
++	}
++
++	/* BINTEN -- per-bank interrupt enable. genirq would also let these
++	 * bits be set/cleared dynamically.
++	 */
++	__raw_writel(0x1f, (void *__iomem)
++		     IO_ADDRESS(DAVINCI_GPIO_BASE + 0x08));
++
++	printk(KERN_INFO "DaVinci: %d gpio irqs\n", irq - gpio_to_irq(0));
++
++	return 0;
++}
++
+Index: linux-2.6.10/include/asm-arm/arch-davinci/gpio.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-davinci/gpio.h
+@@ -0,0 +1,124 @@
++/*
++ * TI DaVinci GPIO Support
++ *
++ * Copyright (c) 2006 David Brownell
++ * Copyright (c) 2007, MontaVista Software, Inc. <source@mvista.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef	__DAVINCI_GPIO_H
++#define	__DAVINCI_GPIO_H
++
++/*
++ * basic gpio routines
++ *
++ * board-specific init should be done by arch/.../.../board-XXX.c (maybe
++ * initializing banks together) rather than boot loaders; kexec() won't
++ * go through boot loaders.
++ *
++ * the gpio clock will be turned on when gpios are used, and you may also
++ * need to pay attention to PINMUX0 and PINMUX1 to be sure those pins are
++ * used as gpios, not with other peripherals.
++ *
++ * GPIOs are numbered 0..(DAVINCI_N_GPIO-1).  For documentation, and maybe
++ * for later updates, code should write GPIO(N) or:
++ *  - GPIOV18(N) for 1.8V pins, N in 0..53; same as GPIO(0)..GPIO(53)
++ *  - GPIOV33(N) for 3.3V pins, N in 0..17; same as GPIO(54)..GPIO(70)
++ *
++ * For GPIO IRQs use gpio_to_irq(GPIO(N)) or gpio_to_irq(GPIOV33(N)) etc
++ * for now, that's != GPIO(N)
++ */
++#define	GPIO(X)		(X)		/* 0 <= X <= 70 */
++#define	GPIOV18(X)	(X)		/* 1.8V i/o; 0 <= X <= 53 */
++#define	GPIOV33(X)	((X)+54)	/* 3.3V i/o; 0 <= X <= 17 */
++
++struct gpio_controller {
++	u32	dir;
++	u32	out_data;
++	u32	set_data;
++	u32	clr_data;
++	u32	in_data;
++	u32	set_rising;
++	u32	clr_rising;
++	u32	set_falling;
++	u32	clr_falling;
++	u32	intstat;
++};
++
++/* The __gpio_to_controller() and __gpio_mask() functions inline to constants
++ * with constant parameters; or in outlined code they execute at runtime.
++ *
++ * You'd access the controller directly when reading or writing more than
++ * one gpio value at a time, and to support wired logic where the value
++ * being driven by the cpu need not match the value read back.
++ *
++ * These are NOT part of the cross-platform GPIO interface
++ */
++static inline struct gpio_controller *__iomem
++__gpio_to_controller(unsigned gpio)
++{
++	void *__iomem ptr;
++
++	if (gpio < 32)
++		ptr = (void *__iomem)IO_ADDRESS(DAVINCI_GPIO_BASE + 0x10);
++	else if (gpio < 64)
++		ptr = (void *__iomem)IO_ADDRESS(DAVINCI_GPIO_BASE + 0x38);
++	else if (gpio < DAVINCI_N_GPIO)
++		ptr = (void *__iomem)IO_ADDRESS(DAVINCI_GPIO_BASE + 0x60);
++	else
++		ptr = NULL;
++	return ptr;
++}
++
++static inline u32 __gpio_mask(unsigned gpio)
++{
++	return 1 << (gpio % 32);
++}
++
++/* The get/set/clear functions will inline when called with constant
++ * parameters, for low-overhead bitbanging.  Illegal constant parameters
++ * cause link-time errors.
++ *
++ * Otherwise, calls with variable parameters use outlined functions.
++ */
++extern int __error_inval_gpio(void);
++
++extern void __gpio_set(unsigned gpio, int value);
++extern int __gpio_get(unsigned gpio);
++
++/* Returns zero or nonzero; works for gpios configured as inputs OR
++ * as outputs.
++ *
++ * NOTE: changes in reported values are synchronized to the GPIO clock.
++ * This is most easily seen after calling gpio_set_value() and then immediatly
++ * gpio_get_value(), where the gpio_get_value() would return the old value
++ * until the GPIO clock ticks and the new value gets latched.
++ */
++extern int gpio_get_value(unsigned gpio);
++extern void gpio_set_value(unsigned gpio, int value);
++
++
++/* powerup default direction is IN */
++extern int gpio_direction_input(unsigned gpio);
++extern int gpio_direction_output(unsigned gpio, int value);
++
++#include <asm-generic/gpio.h>	/* cansleep wrappers */
++
++extern int gpio_request(unsigned gpio, const char *tag);
++extern void gpio_free(unsigned gpio);
++
++static inline int gpio_to_irq(unsigned gpio)
++{
++	return DAVINCI_N_AINTC_IRQ + gpio;
++}
++
++static inline int irq_to_gpio(unsigned irq)
++{
++	return irq - DAVINCI_N_AINTC_IRQ;
++}
++
++#endif				/* __DAVINCI_GPIO_H */
+Index: linux-2.6.10/include/asm-arm/arch-davinci/irqs.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-davinci/irqs.h
++++ linux-2.6.10/include/asm-arm/arch-davinci/irqs.h
+@@ -247,11 +247,14 @@
+ #define IRQ_DM646X_DDRINT	59
+ #define IRQ_DM646X_AEMIFINT	60
+ 
+-#define DAVINCI_MAXIRQNUM	63
+-#define NR_IRQS			(DAVINCI_MAXIRQNUM + 1)
+-#define DAVINCI_MAXSWINUM	DAVINCI_MAXIRQNUM
++#define DAVINCI_N_AINTC_IRQ	64
++#ifdef CONFIG_ARCH_DAVINCI_DM644x
++#define DAVINCI_N_GPIO		71
++#else
++#define DAVINCI_N_GPIO		48
++#endif
+ 
+-#define DAVINCI_MAXFIQNUM	0
++#define NR_IRQS			(DAVINCI_N_AINTC_IRQ + DAVINCI_N_GPIO)
+ 
+ #define ARCH_TIMER_IRQ		IRQ_TINT1_TINT34
+ 
+Index: linux-2.6.10/include/asm-arm/mach/irq.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/mach/irq.h
++++ linux-2.6.10/include/asm-arm/mach/irq.h
+@@ -108,12 +108,22 @@ void __set_irq_handler(unsigned int irq,
+ #define set_irq_handler(irq,handler)		__set_irq_handler(irq,handler,0)
+ #define set_irq_chained_handler(irq,handler)	__set_irq_handler(irq,handler,1)
+ #define set_irq_data(irq,d)			do { irq_desc[irq].data = d; } while (0)
++#define get_irq_data(irq)			(irq_desc[irq].data)
+ #define set_irq_chipdata(irq,d)			do { irq_desc[irq].chipdata = d; } while (0)
+ #define get_irq_chipdata(irq)			(irq_desc[irq].chipdata)
+ 
+ void set_irq_chip(unsigned int irq, struct irqchip *);
+ void set_irq_flags(unsigned int irq, unsigned int flags);
+ 
++/*
++ * Obsolete inline function for calling irq descriptor handlers.
++ */
++static inline void desc_handle_irq(unsigned int irq, struct irqdesc *desc,
++				struct pt_regs *regs)
++{
++	desc->handle(irq, desc, regs);
++}
++
+ #define IRQF_VALID	(1 << 0)
+ #define IRQF_PROBE	(1 << 1)
+ #define IRQF_NOAUTOEN	(1 << 2)
+Index: linux-2.6.10/mvl_patches/pro-1681.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1681.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1681);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

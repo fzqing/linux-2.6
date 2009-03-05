@@ -1,0 +1,1939 @@
+#! /usr/bin/env bash
+# Patch: -xtensa_misc_fixups
+# Date: Fri Feb 16 17:23:35 2007
+# Source: Tensilica | Chris Zankel (czankel@tensilica.com)
+# MR: 21150
+# Type: Defect Fix
+# Disposition: MontaVista
+# Signed-off-by: Chris Zankel (czankel@tensilica.com) and Manish Lachwani <mlachwani@mvista.com>
+# Description:
+# 
+# Miscellaneous Fixups for Xtensa Diamond LE:
+# 
+#  arch/xtensa/kernel/asm-offsets.c   |    2 
+#  arch/xtensa/kernel/entry.S         |   62 ++-
+#  arch/xtensa/kernel/process.c       |    4 
+#  arch/xtensa/kernel/ptrace.c        |    8 
+#  arch/xtensa/kernel/signal.c        |  597 ++++++++++++++++++-------------------
+#  arch/xtensa/kernel/time.c          |   46 +-
+#  arch/xtensa/kernel/traps.c         |   10 
+#  arch/xtensa/platform-xt2000/time.c |    2 
+#  include/asm-xtensa/elf.h           |    2 
+#  include/asm-xtensa/fcntl.h         |   72 ++--
+#  include/asm-xtensa/processor.h     |    3 
+#  include/asm-xtensa/ptrace.h        |    6 
+#  include/asm-xtensa/sigcontext.h    |   13 
+#  include/asm-xtensa/timex.h         |   18 -
+#  include/asm-xtensa/uaccess.h       |  107 +++---
+#  include/asm-xtensa/unistd.h        |    8 
+#  16 files changed, 481 insertions(+), 479 deletions(-)
+# 
+# 
+
+PATCHNUM=1105
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Tensilica | Chris Zankel (czankel@tensilica.com)
+MR: 21150
+Type: Defect Fix
+Disposition: MontaVista
+Signed-off-by: Chris Zankel (czankel@tensilica.com) and Manish Lachwani <mlachwani@mvista.com>
+Description:
+
+Miscellaneous Fixups for Xtensa Diamond LE:
+
+ arch/xtensa/kernel/asm-offsets.c   |    2 
+ arch/xtensa/kernel/entry.S         |   62 ++-
+ arch/xtensa/kernel/process.c       |    4 
+ arch/xtensa/kernel/ptrace.c        |    8 
+ arch/xtensa/kernel/signal.c        |  597 ++++++++++++++++++-------------------
+ arch/xtensa/kernel/time.c          |   46 +-
+ arch/xtensa/kernel/traps.c         |   10 
+ arch/xtensa/platform-xt2000/time.c |    2 
+ include/asm-xtensa/elf.h           |    2 
+ include/asm-xtensa/fcntl.h         |   72 ++--
+ include/asm-xtensa/processor.h     |    3 
+ include/asm-xtensa/ptrace.h        |    6 
+ include/asm-xtensa/sigcontext.h    |   13 
+ include/asm-xtensa/timex.h         |   18 -
+ include/asm-xtensa/uaccess.h       |  107 +++---
+ include/asm-xtensa/unistd.h        |    8 
+ mvl_patches/pro-1105.c             |   16 
+ 17 files changed, 497 insertions(+), 479 deletions(-)
+
+
+Index: linux-2.6.10/arch/xtensa/kernel/asm-offsets.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/asm-offsets.c
++++ linux-2.6.10/arch/xtensa/kernel/asm-offsets.c
+@@ -40,7 +40,7 @@ int main(void)
+ 	DEFINE(PT_LCOUNT, offsetof (struct pt_regs, lcount));
+ 	DEFINE(PT_SAR, offsetof (struct pt_regs, sar));
+ 	DEFINE(PT_ICOUNTLEVEL, offsetof (struct pt_regs, icountlevel));
+-	DEFINE(PT_SYSCALL, offsetof (struct pt_regs, syscall));
++	DEFINE(PT_ORIG_A2, offsetof (struct pt_regs, orig_a2));
+ 	DEFINE(PT_AREG, offsetof (struct pt_regs, areg[0]));
+ 	DEFINE(PT_AREG0, offsetof (struct pt_regs, areg[0]));
+ 	DEFINE(PT_AREG1, offsetof (struct pt_regs, areg[1]));
+Index: linux-2.6.10/arch/xtensa/kernel/entry.S
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/entry.S
++++ linux-2.6.10/arch/xtensa/kernel/entry.S
+@@ -334,17 +334,18 @@ _kernel_exception:
+ 
+ common_exception:
+ 
+-	/* Save EXCVADDR, DEBUGCAUSE, and PC, and clear LCOUNT and SYSCALL */
++	/* Save EXCVADDR, DEBUGCAUSE, and PC, and clear LCOUNT and ORIG_A2 */
+ 
+ 	rsr	a2, DEBUGCAUSE
+ 	rsr	a3, EPC_1
+ 	s32i	a2, a1, PT_DEBUGCAUSE
+ 	s32i	a3, a1, PT_PC
+ 
++	movi	a2, -1
+ 	rsr	a3, EXCVADDR
++	s32i	a2, a1, PT_ORIG_A2
+ 	movi	a2, 0
+ 	s32i	a3, a1, PT_EXCVADDR
+-	s32i	a2, a1, PT_SYSCALL
+ 	xsr	a2, LCOUNT
+ 	s32i	a2, a1, PT_LCOUNT
+ 
+@@ -1016,7 +1017,6 @@ ENTRY(fast_syscall_kernel)
+ 
+ 	j	kernel_exception
+ 
+-
+ ENTRY(fast_syscall_user)
+ 
+ 	/* Skip syscall. */
+@@ -1055,14 +1055,14 @@ ENTRY(fast_syscall_unrecoverable)
+  * int sysxtensa (SYS_XTENSA_ATOMIC_ADD,     ptr, val,    unused);
+  * int sysxtensa (SYS_XTENSA_ATOMIC_EXG_ADD, ptr, val,    unused);
+  * int sysxtensa (SYS_XTENSA_ATOMIC_CMP_SWP, ptr, oldval, newval);
+- * a2                    a6                   a3    a4      a5
++ *        a2            a6                   a3    a4      a5
+  *
+  * Entry condition:
+  *
+- *   a0:	trashed, original value saved on stack (PT_AREG0)
++ *   a0:	a2 (syscall-nr), original value saved on stack (PT_AREG0)
+  *   a1:	a1
+- *   a2:	new stack pointer, original in DEPC
+- *   a3:	dispatch table
++ *   a2:	new stack pointer, original in a0 and DEPC
++ *   a3:	dispatch table, original in excsave_1
+  *   a4..a15:	unchanged
+  *   depc:	a2, original value saved on stack (PT_DEPC)
+  *   excsave_1:	a3
+@@ -1099,13 +1099,12 @@ ENTRY(fast_syscall_unrecoverable)
+ ENTRY(fast_syscall_xtensa)
+ 
+ 	xsr	a3, EXCSAVE_1		# restore a3, excsave1
+-	wsr	a7, DEPC		# use DEPC to save a7
+ 
++	s32i	a7, a2, PT_AREG7	# we need an additional register
+ 	movi	a7, 4			# sizeof(unsigned int)
+-	access_ok a3, a7, a0, a2, .Leac
++	access_ok a3, a7, a0, a2, .Leac	# a0: scratch reg, a2: sp
+ 
+-	addi	a6, a6, -1
+-	l32i	a0, a2, PT_AREG0	# restore a0
++	addi	a6, a6, -1		# assuming SYS_XTENSA_ATOMIC_SET = 1
+ 	_bgeui	a6, SYS_XTENSA_COUNT - 1, .Lill
+ 	_bnei	a6, SYS_XTENSA_ATOMIC_CMP_SWP - 1, .Lnswp
+ 
+@@ -1113,39 +1112,44 @@ ENTRY(fast_syscall_xtensa)
+ 
+ .Lswp:	/* Atomic compare and swap */
+ 
+-
+-TRY	l32i	a7, a3, 0		# read old value
+-	bne	a7, a4, 1f		# same as old value? jump
++TRY	l32i	a0, a3, 0		# read old value
++	bne	a0, a4, 1f		# same as old value? jump
+ TRY	s32i	a5, a3, 0		# different, modify value
++	l32i	a7, a2, PT_AREG7	# restore a7
++	l32i	a0, a2, PT_AREG0	# restore a0
+ 	movi	a2, 1			# and return 1
+-	rsr	a7, DEPC
+ 	addi	a6, a6, 1		# restore a6 (really necessary?)
+ 	rfe
+ 
+-1:	movi	a2, 0			# return 0 (note that we cannot set
+-	rsr	a7, DEPC		# a2 before the store!)
++1:	l32i	a7, a2, PT_AREG7	# restore a7
++	l32i	a0, a2, PT_AREG0	# restore a0
++	movi	a2, 0			# return 0 (note that we cannot set
+ 	addi	a6, a6, 1		# restore a6 (really necessary?)
+ 	rfe
+ 
+ .Lnswp:	/* Atomic set, add, and exg_add. */
+ 
+-TRY	l32i	a5, a3, 0		# orig
+-	add	a7, a4, a5		# + arg
+-	movnez	a4, a7, a6		# !set
+-	s32i	a7, a3, 0		# write new value
+-
+-	rsr	a7, DEPC
+-	mov	a2, a5			# note that we cannot use a2 before
++TRY	l32i	a7, a3, 0		# orig
++	add	a0, a4, a7		# + arg
++	moveqz	a0, a4, a6		# set
++TRY	s32i	a0, a3, 0		# write new value
++
++	mov	a0, a2
++	mov	a2, a7
++	l32i	a7, a0, PT_AREG7	# restore a7
++	l32i	a0, a0, PT_AREG0	# restore a0
+ 	addi	a6, a6, 1		# restore a6 (really necessary?)
+ 	rfe
+ 
+ CATCH
+-.Leac:	movi	a2, -EFAULT
+-	rsr	a7, DEPC
++.Leac:	l32i	a7, a2, PT_AREG7	# restore a7
++	l32i	a0, a2, PT_AREG0	# restore a0
++	movi	a2, -EFAULT
+ 	rfe
+ 
+-.Lill:	movi	a2, -EINVAL
+-	rsr	a7, DEPC
++.Lill:	l32i	a7, a2, PT_AREG0	# restore a7
++	l32i	a0, a2, PT_AREG0	# restore a0
++	movi	a2, -EINVAL
+ 	rfe
+ 
+ 
+@@ -1941,7 +1945,7 @@ ENTRY(system_call)
+ 	l32i	a3, a2, PT_AREG2
+ 	mov	a6, a2
+ 	movi	a4, do_syscall_trace_enter
+-	s32i	a3, a2, PT_SYSCALL
++	s32i	a3, a2, PT_ORIG_A2
+ 	callx4	a4
+ 
+ 	/* syscall = sys_call_table[syscall_nr] */
+Index: linux-2.6.10/arch/xtensa/kernel/process.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/process.c
++++ linux-2.6.10/arch/xtensa/kernel/process.c
+@@ -263,7 +263,7 @@ void do_copy_regs (xtensa_gregset_t *elf
+ 	elfregs->lend		= regs->lend;
+ 	elfregs->lcount		= regs->lcount;
+ 	elfregs->sar		= regs->sar;
+-	elfregs->syscall	= regs->syscall;
++	elfregs->orig_a2	= regs->orig_a2;
+ 
+ 	/* Copy register file.
+ 	 * The layout looks like this:
+@@ -315,7 +315,7 @@ void do_restore_regs (xtensa_gregset_t *
+ 	regs->lend		= elfregs->lend;
+ 	regs->lcount		= elfregs->lcount;
+ 	regs->sar		= elfregs->sar;
+-	regs->syscall		= elfregs->syscall;
++	regs->orig_a2		= elfregs->orig_a2;
+ 
+ 	/* Clear everything. */
+ 
+Index: linux-2.6.10/arch/xtensa/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/ptrace.c
++++ linux-2.6.10/arch/xtensa/kernel/ptrace.c
+@@ -173,8 +173,8 @@ int xtensa_ptrace(long request, long pid
+ 		case REG_EXCVADDR:
+ 			tmp = regs->excvaddr;
+ 			break;
+-		case SYSCALL_NR:
+-			tmp = regs->syscall;
++		case REG_ORIG_AREG2:
++			tmp = regs->orig_a2;
+ 			break;
+ 		default:
+ 			tmp = 0;
+@@ -214,8 +214,8 @@ int xtensa_ptrace(long request, long pid
+ 		case REG_PC:
+ 			regs->pc = data;
+ 			break;
+-		case SYSCALL_NR:
+-			regs->syscall = data;
++		case REG_ORIG_AREG2:
++			regs->orig_a2 = data;
+ 			break;
+ #ifdef TEST_KERNEL
+ 		case REG_WB:
+Index: linux-2.6.10/arch/xtensa/kernel/signal.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/signal.c
++++ linux-2.6.10/arch/xtensa/kernel/signal.c
+@@ -7,12 +7,12 @@
+  * License.  See the file "COPYING" in the main directory of this archive
+  * for more details.
+  *
+- * Copyright (C) 2005 Tensilica Inc.
++ * Copyright (C) 2005, 2006 Tensilica Inc.
+  * Copyright (C) 1991, 1992  Linus Torvalds
+  * 1997-11-28  Modified for POSIX.1b signals by Richard Henderson
+  *
+- * Joe Taylor <joe@tensilica.com>
+  * Chris Zankel <chris@zankel.net>
++ * Joe Taylor <joe@tensilica.com>
+  */
+ 
+ #include <linux/sched.h>
+@@ -36,272 +36,210 @@
+ 
+ #define _BLOCKABLE (~(sigmask(SIGKILL) | sigmask(SIGSTOP)))
+ 
+-asmlinkage long sys_wait4(pid_t pid,unsigned int * stat_addr, int options,
+-			  struct rusage * ru);
+ asmlinkage int do_signal(struct pt_regs *regs, sigset_t *oldset);
+ 
+ extern struct task_struct *coproc_owners[];
+ 
++extern void release_all_cp (struct task_struct *);
+ 
+-/*
+- * Atomically swap in the new signal mask, and wait for a signal.
++struct rt_sigframe
++{
++	struct siginfo info;
++	struct ucontext uc;
++	struct _cpstate cpstate;
++	unsigned char retcode[6];
++	unsigned int window[4];
++};
++
++/* 
++ * Flush register windows stored in pt_regs to stack.
++ * Returns 1 for errors.
++ *
++ * Note that windowbase, windowstart, and wmask are not updated!
+  */
+ 
+-asmlinkage long xtensa_rt_sigsuspend(sigset_t __user *unewset, 
+-    				     size_t sigsetsize,
+-    				     long a2, long a3, long a4, long a5, 
+-				     struct pt_regs *regs)
++int
++flush_window_regs_user(struct pt_regs *regs)
+ {
+-	sigset_t saveset, newset;
++	const unsigned long ws = regs->windowstart;
++	const unsigned long wb = regs->windowbase;
++	unsigned long sp = 0;
++	unsigned long wm;
++	int err = 1;
++	int base;
+ 
+-	/* XXX: Don't preclude handling different sized sigset_t's.  */
+-	if (sigsetsize != sizeof(sigset_t))
+-		return -EINVAL;
++	/* Return if no other frames. */
+ 
+-	if (copy_from_user(&newset, unewset, sizeof(newset)))
+-		return -EFAULT;
++	if (regs->wmask == 1)
++		return 0;
+ 
+-	sigdelsetmask(&newset, ~_BLOCKABLE);
+-	spin_lock_irq(&current->sighand->siglock);
+-	saveset = current->blocked;
+-	current->blocked = newset;
+-	recalc_sigpending();
+-	spin_unlock_irq(&current->sighand->siglock);
++	/* Rotate windowmask and skip empty frames. */
+ 
+-	regs->areg[2] = -EINTR;
+-	while (1) {
+-		current->state = TASK_INTERRUPTIBLE;
+-		schedule();
+-		if (do_signal(regs, &saveset))
+-			return -EINTR;
++	wm = (ws >> wb) | (ws << (XCHAL_NUM_AREGS / 4 - wb));
++	base = (XCHAL_NUM_AREGS / 4) - (regs->wmask >> 4);
++		
++	/* For call8 or call12 frames, we need the previous stack pointer. */
++
++	if ((regs->wmask & 2) == 0)
++		if (__get_user(sp, (int*)(regs->areg[base * 4 + 1] - 12)))
++			goto errout;
++
++	/* Spill frames to stack. */
++
++	while (base < XCHAL_NUM_AREGS / 4) {
++
++		int inc = ((wm >> base) & 0xf) >> 1;
++
++		/* Save registers a4..a7 (call8) or a4...a11 (call12) */
++
++		if (inc == 2) {		/* call8 */
++			if (copy_to_user((void*)(sp - 32),
++					   &regs->areg[(base + 1) * 4], 16))
++				goto errout;
++
++		} else if (inc == 4) {	/* call12 */
++			if (copy_to_user((void*)(sp - 48),
++					   &regs->areg[(base + 1) * 4], 32))
++				goto errout;
++			inc = 3;
++		}
++
++		/* Save current frame a0..a3 under next SP */
++
++		sp = regs->areg[((base + inc) * 4 + 1) % XCHAL_NUM_AREGS];
++		if (copy_to_user((void*)(sp - 16), &regs->areg[base * 4], 16))
++			goto errout;
++
++		/* Get current stack pointer for next loop iteration. */
++
++		sp = regs->areg[base * 4 + 1];
++		base += inc;
+ 	}
+-}
+ 
+-asmlinkage long xtensa_sigaltstack(const stack_t __user *uss, 
+-				   stack_t __user *uoss,
+-    				   long a2, long a3, long a4, long a5,
+-				   struct pt_regs *regs)
+-{
+-	return do_sigaltstack(uss, uoss, regs->areg[1]);
+-}
++	return 0;
+ 
++errout:
++	return err;
++}
+ 
+ /*
+- * Do a signal return; undo the signal stack.
++ * Note: We don't copy double exception 'regs', we have to finish double exc. 
++ * first before we return to signal handler! This dbl.exc.handler might cause 
++ * another double exception, but I think we are fine as the situation is the 
++ * same as if we had returned to the signal handerl and got an interrupt 
++ * immediately...
+  */
+ 
+-struct rt_sigframe
++static int
++setup_sigcontext(struct sigcontext __user *sc, struct _cpstate *cpstate,
++		 struct pt_regs *regs, unsigned long mask)
+ {
+-	struct siginfo info;
+-	struct ucontext uc;
+-	struct _cpstate cpstate;
+-	unsigned char retcode[6];
+-	unsigned int reserved[4]; /* Reserved area for chaining */
+-	unsigned int window[4]; /* Window of 4 registers for initial context */
+-};
++	int err = 0;
+ 
+-extern void release_all_cp (struct task_struct *);
++#define COPY(x)	err |= __put_user(regs->x, &sc->sc_##x)
++	COPY(pc);
++	COPY(ps);
++	COPY(lbeg);
++	COPY(lend);
++	COPY(lcount);
++	COPY(sar);
++#undef COPY
+ 
++	err |= flush_window_regs_user(regs);
++	err |= __copy_to_user (sc->sc_a, regs->areg, 16 * 4);
+ 
+-// FIXME restore_cpextra
+-static inline int
+-restore_cpextra (struct _cpstate *buf)
+-{
+-#if 0
+-	/* The signal handler may have used coprocessors in which
+-	 * case they are still enabled.  We disable them to force a
+-	 * reloading of the original task's CP state by the lazy
+-	 * context-switching mechanisms of CP exception handling.
+-	 * Also, we essentially discard any coprocessor state that the
+-	 * signal handler created. */
++	// err |= __copy_to_user (sc->sc_a, regs->areg, XCHAL_NUM_AREGS * 4)
+ 
+-	struct task_struct *tsk = current;
+-	release_all_cp(tsk);
+-	return __copy_from_user(tsk->thread.cpextra, buf, TOTAL_CPEXTRA_SIZE);
++#if XCHAL_HAVE_CP
++# error Coprocessors unsupported
++	err |= save_cpextra(cpstate);
++	err |= __put_user(err ? NULL : cpstate, &sc->sc_cpstate);
+ #endif
+-	return 0;
+-}
+-
+-/* Note: We don't copy double exception 'tregs', we have to finish double exc. first before we return to signal handler! This dbl.exc.handler might cause another double exception, but I think we are fine as the situation is the same as if we had returned to the signal handerl and got an interrupt immediately...
+- */
++	/* non-iBCS2 extensions.. */
++	err |= __put_user(mask, &sc->oldmask);
+ 
++	return err;
++}
+ 
+ static int
+-restore_sigcontext(struct pt_regs *regs, struct sigcontext *sc)
++restore_sigcontext(struct pt_regs *regs, struct sigcontext __user *sc)
+ {
+-	struct thread_struct *thread;
+ 	unsigned int err = 0;
+ 	unsigned long ps;
+-	struct _cpstate *buf;
+ 
+ #define COPY(x)	err |= __get_user(regs->x, &sc->sc_##x)
+ 	COPY(pc);
+-	COPY(depc);
+-	COPY(wmask);
+ 	COPY(lbeg);
+ 	COPY(lend);
+ 	COPY(lcount);
+ 	COPY(sar);
+-	COPY(windowbase);
+-	COPY(windowstart);
+ #undef COPY
+ 
++	/* All registers have been flushed to stack. */
++
++	regs->wmask = 1;
++	regs->windowbase = 0;
++	regs->windowstart = 1;
++
+ 	/* For PS, restore only PS.CALLINC.
+ 	 * Assume that all other bits are either the same as for the signal
+ 	 * handler, or the user mode value doesn't matter (e.g. PS.OWB).
+ 	 */
+ 	err |= __get_user(ps, &sc->sc_ps);
+-	regs->ps = (regs->ps & ~PS_CALLINC_MASK)
+-		| (ps & PS_CALLINC_MASK);
++	regs->ps = (regs->ps & ~PS_CALLINC_MASK) | (ps & PS_CALLINC_MASK);
+ 
+ 	/* Additional corruption checks */
+ 
+-	if ((regs->windowbase >= (XCHAL_NUM_AREGS/4))
+-	|| ((regs->windowstart & ~((1<<(XCHAL_NUM_AREGS/4)) - 1)) != 0) )
+-		err = 1;
+ 	if ((regs->lcount > 0)
+-	&& ((regs->lbeg > TASK_SIZE) || (regs->lend > TASK_SIZE)) )
++	    && ((regs->lbeg > TASK_SIZE) || (regs->lend > TASK_SIZE)) )
+ 		err = 1;
+ 
+-	/* Restore extended register state.
+-	 * See struct thread_struct in processor.h.
+-	 */
+-	thread = &current->thread;
+-
+-	err |= __copy_from_user (regs->areg, sc->sc_areg, XCHAL_NUM_AREGS*4);
+-	err |= __get_user(buf, &sc->sc_cpstate);
+-	if (buf) {
+-		if (!access_ok(VERIFY_READ, buf, sizeof(*buf)))
+-			goto badframe;
+-		err |= restore_cpextra(buf);
+-	}
+-
+-	regs->syscall = -1;		/* disable syscall checks */
+-	return err;
+-
+-badframe:
+-	return 1;
+-}
+-
+-static inline void
+-flush_my_cpstate(struct task_struct *tsk)
+-{
+-	unsigned long flags;
+-	local_irq_save(flags);
++	//err |= __copy_from_user(regs->areg, sc->sc_a, XCHAL_NUM_AREGS*4);
++	err |= __copy_from_user(regs->areg, sc->sc_a, 16 * 4);
+ 
+-#if 0	// FIXME
+-	for (i = 0; i < XCHAL_CP_NUM; i++) {
+-		if (tsk == coproc_owners[i]) {
+-			xthal_validate_cp(i);
+-			xthal_save_cpregs(tsk->thread.cpregs_ptr[i], i);
+-
+-			/* Invalidate and "disown" the cp to allow
+-			 * callers the chance to reset cp state in the
+-			 * task_struct. */
++#if XCHAL_HAVE_CP
++# error Coprocessors unsupported
++ 	/* The signal handler may have used coprocessors in which
++	 * case they are still enabled.  We disable them to force a
++	 * reloading of the original task's CP state by the lazy
++	 * context-switching mechanisms of CP exception handling.
++	 * Also, we essentially discard any coprocessor state that the
++	 * signal handler created. */
+ 
+-			xthal_invalidate_cp(i);
+-			coproc_owners[i] = 0;
+-		}
++	if (!err) {
++	  struct task_struct *tsk = current;
++	  release_all_cp(tsk);
++	  err |= __copy_from_user(tsk->thread.cpextra, sc->sc_cpstate, 
++	      			  XTENSA_CP_EXTRA_SIZE);
+ 	}
+ #endif
+-	local_irq_restore(flags);
+-}
+-
+-/* Return codes:
+-	0:  nothing saved
+-	1:  stuff to save, successful
+-       -1:  stuff to save, error happened
+-*/
+-static int
+-save_cpextra (struct _cpstate *buf)
+-{
+-#if (XCHAL_EXTRA_SA_SIZE == 0) && (XCHAL_CP_NUM == 0)
+-	return 0;
+-#else
+-
+-	/* FIXME: If a task has never used a coprocessor, there is
+-	 * no need to save and restore anything.  Tracking this
+-	 * information would allow us to optimize this section.
+-	 * Perhaps we can use current->used_math or (current->flags &
+-	 * PF_USEDFPU) or define a new field in the thread
+-	 * structure. */
+-
+-	/* We flush any live, task-owned cp state to the task_struct,
+-	 * then copy it all to the sigframe.  Then we clear all
+-	 * cp/extra state in the task_struct, effectively
+-	 * clearing/resetting all cp/extra state for the signal
+-	 * handler (cp-exception handling will load these new values
+-	 * into the cp/extra registers.)  This step is important for
+-	 * things like a floating-point cp, where the OS must reset
+-	 * the FCR to the default rounding mode. */
+-
+-	int err = 0;
+-	struct task_struct *tsk = current;
+-
+-	flush_my_cpstate(tsk);
+-	/* Note that we just copy everything: 'extra' and 'cp' state together.*/
+-	err |= __copy_to_user(buf, tsk->thread.cp_save, XTENSA_CP_EXTRA_SIZE);
+-	memset(tsk->thread.cp_save, 0, XTENSA_CP_EXTRA_SIZE);
+-
+-#if (XTENSA_CP_EXTRA_SIZE == 0)
+-#error Sanity check on memset above, cpextra_size should not be zero.
+-#endif
+ 
+-	return err ? -1 : 1;
+-#endif
++	regs->orig_a2 = -1;		/* disable syscall checks */
++	return err;
+ }
+ 
+-static int
+-setup_sigcontext(struct sigcontext *sc, struct _cpstate *cpstate,
+-		 struct pt_regs *regs, unsigned long mask)
+-{
+-	struct thread_struct *thread;
+-	int err = 0;
+-
+-#define COPY(x)	err |= __put_user(regs->x, &sc->sc_##x)
+-	COPY(pc);
+-	COPY(ps);
+-	COPY(depc);
+-	COPY(wmask);
+-	COPY(lbeg);
+-	COPY(lend);
+-	COPY(lcount);
+-	COPY(sar);
+-	COPY(windowbase);
+-	COPY(windowstart);
+-#undef COPY
+-
+-	/* Save extended register state.
+-	 * See struct thread_struct in processor.h.
+-	 */
+-	thread = &current->thread;
+-	err |= __copy_to_user (sc->sc_areg, regs->areg, XCHAL_NUM_AREGS * 4);
+-	err |= save_cpextra(cpstate);
+-	err |= __put_user(err ? NULL : cpstate, &sc->sc_cpstate);
+-	/* non-iBCS2 extensions.. */
+-	err |= __put_user(mask, &sc->oldmask);
+ 
+-	return err;
+-}
+ 
++/*
++ * Do a signal return; undo the signal stack.
++ */
+ 
+-asmlinkage long xtensa_rt_sigreturn(long a0, long a1, long a2, long a3, 
+-    				    long a4, long a5, struct pt_regs *regs)
++asmlinkage long xtensa_rt_sigreturn(long a0, long a1, long a2, long a3,
++				    long a4, long a5, struct pt_regs *regs)
+ {
+-	struct rt_sigframe *frame = (struct rt_sigframe *)regs->areg[1];
++	struct rt_sigframe __user *frame;
+ 	sigset_t set;
+-	stack_t st;
+ 	int ret;
++
+ 	if (regs->depc > 64)
+-	{
+-		printk("!!!!!!! DEPC !!!!!!!\n");
+-		return 0;
+-	}
++		panic("rt_sigreturn in double exception!\n");
++
++	frame = (struct rt_sigframe __user *) regs->areg[1];
+ 
+-	if (!access_ok(VERIFY_READ, frame, sizeof(*frame)))
++	if (verify_area(VERIFY_READ, frame, sizeof (*frame)))
+ 		goto badframe;
+ 
+-	if (__copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
++	if (__copy_from_user(&set, &frame->uc.uc_sigmask, sizeof (set)))
+ 		goto badframe;
+ 
+ 	sigdelsetmask(&set, ~_BLOCKABLE);
+@@ -315,12 +253,16 @@ asmlinkage long xtensa_rt_sigreturn(long
+ 
+ 	ret = regs->areg[2];
+ 
++#if 0
+ 	if (__copy_from_user(&st, &frame->uc.uc_stack, sizeof(st)))
+ 		goto badframe;
+-
+ 	/* It is more difficult to avoid calling this function than to
+ 	   call it and ignore errors.  */
+ 	do_sigaltstack(&st, NULL, regs->areg[1]);
++else
++	if (do_sigaltstack(&frame->uc.uc_stack, NULL, regs->areg[1]) == -EFAULT)
++		goto badframe;
++#endif
+ 
+ 	return ret;
+ 
+@@ -329,98 +271,61 @@ badframe:
+ 	return 0;
+ }
+ 
+-/*
+- * Set up a signal frame.
+- */
++
+ 
+ /*
+- * Determine which stack to use..
++ * Set up a signal frame.
+  */
+-static inline void *
+-get_sigframe(struct k_sigaction *ka, unsigned long sp, size_t frame_size)
+-{
+-	if ((ka->sa.sa_flags & SA_ONSTACK) != 0 && ! on_sig_stack(sp))
+-		sp = current->sas_ss_sp + current->sas_ss_size;
+-
+-	return (void *)((sp - frame_size) & -16ul);
+-}
+ 
+ static int
+ gen_return_code(unsigned char *codemem)
+ {
+ 	int err = 0;
+ 
+-#if 0
+-	/* Ignoring SA_RESTORER for now; it's supposed to be obsolete,
+-	 * and the xtensa glibc doesn't use it.
++	/*
++	 * The 12-bit immediate is really split up within the 24-bit MOVI
++	 * instruction.  As long as the above system call numbers fit within
++	 * 8-bits, the following code works fine. See the Xtensa ISA for
++	 * details.
+ 	 */
+-	if (ka->sa.sa_flags & SA_RESTORER) {
+-		regs->pr = (unsigned long) ka->sa.sa_restorer;
+-	} else
+-#endif /* 0 */
+-	{
+-
+-
+-/* The 12-bit immediate is really split up within the 24-bit MOVI
+- * instruction.  As long as the above system call numbers fit within
+- * 8-bits, the following code works fine. See the Xtensa ISA for
+- * details.
+- */
+ 
+ #if __NR_rt_sigreturn > 255
+ # error Generating the MOVI instruction below breaks!
+ #endif
+ 
+ #ifdef __XTENSA_EB__   /* Big Endian version */
+-		/* Generate instruction:  MOVI a2, __NR_rt_sigreturn */
+-		err |= __put_user(0x22, &codemem[0]);
+-		err |= __put_user(0x0a, &codemem[1]);
+-		err |= __put_user(__NR_rt_sigreturn, &codemem[2]);
+-		/* Generate instruction:  SYSCALL */
+-		err |= __put_user(0x00, &codemem[3]);
+-		err |= __put_user(0x05, &codemem[4]);
+-		err |= __put_user(0x00, &codemem[5]);
++	/* Generate instruction:  MOVI a2, __NR_rt_sigreturn */
++	err |= __put_user(0x22, &codemem[0]);
++	err |= __put_user(0x0a, &codemem[1]);
++	err |= __put_user(__NR_rt_sigreturn, &codemem[2]);
++	/* Generate instruction:  SYSCALL */
++	err |= __put_user(0x00, &codemem[3]);
++	err |= __put_user(0x05, &codemem[4]);
++	err |= __put_user(0x00, &codemem[5]);
+ 
+ #elif defined __XTENSA_EL__   /* Little Endian version */
+-		/* Generate instruction:  MOVI a2, __NR_rt_sigreturn */
+-		err |= __put_user(0x22, &codemem[0]);
+-		err |= __put_user(0xa0, &codemem[1]);
+-		err |= __put_user(__NR_rt_sigreturn, &codemem[2]);
+-		/* Generate instruction:  SYSCALL */
+-		err |= __put_user(0x00, &codemem[3]);
+-		err |= __put_user(0x50, &codemem[4]);
+-		err |= __put_user(0x00, &codemem[5]);
++	/* Generate instruction:  MOVI a2, __NR_rt_sigreturn */
++	err |= __put_user(0x22, &codemem[0]);
++	err |= __put_user(0xa0, &codemem[1]);
++	err |= __put_user(__NR_rt_sigreturn, &codemem[2]);
++	/* Generate instruction:  SYSCALL */
++	err |= __put_user(0x00, &codemem[3]);
++	err |= __put_user(0x50, &codemem[4]);
++	err |= __put_user(0x00, &codemem[5]);
+ #else
+-#error Must use compiler for Xtensa processors.
++# error Must use compiler for Xtensa processors.
+ #endif
+-	}
+ 
+ 	/* Flush generated code out of the data cache */
+ 
+ 	if (err == 0) {
+-		__flush_invalidate_dcache_range((unsigned long)codemem, 6UL);
+ 		__invalidate_icache_range((unsigned long)codemem, 6UL);
++		__flush_invalidate_dcache_range((unsigned long)codemem, 6UL);
+ 	}
+ 
+ 	return err;
+ }
+ 
+-static void
+-set_thread_state(struct pt_regs *regs, void *stack, unsigned char *retaddr,
+-	void *handler, unsigned long arg1, void *arg2, void *arg3)
+-{
+-	/* Set up registers for signal handler */
+-	start_thread(regs, (unsigned long) handler, (unsigned long) stack);
+-
+-	/* Set up a stack frame for a call4
+-	 * Note: PS.CALLINC is set to one by start_thread
+-	 */
+-	regs->areg[4] = (((unsigned long) retaddr) & 0x3fffffff) | 0x40000000;
+-	regs->areg[6] = arg1;
+-	regs->areg[7] = (unsigned long) arg2;
+-	regs->areg[8] = (unsigned long) arg3;
+-}
+-
+ 
+ static void setup_frame(int sig, struct k_sigaction *ka, siginfo_t *info,
+ 			sigset_t *set, struct pt_regs *regs)
+@@ -428,8 +333,16 @@ static void setup_frame(int sig, struct 
+ 	struct rt_sigframe *frame;
+ 	int err = 0;
+ 	int signal;
++	unsigned long sp, ra;
++
++	sp = regs->areg[1];
++
++	if ((ka->sa.sa_flags & SA_ONSTACK) != 0 && ! on_sig_stack(sp)) {
++		sp = current->sas_ss_sp + current->sas_ss_size;
++	}
++
++	frame = (void *)((sp - sizeof (*frame)) & -16ul);
+ 
+-	frame = get_sigframe(ka, regs->areg[1], sizeof(*frame));
+ 	if (regs->depc > 64)
+ 		panic ("Double exception sys_sigreturn\n");
+ 
+@@ -442,9 +355,14 @@ static void setup_frame(int sig, struct 
+ 		? current_thread_info()->exec_domain->signal_invmap[sig]
+ 		: sig;
+ 
+-	err |= copy_siginfo_to_user(&frame->info, info);
++	if (ka->sa.sa_flags & SA_SIGINFO) {
++		err |= copy_siginfo_to_user(&frame->info, info);
++		if (err)
++			goto give_sigsegv;
++	}
++
++	/* Create the user context.  */
+ 
+-	/* Create the ucontext.  */
+ 	err |= __put_user(0, &frame->uc.uc_flags);
+ 	err |= __put_user(0, &frame->uc.uc_link);
+ 	err |= __put_user((void *)current->sas_ss_sp,
+@@ -457,16 +375,29 @@ static void setup_frame(int sig, struct 
+ 	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
+ 
+ 	/* Create sys_rt_sigreturn syscall in stack frame */
++
+ 	err |= gen_return_code(frame->retcode);
+ 
+ 	if (err)
+ 		goto give_sigsegv;
+ 
+-	/* Create signal handler execution context.
++	/* 
++	 * Create signal handler execution context.
+ 	 * Return context not modified until this point.
+ 	 */
+-	set_thread_state(regs, frame, frame->retcode,
+-		ka->sa.sa_handler, signal, &frame->info, &frame->uc);
++
++	/* Set up registers for signal handler */
++	start_thread(regs, (unsigned long) ka->sa.sa_handler, 
++		     (unsigned long) frame);
++
++	/* Set up a stack frame for a call4
++	 * Note: PS.CALLINC is set to one by start_thread
++	 */
++	ra = (unsigned long) frame->retcode;
++	regs->areg[4] = (((unsigned long) ra) & 0x3fffffff) | 0x40000000;
++	regs->areg[6] = (unsigned long) signal;
++	regs->areg[7] = (unsigned long) &frame->info;
++	regs->areg[8] = (unsigned long) &frame->uc;
+ 
+ 	/* Set access mode to USER_DS.  Nomenclature is outdated, but
+ 	 * functionality is used in uaccess.h
+@@ -486,6 +417,48 @@ give_sigsegv:
+ 	force_sig(SIGSEGV, current);
+ }
+ 
++/*
++ * Atomically swap in the new signal mask, and wait for a signal.
++ */
++
++asmlinkage long xtensa_rt_sigsuspend(sigset_t __user *unewset, 
++    				     size_t sigsetsize,
++    				     long a2, long a3, long a4, long a5, 
++				     struct pt_regs *regs)
++{
++	sigset_t saveset, newset;
++
++	/* XXX: Don't preclude handling different sized sigset_t's.  */
++	if (sigsetsize != sizeof(sigset_t))
++		return -EINVAL;
++
++	if (copy_from_user(&newset, unewset, sizeof(newset)))
++		return -EFAULT;
++
++	sigdelsetmask(&newset, ~_BLOCKABLE);
++	spin_lock_irq(&current->sighand->siglock);
++	saveset = current->blocked;
++	current->blocked = newset;
++	recalc_sigpending();
++	spin_unlock_irq(&current->sighand->siglock);
++
++	regs->areg[2] = -EINTR;
++	while (1) {
++		current->state = TASK_INTERRUPTIBLE;
++		schedule();
++		if (do_signal(regs, &saveset))
++			return -EINTR;
++	}
++}
++
++asmlinkage long xtensa_sigaltstack(const stack_t __user *uss, 
++				   stack_t __user *uoss,
++    				   long a2, long a3, long a4, long a5,
++				   struct pt_regs *regs)
++{
++	return do_sigaltstack(uss, uoss, regs->areg[1]);
++}
++
+ 
+ 
+ /*
+@@ -503,47 +476,79 @@ int do_signal(struct pt_regs *regs, sigs
+ 	int signr;
+ 	struct k_sigaction ka;
+ 
++	if (!user_mode(regs))
++		return 1;
++
+ 	if (!oldset)
+ 		oldset = &current->blocked;
+ 
+ 	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
+ 
+-	/* Are we from a system call? */
+-	if (regs->syscall >= 0) {
+-		/* If so, check system call restarting.. */
+-		switch (regs->areg[2]) {
+-			case -ERESTARTNOHAND:
+-			case -ERESTART_RESTARTBLOCK:
+-				regs->areg[2] = -EINTR;
+-				break;
++	if (signr > 0) {
++
++		/* Are we from a system call? */
++
++		if ((signed)regs->orig_a2 >= 0) {
+ 
+-			case -ERESTARTSYS:
+-				if (!(ka.sa.sa_flags & SA_RESTART)) {
++			/* If so, check system call restarting.. */
++
++			switch (regs->areg[2]) {
++				case -ERESTARTNOHAND:
++				case -ERESTART_RESTARTBLOCK:
+ 					regs->areg[2] = -EINTR;
+ 					break;
+-				}
+-			/* fallthrough */
+-			case -ERESTARTNOINTR:
+-				regs->areg[2] = regs->syscall;
+-				regs->pc -= 3;
++
++				case -ERESTARTSYS:
++					if (!(ka.sa.sa_flags & SA_RESTART)) {
++						regs->areg[2] = -EINTR;
++						break;
++					}
++					/* fallthrough */
++				case -ERESTARTNOINTR:
++					regs->areg[2] = regs->orig_a2;
++					regs->pc -= 3;
++					break;
++
++				default:
++					/* nothing to do */
++					if (regs->areg[2] != 0)
++					break;
++			}
+ 		}
+-	}
+-	if (signr == 0)
+-		return 0;		/* no signals delivered */
+ 
+-	/* Whee!  Actually deliver the signal.  */
+-	/* Set up the stack frame */
+-	setup_frame(signr, &ka, &info, oldset, regs);
++		/* Whee!  Actually deliver the signal.  */
++		/* Set up the stack frame */
++		setup_frame(signr, &ka, &info, oldset, regs);
+ 
+-	if (ka.sa.sa_flags & SA_ONESHOT)
+-		ka.sa.sa_handler = SIG_DFL;
++		if (ka.sa.sa_flags & SA_ONESHOT)
++			ka.sa.sa_handler = SIG_DFL;
+ 
+-	if (!(ka.sa.sa_flags & SA_NODEFER)) {
+ 		spin_lock_irq(&current->sighand->siglock);
+-		sigorsets(&current->blocked,&current->blocked,&ka.sa.sa_mask);
+-		sigaddset(&current->blocked, signr);
++		sigorsets(&current->blocked, &current->blocked, &ka.sa.sa_mask);
++		if (!(ka.sa.sa_flags & SA_NODEFER))
++			sigaddset(&current->blocked, signr);
+ 		recalc_sigpending();
+ 		spin_unlock_irq(&current->sighand->siglock);
++		return 1;
++	}
++
++no_signal:
++	/* Did we come from a system call? */
++	if ((signed) regs->orig_a2 >= 0) {
++		/* Restart the system call - no handlers present */
++		switch (regs->areg[2]) {
++		case -ERESTARTNOHAND:
++		case -ERESTARTSYS:
++		case -ERESTARTNOINTR:
++			regs->areg[2] = regs->orig_a2;
++			regs->pc -= 3;
++			break;
++		case -ERESTART_RESTARTBLOCK:
++			regs->areg[2] = __NR_restart_syscall;
++			regs->pc -= 3;
++			break;
++		}
+ 	}
+-	return 1;
++	return 0;
+ }
++
+Index: linux-2.6.10/arch/xtensa/kernel/time.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/time.c
++++ linux-2.6.10/arch/xtensa/kernel/time.c
+@@ -38,10 +38,9 @@ EXPORT_SYMBOL(rtc_lock);
+ 
+ #ifdef CONFIG_XTENSA_CALIBRATE_CCOUNT
+ unsigned long ccount_per_jiffy;		/* per 1/HZ */
+-unsigned long ccount_nsec;		/* nsec per ccount increment */
++unsigned long nsec_per_ccount;		/* nsec per ccount increment */
+ #endif
+ 
+-unsigned int last_ccount_stamp;
+ static long last_rtc_update = 0;
+ 
+ /*
+@@ -84,7 +83,6 @@ void __init time_init(void)
+ 
+ 	xtime.tv_nsec = 0;
+ 	last_rtc_update = xtime.tv_sec = sec_n;
+-	last_ccount_stamp = get_ccount();
+ 
+ 	set_normalized_timespec(&wall_to_monotonic,
+ 		-xtime.tv_sec, -xtime.tv_nsec);
+@@ -100,7 +98,7 @@ int do_settimeofday(struct timespec *tv)
+ {
+ 	time_t wtm_sec, sec = tv->tv_sec;
+ 	long wtm_nsec, nsec = tv->tv_nsec;
+-	unsigned long ccount;
++	unsigned long delta;
+ 
+ 	if ((unsigned long)tv->tv_nsec >= NSEC_PER_SEC)
+ 		return -EINVAL;
+@@ -112,9 +110,10 @@ int do_settimeofday(struct timespec *tv)
+ 	 * wall time.  Discover what correction gettimeofday() would have
+ 	 * made, and then undo it!
+ 	 */
+-	ccount = get_ccount();
+-	nsec -= (ccount - last_ccount_stamp) * CCOUNT_NSEC;
+-	nsec -= (jiffies - wall_jiffies) * CCOUNT_PER_JIFFY * CCOUNT_NSEC;
++
++	delta = (jiffies - wall_jiffies + 1) * CCOUNT_PER_JIFFY;
++	delta += get_ccount() - get_linux_timer();
++	nsec -= delta * NSEC_PER_CCOUNT;
+ 
+ 	wtm_sec  = wall_to_monotonic.tv_sec + (xtime.tv_sec - sec);
+ 	wtm_nsec = wall_to_monotonic.tv_nsec + (xtime.tv_nsec - nsec);
+@@ -127,30 +126,31 @@ int do_settimeofday(struct timespec *tv)
+ 	time_status |= STA_UNSYNC;
+ 	time_maxerror = NTP_PHASE_LIMIT;
+ 	time_esterror = NTP_PHASE_LIMIT;
++
+ 	write_sequnlock_irq(&xtime_lock);
+ 	return 0;
+ }
+ 
+ EXPORT_SYMBOL(do_settimeofday);
+ 
+-
+ void do_gettimeofday(struct timeval *tv)
+ {
+-	unsigned long flags;
+-	unsigned long sec, usec, delta, lost, seq;
++	unsigned long volatile sec, usec, delta, lost, seq, flags;
+ 
+ 	do {
+-		seq = read_seqbegin(&xtime_lock);
++		seq = read_seqbegin_irqsave(&xtime_lock, flags);
+ 
+-		delta = get_ccount() - last_ccount_stamp;
+ 		sec = xtime.tv_sec;
+ 		usec = (xtime.tv_nsec / NSEC_PER_USEC);
+ 
++		delta = get_linux_timer() - get_ccount();
+ 		lost = jiffies - wall_jiffies;
+ 
+-	} while (read_seqretry(&xtime_lock, seq));
++	} while (read_seqretry_irqrestore(&xtime_lock, seq, flags));
++
++	usec += (((lost + 1) * (unsigned long) CCOUNT_PER_JIFFY - delta)
++		 * (unsigned long) NSEC_PER_CCOUNT) / NSEC_PER_USEC;
+ 
+-	usec += lost * (1000000UL/HZ) + (delta * CCOUNT_NSEC) / NSEC_PER_USEC;
+ 	for (; usec >= 1000000; sec++, usec -= 1000000)
+ 		;
+ 
+@@ -181,10 +181,13 @@ again:
+ 
+ 		write_seqlock(&xtime_lock);
+ 
+-		last_ccount_stamp = next;
+-		next += CCOUNT_PER_JIFFY;
+ 		do_timer (regs); /* Linux handler in kernel/timer.c */
+ 
++		/* NOTE: writing CCOMPAREn clears the interrupt.  */
++
++		next += CCOUNT_PER_JIFFY;
++		set_linux_timer (next);
++
+ 		//if (ntp_synced() &&
+ 		if ((time_status & STA_UNSYNC) == 0 &&
+ 		    xtime.tv_sec - last_rtc_update >= 659 &&
+@@ -197,22 +200,20 @@ again:
+ 				/* Do it again in 60 s */
+ 				last_rtc_update += 60;
+ 		}
++
+ 		write_sequnlock(&xtime_lock);
+ 	}
+ 
+-	/* NOTE: writing CCOMPAREn clears the interrupt.  */
++	/* Allow platform to do something usefull (Wdog). */
++
++	platform_heartbeat();
+ 
+-	set_linux_timer (next);
+ 
+ 	/* Make sure we didn't miss any tick... */
+ 
+ 	if ((signed long)(get_ccount() - next) > 0)
+ 		goto again;
+ 
+-	/* Allow platform to do something usefull (Wdog). */
+-
+-	platform_heartbeat();
+-
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -226,4 +227,3 @@ void __devinit calibrate_delay(void)
+ 	       (loops_per_jiffy/(10000/HZ)) % 100);
+ }
+ #endif
+-
+Index: linux-2.6.10/arch/xtensa/kernel/traps.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/kernel/traps.c
++++ linux-2.6.10/arch/xtensa/kernel/traps.c
+@@ -196,8 +196,6 @@ extern void do_IRQ(int, struct pt_regs *
+ 
+ void do_interrupt (struct pt_regs *regs)
+ {
+-	unsigned long intread = get_sr (INTREAD);
+-	unsigned long intenable = get_sr (INTENABLE);
+ 	int i, mask;
+ 
+ 	/* Handle all interrupts (no priorities).
+@@ -206,9 +204,9 @@ void do_interrupt (struct pt_regs *regs)
+ 	 */
+ 
+ 	for (i=0, mask = 1; i < XCHAL_NUM_INTERRUPTS; i++, mask <<= 1) {
+-		if (mask & (intread & intenable)) {
++		if ((mask & get_sr(INTREAD) & get_sr(INTENABLE)) != 0) {
+ 			set_sr (mask, INTCLEAR);
+-			do_IRQ (i,regs);
++			do_IRQ (i, regs);
+ 		}
+ 	}
+ }
+@@ -362,9 +360,9 @@ void show_regs(struct pt_regs * regs)
+ 	printk("lbeg: %08lx, lend: %08lx lcount: %08lx, sar: %08lx\n",
+ 	       regs->lbeg, regs->lend, regs->lcount, regs->sar);
+ 	if (user_mode(regs))
+-		printk("wb: %08lx, ws: %08lx, wmask: %08lx, syscall: %ld\n",
++		printk("wb: %08lx, ws: %08lx, wmask: %08lx, orig_a2: %ld\n",
+ 		       regs->windowbase, regs->windowstart, regs->wmask,
+-		       regs->syscall);
++		       regs->orig_a2);
+ }
+ 
+ void show_trace(struct task_struct *task, unsigned long *sp)
+Index: linux-2.6.10/arch/xtensa/platform-xt2000/time.c
+===================================================================
+--- linux-2.6.10.orig/arch/xtensa/platform-xt2000/time.c
++++ linux-2.6.10/arch/xtensa/platform-xt2000/time.c
+@@ -93,6 +93,6 @@ void platform_calibrate_ccount(void)
+ 	tperiod = tperiod / 10000;
+ 	tperiod = tperiod * 10000;
+ 	ccount_per_jiffy = tperiod/HZ;
+-	ccount_nsec = 1000000000UL / tperiod;
++	nsec_per_ccount = 1000000000UL / tperiod;
+ }
+ #endif
+Index: linux-2.6.10/include/asm-xtensa/elf.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/elf.h
++++ linux-2.6.10/include/asm-xtensa/elf.h
+@@ -99,7 +99,7 @@ typedef struct {
+ 	elf_greg_t lend;
+ 	elf_greg_t lcount;
+ 	elf_greg_t sar;
+-	elf_greg_t syscall;
++	elf_greg_t orig_a2;
+ 	elf_greg_t ar[XCHAL_NUM_AREGS];
+ } xtensa_gregset_t;
+ 
+Index: linux-2.6.10/include/asm-xtensa/fcntl.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/fcntl.h
++++ linux-2.6.10/include/asm-xtensa/fcntl.h
+@@ -14,43 +14,43 @@
+ 
+ /* open/fcntl - O_SYNC is only implemented on blocks devices and on files
+    located on an ext2 file system */
+-#define O_ACCMODE	0x0003
+-#define O_RDONLY	0x0000
+-#define O_WRONLY	0x0001
+-#define O_RDWR		0x0002
+-#define O_APPEND	0x0008
+-#define O_SYNC		0x0010
+-#define O_NONBLOCK	0x0080
+-#define O_CREAT         0x0100	/* not fcntl */
+-#define O_TRUNC		0x0200	/* not fcntl */
+-#define O_EXCL		0x0400	/* not fcntl */
+-#define O_NOCTTY	0x0800	/* not fcntl */
+-#define FASYNC		0x1000	/* fcntl, for BSD compatibility */
+-#define O_LARGEFILE	0x2000	/* allow large file opens - currently ignored */
+-#define O_DIRECT	0x8000	/* direct disk access hint - currently ignored*/
+-#define O_DIRECTORY	0x10000	/* must be a directory */
+-#define O_NOFOLLOW	0x20000	/* don't follow links */
+-#define O_NOATIME	0x100000
+-
++#define O_ACCMODE	   0003
++#define O_RDONLY	     00
++#define O_WRONLY	     01
++#define O_RDWR		     02
++#define O_CREAT		   0100	/* not fcntl */
++#define O_EXCL		   0200	/* not fcntl */
++#define O_NOCTTY	   0400	/* not fcntl */
++#define O_TRUNC		  01000	/* not fcntl */
++#define O_APPEND	  02000
++#define O_NONBLOCK	  04000
+ #define O_NDELAY	O_NONBLOCK
++#define O_SYNC		 010000
++#define FASYNC		 020000	/* fcntl, for BSD compatibility */
++#define O_DIRECT	 040000	/* direct disk access hint */
++#define O_LARGEFILE	0100000
++#define O_DIRECTORY	0200000	/* must be a directory */
++#define O_NOFOLLOW	0400000 /* don't follow links */
++#define O_NOATIME	01000000
+ 
+ #define F_DUPFD		0	/* dup */
+ #define F_GETFD		1	/* get close_on_exec */
+ #define F_SETFD		2	/* set/clear close_on_exec */
+ #define F_GETFL		3	/* get file->f_flags */
+ #define F_SETFL		4	/* set file->f_flags */
+-#define F_GETLK		14
+-#define F_GETLK64       15
++#define F_GETLK		5
+ #define F_SETLK		6
+ #define F_SETLKW	7
+-#define F_SETLK64       16
+-#define F_SETLKW64      17
+ 
+-#define F_SETOWN	24	/*  for sockets. */
+-#define F_GETOWN	23	/*  for sockets. */
++#define F_SETOWN	8	/*  for sockets. */
++#define F_GETOWN	9	/*  for sockets. */
+ #define F_SETSIG	10	/*  for sockets. */
+ #define F_GETSIG	11	/*  for sockets. */
+ 
++#define F_GETLK64	12	/*  using 'struct flock64' */
++#define F_SETLK64	13
++#define F_SETLKW64	14
++
+ /* for F_[GET|SET]FL */
+ #define FD_CLOEXEC	1	/* actually anything with low bit set goes */
+ 
+@@ -73,26 +73,24 @@
+ 				   blocking */
+ #define LOCK_UN		8	/* remove lock */
+ 
+-#define LOCK_MAND	32	/* This is a mandatory flock ... */
+-#define LOCK_READ	64	/*  which allows concurrent read operations */
+-#define LOCK_WRITE	128	/*  which allows concurrent write operations */
+-#define LOCK_RW		192	/*  which allows concurrent read & write ops */
++#define LOCK_MAND	32	/* This is a mandatory flock */
++#define LOCK_READ	64	/* ... Which allows concurrent read operations */
++#define LOCK_WRITE	128	/* ... Which allows concurrent write operations */
++#define LOCK_RW		192	/* ... Which allows concurrent read & write ops */
+ 
+-typedef struct flock {
++struct flock {
+ 	short l_type;
+ 	short l_whence;
+-	__kernel_off_t l_start;
+-	__kernel_off_t l_len;
+-	long  l_sysid;
+-	__kernel_pid_t l_pid;
+-	long  pad[4];
+-} flock_t;
++	off_t l_start;
++	off_t l_len;
++	pid_t l_pid;
++};
+ 
+ struct flock64 {
+ 	short  l_type;
+ 	short  l_whence;
+-	__kernel_off_t l_start;
+-	__kernel_off_t l_len;
++	loff_t l_start;
++	loff_t l_len;
+ 	pid_t  l_pid;
+ };
+ 
+Index: linux-2.6.10/include/asm-xtensa/processor.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/processor.h
++++ linux-2.6.10/include/asm-xtensa/processor.h
+@@ -155,7 +155,8 @@ struct thread_struct {
+ 	regs->wmask = 1; \
+ 	regs->depc = 0; \
+ 	regs->windowbase = 0; \
+-	regs->windowstart = 1;
++	regs->windowstart = 1; \
++	regs->orig_a2 = -1;
+ 
+ /* Forward declaration */
+ struct task_struct;
+Index: linux-2.6.10/include/asm-xtensa/ptrace.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/ptrace.h
++++ linux-2.6.10/include/asm-xtensa/ptrace.h
+@@ -70,7 +70,7 @@
+ #define REG_DEPC	0x080000c0
+ #define	REG_EXCCAUSE	0x080000e8
+ #define REG_EXCVADDR	0x080000ee
+-#define SYSCALL_NR	0x1
++#define REG_ORIG_AREG2	0x1
+ 
+ #define AR_REGNO_TO_A_REGNO(ar, wb) (ar - wb*4) & ~(XCHAL_NUM_AREGS - 1)
+ 
+@@ -102,7 +102,7 @@ struct pt_regs {
+ 	unsigned long sar;		/*  44 */
+ 	unsigned long windowbase;	/*  48 */
+ 	unsigned long windowstart;	/*  52 */
+-	unsigned long syscall;		/*  56 */
++	unsigned long orig_a2;		/*  56 */
+ 	unsigned long icountlevel;	/*  60 */
+ 	int reserved[1];		/*  64 */
+ 
+@@ -128,7 +128,7 @@ struct pt_regs {
+ #define REG_GDB_DEPC        0x000002c0
+ #define REG_GDB_EXCCAUSE    0x000002e8
+ #define REG_GDB_EXCVADDR    0x000002ee
+-#define SYSCALL_NR      0x1
++#define REG_GDB_ORIG_AREG2  0x1
+                                                                                       
+ /* Note: can return illegal A reg numbers, i.e. > 15 */
+ #ifdef __KERNEL__
+Index: linux-2.6.10/include/asm-xtensa/sigcontext.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/sigcontext.h
++++ linux-2.6.10/include/asm-xtensa/sigcontext.h
+@@ -14,7 +14,6 @@
+ #include <asm/cpu/config.h>
+ #include <asm/coprocessor.h>
+ 
+-
+ struct _cpstate {
+ 	unsigned char _cpstate[XTENSA_CP_EXTRA_SIZE];
+ } __attribute__ ((aligned (XTENSA_CP_EXTRA_ALIGN)));
+@@ -24,20 +23,16 @@ struct sigcontext {
+ 	unsigned long	oldmask;
+ 
+ 	/* CPU registers */
++
+ 	unsigned long sc_pc;
+ 	unsigned long sc_ps;
+-	unsigned long sc_wmask;
+-	unsigned long sc_windowbase;
+-	unsigned long sc_windowstart;
+ 	unsigned long sc_lbeg;
+ 	unsigned long sc_lend;
+ 	unsigned long sc_lcount;
+ 	unsigned long sc_sar;
+-	unsigned long sc_depc;
+-	unsigned long sc_dareg0;
+-	unsigned long sc_treg[4];
+-	unsigned long sc_areg[XCHAL_NUM_AREGS];
+-	struct _cpstate *sc_cpstate;
++	unsigned long sc_acclo;
++	unsigned long sc_acchi;
++	unsigned long sc_a[16];
+ };
+ 
+ #endif /* _XTENSA_SIGCONTEXT_H */
+Index: linux-2.6.10/include/asm-xtensa/timex.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/timex.h
++++ linux-2.6.10/include/asm-xtensa/timex.h
+@@ -42,12 +42,12 @@
+ 
+ #ifdef CONFIG_XTENSA_CALIBRATE_CCOUNT
+ extern unsigned long ccount_per_jiffy;
+-extern unsigned long ccount_nsec;
++extern unsigned long nsec_per_ccount;
+ #define CCOUNT_PER_JIFFY ccount_per_jiffy
+-#define CCOUNT_NSEC ccount_nsec
++#define NSEC_PER_CCOUNT nsec_per_ccount
+ #else
+ #define CCOUNT_PER_JIFFY (CONFIG_XTENSA_CPU_CLOCK*(1000000UL/HZ))
+-#define CCOUNT_NSEC (1000000000UL / CONFIG_XTENSA_CPU_CLOCK)
++#define NSEC_PER_CCOUNT (1000000000UL / CONFIG_XTENSA_CPU_CLOCK)
+ #endif
+ 
+ 
+@@ -66,14 +66,14 @@ extern cycles_t cacheflush_time;
+  * Register access.
+  */
+ 
+-#define WSR_CCOUNT(r)	  __asm__("wsr %0,"__stringify(CCOUNT) :: "a" (r))
++#define WSR_CCOUNT(r)	  __asm__ __volatile__ ("wsr %0,"__stringify(CCOUNT) :: "a" (r))
+ #define RSR_CCOUNT(r)	  __asm__("rsr %0,"__stringify(CCOUNT) : "=a" (r))
+-#define WSR_CCOMPARE(x,r) __asm__("wsr %0,"__stringify(CCOMPARE_0)"+"__stringify(x) :: "a"(r))
++#define WSR_CCOMPARE(x,r) __asm__ __volatile__ ("wsr %0,"__stringify(CCOMPARE_0)"+"__stringify(x) :: "a"(r))
+ #define RSR_CCOMPARE(x,r) __asm__("rsr %0,"__stringify(CCOMPARE_0)"+"__stringify(x) : "=a"(r))
+ 
+-static inline unsigned long get_ccount (void)
++static inline unsigned long volatile get_ccount (void)
+ {
+-	unsigned long ccount;
++	unsigned long volatile ccount;
+ 	RSR_CCOUNT(ccount);
+ 	return ccount;
+ }
+@@ -83,9 +83,9 @@ static inline void set_ccount (unsigned 
+ 	WSR_CCOUNT(ccount);
+ }
+ 
+-static inline unsigned long get_linux_timer (void)
++static inline unsigned long volatile get_linux_timer (void)
+ {
+-	unsigned ccompare;
++	unsigned long volatile ccompare;
+ 	RSR_CCOMPARE(LINUX_TIMER, ccompare);
+ 	return ccompare;
+ }
+Index: linux-2.6.10/include/asm-xtensa/uaccess.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/uaccess.h
++++ linux-2.6.10/include/asm-xtensa/uaccess.h
+@@ -23,7 +23,6 @@
+ 
+ #ifdef __ASSEMBLY__
+ 
+-#define _ASMLANGUAGE
+ #include <asm/current.h>
+ #include <asm/offsets.h>
+ #include <asm/processor.h>
+@@ -184,7 +183,7 @@
+ 
+ static inline int verify_area(int type, const void * addr, unsigned long size)
+ {
+-        return access_ok(type, addr, size) ? 0 : -EFAULT;
++	return access_ok(type,addr,size) ? 0 : -EFAULT;
+ }
+ 
+ /*
+@@ -232,20 +231,21 @@ extern long __put_user_bad(void);
+ 	__pu_err;						\
+ })
+ 
+-#define __put_user_size(x,ptr,size,retval)			\
+-do {								\
+-	retval = 0;						\
+-	switch (size) {						\
+-        case 1: __put_user_asm(x,ptr,retval,1,"s8i");  break;	\
+-        case 2: __put_user_asm(x,ptr,retval,2,"s16i"); break;   \
+-        case 4: __put_user_asm(x,ptr,retval,4,"s32i"); break;   \
+-        case 8: {						\
+-		     __typeof__(*ptr) __v64 = x;		\
+-		     retval = __copy_to_user(ptr,&__v64,8);	\
+-		     break;					\
+-	        }						\
+-	default: __put_user_bad();				\
+-	}							\
++#define __put_user_size(x,ptr,size,retval)				\
++do {									\
++	int __cb;							\
++	retval = 0;							\
++	switch (size) {							\
++        case 1: __put_user_asm(x,ptr,retval,1,"s8i",__cb);  break;	\
++        case 2: __put_user_asm(x,ptr,retval,2,"s16i",__cb); break;	\
++        case 4: __put_user_asm(x,ptr,retval,4,"s32i",__cb); break;	\
++        case 8: {							\
++		     __typeof__(*ptr) __v64 = x;			\
++		     retval = __copy_to_user(ptr,&__v64,8);		\
++		     break;						\
++	        }							\
++	default: __put_user_bad();					\
++	}								\
+ } while (0)
+ 
+ 
+@@ -273,14 +273,14 @@ do {								\
+ #define __check_align_1  ""
+ 
+ #define __check_align_2				\
+-	"   _bbci.l %2,  0, 1f		\n"	\
+-	"   movi    %0, %3		\n"	\
++	"   _bbci.l %3,  0, 1f		\n"	\
++	"   movi    %0, %4		\n"	\
+ 	"   _j      2f			\n"
+ 
+ #define __check_align_4				\
+-	"   _bbsi.l %2,  0, 0f		\n"	\
+-	"   _bbci.l %2,  1, 1f		\n"	\
+-	"0: movi    %0, %3		\n"	\
++	"   _bbsi.l %3,  0, 0f		\n"	\
++	"   _bbci.l %3,  1, 1f		\n"	\
++	"0: movi    %0, %4		\n"	\
+ 	"   _j      2f			\n"
+ 
+ 
+@@ -292,24 +292,24 @@ do {								\
+  * WARNING: If you modify this macro at all, verify that the
+  * __check_align_* macros still work.
+  */
+-#define __put_user_asm(x, addr, err, align, insn) \
+-   __asm__ __volatile__(			\
+-	__check_align_##align			\
+-	"1: "insn"  %1, %2, 0		\n"	\
+-	"2:				\n"	\
+-	"   .section  .fixup,\"ax\"	\n"	\
+-	"   .align 4			\n"	\
+-	"4:				\n"	\
+-	"   .long  2b			\n"	\
+-	"5:				\n"	\
+-	"   l32r   %2, 4b		\n"	\
+-        "   movi   %0, %3		\n"	\
+-        "   jx     %2			\n"	\
+-	"   .previous			\n"	\
+-	"   .section  __ex_table,\"a\"	\n"	\
+-	"   .long	1b, 5b		\n"	\
+-	"   .previous"				\
+-	:"=r" (err)				\
++#define __put_user_asm(x, addr, err, align, insn, cb)	\
++   __asm__ __volatile__(				\
++	__check_align_##align				\
++	"1: "insn"  %2, %3, 0		\n"		\
++	"2:				\n"		\
++	"   .section  .fixup,\"ax\"	\n"		\
++	"   .align 4			\n"		\
++	"4:				\n"		\
++	"   .long  2b			\n"		\
++	"5:				\n"		\
++	"   l32r   %1, 4b		\n"		\
++        "   movi   %0, %4		\n"		\
++        "   jx     %1			\n"		\
++	"   .previous			\n"		\
++	"   .section  __ex_table,\"a\"	\n"		\
++	"   .long	1b, 5b		\n"		\
++	"   .previous"					\
++	:"=r" (err), "=r" (cb)				\
+ 	:"r" ((int)(x)), "r" (addr), "i" (-EFAULT), "0" (err))
+ 
+ #define __get_user_nocheck(x,ptr,size)				\
+@@ -334,11 +334,12 @@ extern long __get_user_bad(void);
+ 
+ #define __get_user_size(x,ptr,size,retval)				\
+ do {									\
++	int __cb;							\
+ 	retval = 0;							\
+         switch (size) {							\
+-          case 1: __get_user_asm(x,ptr,retval,1,"l8ui");  break;	\
+-          case 2: __get_user_asm(x,ptr,retval,2,"l16ui"); break;	\
+-          case 4: __get_user_asm(x,ptr,retval,4,"l32i");  break;	\
++          case 1: __get_user_asm(x,ptr,retval,1,"l8ui",__cb);  break;	\
++          case 2: __get_user_asm(x,ptr,retval,2,"l16ui",__cb); break;	\
++          case 4: __get_user_asm(x,ptr,retval,4,"l32i",__cb);  break;	\
+           case 8: retval = __copy_from_user(&x,ptr,8);    break;	\
+           default: (x) = __get_user_bad();				\
+         }								\
+@@ -349,25 +350,25 @@ do {									\
+  * WARNING: If you modify this macro at all, verify that the
+  * __check_align_* macros still work.
+  */
+-#define __get_user_asm(x, addr, err, align, insn) \
++#define __get_user_asm(x, addr, err, align, insn, cb) \
+    __asm__ __volatile__(			\
+ 	__check_align_##align			\
+-	"1: "insn"  %1, %2, 0		\n"	\
++	"1: "insn"  %2, %3, 0		\n"	\
+ 	"2:				\n"	\
+ 	"   .section  .fixup,\"ax\"	\n"	\
+ 	"   .align 4			\n"	\
+ 	"4:				\n"	\
+ 	"   .long  2b			\n"	\
+ 	"5:				\n"	\
+-	"   l32r   %2, 4b		\n"	\
+-	"   movi   %1, 0		\n"	\
+-        "   movi   %0, %3		\n"	\
+-        "   jx     %2			\n"	\
++	"   l32r   %1, 4b		\n"	\
++	"   movi   %2, 0		\n"	\
++        "   movi   %0, %4		\n"	\
++        "   jx     %1			\n"	\
+ 	"   .previous			\n"	\
+ 	"   .section  __ex_table,\"a\"	\n"	\
+ 	"   .long	1b, 5b		\n"	\
+ 	"   .previous"				\
+-	:"=r" (err), "=r" (x)			\
++	:"=r" (err), "=r" (cb), "=r" (x)	\
+ 	:"r" (addr), "i" (-EFAULT), "0" (err))
+ 
+ 
+@@ -435,7 +436,7 @@ __generic_copy_from_user(void *to, const
+  * success.
+  */
+ 
+-extern inline unsigned long
++static inline unsigned long
+ __xtensa_clear_user(void *addr, unsigned long size)
+ {
+ 	if ( ! memset(addr, 0, size) )
+@@ -443,7 +444,7 @@ __xtensa_clear_user(void *addr, unsigned
+ 	return 0;
+ }
+ 
+-extern inline unsigned long
++static inline unsigned long
+ clear_user(void *addr, unsigned long size)
+ {
+ 	if (access_ok(VERIFY_WRITE, addr, size))
+@@ -457,7 +458,7 @@ clear_user(void *addr, unsigned long siz
+ extern long __strncpy_user(char *, const char *, long);
+ #define __strncpy_from_user __strncpy_user
+ 
+-extern inline long
++static inline long
+ strncpy_from_user(char *dst, const char *src, long count)
+ {
+ 	if (access_ok(VERIFY_READ, src, 1))
+@@ -473,7 +474,7 @@ strncpy_from_user(char *dst, const char 
+  */
+ extern long __strnlen_user(const char *, long);
+ 
+-extern inline long strnlen_user(const char *str, long len)
++static inline long strnlen_user(const char *str, long len)
+ {
+ 	unsigned long top = __kernel_ok ? ~0UL : TASK_SIZE - 1;
+ 
+Index: linux-2.6.10/include/asm-xtensa/unistd.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-xtensa/unistd.h
++++ linux-2.6.10/include/asm-xtensa/unistd.h
+@@ -79,9 +79,9 @@ __SYSCALL( 28, sys_truncate64, 2)
+ #define __NR_ftruncate64 			 29
+ __SYSCALL( 29, sys_ftruncate64, 2)
+ #define __NR_pread64 				 30
+-__SYSCALL( 30, sys_pread64, 5)
++__SYSCALL( 30, sys_pread64, 6)
+ #define __NR_pwrite64 				 31
+-__SYSCALL( 31, sys_pwrite64, 5)
++__SYSCALL( 31, sys_pwrite64, 6)
+ 
+ #define __NR_link 				 32
+ __SYSCALL( 32, sys_link, 2)
+@@ -487,11 +487,11 @@ __SYSCALL(218, sys_sched_rr_get_interval
+ __SYSCALL(219, sys_sched_yield, 0)
+ #define __NR_reserved222 			222
+ __SYSCALL(222, sys_ni_syscall, 0)
+-#define __NR_reserved219 			223
+-__SYSCALL(223, sys_ni_syscall, 0)
+ 
+ /* Signal Handling */
+ 
++#define __NR_restart_syscall 			223
++__SYSCALL(223, sys_restart_syscall, 0)
+ #define __NR_sigaltstack 			224
+ __SYSCALL(224, xtensa_sigaltstack, 2)
+ #define __NR_rt_sigreturn 			225
+Index: linux-2.6.10/mvl_patches/pro-1105.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1105.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1105);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

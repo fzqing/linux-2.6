@@ -1,0 +1,595 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc32_add_platform_device_functions
+# Date: Thu Jun  1 09:11:29 2006
+# Source: MontaVista Software, Inc.
+# MR: 16533
+# Type: Enhancement
+# Disposition: submitted to linuxppc-embedded@ozlabs.org
+# Signed-off-by: Vitaly Bordug <vbordug@ru.mvista.com>
+# Signed-off-by: Marcelo Tosatti <marcelo.tosatti@cyclades.com>
+# Description:
+#     Implemented by  modification of the .name field of the platform device,
+#     when PDs with the
+#     same names are to be used within different drivers, as
+#     <device_name> -> <device_name>:<function>
+#     Corresponding drivers should change the .name in struct device_driver to
+#     reflect upper of course.
+# 
+#     Added ppc_sys_device_disable/enable function set, making it easier to
+#     disable all the inexistent/not utilized platform device way pdevs. By the
+#     check of the "disabled" bit in the config field of ppc_sys_specs, disabled
+#     platform devices will be either added/removed from the bus, or simply not
+#     registered on it, depending on the time when disable/enable call asserted.
+# 
+#     The default behaviour when nothing is disabled/enabled will be "all devices
+#     are enabled", which is the same as before.
+# 
+#     Also helper platform_notify_map function added, making assignment of
+#     board-specific platform_info more consistent and generic.
+# 
+#  arch/ppc/syslib/ppc_sys.c |  176 +++++++++++++++++++++++++++++++++++++++++++++-
+#  include/asm-ppc/mpc8260.h |    1 
+#  include/asm-ppc/mpc83xx.h |    1 
+#  include/asm-ppc/mpc85xx.h |    1 
+#  include/asm-ppc/mpc8xx.h  |    1 
+#  include/asm-ppc/ppc_sys.h |   32 ++++++++
+#  6 files changed, 209 insertions(+), 3 deletions(-)
+# 
+
+PATCHNUM=603
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16533
+Type: Enhancement
+Disposition: submitted to linuxppc-embedded@ozlabs.org
+Signed-off-by: Vitaly Bordug <vbordug@ru.mvista.com>
+Signed-off-by: Marcelo Tosatti <marcelo.tosatti@cyclades.com>
+Description:
+    Implemented by  modification of the .name field of the platform device,
+    when PDs with the
+    same names are to be used within different drivers, as
+    <device_name> -> <device_name>:<function>
+    Corresponding drivers should change the .name in struct device_driver to
+    reflect upper of course.
+
+    Added ppc_sys_device_disable/enable function set, making it easier to
+    disable all the inexistent/not utilized platform device way pdevs. By the
+    check of the "disabled" bit in the config field of ppc_sys_specs, disabled
+    platform devices will be either added/removed from the bus, or simply not
+    registered on it, depending on the time when disable/enable call asserted.
+
+    The default behaviour when nothing is disabled/enabled will be "all devices
+    are enabled", which is the same as before.
+
+    Also helper platform_notify_map function added, making assignment of
+    board-specific platform_info more consistent and generic.
+
+ arch/ppc/syslib/ppc_sys.c |  176 +++++++++++++++++++++++++++++++++++++++++++++-
+ include/asm-ppc/mpc8260.h |    1 
+ include/asm-ppc/mpc83xx.h |    1 
+ include/asm-ppc/mpc85xx.h |    1 
+ include/asm-ppc/mpc8xx.h  |    1 
+ include/asm-ppc/ppc_sys.h |   32 ++++++++
+ mvl_patches/pro-0603.c    |   16 ++++
+ 7 files changed, 225 insertions(+), 3 deletions(-)
+
+Index: linux-2.6.10/arch/ppc/syslib/ppc_sys.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc_sys.c
++++ linux-2.6.10/arch/ppc/syslib/ppc_sys.c
+@@ -19,6 +19,16 @@
+ int (*ppc_sys_device_fixup) (struct platform_device * pdev);
+ 
+ static int ppc_sys_inited;
++static int ppc_sys_func_inited;
++
++static const char *ppc_sys_func_names[] = {
++	[PPC_SYS_FUNC_DUMMY] = "dummy",
++	[PPC_SYS_FUNC_ETH] = "eth",
++	[PPC_SYS_FUNC_UART] = "uart",
++	[PPC_SYS_FUNC_HLDC] = "hldc",
++	[PPC_SYS_FUNC_USB] = "usb",
++	[PPC_SYS_FUNC_IRDA] = "irda",
++};
+ 
+ void __init identify_ppc_sys_by_id(u32 id)
+ {
+@@ -37,13 +47,13 @@ void __init identify_ppc_sys_by_id(u32 i
+ void __init identify_ppc_sys_by_name(char *name)
+ {
+ 	unsigned int i = 0;
+-	while (ppc_sys_specs[i].ppc_sys_name[0])
+-	{
++	while (ppc_sys_specs[i].ppc_sys_name[0]) {
+ 		if (!strcmp(ppc_sys_specs[i].ppc_sys_name, name))
+ 			break;
+ 		i++;
+ 	}
+ 	cur_ppc_sys_spec = &ppc_sys_specs[i];
++
+ 	return;
+ }
+ 
+@@ -127,6 +137,165 @@ void ppc_sys_device_remove(enum ppc_sys_
+ 	}
+ }
+ 
++/* Platform-notify mapping
++ * Helper function for BSP code to assign board-specific platfom-divice bits
++ */
++
++void platform_notify_map(const struct platform_notify_dev_map *map,
++			 struct device *dev)
++{
++	struct platform_device *pdev;
++	int len, idx;
++	const char *s;
++
++	/* do nothing if no device or no bus_id */
++	if (!dev || !dev->bus_id)
++		return;
++
++	/* call per device map */
++	while (map->bus_id != NULL) {
++		idx = -1;
++		s = strrchr(dev->bus_id, '.');
++		if (s != NULL)
++			idx = (int)simple_strtol(s + 1, NULL, 10);
++		else
++			s = dev->bus_id;
++
++		len = s - dev->bus_id;
++
++		if (!strncmp(dev->bus_id, map->bus_id, len)) {
++			pdev = container_of(dev, struct platform_device, dev);
++			map->rtn(pdev, idx);
++		}
++		map++;
++	}
++}
++
++/*
++   Function assignment stuff.
++ Intended to work as follows:
++ the device name defined in foo_devices.c will be concatenated with :"func",
++ where func is string map of respective function from platfom_device_func enum
++
++ The PPC_SYS_FUNC_DUMMY function is intended to remove all assignments, making the device to appear
++ in platform bus with unmodified name.
++ */
++
++/*
++   Here we'll replace .name pointers with fixed-lenght strings
++   Hereby, this should be called *before* any func stuff triggeded.
++ */
++void ppc_sys_device_initfunc(void)
++{
++	int i;
++	const char *name;
++	static char new_names[NUM_PPC_SYS_DEVS][BUS_ID_SIZE];
++	enum ppc_sys_devices cur_dev;
++
++	/* If inited yet, do nothing */
++	if (ppc_sys_func_inited)
++		return;
++
++	for (i = 0; i < cur_ppc_sys_spec->num_devices; i++) {
++		if ((cur_dev = cur_ppc_sys_spec->device_list[i]) < 0)
++			continue;
++
++		if (ppc_sys_platform_devices[cur_dev].name) {
++			/*backup name */
++			name = ppc_sys_platform_devices[cur_dev].name;
++			strlcpy(new_names[i], name, BUS_ID_SIZE);
++			ppc_sys_platform_devices[cur_dev].name = new_names[i];
++		}
++	}
++
++	ppc_sys_func_inited = 1;
++}
++
++/*The "engine" of the func stuff. Here we either concat specified function string description
++ to the name, or remove it if PPC_SYS_FUNC_DUMMY parameter is passed here*/
++void ppc_sys_device_setfunc(enum ppc_sys_devices dev,
++			    enum platform_device_func func)
++{
++	char *s;
++	char *name = (char *)ppc_sys_platform_devices[dev].name;
++	char tmp[BUS_ID_SIZE];
++
++	if (!ppc_sys_func_inited) {
++		printk(KERN_ERR "Unable to alter function - not inited!\n");
++		return;
++	}
++
++	if (ppc_sys_inited) {
++		platform_device_unregister(&ppc_sys_platform_devices[dev]);
++	}
++
++	if ((s = (char *)strchr(name, ':')) != NULL) {	/* reassign */
++		/* Either change the name after ':' or remove func modifications */
++		if (func != PPC_SYS_FUNC_DUMMY)
++			strlcpy(s + 1, ppc_sys_func_names[func], BUS_ID_SIZE);
++		else
++			*s = 0;
++	} else if (func != PPC_SYS_FUNC_DUMMY) {
++		/* do assignment if it is not just "clear"  request */
++		sprintf(tmp, "%s:%s", name, ppc_sys_func_names[func]);
++		strlcpy(name, tmp, BUS_ID_SIZE);
++	}
++
++	if (ppc_sys_inited) {
++		platform_device_register(&ppc_sys_platform_devices[dev]);
++	}
++}
++
++void ppc_sys_device_disable(enum ppc_sys_devices dev)
++{
++	BUG_ON(cur_ppc_sys_spec == NULL);
++
++	/*Check if it is enabled*/
++	if(!(cur_ppc_sys_spec->config[dev] & PPC_SYS_CONFIG_DISABLED)) {
++		if (ppc_sys_inited) {
++			platform_device_unregister(&ppc_sys_platform_devices[dev]);
++		}
++		cur_ppc_sys_spec->config[dev] |= PPC_SYS_CONFIG_DISABLED;
++	}
++}
++
++void ppc_sys_device_enable(enum ppc_sys_devices dev)
++{
++	BUG_ON(cur_ppc_sys_spec == NULL);
++
++	/*Check if it is disabled*/
++	if(cur_ppc_sys_spec->config[dev] & PPC_SYS_CONFIG_DISABLED) {
++		if (ppc_sys_inited) {
++			platform_device_register(&ppc_sys_platform_devices[dev]);
++		}
++		cur_ppc_sys_spec->config[dev] &= ~PPC_SYS_CONFIG_DISABLED;
++	}
++
++}
++
++void ppc_sys_device_enable_all(void)
++{
++	enum ppc_sys_devices cur_dev;
++	int i;
++
++	for (i = 0; i < cur_ppc_sys_spec->num_devices; i++) {
++		cur_dev = cur_ppc_sys_spec->device_list[i];
++		ppc_sys_device_enable(cur_dev);
++	}
++}
++
++void ppc_sys_device_disable_all(void)
++{
++	enum ppc_sys_devices cur_dev;
++	int i;
++
++	for (i = 0; i < cur_ppc_sys_spec->num_devices; i++) {
++		cur_dev = cur_ppc_sys_spec->device_list[i];
++		ppc_sys_device_disable(cur_dev);
++	}
++}
++
++
+ static int __init ppc_sys_init(void)
+ {
+ 	unsigned int i, dev_id, ret = 0;
+@@ -135,7 +304,8 @@ static int __init ppc_sys_init(void)
+ 
+ 	for (i = 0; i < cur_ppc_sys_spec->num_devices; i++) {
+ 		dev_id = cur_ppc_sys_spec->device_list[i];
+-		if (dev_id != -1) {
++		if ((dev_id != -1) &&
++		!(cur_ppc_sys_spec->config[dev_id] & PPC_SYS_CONFIG_DISABLED)) {
+ 			if (ppc_sys_device_fixup != NULL)
+ 				ppc_sys_device_fixup(&ppc_sys_platform_devices
+ 						     [dev_id]);
+Index: linux-2.6.10/include/asm-ppc/mpc8260.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc8260.h
++++ linux-2.6.10/include/asm-ppc/mpc8260.h
+@@ -84,6 +84,7 @@ enum ppc_sys_devices {
+ 	MPC82xx_CPM_USB,
+ 	MPC82xx_SEC1,
+ 	MPC82xx_MDIO_BB,
++	NUM_PPC_SYS_DEVS,
+ };
+ 
+ #ifndef __ASSEMBLY__
+Index: linux-2.6.10/include/asm-ppc/mpc83xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc83xx.h
++++ linux-2.6.10/include/asm-ppc/mpc83xx.h
+@@ -138,6 +138,7 @@ enum ppc_sys_devices {
+ 	MPC83xx_USB2_DR,
+ 	MPC83xx_USB2_MPH,
+ 	MPC83xx_MDIO,
++	NUM_PPC_SYS_DEVS,
+ };
+ 
+ #endif /* CONFIG_83xx */
+Index: linux-2.6.10/include/asm-ppc/mpc85xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc85xx.h
++++ linux-2.6.10/include/asm-ppc/mpc85xx.h
+@@ -138,6 +138,7 @@ enum ppc_sys_devices {
+ 	MPC85xx_IIC2,
+ 	MPC85xx_MDIO,
+ 	MPC85xx_MDIO_BB,
++	NUM_PPC_SYS_DEVS,
+ };
+ 
+ /* Internal interrupts are all Level Sensitive, and Positive Polarity */
+Index: linux-2.6.10/include/asm-ppc/mpc8xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc8xx.h
++++ linux-2.6.10/include/asm-ppc/mpc8xx.h
+@@ -116,6 +116,7 @@ enum ppc_sys_devices {
+ 	MPC8xx_CPM_SMC2,
+ 	MPC8xx_CPM_USB,
+ 	MPC8xx_MDIO_FEC,
++	NUM_PPC_SYS_DEVS,
+ };
+ 
+ #ifndef BOARD_CHIP_NAME
+Index: linux-2.6.10/include/asm-ppc/ppc_sys.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/ppc_sys.h
++++ linux-2.6.10/include/asm-ppc/ppc_sys.h
+@@ -40,9 +40,26 @@ struct ppc_sys_spec {
+ 	u32 			value;
+ 	u32 			num_devices;
+ 	char 			*ppc_sys_name;
++	u8			config[NUM_PPC_SYS_DEVS];
+ 	enum ppc_sys_devices 	*device_list;
+ };
+ 
++struct platform_notify_dev_map {
++	const char *bus_id;
++	void (*rtn)(struct platform_device * pdev, int idx);
++};
++
++enum platform_device_func {
++	PPC_SYS_FUNC_DUMMY = 0,
++	PPC_SYS_FUNC_ETH = 1,
++	PPC_SYS_FUNC_UART = 2,
++	PPC_SYS_FUNC_HLDC = 3,
++	PPC_SYS_FUNC_USB = 4,
++	PPC_SYS_FUNC_IRDA = 5,
++};
++
++#define PPC_SYS_CONFIG_DISABLED		1
++
+ /* describes all specific chips and which devices they have on them */
+ extern struct ppc_sys_spec ppc_sys_specs[];
+ extern struct ppc_sys_spec *cur_ppc_sys_spec;
+@@ -68,5 +85,20 @@ extern void *ppc_sys_get_pdata(enum ppc_
+ /* remove a device from the system */
+ extern void ppc_sys_device_remove(enum ppc_sys_devices dev);
+ 
++/* Function assignment stuff */
++void ppc_sys_device_initfunc(void);
++void ppc_sys_device_setfunc(enum ppc_sys_devices dev,
++			    enum platform_device_func func);
++void ppc_sys_device_set_func_all(enum platform_device_func func);
++
++void platform_notify_map(const struct platform_notify_dev_map *map,
++			 struct device *dev);
++
++/* Enable / disable stuff */
++void ppc_sys_device_disable(enum ppc_sys_devices dev);
++void ppc_sys_device_enable(enum ppc_sys_devices dev);
++void ppc_sys_device_enable_all(void);
++void ppc_sys_device_disable_all(void);
++
+ #endif				/* __ASM_PPC_SYS_H */
+ #endif				/* __KERNEL__ */
+Index: linux-2.6.10/mvl_patches/pro-0603.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0603.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(603);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

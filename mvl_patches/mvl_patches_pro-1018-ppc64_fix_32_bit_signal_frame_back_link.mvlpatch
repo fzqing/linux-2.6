@@ -1,0 +1,287 @@
+#! /usr/bin/env bash
+# Patch: -ppc64_fix_32_bit_signal_frame_back_link
+# Date: Mon Jan 22 08:17:57 2007
+# Source: MontaVista Software
+# MR: 21279
+# Type: Defect fix
+# Disposition: backport of linux-2.6.12-rc4
+# minor hand patching, line numbers where off, RT is my guess.
+# 
+# From 9747dd6fa98f2983f4dd09cd6dad1fa3d2a4c5f2 Mon Sep 17 00:00:00 2001
+# From: Paul Mackerras <paulus@samba.org>
+# Date: Sat, 30 Apr 2005 10:01:40 -0700
+# Subject: [PATCH 1/1] [PATCH] ppc64: fix 32-bit signal frame back link
+# 
+# When the kernel creates a signal frame on the user stack, it puts the
+# old stack pointer value at the beginning so that the signal frame is
+# linked into the chain of stack frames like any other frame.
+# Unfortunately, for 32-bit processes we are writing the old stack
+# pointer as a 64-bit value rather than a 32-bit value, and the process
+# sees that as a null pointer, since it only looks at the first 32 bits,
+# which are zero since ppc is bigendian and the stack pointer is below
+# 4GB.  This bug is in SLES9 and RHEL4 too, hence the ccs.
+# 
+# This patch fixes the bug by making the signal code write the old stack
+# pointer as a u32 instead of an unsigned long.
+# 
+# Signed-off-by: Paul Mackerras <paulus@samba.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1018
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software
+MR: 21279
+Type: Defect fix
+Disposition: backport of linux-2.6.12-rc4
+minor hand patching, line numbers where off, RT is my guess.
+
+From 9747dd6fa98f2983f4dd09cd6dad1fa3d2a4c5f2 Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@samba.org>
+Date: Sat, 30 Apr 2005 10:01:40 -0700
+Subject: [PATCH 1/1] [PATCH] ppc64: fix 32-bit signal frame back link
+
+When the kernel creates a signal frame on the user stack, it puts the
+old stack pointer value at the beginning so that the signal frame is
+linked into the chain of stack frames like any other frame.
+Unfortunately, for 32-bit processes we are writing the old stack
+pointer as a 64-bit value rather than a 32-bit value, and the process
+sees that as a null pointer, since it only looks at the first 32 bits,
+which are zero since ppc is bigendian and the stack pointer is below
+4GB.  This bug is in SLES9 and RHEL4 too, hence the ccs.
+
+This patch fixes the bug by making the signal code write the old stack
+pointer as a u32 instead of an unsigned long.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/arch/ppc64/kernel/signal32.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc64/kernel/signal32.c
++++ linux-2.6.10/arch/ppc64/kernel/signal32.c
+@@ -689,7 +689,7 @@ static int handle_rt_signal32(unsigned l
+ 	if (save_user_regs(regs, frame, __NR_rt_sigreturn))
+ 		goto badframe;
+ 
+-	if (put_user(regs->gpr[1], (unsigned long __user *)newsp))
++	if (put_user(regs->gpr[1], (u32 __user *)newsp))
+ 		goto badframe;
+ 	regs->gpr[1] = (unsigned long) newsp;
+ 	regs->gpr[3] = sig;
+@@ -859,7 +859,7 @@ static int handle_signal32(unsigned long
+ 	if (save_user_regs(regs, &frame->mctx, __NR_sigreturn))
+ 		goto badframe;
+ 
+-	if (put_user(regs->gpr[1], (unsigned long __user *)newsp))
++	if (put_user(regs->gpr[1], (u32 __user *)newsp))
+ 		goto badframe;
+ 	regs->gpr[1] = (unsigned long) newsp;
+ 	regs->gpr[3] = sig;
+Index: linux-2.6.10/mvl_patches/pro-1018.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1018.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1018);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

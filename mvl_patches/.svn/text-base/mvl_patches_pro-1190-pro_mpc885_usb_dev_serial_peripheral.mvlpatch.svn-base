@@ -1,0 +1,1940 @@
+#! /usr/bin/env bash
+# Patch: -pro_mpc885_usb_dev_serial_peripheral
+# Date: Tue Mar  6 16:12:22 2007
+# Source: MontaVista Software, Inc.
+# MR: 
+# Type: Enhancement
+# Disposition: needs submitting to upstream
+# Signed-off-by: Gennadiy Kurtsman <gkurtsman@ru.mvista.com>
+# Description:
+#     MPC885 peripheral controller for USB serial gadget driver
+# 
+
+PATCHNUM=1190
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 
+Type: Enhancement
+Disposition: needs submitting to upstream
+Signed-off-by: Gennadiy Kurtsman <gkurtsman@ru.mvista.com>
+Description:
+    MPC885 peripheral controller for USB serial gadget driver
+
+Index: linux-2.6.10/drivers/usb/gadget/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/Kconfig
++++ linux-2.6.10/drivers/usb/gadget/Kconfig
+@@ -242,6 +242,12 @@ config USB_OTG
+ 
+ 	   Select this only if your OMAP board has a Mini-AB connector.
+ 
++config USB_GADGET_MPC885ADS
++	boolean "MPC885ADS USB device controller"
++	depends on MPC885ADS
++	help
++	   Intended to support USB serial gadget.
++
+ config USB_GADGET_MPC8272ADS
+ 	boolean "MPC8272ADS/PQ2FADS Support"
+ 	depends on (ADS8272 || PQ2FADS)
+Index: linux-2.6.10/drivers/usb/gadget/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/Makefile
++++ linux-2.6.10/drivers/usb/gadget/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_USB_LH7A40X)	+= lh7a40x_udc
+ obj-$(CONFIG_USB_PXA27X)	+= pxa27x_udc.o
+ obj-$(CONFIG_USB_MPC8272ADS)	+= mpc8272_udcper.o
+ obj-$(CONFIG_USB_MUSBHSFC)	+= musbhsfc_udc.o
++obj-$(CONFIG_USB_GADGET_MPC885ADS)	+= mpc885_udc.o
+ 
+ #
+ # USB gadget drivers
+Index: linux-2.6.10/drivers/usb/gadget/mpc885_udc.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/gadget/mpc885_udc.c
+@@ -0,0 +1,1044 @@
++/*
++ * Driver for the MPC885 on-chip peripheral USB device controller.
++ * Specs and errata are available from <http://www.freescale.com>.
++ *
++ * This driver should work well with Serial "gadget" driver.
++ *
++ * Author: Gennadiy Kurtsman <source@mvista.com>
++ *
++ * Based on:
++ * Montavista Pro 3.1 8xx USB-based tty device driver, by Yuri Shpilevsly
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ *
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/delay.h>
++#include <linux/ioport.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/smp_lock.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/timer.h>
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/moduleparam.h>
++#include <linux/device.h>
++#include <linux/usb.h>
++#include <linux/usb_ch9.h>
++#include <linux/usb_gadget.h>
++
++#include <asm/byteorder.h>
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++#include <asm/system.h>
++#include <asm/unaligned.h>
++#include <asm/8xx_immap.h>
++#include <asm/commproc.h>
++#include "mpc885_udc.h"
++
++static struct _mpc885_udc_dev *the_controller = NULL;
++static struct _mpc885_udc_dev *the_controller_pa = NULL;
++
++static const char driver_name[] = "mpc885_udc, 2006, march 27";
++
++#define EP0_NAME "ep0"
++#define EP_IN_NAME "ep-in"
++#define EP_OUT_NAME "ep-out"
++
++static const char *ep_name[] = {
++	EP0_NAME,
++	EP_IN_NAME,
++	EP_OUT_NAME,
++};
++
++/* Parse standard setup request */
++static inline int
++mpc885_usbc_setup(struct mpc885_usbc_ep *ep, __u8 * data, int len,
++		  unsigned long flags)
++{
++	struct _mpc885_udc_dev *usbc_dev = ep->dev;
++	struct usb_ctrlrequest *cmd =
++	    (struct usb_ctrlrequest *)(data - ep->rx_pool + ep->rx_pool_va);
++	__u16 typeReq, wValue, wIndex, wLength;
++	int ret = -EINVAL;
++	int handshake;
++
++	if (len != 8)
++		return ret;
++	typeReq = (cmd->bRequestType << 8) | cmd->bRequest;
++	wValue = le16_to_cpu(cmd->wValue);
++	wIndex = le16_to_cpu(cmd->wIndex);
++	wLength = le16_to_cpu(cmd->wLength);
++	handshake = 1;
++
++	data = usbc_dev->ctrl_data_va;
++
++	switch (typeReq) {
++	case DeviceRequest | USB_REQ_GET_STATUS:
++	case EndpointRequest | USB_REQ_GET_STATUS:
++		data[0] = 0;
++		data[1] = 0;
++		len = 2;
++		ret = 0;
++		break;
++
++	case DeviceOutRequest | USB_REQ_SET_ADDRESS:
++		/* Assign address */
++		usbc_dev->address = (__u8) wValue;
++		len = 0;
++		ret = 0;
++		handshake = 0;
++		break;
++
++	default:
++		spin_unlock_irqrestore(&ep->rxirq_lock, flags);
++		if (cmd->bRequest == USB_REQ_SET_CONFIGURATION) {
++			/* according to USB Spec */
++			usbc_dev->eps[1].pid = BD_USB_PID0;
++			usbc_dev->eps[2].pid = BD_USB_RXPID_0;
++		}
++		ret = usbc_dev->driver->setup(&usbc_dev->gadget, cmd);
++		if (ret >= 0)
++			len = usbc_dev->ctrl_length;
++		spin_lock_irqsave(&ep->rxirq_lock, flags);
++	}
++	if (ret < 0)
++		return ret;
++	else {
++		if (len > wLength)
++			len = wLength;
++		/* this for setup packet must start from DATA1 */
++		ep->pid = BD_USB_PID1;
++		if ((cmd->bRequest == USB_REQ_GET_DESCRIPTOR)
++		    && ((wValue >> 8) == USB_DT_DEVICE)) {
++			((struct usb_device_descriptor *)data)->
++			    bMaxPacketSize0 = UDC_USBC_CTL_PACKET_SIZE;
++			if (wLength > 8) {
++				((struct usb_device_descriptor *)data)->
++				    idVendor = cpu_to_le16(0x6655);
++				((struct usb_device_descriptor *)data)->
++				    idProduct = cpu_to_le16(0xffff);
++			}
++		}
++		if ((cmd->bRequest == USB_REQ_GET_DESCRIPTOR) &&
++		    ((wValue >> 8) == USB_DT_CONFIG) &&
++		    (len == sizeof(struct usb_config_descriptor) +
++		     sizeof(struct usb_interface_descriptor) +
++		     (sizeof(struct usb_endpoint_descriptor) -
++		      2) * (UDC_USBC_MAX_EPS - 1))) {
++			struct usb_endpoint_descriptor *ed =
++			    (struct usb_endpoint_descriptor *)(data +
++							       sizeof(struct
++								      usb_config_descriptor)
++							       +
++							       sizeof(struct
++								      usb_interface_descriptor));
++			int i;
++
++			for (i = 0; i < (UDC_USBC_MAX_EPS - 1); i++) {
++				ed->wMaxPacketSize =
++				    cpu_to_le16(UDC_USBC_PACKET_SIZE);
++				ed = (struct usb_endpoint_descriptor *)((u8 *)
++									ed +
++									sizeof
++									(struct
++									 usb_endpoint_descriptor)
++									- 2);
++			}
++		}
++		mpc885_usbc_tx_data(ep, usbc_dev->ctrl_data, len);
++	}
++	return ret;
++}
++
++/* Reset Interrupt handler */
++static void
++mpc885_usbc_reset_isr(struct _mpc885_udc_dev *usbc_dev)
++{
++	int i;
++
++	for (i = 0; i < UDC_USBC_MAX_EPS; i++) {
++		mpc885_usbc_tx_recover(&usbc_dev->eps[i]);
++	}
++	usbc_dev->usb_prms->frame_n = 0;
++	usbc_dev->usb_rgs->usadr = 0;
++}
++
++static irqreturn_t
++mpc885_usbc_isr(int irq, void *_dev, struct pt_regs *r)
++{
++	struct _mpc885_udc_dev *usbc_dev = _dev;
++	__u16 usb_usber = usbc_dev->usb_rgs->usber;
++	int i;
++
++	/* Confirm */
++	usbc_dev->usb_rgs->usber = usb_usber;
++
++	if ((usb_usber & USBE_RXB)) {
++		/* Handle receive */
++		for (i = 0; i < UDC_USBC_MAX_EPS; i++)
++			mpc885_usbc_rx_isr(usbc_dev, i);
++	}
++	if ((usb_usber & USBE_TXB)) {
++		/* Handle transmit confirmation */
++		for (i = 0; i < UDC_USBC_MAX_EPS; i++)
++			mpc885_usbc_tx_isr(usbc_dev, i);
++	}
++	if ((usb_usber & USBE_RESET)) {
++		/* Reset. Clear address and kill all transactions in progress */
++		mpc885_usbc_reset_isr(usbc_dev);
++	}
++	if ((usb_usber & USBE_ERROR)) {
++		if ((usb_usber &
++		     (USBE_TXE0 | USBE_TXE1 | USBE_TXE2 | USBE_TXE3))) ;
++	}
++
++	return IRQ_HANDLED;
++}
++
++static void
++mpc885_usbc_kick_tx(struct _mpc885_udc_dev *usbc_dev)
++{
++
++	struct mpc885_usbc_ep *ep = &usbc_dev->eps[1];	/* bulk-in */
++	int len = __mpc885_usbc_buf_len_flat(&ep->dev->write_buf);
++	unsigned long flags;
++
++	if (!len)
++		return;
++	if (len > UDC_USBC_PACKET_SIZE)
++		len = UDC_USBC_PACKET_SIZE;
++	spin_lock_irqsave(&ep->txbd_lock, flags);
++	mpc885_usbc_tx_data(ep,
++			    ep->dev->write_buf.buffer_pa +
++			    ep->dev->write_buf.read_pos, len);
++	spin_unlock_irqrestore(&ep->txbd_lock, flags);
++}
++
++/* EP0 0 control receive callback */
++static int
++mpc885_usbc_rx_ctrl(struct mpc885_usbc_ep *ep, int pid, __u8 * data, __u16 len,
++		    int is_error, unsigned long flags)
++{
++	int ret;
++
++	if (is_error)
++		return 0;
++
++	if (!len)
++		return 0;	/* It was a setup status. No action required */
++
++	/* Current packet is rejected, new one will be initiated in mpc885_usbc_setup() */
++	if (ep->data) {
++		mpc885_usbc_tx_recover(ep);
++	}
++
++	if (pid != BD_USB_RXPID_SETUP)
++		ret = -EINVAL;
++	else
++		ret = mpc885_usbc_setup(ep, data, len, flags);
++
++	if (ret)
++		mpc885_usbc_tx_handshake(ep, USB_PID_STALL);
++
++	return 0;
++}
++
++/* EP0 1 - bulk in receive callback */
++static int
++mpc885_usbc_rx_data_in(struct mpc885_usbc_ep *ep, int pid, __u8 * data,
++		       __u16 len, int is_error, unsigned long flags)
++{
++	/* We don't expect to receive anything, but IN token on this endpoint */
++	return 0;
++}
++
++/* EP0 2 - bulk out receive callback */
++static int
++mpc885_usbc_rx_data_out(struct mpc885_usbc_ep *ep, int pid, __u8 * data,
++			__u16 len, int is_error, unsigned long flags)
++{
++	int room_len;
++	struct mpc885_request *req;
++	int count;
++	struct _mpc885_udc_dev *usbc_dev = (struct _mpc885_udc_dev *)ep->dev;
++
++	mpc885_usbc_tx_handshake(ep, USB_PID_NAK);
++	if (is_error)
++		return 0;
++
++	/* If pid is not what expected - do nothing */
++	if (pid != ep->pid) {
++		return 0;
++	}
++
++	ep->pid = (pid == BD_USB_RXPID_0) ? BD_USB_RXPID_1 : BD_USB_RXPID_0;
++
++	room_len = __mpc885_usbc_buf_room(&ep->dev->read_buf);
++	if (room_len < len)
++		return 1;	/* no room */
++	__mpc885_usbc_buf_write(&ep->dev->read_buf,
++				data + (u32) (ep->rx_pool_va) -
++				(u32) (ep->rx_pool), len);
++	count = __mpc885_usbc_buf_len(&usbc_dev->read_buf);
++	if (!count)
++		return 0;
++	if (list_empty(&ep->rqueue))
++		return 0;
++	req = list_entry(ep->rqueue.next, struct mpc885_request, queue);
++	list_del_init(&req->queue);
++	count =
++	    __mpc885_usbc_buf_read(&usbc_dev->read_buf, req->req.buf,
++				   req->req.length);
++	req->req.status = 0;
++	req->req.actual = count;
++	spin_lock_irqsave(&ep->up_complete_lock, flags);
++	req->req.complete(&ep->ep, &req->req);
++	spin_unlock_irqrestore(&ep->up_complete_lock, flags);
++
++	return 0;
++}
++
++/* EP0 0 control transmit confirmation callback */
++static void
++mpc885_usbc_txconf_ctrl(struct mpc885_usbc_ep *ep, __u16 len, int is_error)
++{
++	if (is_error)
++		return;
++	if (ep->dev->address) {	/* Set address pending */
++		ep->dev->usb_rgs->usadr = ep->dev->address;
++		ep->dev->address = 0;
++	}
++	ep->ack_len += len;
++	BUG_ON(ep->ack_len > ep->data_len);
++	if (ep->ack_len < ep->data_len) {
++		ep->pid = (ep->pid == BD_USB_PID1) ? BD_USB_PID0 : BD_USB_PID1;
++		mpc885_usbc_tx(ep, &ep->data[ep->ack_len],
++			       ep->data_len - ep->ack_len,
++			       BD_USB_TC | BD_USB_CNF | BD_SC_INTRPT);
++	} else
++		/* All done */
++		ep->data = NULL;
++	return;
++}
++
++/* EP0 1 - bulk in transmit confirmation callback */
++static void
++mpc885_usbc_txconf_data_in(struct mpc885_usbc_ep *ep, __u16 len, int is_error)
++{
++	struct mpc885_request *req = NULL;
++	int count;
++	struct _mpc885_udc_dev *usbc_dev = (struct _mpc885_udc_dev *)ep->dev;
++	int len_to_resp;
++	unsigned long flags;
++
++	if (!is_error) {
++		BUG_ON(!len || (len >= MPC885_USBC_BUF_SIZE));
++		__mpc885_usbc_buf_inc_read(&ep->dev->write_buf, len);
++		for (len_to_resp = len + ep->len_to_req; len_to_resp;) {
++			if (list_empty(&ep->squeue)) {
++				len_to_resp = 0;
++				break;
++			}
++			req =
++			    list_entry(ep->squeue.next, struct mpc885_request,
++				       queue);
++			if (req->req.length > len_to_resp)
++				break;
++			list_del_init(&req->queue);
++			req->req.status = 0;
++			req->req.actual = req->req.length;
++			len_to_resp -= req->req.length;
++			spin_lock_irqsave(&ep->up_complete_lock, flags);
++			req->req.complete(&ep->ep, &(req->req));
++			spin_unlock_irqrestore(&ep->up_complete_lock,
++						    flags);
++		}
++		ep->len_to_req = len_to_resp;
++		ep->pid = (ep->pid == BD_USB_PID0) ? BD_USB_PID1 : BD_USB_PID0;
++		while (!(list_empty(&ep->rqueue))) {
++			req =
++			    list_entry(ep->rqueue.next, struct mpc885_request,
++				       queue);
++			count = __mpc885_usbc_buf_room(&usbc_dev->write_buf);
++			if (count > req->req.length) {
++				list_del_init(&req->queue);
++				list_add_tail(&req->queue, &ep->squeue);
++				count =
++				    __mpc885_usbc_buf_write(&usbc_dev->
++							    write_buf,
++							    req->req.buf,
++							    req->req.length);
++				req->req.status = -EINPROGRESS;
++				req->req.actual = 0;
++			} else
++				break;
++		}
++	}
++	mpc885_usbc_kick_tx(ep->dev);
++}
++
++/* EP0 2 - bulk out transmit confirmation callback */
++static void
++mpc885_usbc_txconf_data_out(struct mpc885_usbc_ep *ep, __u16 len, int is_error)
++{
++	return;
++}
++
++static mpc885_usbc_rx_callback rx_cb[] = {
++	mpc885_usbc_rx_ctrl,
++	mpc885_usbc_rx_data_in,
++	mpc885_usbc_rx_data_out,
++};
++
++static mpc885_usbc_txconf_callback txconf_cb[] = {
++	mpc885_usbc_txconf_ctrl,
++	mpc885_usbc_txconf_data_in,
++	mpc885_usbc_txconf_data_out,
++};
++
++/* when a driver is successfully registered, it will receive
++ * control requests including set_configuration(), which enables
++ * non-control requests.  then usb traffic follows until a
++ * disconnect is reported.  then a host may connect again, or
++ * the driver might get unbound.
++ */
++int
++usb_gadget_register_driver(struct usb_gadget_driver *driver)
++{
++	struct _mpc885_udc_dev *usbc_dev = the_controller;
++	int retval;
++	if (!driver
++	    || !driver->bind
++	    || !driver->unbind || !driver->disconnect || !driver->setup)
++		return -EINVAL;
++	if (!usbc_dev)
++		return -ENODEV;
++	if (usbc_dev->driver)
++		return -EBUSY;
++
++	/* hook up the driver */
++	driver->driver.bus = NULL;
++	usbc_dev->driver = driver;
++	usbc_dev->gadget.dev.driver = &driver->driver;
++	retval = driver->bind(&usbc_dev->gadget);
++	if (retval) {
++		usbc_dev->driver = NULL;
++		usbc_dev->gadget.dev.driver = NULL;
++		return retval;
++	}
++	/* then enable host detection and ep0; and we're ready
++	 * for set_configuration as well as eventual disconnect.
++	 */
++
++	return 0;
++}
++
++int
++usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
++{
++	struct _mpc885_udc_dev *dev = the_controller;
++
++	if (!dev)
++		return -ENODEV;
++	if (!driver || driver != dev->driver)
++		return -EINVAL;
++
++	driver->unbind(&dev->gadget);
++	dev->gadget.dev.driver = NULL;
++	dev->driver = NULL;
++
++	return 0;
++}
++
++static int
++mpc885_disable(struct usb_ep *ep)
++{
++	return 0;
++}
++
++static int
++mpc885_enable(struct usb_ep *_ep, const struct usb_endpoint_descriptor *desc)
++{
++	struct _mpc885_udc_dev *dev;
++	struct mpc885_usbc_ep *ep;
++	u16 max;
++	unsigned long flags = 0;
++
++	ep = container_of(_ep, struct mpc885_usbc_ep, ep);
++	if (!_ep || !desc || ep->desc
++	    || desc->bDescriptorType != USB_DT_ENDPOINT)
++		return -EINVAL;
++	dev = ep->dev;
++	if (ep == &dev->eps[0])
++		return -EINVAL;
++	if (!dev->driver)
++		return -ESHUTDOWN;
++	if (ep->ep_num != (desc->bEndpointAddress & 0x0f))
++		return -EINVAL;
++
++	switch (desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
++	case USB_ENDPOINT_XFER_BULK:
++	case USB_ENDPOINT_XFER_INT:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* enabling the no-toggle interrupt mode would need an api hook */
++
++	max = UDC_USBC_PACKET_SIZE;
++	if (!max)
++		return -EINVAL;
++
++	spin_lock_irqsave(&ep->enable_lock,flags);
++
++	ep->ep.maxpacket = max;
++	ep->desc = (struct usb_endpoint_descriptor *)desc;
++	spin_unlock_irqrestore(&ep->enable_lock, flags);
++	return 0;
++};
++
++static int
++mpc885_queue(struct usb_ep *_ep, struct usb_request *_req, int gfp_flags)
++{
++	struct mpc885_request *req;
++	struct mpc885_usbc_ep *ep;
++	struct _mpc885_udc_dev *usbc_dev;
++	unsigned long flags = 0;
++	int count;
++
++	/* always require a cpu-view buffer so pio works */
++	if (unlikely(!_req || !_req->complete || !_req->buf))
++		return -EINVAL;
++	if (unlikely(!_ep))
++		return -EINVAL;
++
++	req = container_of(_req, struct mpc885_request, req);
++	ep = (struct mpc885_usbc_ep *)container_of(_ep, struct mpc885_usbc_ep,
++						   ep);
++	usbc_dev = ep->dev;
++	if (!strcmp(_ep->name, EP0_NAME)) {
++		memcpy(usbc_dev->ctrl_data_va, _req->buf, _req->length);
++		usbc_dev->ctrl_length = _req->length;
++		_req->status = 0;
++		_req->actual = _req->length;
++		spin_lock_irqsave(&ep->up_complete_lock,flags);
++		_req->complete(&ep->ep, _req);
++		spin_unlock_irqrestore(&ep->up_complete_lock, flags);
++	}
++	if (!strcmp(_ep->name, EP_IN_NAME)) {
++		spin_lock_irqsave(&ep->txreq_lock, flags);
++		req->req.status = -EINPROGRESS;
++		req->req.actual = 0;
++		list_add_tail(&req->queue, &ep->rqueue);
++		req = list_entry(ep->rqueue.next, struct mpc885_request, queue);
++		count = __mpc885_usbc_buf_room(&usbc_dev->write_buf);
++		if ((count > req->req.length)) {
++			count =
++			    __mpc885_usbc_buf_write(&usbc_dev->write_buf,
++						    req->req.buf,
++						    req->req.length);
++			list_del_init(&req->queue);
++			list_add_tail(&req->queue, &ep->squeue);
++			if ((count =
++			     __mpc885_usbc_buf_room(&usbc_dev->write_buf)) ==
++			    (usbc_dev->write_buf.size - req->req.length) - 1) {
++				mpc885_usbc_kick_tx(usbc_dev);
++			}
++		}
++		spin_unlock_irqrestore(&ep->txreq_lock, flags);
++	}
++	if (!strcmp(_ep->name, EP_OUT_NAME)) {
++		spin_lock_irqsave(&ep->rxreq_lock, flags);
++		count = __mpc885_usbc_buf_len(&usbc_dev->read_buf);
++		if (!count) {
++			_req->status = -EINPROGRESS;
++			_req->actual = 0;
++			list_add_tail(&req->queue, &ep->rqueue);
++			spin_unlock_irqrestore(&ep->rxreq_lock, flags);
++		} else {
++			count =
++			    __mpc885_usbc_buf_read(&usbc_dev->read_buf,
++						   _req->buf, _req->length);
++			spin_unlock_irqrestore(&ep->rxreq_lock, flags);
++			_req->status = 0;
++			_req->actual = count;
++			spin_lock_irqsave(&ep->up_complete_lock, flags);
++			_req->complete(&ep->ep, _req);
++			spin_unlock_irqrestore(&ep->up_complete_lock,
++						    flags);
++		}
++	}
++
++	return 0;
++}
++
++static struct usb_request*
++mpc885_alloc_request(struct usb_ep *_ep,
++						int gfp_flags)
++{
++	struct mpc885_request *req;
++
++	if (!_ep)
++		return NULL;
++	req = kmalloc(sizeof *req, gfp_flags);
++	if (!req)
++		return NULL;
++
++	memset(req, 0, sizeof *req);
++	INIT_LIST_HEAD(&req->queue);
++	return &req->req;
++}
++
++static void
++mpc885_free_request(struct usb_ep *_ep, struct usb_request *_req)
++{
++	struct mpc885_request *req;
++
++	if (!_ep || !_req)
++		return;
++
++	req = container_of(_req, struct mpc885_request, req);
++	WARN_ON(!list_empty(&req->queue));
++	kfree(req);
++}
++
++static struct usb_ep_ops mpc885_ep_ops = {
++	.enable = mpc885_enable,
++	.disable = mpc885_disable,
++	.alloc_request = mpc885_alloc_request,
++	.free_request = mpc885_free_request,
++	.queue = mpc885_queue,
++};
++
++MODULE_DESCRIPTION("MPC885_ADS USB Peripheral Controller");
++MODULE_AUTHOR("Gennadiy Kurtsman");
++MODULE_LICENSE("GPL");
++
++static int
++mpc885_udc_get_frame(struct usb_gadget *_gadget)
++{
++	return 0;
++}
++
++static const struct usb_gadget_ops mpc885_udc_ops = {
++	.get_frame = mpc885_udc_get_frame,
++};
++
++static int
++mpc885_usbc_hw_ep_init(struct _mpc885_udc_dev *usbc_dev, int ep_idx,
++		       int ep_num, __u16 ep_type, int max_len)
++{
++	struct mpc885_usbc_ep *ep;
++	usb_ep_parms_t *ep_parms;
++	__u16 ep_parms_offset;
++	__u16 *p_usep_reg;
++	__u16 usep_reg;
++
++	if (ep_idx >= UDC_USBC_MAX_EPS)
++		return -EINVAL;
++
++	ep = &(usbc_dev->eps[ep_idx]);
++	ep->ep.name = ep_name[ep_idx];
++	if (ep_idx)
++		list_add_tail(&usbc_dev->eps[ep_idx].ep.ep_list,
++			      &usbc_dev->gadget.ep_list);
++	ep->ep.ops = &mpc885_ep_ops;
++	ep->ep_idx = ep_idx;
++	ep->ep_num = ep_num;
++	ep->dev = usbc_dev;
++	ep->max_len = max_len;
++	p_usep_reg = &usbc_dev->usb_rgs->usep0 + ep_idx;
++
++	/* Allocate memory for buffer descriptors */
++	ep->tx_base_offset =
++	    cpm_dpalloc(UDC_USBC_TX_BDS * sizeof(mpc885_cpm_bd),
++			sizeof(mpc885_cpm_bd));
++	if (!(ep->tx_base_offset)) {
++		BUG_ON(ep->tx_base == NULL);
++		return -ENOMEM;
++	}
++	ep->tx_base = (mpc885_cpm_bd *) (cpm_dpram_addr(ep->tx_base_offset));
++	ep->tx_base_va =
++	    ioremap((phys_addr_t) ep->tx_base,
++		    UDC_USBC_TX_BDS * sizeof(mpc885_cpm_bd));
++	ep->rx_base_offset =
++	    cpm_dpalloc(UDC_USBC_RX_BDS * sizeof(mpc885_cpm_bd),
++			UDC_USBC_RX_BDS * sizeof(mpc885_cpm_bd));
++	if (!(ep->rx_base_offset)) {
++		cpm_dpfree(ep->tx_base_offset);
++		ep->tx_base_offset = 0;
++		ep->tx_base = NULL;
++		iounmap(ep->tx_base_va);
++		ep->tx_base_va = NULL;
++		BUG_ON(ep->rx_base == NULL);
++		return -ENOMEM;
++	}
++	ep->rx_base = (mpc885_cpm_bd *) (cpm_dpram_addr(ep->rx_base_offset));
++	ep->rx_base_va =
++	    ioremap((phys_addr_t) ep->rx_base,
++		    UDC_USBC_RX_BDS * sizeof(mpc885_cpm_bd));
++	ep->tx_bd = ep->conf_bd = ep->tx_base;
++	ep->tx_bd_va = ep->conf_bd_va = ep->tx_base_va;
++	ep->rx_bd = ep->rx_base;
++	ep->rx_bd_va = ep->rx_base_va;
++	ep_parms_offset = cpm_dpalloc(sizeof(usb_ep_parms_t),
++				      sizeof(usb_ep_parms_t));
++	if (ep_parms_offset == 0) {
++		cpm_dpfree(ep->tx_base_offset);
++		ep->tx_base_offset = 0;
++		ep->tx_base = NULL;
++		iounmap(ep->tx_base_va);
++		ep->tx_base_va = NULL;
++		cpm_dpfree(ep->rx_base_offset);
++		ep->rx_base_offset = 0;
++		ep->rx_base = NULL;
++		iounmap(ep->rx_base_va);
++		ep->rx_base_va = NULL;
++		BUG_ON(ep->ep_parms == NULL);
++		return -ENOMEM;
++	}
++	ep_parms = (usb_ep_parms_t *) cpm_dpram_addr(ep_parms_offset);
++	ep->ep_parms = ep_parms;
++	ep->ep_parms_va =
++	    ioremap((phys_addr_t) ep_parms, sizeof(usb_ep_parms_t));
++	ep->ep_parms_offset = ep_parms_offset;
++	memset((void *)ep->ep_parms_va, 0, sizeof(usb_ep_parms_t));
++
++	*(__u16 *) ((unsigned long)&usbc_dev->usb_prms->ep0_ptr +
++		    ep_idx * sizeof(__u16)) =
++	    mpc885_dpram_offset((void *)ep_parms);
++	ep_parms->rbase = ep_parms->rbptr =
++	    mpc885_dpram_offset((void *)ep->rx_base);
++	ep_parms->tbase = ep_parms->tbptr =
++	    mpc885_dpram_offset((void *)ep->tx_base);
++
++	/* for control and bulk pipe, rx buffer is 8 bytes data and 2 bytes CRC */
++	ep_parms->mrblr = max_len + 4;
++	ep_parms->tfcr = ep_parms->rfcr = USB_FCR_BO_BE;
++
++	/* Init Tx BD ring */
++	{
++		memset(ep->tx_base_va, 0,
++		       UDC_USBC_TX_BDS * sizeof(mpc885_cpm_bd));
++		UDC_BD_STATUS_SET(ep->tx_base + UDC_USBC_TX_BDS - 1,
++				  BD_SC_WRAP);
++	}
++	/* Allocate Rx buffer pool and init Rx BD ring */
++	ep->rx_pool_va =
++	    dma_alloc_coherent(NULL, UDC_USBC_RX_BDS * (max_len + 4),
++			       (dma_addr_t *) & ep->rx_pool, GFP_KERNEL);
++	if (!ep->rx_pool_va) {
++		cpm_dpfree(ep->tx_base_offset);
++		ep->tx_base_offset = 0;
++		ep->tx_base = NULL;
++		iounmap(ep->tx_base_va);
++		ep->tx_base_va = NULL;
++		cpm_dpfree(ep->rx_base_offset);
++		ep->rx_base_offset = 0;
++		ep->rx_base = NULL;
++		iounmap(ep->rx_base_va);
++		ep->rx_base_va = NULL;
++		cpm_dpfree(ep_parms_offset);
++		ep_parms_offset = 0;
++		iounmap(ep->ep_parms_va);
++		ep->ep_parms_va = NULL;
++		BUG_ON(ep->ep_parms == NULL);
++		return -ENOMEM;
++	}
++	/* Init Rx BD ring */
++	{
++		mpc885_cpm_bd *_bd = ep->rx_base_va;
++		__u8 *_buf = ep->rx_pool;
++		int _i;
++		for (_i = 0; _i < UDC_USBC_RX_BDS; _i++) {
++			UDC_BD_DATA_SET(_bd, (unsigned long)_buf);
++			UDC_BD_LENGTH_SET(_bd, 0);
++			UDC_BD_STATUS_SET(_bd, BD_SC_INTRPT | BD_SC_EMPTY);
++			_bd++;
++			_buf += max_len + 4;
++		}
++		UDC_BD_STATUS_SET((--_bd),
++				  BD_SC_INTRPT | BD_SC_WRAP | BD_SC_EMPTY);
++	}
++
++	ep->rx_cb = rx_cb[ep_idx];
++	ep->txconf_cb = txconf_cb[ep_idx];
++
++	ep->ep_type = ep_type;
++	usep_reg = (ep_num << USEP_NUM_SHIFT) | ep_type;
++	/* IT: */
++	usep_reg |= USEP_RTE;
++
++	*p_usep_reg = usep_reg;
++
++	mpc885_usbc_cmd(ep, CPM_USBCMD_RESTART_TX);
++
++	return 0;
++}
++
++/* Board specific configuration
++ */
++#ifdef CONFIG_MPC885ADS
++
++/* bits in parallel i/o port registers
++ */
++#define PA_USB_RXD	((__u16)0x0001)
++#define PA_USB_OE	((__u16)0x0002)
++#define PA_CLK2		((__u16)0x0200)
++#define PC_USB_RXP	((__u16)0x0010)
++#define PC_USB_RXN	((__u16)0x0020)
++#define PC_USB_TXP	((__u16)0x0100)
++#define PC_USB_TXN	((__u16)0x0200)
++
++void
++mpc885_usb_iface_config(int enable)
++{
++	void *__iomem bcsr4_va = ioremap(BCSR4, sizeof(__u32));
++	__u32 bcsr4_val;
++
++	bcsr4_val = *((__u32 *) bcsr4_va);
++
++	if (enable) {
++		bcsr4_val |= BCSR4_USB_LO_SPD;
++		bcsr4_val &= ~BCSR4_USB_FULL_SPD;
++		bcsr4_val &= ~BCSR4_USB_EN;
++	} else
++		bcsr4_val |= BCSR4_USB_EN;
++
++	*((__u32 *) bcsr4_va) = bcsr4_val;
++	iounmap(bcsr4_va);
++}
++
++void
++mpc885_usb_clock_config(immap_t * immap)
++{
++	cpm8xx_t *cp;
++
++	/* get pointer to Communication Processor */
++	cp = ioremap((phys_addr_t) cpmp, 48);
++
++	/* we assume a 48Mhz system clock connected to CLK2 via PA6
++	 */
++	immap->im_ioport.iop_padir &= ~PA_CLK2;
++	immap->im_ioport.iop_papar |= PA_CLK2;
++
++	/* configure Serial Interface clock routing
++	 */
++	cp->cp_sicr &= (__u32) 0xffffff00;
++	cp->cp_sicr |= (__u32) 0x00000028;
++	iounmap(cp);
++}
++
++void
++mpc885_usb_io_pin_config(immap_t * immap)
++{
++
++	/* select USBRXD & USBOE
++	 */
++	immap->im_ioport.iop_padir &= ~(PA_USB_RXD | PA_USB_OE);
++	immap->im_ioport.iop_papar |= (PA_USB_RXD | PA_USB_OE);
++	immap->im_ioport.iop_paodr &= ~PA_USB_OE;
++
++	/* select USBRXP & USBRXN
++	 */
++	immap->im_ioport.iop_pcdir &= ~(PC_USB_RXP | PC_USB_RXN);
++	immap->im_ioport.iop_pcpar &= ~(PC_USB_RXP | PC_USB_RXN);
++	immap->im_ioport.iop_pcso |= (PC_USB_RXP | PC_USB_RXN);
++
++	/* select USBTXP and USBTXN
++	 */
++	immap->im_ioport.iop_pcdir |= (PC_USB_TXP | PC_USB_TXN);
++	immap->im_ioport.iop_pcpar |= (PC_USB_TXP | PC_USB_TXN);
++}
++#endif
++
++static void
++mpc885_usbc_hw_deinit(struct _mpc885_udc_dev *usbc_dev)
++{
++	int i;
++
++	usbc_dev->usb_rgs->usmod &= ~USMOD_ENABLE;
++	usbc_dev->intram->im_cpm.cp_sicr &= ~0x0000003f;
++	mpc885_usb_iface_config(0);
++	free_irq(CPM_IRQ_OFFSET + CPMVEC_SCC1, usbc_dev);
++	for (i = 0; i < ARRAY_SIZE(usbc_dev->eps); i++) {
++		if (usbc_dev->eps[i].tx_base_offset) {
++			cpm_dpfree(usbc_dev->eps[i].tx_base_offset);
++			usbc_dev->eps[i].tx_base_offset = 0;
++			iounmap(usbc_dev->eps[i].tx_base_va);
++		}
++		usbc_dev->eps[i].tx_base_va = NULL;
++		usbc_dev->eps[i].tx_base = NULL;
++		if (usbc_dev->eps[i].rx_base_offset) {
++			cpm_dpfree(usbc_dev->eps[i].rx_base_offset);
++			usbc_dev->eps[i].rx_base_offset = 0;
++			iounmap(usbc_dev->eps[i].rx_base_va);
++		}
++		usbc_dev->eps[i].rx_base_va = NULL;
++		usbc_dev->eps[i].rx_base = NULL;
++		if (usbc_dev->eps[i].ep_parms_offset) {
++			cpm_dpfree(usbc_dev->eps[i].ep_parms_offset);
++			usbc_dev->eps[i].ep_parms_offset = 0;
++			iounmap(usbc_dev->eps[i].ep_parms_va);
++		}
++		usbc_dev->eps[i].ep_parms_va = NULL;
++		usbc_dev->eps[i].ep_parms = NULL;
++		if (usbc_dev->eps[i].rx_pool_offset) {
++			cpm_dpfree(usbc_dev->eps[i].rx_pool_offset);
++			usbc_dev->eps[i].rx_pool_offset = 0;
++			iounmap(usbc_dev->eps[i].rx_pool_va);
++		}
++		usbc_dev->eps[i].rx_pool_va = NULL;
++		usbc_dev->eps[i].rx_pool = NULL;
++	}
++	iounmap(usbc_dev->intram);
++}
++
++static int
++mpc885_usbc_hw_init(struct _mpc885_udc_dev *usbc_dev)
++{
++	immap_t *immap;
++	usb_parms_t *usb_prms;
++	usb_regs_t *usb_rgs;
++	int ret;
++
++	/* Get IMMR address, USB params */
++	immap = usbc_dev->intram = (immap_t *) ioremap(IMAP_ADDR, IMAP_SIZE);
++	usb_prms = usbc_dev->usb_prms =
++	    (usb_parms_t *) & immap->im_cpm.cp_dparam;
++	usb_rgs = usbc_dev->usb_rgs = (usb_regs_t *) & immap->im_cpm.cp_scc[0];
++
++	mpc885_usb_iface_config(1);
++	mpc885_usb_clock_config(immap);
++	mpc885_usb_io_pin_config(immap);
++
++	/* Initialize USB parameters RAM and registers */
++	memset((void *)usb_prms, 0, sizeof(usb_parms_t));
++
++	/* Initialize endpoints */
++	INIT_LIST_HEAD(&usbc_dev->gadget.ep_list);
++	usbc_dev->gadget.ep0 = &usbc_dev->eps[0].ep;
++	ret = mpc885_usbc_hw_ep_init(usbc_dev, 0, 0, USEP_TM_CTRL,
++				     UDC_USBC_CTL_PACKET_SIZE);
++	ret = ret ? ret : mpc885_usbc_hw_ep_init(usbc_dev, 1, 1, USEP_TM_BULK,
++						 UDC_USBC_PACKET_SIZE);
++	ret = ret ? ret : mpc885_usbc_hw_ep_init(usbc_dev, 2, 2, USEP_TM_BULK,
++						 UDC_USBC_PACKET_SIZE);
++	usbc_dev->eps[1].pid = BD_USB_PID0;
++	usbc_dev->eps[2].pid = BD_USB_RXPID_0;
++	usb_rgs->usber = 0xffff;
++	usb_rgs->usbmr = USBE_TXE0 | USBE_BSY | USBE_TXB
++	    | USBE_RXB | USBE_RESET;
++
++	ret =
++	    ret ? ret : request_irq(CPM_IRQ_OFFSET + CPMVEC_SCC1,
++				    mpc885_usbc_isr, SA_RESTART,
++				    "usb_gadget_peripheral", usbc_dev);
++	if (!ret)
++		usbc_dev->usb_rgs->usmod |= USMOD_ENABLE;
++	return ret;
++}
++
++static int __init
++init(void)
++{
++	int ret = 0;
++
++	if (the_controller) {
++		WARN_ON(the_controller);
++		return -EBUSY;
++	}
++	the_controller =
++	    dma_alloc_coherent(NULL, sizeof(struct _mpc885_udc_dev),
++			       (dma_addr_t *) & the_controller_pa, SLAB_KERNEL);
++	the_controller->read_buf.buffer_pa = the_controller_pa->read_buf.buffer;
++	if (!the_controller) {
++		WARN_ON(!the_controller);
++		return -ENOMEM;
++	}
++	memset(the_controller, 0, sizeof(struct _mpc885_udc_dev));
++	the_controller->write_buf.buffer_pa =
++	    the_controller_pa->write_buf.buffer;
++	the_controller->ctrl_data_va =
++	    dma_alloc_coherent(NULL, MPC885_USBC_CTL_DATA_LEN,
++			       (dma_addr_t *) & the_controller->ctrl_data,
++			       GFP_KERNEL);
++	if (!the_controller->ctrl_data_va) {
++		WARN_ON(!the_controller->ctrl_data_va);
++		kfree(the_controller);
++		return -ENOMEM;
++	}
++	memset(the_controller->ctrl_data_va, 0, MPC885_USBC_CTL_DATA_LEN);
++	the_controller->gadget.ops = &mpc885_udc_ops;
++	spin_lock_init(&the_controller->eps[0].rxirq_lock);
++	spin_lock_init(&the_controller->eps[0].txirq_lock);
++	spin_lock_init(&the_controller->eps[0].enable_lock);
++	spin_lock_init(&the_controller->eps[0].txreq_lock);
++	spin_lock_init(&the_controller->eps[0].rxreq_lock);
++	spin_lock_init(&the_controller->eps[0].txbd_lock);
++	spin_lock_init(&the_controller->eps[0].up_complete_lock);
++	INIT_LIST_HEAD(&the_controller->eps[0].rqueue);
++	INIT_LIST_HEAD(&the_controller->eps[0].squeue);
++	spin_lock_init(&the_controller->eps[1].rxirq_lock);
++	spin_lock_init(&the_controller->eps[1].txirq_lock);
++	spin_lock_init(&the_controller->eps[1].enable_lock);
++	spin_lock_init(&the_controller->eps[1].txreq_lock);
++	spin_lock_init(&the_controller->eps[1].rxreq_lock);
++	spin_lock_init(&the_controller->eps[1].txbd_lock);
++	spin_lock_init(&the_controller->eps[1].up_complete_lock);
++	INIT_LIST_HEAD(&the_controller->eps[1].rqueue);
++	INIT_LIST_HEAD(&the_controller->eps[1].squeue);
++	spin_lock_init(&the_controller->eps[2].rxirq_lock);
++	spin_lock_init(&the_controller->eps[2].txirq_lock);
++	spin_lock_init(&the_controller->eps[2].enable_lock);
++	spin_lock_init(&the_controller->eps[2].txreq_lock);
++	spin_lock_init(&the_controller->eps[2].rxreq_lock);
++	spin_lock_init(&the_controller->eps[2].txbd_lock);
++	spin_lock_init(&the_controller->eps[2].up_complete_lock);
++	INIT_LIST_HEAD(&the_controller->eps[2].rqueue);
++	INIT_LIST_HEAD(&the_controller->eps[2].squeue);
++	strcpy(the_controller->gadget.dev.bus_id, "gadget");
++	the_controller->gadget.name = driver_name;
++	__mpc885_usbc_buf_init(&the_controller->read_buf, MPC885_USBC_BUF_SIZE);
++	__mpc885_usbc_buf_init(&the_controller->write_buf,
++			       MPC885_USBC_BUF_SIZE);
++	ret = mpc885_usbc_hw_init(the_controller);
++	if (ret) {
++		mpc885_usbc_hw_deinit(the_controller);
++		kfree(the_controller);
++		the_controller = NULL;
++		printk("Unable to initialize USB peripheral device\n");
++	} else
++		printk("MPC885 USB peripheral device\n");
++	device_register(&the_controller->gadget.dev);
++
++	return ret;
++}
++
++module_init(init);
++
++static void __exit
++cleanup(void)
++{
++	if (!the_controller)
++		return;
++	mpc885_usbc_hw_deinit(the_controller);
++	dma_free_coherent(NULL, sizeof(struct _mpc885_udc_dev),
++			  the_controller, (dma_addr_t) the_controller_pa);
++	the_controller = NULL;
++}
++
++module_exit(cleanup);
+Index: linux-2.6.10/drivers/usb/gadget/mpc885_udc.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/gadget/mpc885_udc.h
+@@ -0,0 +1,463 @@
++/*
++ * drivers/usb/gadget/mpc885_udc.h
++ *
++ * MPC885ADS USB peripheral device TTY driver necessary defines
++ *
++ * Author: Gennadiy Kurtsman <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++#ifndef __MPC885_UDC_H__
++#define __MPC885_UDC_H__
++
++/*--------------------------------*/
++/*  BD access macros              */
++/*--------------------------------*/
++#define UDC_BD_STATUS(_bd)                (((mpc885_cpm_bd *)(_bd))->status)
++#define UDC_BD_STATUS_SET(_bd, _val)      (((mpc885_cpm_bd *)(_bd))->status = _val)
++#define UDC_BD_LENGTH(_bd)                (((mpc885_cpm_bd *)(_bd))->len)
++#define UDC_BD_LENGTH_SET(_bd, _val)      (((mpc885_cpm_bd *)(_bd))->len = _val)
++#define UDC_BD_DATA_CLEAR(_bd)            (((mpc885_cpm_bd *)(_bd))->data = 0)
++#define UDC_BD_DATA(_bd)                  ((u8*) ((((mpc885_cpm_bd *)(_bd))->data)))
++#define UDC_BD_DATA_SET(_bd, _data)       (((mpc885_cpm_bd *)(_bd))->data = (_data))
++#define UDC_BD_ADVANCE(_bd,_status,_base) (((_status) & BD_SC_WRAP) ? (_bd)=(_base) : ++((mpc885_cpm_bd *)(_bd)))
++
++/* USB Console stuff*/
++#define UDC_USBC_TX_BDS         4	/* Tx BD ring size */
++#define UDC_USBC_RX_BDS         8	/* Rx BD ring size */
++#define UDC_USBC_PACKET_SIZE    8	/* Max packet size */
++#define UDC_USBC_CTL_PACKET_SIZE 16	/* Max packet size for CTL endpoint */
++#define UDC_USBC_MAX_EPS        3	/* Max number of endpoints */
++
++#define MPC885_USBC_BUF_SIZE		128
++#define MPC885_USBC_MAX_EPS		3	/* Max number of endpoints */
++#define MPC885_USBC_CTL_DATA_LEN	80
++
++/*
++ * USB Packet IDs (PIDs)
++ */
++#define USB_PID_NAK			0x5a
++#define USB_PID_STALL			0x1e
++
++#include "../core/hcd.h"
++
++/* Struct definitions */
++
++struct mpc885_request {
++	struct usb_request req;
++	struct list_head queue;
++};
++
++typedef struct mpc885_cpm_bd_s {
++	u16 status;
++	u16 len;
++	u32 data;
++} mpc885_cpm_bd;
++
++/* IO buf:
++   empty: read==write
++   full: next_write==read
++*/
++struct mpc885_usbc_buf {
++	int read_pos;
++	int write_pos;
++	int size;
++	__u8 buffer[MPC885_USBC_BUF_SIZE];
++	__u8 *buffer_pa;
++	struct semaphore sem;
++};
++
++struct mpc885_usbc_ep;
++typedef int (*mpc885_usbc_rx_callback) (struct mpc885_usbc_ep * ep, int pid,
++					__u8 * data, __u16 len, int is_error,
++					unsigned long flags);
++typedef void (*mpc885_usbc_txconf_callback) (struct mpc885_usbc_ep * ep,
++					     __u16 len, int is_error);
++
++/* Endpoint */
++struct mpc885_usbc_ep {
++	struct usb_ep ep;
++	struct _mpc885_udc_dev *dev;
++	int ep_idx;		/* Endpoint index */
++	int ep_num;		/* Number of the endpoint */
++	__u16 ep_type;		/* Endpoint type: bulk, control, interrupt, iso */
++	struct usb_endpoint_descriptor *desc;
++	usb_ep_parms_t *ep_parms;	/* EP parameters area */
++	usb_ep_parms_t *ep_parms_va;	/* result of ioremap */
++	__u16 ep_parms_offset;	/* dual-port memory offset */
++	mpc885_cpm_bd *tx_base;	/* 1st BD in Tx BD ring */
++	mpc885_cpm_bd *tx_base_va;	/* result of ioremap */
++	__u16 tx_base_offset;	/* dual-port memory offset */
++	mpc885_cpm_bd *rx_base;	/* 1st BD in Rx BD ring */
++	mpc885_cpm_bd *rx_base_va;	/* result of ioremap */
++	__u16 rx_base_offset;	/* dual-port memory offset */
++	mpc885_cpm_bd *conf_bd;	/* Next bd to confirm */
++	mpc885_cpm_bd *conf_bd_va;	/* result of ioremap */
++	mpc885_cpm_bd *tx_bd;	/* Next tx bd */
++	mpc885_cpm_bd *tx_bd_va;	/* result of ioremap */
++	mpc885_cpm_bd *rx_bd;	/* Next rx bd */
++	mpc885_cpm_bd *rx_bd_va;	/* result of ioremap */
++	__u16 rx_pool_offset;
++	__u8 *rx_pool;
++	__u8 *rx_pool_va;
++	mpc885_usbc_rx_callback rx_cb;
++	mpc885_usbc_txconf_callback txconf_cb;
++/* Spinlocks below are intended to serialize access to the driver resources.
++   There are a wrong functioning and a lot of diagnostics when
++   CONFIG_DEBUG_PREEMPT and CONFIG_RT_DEADLOCK_DETECT kernel configuration
++   definitions are yes in RT preemption kernel. When CONFIG_DEBUG_PREEMPT
++   and CONFIG_RT_DEADLOCK_DETECT are n functioning is correct.
++*/
++	spinlock_t cmd_lock;		/* serialization of access to CPCR register */
++	spinlock_t rxirq_lock;		/* serialization of RX interrupt handlers for
++					   RT kernel threaded hardirqs */
++	spinlock_t txirq_lock;		/* serialization of TX interrupt handlers for
++					   RT kernel threaded hardirqs */
++	spinlock_t enable_lock;		/* serialization of access to endpoint
++					   descriptor structure */
++	spinlock_t txreq_lock;		/* serialization of access to serial gadget's
++					   TX request structure */
++	spinlock_t rxreq_lock;		/* serialization of access to serial gadget's
++					   RX request structure */
++	spinlock_t txbd_lock;		/* serialization of access to USB TX buffer
++					   descriptor ring */
++	spinlock_t up_complete_lock;	/* serialization of access to complete()
++					   callback of gadget's request structure */
++/************************************************************/
++	int len_to_req;
++	struct list_head rqueue;
++	struct list_head squeue;
++	/* State variables */
++	__u8 *data;
++	__u16 pid;
++	int max_len;
++	int data_len;
++	int ack_len;
++};
++
++struct _mpc885_udc_dev {
++	struct usb_gadget gadget;
++	struct usb_gadget_driver *driver;
++
++	struct mpc885_usbc_ep eps[MPC885_USBC_MAX_EPS];
++
++	/* Useful addresses */
++	immap_t *intram;
++	usb_parms_t *usb_prms;
++	usb_regs_t *usb_rgs;
++
++	/* IO buffers */
++	struct mpc885_usbc_buf read_buf;
++	struct mpc885_usbc_buf write_buf;
++
++	/* Control variables */
++	__u8 *ctrl_data;
++	__u8 *ctrl_data_va;
++	int ctrl_length;
++	int address;
++};
++
++static inline void
++__mpc885_usbc_buf_init(struct mpc885_usbc_buf *buf, int size)
++{
++	buf->size = size;
++	buf->read_pos = buf->write_pos = 0;
++	init_MUTEX(&buf->sem);
++}
++
++static inline int
++__mpc885_usbc_buf_len(struct mpc885_usbc_buf *buf)
++{
++	int len;
++	if (buf->write_pos >= buf->read_pos)
++		len = buf->write_pos - buf->read_pos;
++	else
++		len = buf->size - buf->read_pos + buf->write_pos;
++	return len;
++}
++
++static inline int
++__mpc885_usbc_buf_len_flat(struct mpc885_usbc_buf *buf)
++{
++	int len;
++	if (buf->write_pos >= buf->read_pos)
++		len = buf->write_pos - buf->read_pos;
++	else
++		len = buf->size - buf->read_pos;
++	return len;
++}
++
++static inline __u8*
++__mpc885_usbc_buf_data(struct mpc885_usbc_buf *buf)
++{
++	return buf->buffer + buf->read_pos;
++}
++
++static inline int
++__mpc885_usbc_buf_room(struct mpc885_usbc_buf *buf)
++{
++	int len;
++	if (buf->write_pos >= buf->read_pos)
++		len = buf->size - buf->write_pos + buf->read_pos - 1;
++	else
++		len = buf->read_pos - buf->write_pos - 1;
++	return len;
++}
++
++static inline int
++__mpc885_usbc_buf_inc_read(struct mpc885_usbc_buf *buf, int len)
++{
++	int pos = buf->read_pos + len;
++	buf->read_pos = pos % buf->size;
++	return buf->read_pos;
++}
++
++static inline int
++__mpc885_usbc_buf_inc_write(struct mpc885_usbc_buf *buf, int len)
++{
++	int pos = buf->write_pos + len;
++	buf->write_pos = pos % buf->size;
++	return buf->write_pos;
++}
++
++/**********************************************************************************
++ * IO buffer helpers
++ *********************************************************************************/
++
++static inline int
++__mpc885_usbc_buf_write(struct mpc885_usbc_buf *buf, const __u8 * data, int len)
++{
++	int buf_len = __mpc885_usbc_buf_room(buf);
++	int tail_len = buf->size - buf->write_pos;
++
++	if (len > buf_len) {
++		len = buf_len;
++	}
++	if (tail_len > len)
++		tail_len = len;
++	memcpy(&buf->buffer[buf->write_pos], data, tail_len);
++	__mpc885_usbc_buf_inc_write(buf, tail_len);
++	data += tail_len;
++	if (len > tail_len) {
++		memcpy(&buf->buffer[0], data, len - tail_len);
++		__mpc885_usbc_buf_inc_write(buf, len - tail_len);
++	}
++	return len;
++}
++
++static inline int
++__mpc885_usbc_buf_writeuser(struct mpc885_usbc_buf *buf, const __u8 * data,
++			    int len)
++{
++	int buf_len = __mpc885_usbc_buf_room(buf);
++	int tail_len = buf->size - buf->write_pos;
++
++	if (len > buf_len)
++		len = buf_len;
++	if (tail_len > len)
++		tail_len = len;
++	copy_from_user(&buf->buffer[buf->write_pos], data, tail_len);
++	__mpc885_usbc_buf_inc_write(buf, tail_len);
++	data += tail_len;
++	if (len > tail_len) {
++		copy_from_user(&buf->buffer[0], data, len - tail_len);
++		__mpc885_usbc_buf_inc_write(buf, len - tail_len);
++	}
++	return len;
++}
++
++static inline int
++__mpc885_usbc_buf_read(struct mpc885_usbc_buf *buf, __u8 * data, int len)
++{
++	int buf_len = __mpc885_usbc_buf_len(buf);
++	int tail_len = buf->size - buf->read_pos;
++
++	if (len > buf_len)
++		len = buf_len;
++	if (tail_len > len)
++		tail_len = len;
++	memcpy(data, &buf->buffer[buf->read_pos], tail_len);
++	__mpc885_usbc_buf_inc_read(buf, tail_len);
++	data += tail_len;
++	if (len > tail_len) {
++		memcpy(data, &buf->buffer[0], len - tail_len);
++		__mpc885_usbc_buf_inc_read(buf, len - tail_len);
++	}
++	return len;
++}
++
++static inline void
++mpc885_usbc_cmd(struct mpc885_usbc_ep *ep, __u32 cmd)
++{
++	unsigned long flags = 0;
++
++	spin_lock_irqsave(&ep->cmd_lock, flags);
++	ep->dev->intram->im_cpm.cp_cpcr =
++	    (cmd | mk_cr_cmd(CPM_CR_CH_USB, CPM_CR_USB) | ep->
++	     ep_idx << 2 | CPM_CR_FLG);
++	/* Wait for the CR_FLG to clear */
++	udelay(2);		/* I can not explain this delay but w/o it driver freezes */
++	while (ep->dev->intram->im_cpm.cp_cpcr & CPM_CR_FLG) ;	/* wait for the CR_FLG to clear */
++	spin_unlock_irqrestore(&ep->cmd_lock, flags);
++}
++
++__u16
++mpc885_dpram_offset(void *addr)
++{
++	int offset = (int)((__u32) addr -
++			   (__u32) ((immap_t *) IMAP_ADDR)->im_cpm.cp_dpmem);
++
++	if ((offset < 0) ||
++	    (offset >= sizeof(((immap_t *) IMAP_ADDR)->im_cpm.cp_dpmem))) {
++		printk(KERN_ERR "%s: invalid dpram address 0x%08x\n",
++		       __FUNCTION__, (__u32) addr);
++		return 0;
++	}
++
++	return (__u16) offset;
++}
++
++static inline void
++mpc885_usbc_tx_recover(struct mpc885_usbc_ep *ep)
++{
++
++	mpc885_cpm_bd *bd = ep->conf_bd_va;
++	/* Stop TX (just in case - should have stopped by itself) */
++	mpc885_usbc_cmd(ep, CPM_USBCMD_STOP_TX);
++	ep->dev->usb_rgs->uscom = USCOM_FLUSH | ep->ep_idx;
++
++	while (bd->data) {
++		__u16 status = UDC_BD_STATUS(bd);
++		status &= BD_SC_WRAP;
++		UDC_BD_STATUS_SET(bd, status);
++		UDC_BD_DATA_CLEAR(bd);
++		UDC_BD_ADVANCE(bd, status, ep->tx_base_va);
++	}
++
++	ep->tx_bd = ep->conf_bd = ep->tx_base;
++	ep->tx_bd_va = ep->conf_bd_va = ep->tx_base_va;
++	ep->ep_parms_va->tbptr = mpc885_dpram_offset(ep->tx_base);
++	ep->ep_parms_va->tstate = 0;
++	ep->data = NULL;
++	ep->ack_len = ep->data_len = 0;
++	mpc885_usbc_cmd(ep, CPM_USBCMD_RESTART_TX);
++}
++
++/* Transmit data or handshake */
++static inline void
++mpc885_usbc_tx(struct mpc885_usbc_ep *ep, __u8 * data, int len, __u16 flags)
++{
++	mpc885_cpm_bd *tx_bd = ep->tx_bd;
++	mpc885_cpm_bd *tx_bd_va = ep->tx_bd_va;
++	__u16 status = UDC_BD_STATUS(tx_bd_va);
++
++	if ((status & BD_SC_READY)) {
++		return;
++	}
++	if (len > ep->max_len)
++		len = ep->max_len;
++	UDC_BD_DATA_SET(tx_bd_va, (u32) data);
++	UDC_BD_LENGTH_SET(tx_bd_va, len);
++	status &= BD_SC_WRAP;
++	status |= flags | BD_SC_READY | BD_SC_LAST;
++	status |= ep->pid;
++	UDC_BD_STATUS_SET(tx_bd_va, status);
++	ep->tx_bd_va = UDC_BD_ADVANCE(tx_bd_va, status, ep->tx_base_va);
++	ep->tx_bd = UDC_BD_ADVANCE(tx_bd, status, ep->tx_base);
++	ep->dev->usb_rgs->uscom = (USCOM_STR | ep->ep_idx);
++}
++
++/* Transmit handshake */
++static inline void
++mpc885_usbc_tx_handshake(struct mpc885_usbc_ep *ep, __u8 handshake)
++{
++
++	ep->dev->ctrl_data_va[0] = handshake;
++	mpc885_usbc_tx(ep, ep->dev->ctrl_data, 1, 0);
++}
++
++/* Transmit data */
++static inline void
++mpc885_usbc_tx_data(struct mpc885_usbc_ep *ep, __u8 * data, int len)
++{
++	ep->data = data;
++	ep->data_len = len;
++	ep->ack_len = 0;
++	mpc885_usbc_tx(ep, data, len,
++		       BD_USB_TC | BD_USB_CNF | BD_SC_INTRPT | ep->pid);
++}
++
++/* Rx Interrupt handler */
++static inline void
++mpc885_usbc_rx_isr(struct _mpc885_udc_dev *usbc_dev, int ep_idx)
++{
++	struct mpc885_usbc_ep *ep = &usbc_dev->eps[ep_idx];
++	mpc885_cpm_bd *rx_bd = ep->rx_bd;
++	mpc885_cpm_bd *rx_bd_va = ep->rx_bd_va;
++	__u16 status = UDC_BD_STATUS(rx_bd_va);
++	__u8 *data;
++	__u16 len;
++	int pid;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ep->rxirq_lock, flags);
++	while (!(status & BD_SC_EMPTY)) {
++		data = (__u8 *) UDC_BD_DATA(rx_bd_va);
++		len = UDC_BD_LENGTH(rx_bd_va);
++		if (len >= 2)
++			len -= 2;	/* Strip CRC16 */
++		pid = status & BD_USB_RXPID_MASK;
++		if (ep->rx_cb(ep, pid, data,
++			      len, (status & BD_USB_RXERR), flags))
++			break;
++		status &= BD_USB_CLEAN;
++		UDC_BD_LENGTH_SET(rx_bd_va, 0);
++		UDC_BD_STATUS_SET(rx_bd_va, status | BD_SC_EMPTY);
++		UDC_BD_ADVANCE(rx_bd_va, status, ep->rx_base_va);
++		UDC_BD_ADVANCE(rx_bd, status, ep->rx_base);
++		udelay(1000);	/* I can not explain this delay but w/o it driver freezes */
++		status = UDC_BD_STATUS(rx_bd_va);
++	}
++	ep->rx_bd = rx_bd;
++	ep->rx_bd_va = rx_bd_va;
++	spin_unlock_irqrestore(&ep->rxirq_lock, flags);
++}
++
++/* Tx Interrupt handler */
++static inline void
++mpc885_usbc_tx_isr(struct _mpc885_udc_dev *usbc_dev, int ep_idx)
++{
++	struct mpc885_usbc_ep *ep = &usbc_dev->eps[ep_idx];
++	mpc885_cpm_bd *tx_bd = ep->conf_bd;
++	mpc885_cpm_bd *tx_bd_va = ep->conf_bd_va;
++	__u16 status = UDC_BD_STATUS(tx_bd_va);
++	int is_error;
++	__u16 len;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ep->txirq_lock, flags);
++	while (!(status & BD_SC_READY)) {
++		if (!tx_bd_va->data) {
++			break;
++		}
++		len = UDC_BD_LENGTH(tx_bd_va);
++		is_error = (status & BD_USB_TXERR);
++		if ((status & (BD_USB_TO | BD_USB_UN)))
++			mpc885_usbc_tx_recover(ep);
++		else
++			ep->txconf_cb(ep, len, is_error);
++		UDC_BD_DATA_CLEAR(tx_bd_va);
++		UDC_BD_ADVANCE(tx_bd, status, ep->tx_base);
++		UDC_BD_ADVANCE(tx_bd_va, status, ep->tx_base_va);
++		status = UDC_BD_STATUS(tx_bd_va);
++	}
++	ep->conf_bd = tx_bd;
++	ep->conf_bd_va = tx_bd_va;
++	spin_unlock_irqrestore(&ep->txirq_lock, flags);
++}
++
++#endif				/* __MPC885_UDC_H__ */
+Index: linux-2.6.10/include/asm-ppc/8xx_immap.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/8xx_immap.h
++++ linux-2.6.10/include/asm-ppc/8xx_immap.h
+@@ -385,6 +385,24 @@ typedef struct smc {		/* Serial manageme
+ 	char	res4[5];
+ } smc_t;
+ 
++typedef struct usb_registers {  /* USB registers */
++	u_char  usmod;
++	u_char  usadr;
++	u_char  uscom;
++	u_char  res1;
++	ushort  usep0;
++	ushort  usep1;
++	ushort  usep2;
++	ushort  usep3;
++	uint    res2;
++	ushort  usber;
++	ushort  res3;
++	ushort  usbmr;
++	u_char  res4;
++	u_char  usbs;
++	u_char  res6[8];
++} usb_regs_t;
++
+ /* MPC860T Fast Ethernet Controller.  It isn't part of the CPM, but
+  * it fits within the address space.
+  */
+Index: linux-2.6.10/include/asm-ppc/commproc.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/commproc.h
++++ linux-2.6.10/include/asm-ppc/commproc.h
+@@ -39,10 +39,15 @@
+ #define CPM_CR_CLOSE_RX_BD	((ushort)0x0007)
+ #define CPM_CR_SET_GADDR	((ushort)0x0008)
+ #define CPM_CR_SET_TIMER	CPM_CR_SET_GADDR
++#define CPM_CR_USB		((ushort)0x000f)
++
++#define CPM_USBCMD_STOP_TX	((ushort)0x1000)
++#define CPM_USBCMD_RESTART_TX	((ushort)0x2000)
+ 
+ /* Channel numbers.
+ */
+ #define CPM_CR_CH_SCC1		((ushort)0x0000)
++#define CPM_CR_CH_USB		CPM_CR_CH_SCC1
+ #define CPM_CR_CH_I2C		((ushort)0x0001)	/* I2C and IDMA1 */
+ #define CPM_CR_CH_SCC2		((ushort)0x0004)
+ #define CPM_CR_CH_SPI		((ushort)0x0005)	/* SPI / IDMA2 / Timers */
+@@ -613,6 +618,90 @@ typedef struct spi {
+ #define SPIE_TXB	0x02
+ #define SPIE_RXB	0x01
+ 
++/* USB Mode Parameter RAM.
++*/
++
++#define BD_USB_CLEAN    (BD_SC_WRAP | BD_SC_INTRPT)
++
++/* Buffer descriptor control/status used by USB receive.
++ */
++#define BD_USB_RXPID_MASK	0x00c0
++#define BD_USB_RXPID_0		0x0000
++#define BD_USB_RXPID_1		0x0040
++#define BD_USB_RXPID_SETUP	0x0080
++#define BD_USB_NO		0x0010   /* Rx non-octet aligned packet */
++#define BD_USB_AB		0x0008   /* Frame aborted (bit stuff error) */
++#define BD_USB_CRC		0x0004   /* CRC error */
++#define BD_USB_OV		0x0002   /* Overrun */
++
++/* Buffer descriptor control/status used by USB transmit.
++ */
++#define BD_USB_TC		0x0400   /* Transmit CRC */
++#define BD_USB_CNF		0x0200   /* Expect for confirmation before sending the next packet */
++#define BD_USB_PID0		0x0080   /* Transmit DATA0 PID */
++#define BD_USB_PID1		0x00c0   /* Transmit DATA1 PID */
++#define BD_USB_NAK		0x0010   /* NAK received */
++#define BD_USB_STAL		0x0008   /* STALL received */
++#define BD_USB_TO		0x0004   /* Timeout */
++#define BD_USB_UN		0x0002   /* Underrun */
++#define BD_USB_TXERR		(BD_USB_NAK | BD_USB_STAL | BD_USB_TO | BD_USB_UN)
++#define BD_USB_RXERR		(BD_USB_NO | BD_USB_AB | BD_USB_CRC | BD_USB_OV)
++
++/* USB parameters table*/
++typedef struct usb_params {
++	ushort  ep0_ptr;
++	ushort  ep1_ptr;
++	ushort  ep2_ptr;
++	ushort  ep3_ptr;
++	uint    rstate;
++	uint    rptr;
++	ushort  frame_n;
++	ushort  rbcnt; /*receive internal byte count*/
++	uint    rtemp;
++	uint    rxusb_data;
++	ushort  rxuptr;
++	ushort  res1;
++} usb_parms_t;
++
++/* USB Endpoint parameters*/
++typedef struct usb_ep_params {
++	ushort  rbase; /* RX BD ring */
++	ushort  tbase; /* TX BD ring */
++	u_char  rfcr;
++	u_char  tfcr;
++	ushort  mrblr; /* max RX packet */
++	ushort  rbptr; /* RX BD pointer */
++	ushort  tbptr; /* TX --//--  */
++	uint    tstate;
++	uint    tptr;
++	ushort  tcrc;
++	ushort  tbcnt;
++	uint    ttemp;
++	ushort  tx_usbuptr;
++	ushort  res1;
++} usb_ep_parms_t;
++
++/* RFCR/TFCR fields */
++#define USB_FCR_BO_BE		0x18   /* MOT mode: big endian */
++
++#define USMOD_ENABLE		0x01    /* USB enable */
++
++#define USCOM_FLUSH		0x40    /* Flush FIFO */
++#define USCOM_STR		0x80    /* Start FIFO fill */
++#define USBE_TXB		0x0002  /* A buffer has been transmitted */
++#define USBE_RXB		0x0001  /* A buffer has been received */
++#define USBE_RESET		0x0200  /* Reset condition detected */
++#define USBE_TXE3		0x0080  /* Tx error: EP3 */
++#define USBE_TXE2		0x0040  /* Tx error: EP2 */
++#define USBE_TXE1		0x0020  /* Tx error: EP1 */
++#define USBE_TXE0		0x0010  /* Tx error: EP0 */
++#define USBE_BSY		0x0004  /* Busy condition (no rx buffer) */
++#define USBE_ERROR		(USBE_BSY|USBE_TXE0|USBE_TXE1|USBE_TXE2|USBE_TXE3)
++#define USEP_NUM_SHIFT		12
++#define USEP_RTE		0x0010  /* Retransmit enable (function only) */
++#define USEP_TM_CTRL		0x0000  /* Transfer mode: control */
++#define USEP_TM_BULK		0x0200  /* Transfer mode: bulk (function only) */
++
+ /* Asynchronous HDLC Mode Parameter RAM.
+ */
+ typedef struct scc_ahdlc {
+Index: linux-2.6.10/drivers/usb/gadget/gadget_chips.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/gadget_chips.h
++++ linux-2.6.10/drivers/usb/gadget/gadget_chips.h
+@@ -113,6 +113,12 @@
+ #define gadget_is_mpc8272(g)	0
+ #endif
+ 
++#ifdef CONFIG_USB_GADGET_MPC885ADS
++#define gadget_is_mpc885(g)	strstr((g)->name, "mpc885_udc")
++#else
++#define gadget_is_mpc885(g)	0
++#endif
++
+ // CONFIG_USB_GADGET_SX2
+ // CONFIG_USB_GADGET_AU1X00
+ // ...
+@@ -169,5 +175,7 @@ static inline int usb_gadget_controller_
+ 		return 0x16;
+ 	else if (gadget_is_mpc8272(gadget))
+ 		return 0x17;
++	else if (gadget_is_mpc885(gadget))
++		return 0x18;
+ 	return -ENOENT;
+ }
+Index: linux-2.6.10/mvl_patches/pro-1190.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1190.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1190);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1323 @@
+#! /usr/bin/env bash
+# Patch: -phy-numerous-minor-fixes.patch
+# Date: Thu Apr 20 12:20:13 2006
+# commit 67c4f3fa25502ce7ed82fb0307e09cf36f1f81da
+# Author: Jeff Garzik <jgarzik@pobox.com>
+# Date:   Thu Aug 11 02:07:25 2005 -0400
+# 
+#     Fix numerous minor problems with new phy subsystem.
+#     
+#     Includes fixes for problems noted by Adrian Bunk, Andrew Morton,
+#     and one other person lost in the annals of history (and email folders).
+# 
+# 
+
+PATCHNUM=470
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+commit 67c4f3fa25502ce7ed82fb0307e09cf36f1f81da
+Author: Jeff Garzik <jgarzik@pobox.com>
+Date:   Thu Aug 11 02:07:25 2005 -0400
+
+    Fix numerous minor problems with new phy subsystem.
+    
+    Includes fixes for problems noted by Adrian Bunk, Andrew Morton,
+    and one other person lost in the annals of history (and email folders).
+
+
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index 8b5db23..c2f1bf1 100644
+ drivers/net/phy/Kconfig      |   12 
+ drivers/net/phy/Makefile     |   12 
+ drivers/net/phy/mdio_bus.c   |    4 
+ drivers/net/phy/phy.c        |    9 
+ drivers/net/phy/phy.c.orig   |  860 -------------------------------------------
+ drivers/net/phy/phy_device.c |   48 +-
+ include/linux/phy.h          |    1 
+ mvl_patches/pro-0470.c       |   16 
+ 8 files changed, 69 insertions(+), 893 deletions(-)
+
+Index: linux-2.6.10/drivers/net/phy/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/Kconfig
++++ linux-2.6.10/drivers/net/phy/Kconfig
+@@ -5,7 +5,7 @@
+ menu "PHY device support"
+ 
+ config PHYLIB
+-	bool "PHY Device support and infrastructure"
++	tristate "PHY Device support and infrastructure"
+ 	depends on NET_ETHERNET
+ 	help
+ 	  Ethernet controllers are usually attached to PHY
+@@ -24,31 +24,31 @@ comment "MII PHY device drivers"
+ 	depends on PHYLIB
+ 
+ config MARVELL_PHY
+-	bool "Drivers for Marvell PHYs"
++	tristate "Drivers for Marvell PHYs"
+ 	depends on PHYLIB
+ 	---help---
+ 	  Currently has a driver for the 88E1011S
+ 	
+ config DAVICOM_PHY
+-	bool "Drivers for Davicom PHYs"
++	tristate "Drivers for Davicom PHYs"
+ 	depends on PHYLIB
+ 	---help---
+ 	  Currently supports dm9161e and dm9131
+ 
+ config QSEMI_PHY
+-	bool "Drivers for Quality Semiconductor PHYs"
++	tristate "Drivers for Quality Semiconductor PHYs"
+ 	depends on PHYLIB
+ 	---help---
+ 	  Currently supports the qs6612
+ 
+ config LXT_PHY
+-	bool "Drivers for the Intel LXT PHYs"
++	tristate "Drivers for the Intel LXT PHYs"
+ 	depends on PHYLIB
+ 	---help---
+ 	  Currently supports the lxt970, lxt971
+ 
+ config CICADA_PHY
+-	bool "Drivers for the Cicada PHYs"
++	tristate "Drivers for the Cicada PHYs"
+ 	depends on PHYLIB
+ 	---help---
+ 	  Currently supports the cis8204
+Index: linux-2.6.10/drivers/net/phy/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/Makefile
++++ linux-2.6.10/drivers/net/phy/Makefile
+@@ -1,9 +1,9 @@
+ # Makefile for Linux PHY drivers
+ 
+-obj-$(CONFIG_PHYLIB) += phy.o phy_device.o mdio_bus.o
++libphy-objs			:= phy.o phy_device.o mdio_bus.o
+ 
+-obj-$(CONFIG_MARVELL_PHY) += marvell.o
+-obj-$(CONFIG_DAVICOM_PHY) += davicom.o
+-obj-$(CONFIG_CICADA_PHY) += cicada.o
+-obj-$(CONFIG_LXT_PHY) += lxt.o
+-obj-$(CONFIG_QSEMI_PHY) += qsemi.o
++obj-$(CONFIG_MARVELL_PHY)	+= libphy.o marvell.o
++obj-$(CONFIG_DAVICOM_PHY)	+= libphy.o davicom.o
++obj-$(CONFIG_CICADA_PHY)	+= libphy.o cicada.o
++obj-$(CONFIG_LXT_PHY)		+= libphy.o lxt.o
++obj-$(CONFIG_QSEMI_PHY)		+= libphy.o qsemi.o
+Index: linux-2.6.10/drivers/net/phy/mdio_bus.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/mdio_bus.c
++++ linux-2.6.10/drivers/net/phy/mdio_bus.c
+@@ -165,9 +165,9 @@ struct bus_type mdio_bus_type = {
+ 	.resume		= mdio_bus_resume,
+ };
+ 
+-static int __init mdio_bus_init(void)
++int __init mdio_bus_init(void)
+ {
+ 	return bus_register(&mdio_bus_type);
+ }
+ 
+-subsys_initcall(mdio_bus_init);
++
+Index: linux-2.6.10/drivers/net/phy/phy.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/phy.c
++++ linux-2.6.10/drivers/net/phy/phy.c
+@@ -39,7 +39,6 @@
+ #include <asm/irq.h>
+ #include <asm/uaccess.h>
+ 
+-static void phy_change(void *data);
+ static void phy_timer(unsigned long data);
+ 
+ /* Convenience function to print out the current phy status
+@@ -464,7 +463,6 @@ void phy_stop_machine(struct phy_device 
+ 	phydev->adjust_state = NULL;
+ }
+ 
+-#ifdef CONFIG_PHYCONTROL
+ /* phy_error:
+  *
+  * Moves the PHY to the HALTED state in response to a read
+@@ -479,6 +477,10 @@ void phy_error(struct phy_device *phydev
+ 	spin_unlock(&phydev->lock);
+ }
+ 
++#ifdef CONFIG_PHYCONTROL
++
++static void phy_change(void *data);
++
+ /* phy_interrupt
+  *
+  * description: When a PHY interrupt occurs, the handler disables
+@@ -672,6 +674,8 @@ void phy_start(struct phy_device *phydev
+ EXPORT_SYMBOL(phy_stop);
+ EXPORT_SYMBOL(phy_start);
+ 
++#endif /* CONFIG_PHYCONTROL */
++
+ /* PHY timer which handles the state machine */
+ static void phy_timer(unsigned long data)
+ {
+@@ -859,4 +863,3 @@ static void phy_timer(unsigned long data
+ 	mod_timer(&phydev->phy_timer, jiffies + PHY_STATE_TIME * HZ);
+ }
+ 
+-#endif /* CONFIG_PHYCONTROL */
+Index: linux-2.6.10/drivers/net/phy/phy.c.orig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/phy.c.orig
++++ /dev/null
+@@ -1,860 +0,0 @@
+-/*
+- * drivers/net/phy/phy.c
+- *
+- * Framework for configuring and reading PHY devices
+- * Based on code in sungem_phy.c and gianfar_phy.c
+- *
+- * Author: Andy Fleming
+- *
+- * Copyright (c) 2004 Freescale Semiconductor, Inc.
+- *
+- * This program is free software; you can redistribute  it and/or modify it
+- * under  the terms of  the GNU General  Public License as published by the
+- * Free Software Foundation;  either version 2 of the  License, or (at your
+- * option) any later version.
+- *
+- */
+-#include <linux/config.h>
+-#include <linux/kernel.h>
+-#include <linux/sched.h>
+-#include <linux/string.h>
+-#include <linux/errno.h>
+-#include <linux/unistd.h>
+-#include <linux/slab.h>
+-#include <linux/interrupt.h>
+-#include <linux/init.h>
+-#include <linux/delay.h>
+-#include <linux/netdevice.h>
+-#include <linux/etherdevice.h>
+-#include <linux/skbuff.h>
+-#include <linux/spinlock.h>
+-#include <linux/mm.h>
+-#include <linux/module.h>
+-#include <linux/version.h>
+-#include <linux/mii.h>
+-#include <linux/ethtool.h>
+-#include <linux/phy.h>
+-
+-#include <asm/io.h>
+-#include <asm/irq.h>
+-#include <asm/uaccess.h>
+-
+-static void phy_change(void *data);
+-static void phy_timer(unsigned long data);
+-
+-/* Convenience function to print out the current phy status
+- */
+-void phy_print_status(struct phy_device *phydev)
+-{
+-	pr_info("%s: Link is %s", phydev->dev.bus_id,
+-			phydev->link ? "Up" : "Down");
+-	if (phydev->link)
+-		printk(" - %d/%s", phydev->speed,
+-				DUPLEX_FULL == phydev->duplex ?
+-				"Full" : "Half");
+-
+-	printk("\n");
+-}
+-EXPORT_SYMBOL(phy_print_status);
+-
+-
+-/* Convenience functions for reading/writing a given PHY
+- * register. They MUST NOT be called from interrupt context,
+- * because the bus read/write functions may wait for an interrupt
+- * to conclude the operation. */
+-int phy_read(struct phy_device *phydev, u16 regnum)
+-{
+-	int retval;
+-	struct mii_bus *bus = phydev->bus;
+-
+-	spin_lock_bh(&bus->mdio_lock);
+-	retval = bus->read(bus, phydev->addr, regnum);
+-	spin_unlock_bh(&bus->mdio_lock);
+-
+-	return retval;
+-}
+-EXPORT_SYMBOL(phy_read);
+-
+-int phy_write(struct phy_device *phydev, u16 regnum, u16 val)
+-{
+-	int err;
+-	struct mii_bus *bus = phydev->bus;
+-
+-	spin_lock_bh(&bus->mdio_lock);
+-	err = bus->write(bus, phydev->addr, regnum, val);
+-	spin_unlock_bh(&bus->mdio_lock);
+-
+-	return err;
+-}
+-EXPORT_SYMBOL(phy_write);
+-
+-
+-int phy_clear_interrupt(struct phy_device *phydev)
+-{
+-	int err = 0;
+-
+-	if (phydev->drv->ack_interrupt)
+-		err = phydev->drv->ack_interrupt(phydev);
+-
+-	return err;
+-}
+-
+-
+-int phy_config_interrupt(struct phy_device *phydev, u32 interrupts)
+-{
+-	int err = 0;
+-
+-	phydev->interrupts = interrupts;
+-	if (phydev->drv->config_intr)
+-		err = phydev->drv->config_intr(phydev);
+-
+-	return err;
+-}
+-
+-
+-/* phy_aneg_done
+- *
+- * description: Reads the status register and returns 0 either if
+- *   auto-negotiation is incomplete, or if there was an error.
+- *   Returns BMSR_ANEGCOMPLETE if auto-negotiation is done.
+- */
+-static inline int phy_aneg_done(struct phy_device *phydev)
+-{
+-	int retval;
+-
+-	retval = phy_read(phydev, MII_BMSR);
+-
+-	return (retval < 0) ? retval : (retval & BMSR_ANEGCOMPLETE);
+-}
+-
+-/* phy_start_aneg
+- *
+- * description: Calls the PHY driver's config_aneg, and then
+- *   sets the PHY state to PHY_AN if auto-negotiation is enabled,
+- *   and to PHY_FORCING if auto-negotiation is disabled. Unless
+- *   the PHY is currently HALTED.
+- */
+-int phy_start_aneg(struct phy_device *phydev)
+-{
+-	int err;
+-
+-	spin_lock(&phydev->lock);
+-
+-	if (AUTONEG_DISABLE == phydev->autoneg)
+-		phy_sanitize_settings(phydev);
+-
+-	err = phydev->drv->config_aneg(phydev);
+-
+-	if (err < 0)
+-		goto out_unlock;
+-
+-	if (phydev->state != PHY_HALTED) {
+-		if (AUTONEG_ENABLE == phydev->autoneg) {
+-			phydev->state = PHY_AN;
+-			phydev->link_timeout = PHY_AN_TIMEOUT;
+-		} else {
+-			phydev->state = PHY_FORCING;
+-			phydev->link_timeout = PHY_FORCE_TIMEOUT;
+-		}
+-	}
+-
+-out_unlock:
+-	spin_unlock(&phydev->lock);
+-	return err;
+-}
+-EXPORT_SYMBOL(phy_start_aneg);
+-
+-
+-/* A structure for mapping a particular speed and duplex
+- * combination to a particular SUPPORTED and ADVERTISED value */
+-struct phy_setting {
+-	int speed;
+-	int duplex;
+-	u32 setting;
+-};
+-
+-/* A mapping of all SUPPORTED settings to speed/duplex */
+-static struct phy_setting settings[] = {
+-	{
+-		.speed = 10000,
+-		.duplex = DUPLEX_FULL,
+-		.setting = SUPPORTED_10000baseT_Full,
+-	},
+-	{
+-		.speed = SPEED_1000,
+-		.duplex = DUPLEX_FULL,
+-		.setting = SUPPORTED_1000baseT_Full,
+-	},
+-	{
+-		.speed = SPEED_1000,
+-		.duplex = DUPLEX_HALF,
+-		.setting = SUPPORTED_1000baseT_Half,
+-	},
+-	{
+-		.speed = SPEED_100,
+-		.duplex = DUPLEX_FULL,
+-		.setting = SUPPORTED_100baseT_Full,
+-	},
+-	{
+-		.speed = SPEED_100,
+-		.duplex = DUPLEX_HALF,
+-		.setting = SUPPORTED_100baseT_Half,
+-	},
+-	{
+-		.speed = SPEED_10,
+-		.duplex = DUPLEX_FULL,
+-		.setting = SUPPORTED_10baseT_Full,
+-	},
+-	{
+-		.speed = SPEED_10,
+-		.duplex = DUPLEX_HALF,
+-		.setting = SUPPORTED_10baseT_Half,
+-	},
+-};
+-
+-#define MAX_NUM_SETTINGS (sizeof(settings)/sizeof(struct phy_setting))
+-
+-/* phy_find_setting
+- *
+- * description: Searches the settings array for the setting which
+- *   matches the desired speed and duplex, and returns the index
+- *   of that setting.  Returns the index of the last setting if
+- *   none of the others match.
+- */
+-static inline int phy_find_setting(int speed, int duplex)
+-{
+-	int idx = 0;
+-
+-	while (idx < ARRAY_SIZE(settings) &&
+-			(settings[idx].speed != speed ||
+-			settings[idx].duplex != duplex))
+-		idx++;
+-
+-	return idx < MAX_NUM_SETTINGS ? idx : MAX_NUM_SETTINGS - 1;
+-}
+-
+-/* phy_find_valid
+- * idx: The first index in settings[] to search
+- * features: A mask of the valid settings
+- *
+- * description: Returns the index of the first valid setting less
+- *   than or equal to the one pointed to by idx, as determined by
+- *   the mask in features.  Returns the index of the last setting
+- *   if nothing else matches.
+- */
+-static inline int phy_find_valid(int idx, u32 features)
+-{
+-	while (idx < MAX_NUM_SETTINGS && !(settings[idx].setting & features))
+-		idx++;
+-
+-	return idx < MAX_NUM_SETTINGS ? idx : MAX_NUM_SETTINGS - 1;
+-}
+-
+-/* phy_sanitize_settings
+- *
+- * description: Make sure the PHY is set to supported speeds and
+- *   duplexes.  Drop down by one in this order:  1000/FULL,
+- *   1000/HALF, 100/FULL, 100/HALF, 10/FULL, 10/HALF
+- */
+-void phy_sanitize_settings(struct phy_device *phydev)
+-{
+-	u32 features = phydev->supported;
+-	int idx;
+-
+-	/* Sanitize settings based on PHY capabilities */
+-	if ((features & SUPPORTED_Autoneg) == 0)
+-		phydev->autoneg = 0;
+-
+-	idx = phy_find_valid(phy_find_setting(phydev->speed, phydev->duplex),
+-			features);
+-
+-	phydev->speed = settings[idx].speed;
+-	phydev->duplex = settings[idx].duplex;
+-}
+-EXPORT_SYMBOL(phy_sanitize_settings);
+-
+-/* phy_force_reduction
+- *
+- * description: Reduces the speed/duplex settings by
+- *   one notch.  The order is so:
+- *   1000/FULL, 1000/HALF, 100/FULL, 100/HALF,
+- *   10/FULL, 10/HALF.  The function bottoms out at 10/HALF.
+- */
+-static void phy_force_reduction(struct phy_device *phydev)
+-{
+-	int idx;
+-
+-	idx = phy_find_setting(phydev->speed, phydev->duplex);
+-	
+-	idx++;
+-
+-	idx = phy_find_valid(idx, phydev->supported);
+-
+-	phydev->speed = settings[idx].speed;
+-	phydev->duplex = settings[idx].duplex;
+-
+-	pr_info("Trying %d/%s\n", phydev->speed,
+-			DUPLEX_FULL == phydev->duplex ?
+-			"FULL" : "HALF");
+-}
+-
+-/* phy_ethtool_sset:
+- * A generic ethtool sset function.  Handles all the details
+- *
+- * A few notes about parameter checking:
+- * - We don't set port or transceiver, so we don't care what they
+- *   were set to.
+- * - phy_start_aneg() will make sure forced settings are sane, and
+- *   choose the next best ones from the ones selected, so we don't
+- *   care if ethtool tries to give us bad values
+- */
+-int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd)
+-{
+-	if (cmd->phy_address != phydev->addr)
+-		return -EINVAL;
+-
+-	/* We make sure that we don't pass unsupported
+-	 * values in to the PHY */
+-	cmd->advertising &= phydev->supported;
+-
+-	/* Verify the settings we care about. */
+-	if (cmd->autoneg != AUTONEG_ENABLE && cmd->autoneg != AUTONEG_DISABLE)
+-		return -EINVAL;
+-
+-	if (cmd->autoneg == AUTONEG_ENABLE && cmd->advertising == 0)
+-		return -EINVAL;
+-
+-	if (cmd->autoneg == AUTONEG_DISABLE
+-			&& ((cmd->speed != SPEED_1000
+-					&& cmd->speed != SPEED_100
+-					&& cmd->speed != SPEED_10)
+-				|| (cmd->duplex != DUPLEX_HALF
+-					&& cmd->duplex != DUPLEX_FULL)))
+-		return -EINVAL;
+-
+-	phydev->autoneg = cmd->autoneg;
+-
+-	phydev->speed = cmd->speed;
+-
+-	phydev->advertising = cmd->advertising;
+-
+-	if (AUTONEG_ENABLE == cmd->autoneg)
+-		phydev->advertising |= ADVERTISED_Autoneg;
+-	else
+-		phydev->advertising &= ~ADVERTISED_Autoneg;
+-
+-	phydev->duplex = cmd->duplex;
+-
+-	/* Restart the PHY */
+-	phy_start_aneg(phydev);
+-
+-	return 0;
+-}
+-
+-int phy_ethtool_gset(struct phy_device *phydev, struct ethtool_cmd *cmd)
+-{
+-	cmd->supported = phydev->supported;
+-
+-	cmd->advertising = phydev->advertising;
+-
+-	cmd->speed = phydev->speed;
+-	cmd->duplex = phydev->duplex;
+-	cmd->port = PORT_MII;
+-	cmd->phy_address = phydev->addr;
+-	cmd->transceiver = XCVR_EXTERNAL;
+-	cmd->autoneg = phydev->autoneg;
+-
+-	return 0;
+-}
+-
+-
+-/* Note that this function is currently incompatible with the
+- * PHYCONTROL layer.  It changes registers without regard to
+- * current state.  Use at own risk
+- */
+-int phy_mii_ioctl(struct phy_device *phydev,
+-		struct mii_ioctl_data *mii_data, int cmd)
+-{
+-	u16 val = mii_data->val_in;
+-
+-	switch (cmd) {
+-	case SIOCGMIIPHY:
+-		mii_data->phy_id = phydev->addr;
+-		break;
+-	case SIOCGMIIREG:
+-		mii_data->val_out = phy_read(phydev, mii_data->reg_num);
+-		break;
+-
+-	case SIOCSMIIREG:
+-		if (!capable(CAP_NET_ADMIN))
+-			return -EPERM;
+-
+-		if (mii_data->phy_id == phydev->addr) {
+-			switch(mii_data->reg_num) {
+-			case MII_BMCR:
+-				if (val & (BMCR_RESET|BMCR_ANENABLE))
+-					phydev->autoneg = AUTONEG_DISABLE;
+-				else
+-					phydev->autoneg = AUTONEG_ENABLE;
+-				if ((!phydev->autoneg) && (val & BMCR_FULLDPLX))
+-					phydev->duplex = DUPLEX_FULL;
+-				else
+-					phydev->duplex = DUPLEX_HALF;
+-				break;
+-			case MII_ADVERTISE:
+-				phydev->advertising = val;
+-				break;
+-			default:
+-				/* do nothing */
+-				break;
+-			}
+-		}
+-
+-		phy_write(phydev, mii_data->reg_num, val);
+-		
+-		if (mii_data->reg_num == MII_BMCR 
+-				&& val & BMCR_RESET
+-				&& phydev->drv->config_init)
+-			phydev->drv->config_init(phydev);
+-		break;
+-	}
+-
+-	return 0;
+-}
+-
+-/* phy_start_machine:
+- *
+- * description: The PHY infrastructure can run a state machine
+- *   which tracks whether the PHY is starting up, negotiating,
+- *   etc.  This function starts the timer which tracks the state
+- *   of the PHY.  If you want to be notified when the state
+- *   changes, pass in the callback, otherwise, pass NULL.  If you
+- *   want to maintain your own state machine, do not call this
+- *   function. */
+-void phy_start_machine(struct phy_device *phydev,
+-		void (*handler)(struct net_device *))
+-{
+-	phydev->adjust_state = handler;
+-
+-	init_timer(&phydev->phy_timer);
+-	phydev->phy_timer.function = &phy_timer;
+-	phydev->phy_timer.data = (unsigned long) phydev;
+-	mod_timer(&phydev->phy_timer, jiffies + HZ);
+-}
+-
+-/* phy_stop_machine
+- *
+- * description: Stops the state machine timer, sets the state to
+- *   UP (unless it wasn't up yet), and then frees the interrupt,
+- *   if it is in use. This function must be called BEFORE
+- *   phy_detach.
+- */
+-void phy_stop_machine(struct phy_device *phydev)
+-{
+-	del_timer_sync(&phydev->phy_timer);
+-
+-	spin_lock(&phydev->lock);
+-	if (phydev->state > PHY_UP)
+-		phydev->state = PHY_UP;
+-	spin_unlock(&phydev->lock);
+-
+-	if (phydev->irq != PHY_POLL)
+-		phy_stop_interrupts(phydev);
+-
+-	phydev->adjust_state = NULL;
+-}
+-
+-#ifdef CONFIG_PHYCONTROL
+-/* phy_error:
+- *
+- * Moves the PHY to the HALTED state in response to a read
+- * or write error, and tells the controller the link is down.
+- * Must not be called from interrupt context, or while the
+- * phydev->lock is held.
+- */
+-void phy_error(struct phy_device *phydev)
+-{
+-	spin_lock(&phydev->lock);
+-	phydev->state = PHY_HALTED;
+-	spin_unlock(&phydev->lock);
+-}
+-
+-/* phy_interrupt
+- *
+- * description: When a PHY interrupt occurs, the handler disables
+- * interrupts, and schedules a work task to clear the interrupt.
+- */
+-static irqreturn_t phy_interrupt(int irq, void *phy_dat, struct pt_regs *regs)
+-{
+-	struct phy_device *phydev = phy_dat;
+-
+-	/* The MDIO bus is not allowed to be written in interrupt
+-	 * context, so we need to disable the irq here.  A work
+-	 * queue will write the PHY to disable and clear the
+-	 * interrupt, and then reenable the irq line. */
+-	disable_irq_nosync(irq);
+-
+-	schedule_work(&phydev->phy_queue);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-/* Enable the interrupts from the PHY side */
+-int phy_enable_interrupts(struct phy_device *phydev)
+-{
+-	int err;
+-
+-	err = phy_clear_interrupt(phydev);
+-
+-	if (err < 0)
+-		return err;
+-
+-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED);
+-
+-	return err;
+-}
+-
+-/* Disable the PHY interrupts from the PHY side */
+-int phy_disable_interrupts(struct phy_device *phydev)
+-{
+-	int err;
+-
+-	/* Disable PHY interrupts */
+-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
+-
+-	if (err)
+-		goto phy_err;
+-
+-	/* Clear the interrupt */
+-	err = phy_clear_interrupt(phydev);
+-
+-	if (err)
+-		goto phy_err;
+-
+-	return 0;
+-
+-phy_err:
+-	phy_error(phydev);
+-
+-	return err;
+-}
+-
+-/* phy_start_interrupts
+- *
+- * description: Request the interrupt for the given PHY.  If
+- *   this fails, then we set irq to PHY_POLL.
+- *   Otherwise, we enable the interrupts in the PHY.
+- *   Returns 0 on success.
+- *   This should only be called with a valid IRQ number.
+- */
+-int phy_start_interrupts(struct phy_device *phydev)
+-{
+-	int err = 0;
+-
+-	INIT_WORK(&phydev->phy_queue, phy_change, phydev);
+-
+-	if (request_irq(phydev->irq, phy_interrupt,
+-				SA_SHIRQ,
+-				"phy_interrupt",
+-				phydev) < 0) {
+-		printk(KERN_WARNING "%s: Can't get IRQ %d (PHY)\n",
+-				phydev->bus->name,
+-				phydev->irq);
+-		phydev->irq = PHY_POLL;
+-		return 0;
+-	}
+-
+-	err = phy_enable_interrupts(phydev);
+-
+-	return err;
+-}
+-EXPORT_SYMBOL(phy_start_interrupts);
+-
+-int phy_stop_interrupts(struct phy_device *phydev)
+-{
+-	int err;
+-
+-	err = phy_disable_interrupts(phydev);
+-
+-	if (err)
+-		phy_error(phydev);
+-
+-	free_irq(phydev->irq, phydev);
+-
+-	return err;
+-}
+-EXPORT_SYMBOL(phy_stop_interrupts);
+-
+-
+-/* Scheduled by the phy_interrupt/timer to handle PHY changes */
+-static void phy_change(void *data)
+-{
+-	int err;
+-	struct phy_device *phydev = data;
+-
+-	err = phy_disable_interrupts(phydev);
+-
+-	if (err)
+-		goto phy_err;
+-
+-	spin_lock(&phydev->lock);
+-	if ((PHY_RUNNING == phydev->state) || (PHY_NOLINK == phydev->state))
+-		phydev->state = PHY_CHANGELINK;
+-	spin_unlock(&phydev->lock);
+-
+-	enable_irq(phydev->irq);
+-
+-	/* Reenable interrupts */
+-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED);
+-
+-	if (err)
+-		goto irq_enable_err;
+-
+-	return;
+-
+-irq_enable_err:
+-	disable_irq(phydev->irq);
+-phy_err:
+-	phy_error(phydev);
+-}
+-
+-/* Bring down the PHY link, and stop checking the status. */
+-void phy_stop(struct phy_device *phydev)
+-{
+-	spin_lock(&phydev->lock);
+-
+-	if (PHY_HALTED == phydev->state)
+-		goto out_unlock;
+-
+-	if (phydev->irq != PHY_POLL) {
+-		/* Clear any pending interrupts */
+-		phy_clear_interrupt(phydev);
+-
+-		/* Disable PHY Interrupts */
+-		phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
+-	}
+-
+-	phydev->state = PHY_HALTED;
+-
+-out_unlock:
+-	spin_unlock(&phydev->lock);
+-}
+-
+-
+-/* phy_start
+- *
+- * description: Indicates the attached device's readiness to
+- *   handle PHY-related work.  Used during startup to start the
+- *   PHY, and after a call to phy_stop() to resume operation.
+- *   Also used to indicate the MDIO bus has cleared an error
+- *   condition.
+- */
+-void phy_start(struct phy_device *phydev)
+-{
+-	spin_lock(&phydev->lock);
+-
+-	switch (phydev->state) {
+-		case PHY_STARTING:
+-			phydev->state = PHY_PENDING;
+-			break;
+-		case PHY_READY:
+-			phydev->state = PHY_UP;
+-			break;
+-		case PHY_HALTED:
+-			phydev->state = PHY_RESUMING;
+-		default:
+-			break;
+-	}
+-	spin_unlock(&phydev->lock);
+-}
+-EXPORT_SYMBOL(phy_stop);
+-EXPORT_SYMBOL(phy_start);
+-
+-/* PHY timer which handles the state machine */
+-static void phy_timer(unsigned long data)
+-{
+-	struct phy_device *phydev = (struct phy_device *)data;
+-	int needs_aneg = 0;
+-	int err = 0;
+-
+-	spin_lock(&phydev->lock);
+-
+-	if (phydev->adjust_state)
+-		phydev->adjust_state(phydev->attached_dev);
+-
+-	switch(phydev->state) {
+-		case PHY_DOWN:
+-		case PHY_STARTING:
+-		case PHY_READY:
+-		case PHY_PENDING:
+-			break;
+-		case PHY_UP:
+-			needs_aneg = 1;
+-
+-			phydev->link_timeout = PHY_AN_TIMEOUT;
+-
+-			break;
+-		case PHY_AN:
+-			/* Check if negotiation is done.  Break
+-			 * if there's an error */
+-			err = phy_aneg_done(phydev);
+-			if (err < 0)
+-				break;
+-
+-			/* If auto-negotiation is done, we change to
+-			 * either RUNNING, or NOLINK */
+-			if (err > 0) {
+-				err = phy_read_status(phydev);
+-
+-				if (err)
+-					break;
+-
+-				if (phydev->link) {
+-					phydev->state = PHY_RUNNING;
+-					netif_carrier_on(phydev->attached_dev);
+-				} else {
+-					phydev->state = PHY_NOLINK;
+-					netif_carrier_off(phydev->attached_dev);
+-				}
+-
+-				phydev->adjust_link(phydev->attached_dev);
+-
+-			} else if (0 == phydev->link_timeout--) {
+-				/* The counter expired, so either we
+-				 * switch to forced mode, or the
+-				 * magic_aneg bit exists, and we try aneg
+-				 * again */
+-				if (!(phydev->drv->flags & PHY_HAS_MAGICANEG)) {
+-					int idx;
+-
+-					/* We'll start from the
+-					 * fastest speed, and work
+-					 * our way down */
+-					idx = phy_find_valid(0,
+-							phydev->supported);
+-
+-					phydev->speed = settings[idx].speed;
+-					phydev->duplex = settings[idx].duplex;
+-					
+-					phydev->autoneg = AUTONEG_DISABLE;
+-					phydev->state = PHY_FORCING;
+-					phydev->link_timeout =
+-						PHY_FORCE_TIMEOUT;
+-
+-					pr_info("Trying %d/%s\n",
+-							phydev->speed,
+-							DUPLEX_FULL ==
+-							phydev->duplex ?
+-							"FULL" : "HALF");
+-				}
+-
+-				needs_aneg = 1;
+-			}
+-			break;
+-		case PHY_NOLINK:
+-			err = phy_read_status(phydev);
+-
+-			if (err)
+-				break;
+-
+-			if (phydev->link) {
+-				phydev->state = PHY_RUNNING;
+-				netif_carrier_on(phydev->attached_dev);
+-				phydev->adjust_link(phydev->attached_dev);
+-			}
+-			break;
+-		case PHY_FORCING:
+-			err = phy_read_status(phydev);
+-
+-			if (err)
+-				break;
+-
+-			if (phydev->link) {
+-				phydev->state = PHY_RUNNING;
+-				netif_carrier_on(phydev->attached_dev);
+-			} else {
+-				if (0 == phydev->link_timeout--) {
+-					phy_force_reduction(phydev);
+-					needs_aneg = 1;
+-				}
+-			}
+-
+-			phydev->adjust_link(phydev->attached_dev);
+-			break;
+-		case PHY_RUNNING:
+-			/* Only register a CHANGE if we are
+-			 * polling */
+-			if (PHY_POLL == phydev->irq)
+-				phydev->state = PHY_CHANGELINK;
+-			break;
+-		case PHY_CHANGELINK:
+-			err = phy_read_status(phydev);
+-
+-			if (err)
+-				break;
+-
+-			if (phydev->link) {
+-				phydev->state = PHY_RUNNING;
+-				netif_carrier_on(phydev->attached_dev);
+-			} else {
+-				phydev->state = PHY_NOLINK;
+-				netif_carrier_off(phydev->attached_dev);
+-			}
+-
+-			phydev->adjust_link(phydev->attached_dev);
+-
+-			if (PHY_POLL != phydev->irq)
+-				err = phy_config_interrupt(phydev,
+-						PHY_INTERRUPT_ENABLED);
+-			break;
+-		case PHY_HALTED:
+-			if (phydev->link) {
+-				phydev->link = 0;
+-				netif_carrier_off(phydev->attached_dev);
+-				phydev->adjust_link(phydev->attached_dev);
+-			}
+-			break;
+-		case PHY_RESUMING:
+-
+-			err = phy_clear_interrupt(phydev);
+-
+-			if (err)
+-				break;
+-
+-			err = phy_config_interrupt(phydev,
+-					PHY_INTERRUPT_ENABLED);
+-
+-			if (err)
+-				break;
+-
+-			if (AUTONEG_ENABLE == phydev->autoneg) {
+-				err = phy_aneg_done(phydev);
+-				if (err < 0)
+-					break;
+-
+-				/* err > 0 if AN is done.
+-				 * Otherwise, it's 0, and we're
+-				 * still waiting for AN */
+-				if (err > 0) {
+-					phydev->state = PHY_RUNNING;
+-				} else {
+-					phydev->state = PHY_AN;
+-					phydev->link_timeout = PHY_AN_TIMEOUT;
+-				}
+-			} else
+-				phydev->state = PHY_RUNNING;
+-			break;
+-	}
+-
+-	spin_unlock(&phydev->lock);
+-
+-	if (needs_aneg)
+-		err = phy_start_aneg(phydev);
+-
+-	if (err < 0)
+-		phy_error(phydev);
+-
+-	mod_timer(&phydev->phy_timer, jiffies + PHY_STATE_TIME * HZ);
+-}
+-
+-#endif /* CONFIG_PHYCONTROL */
+Index: linux-2.6.10/drivers/net/phy/phy_device.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/phy_device.c
++++ linux-2.6.10/drivers/net/phy/phy_device.c
+@@ -39,6 +39,19 @@
+ #include <asm/irq.h>
+ #include <asm/uaccess.h>
+ 
++static int genphy_config_init(struct phy_device *phydev);
++
++static struct phy_driver genphy_driver = {
++	.phy_id		= 0xffffffff,
++	.phy_id_mask	= 0xffffffff,
++	.name		= "Generic PHY",
++	.config_init	= genphy_config_init,
++	.features	= 0,
++	.config_aneg	= genphy_config_aneg,
++	.read_status	= genphy_read_status,
++	.driver	=	{.owner	= THIS_MODULE, },
++};
++
+ /* get_phy_device
+  *
+  * description: Reads the ID registers of the PHY at addr on the
+@@ -656,27 +669,32 @@ void phy_driver_unregister(struct phy_dr
+ }
+ EXPORT_SYMBOL(phy_driver_unregister);
+ 
+-static struct phy_driver genphy_driver = {
+-	.phy_id		= 0xffffffff,
+-	.phy_id_mask	= 0xffffffff,
+-	.name		= "Generic PHY",
+-	.config_init	= genphy_config_init,
+-	.features	= 0,
+-	.config_aneg	= genphy_config_aneg,
+-	.read_status	= genphy_read_status,
+-	.driver	=	{.owner	= THIS_MODULE, },
+-};
+ 
+-static int __init genphy_init(void)
++static int __init phy_init(void)
+ {
+-	return phy_driver_register(&genphy_driver);
++	int rc;
++	extern int mdio_bus_init(void);
++
++	rc = phy_driver_register(&genphy_driver);
++	if (rc)
++		goto out;
++
++	rc = mdio_bus_init();
++	if (rc)
++		goto out_unreg;
+ 
++	return 0;
++
++out_unreg:
++	phy_driver_unregister(&genphy_driver);
++out:
++	return rc;
+ }
+ 
+-static void __exit genphy_exit(void)
++static void __exit phy_exit(void)
+ {
+ 	phy_driver_unregister(&genphy_driver);
+ }
+ 
+-module_init(genphy_init);
+-module_exit(genphy_exit);
++module_init(phy_init);
++module_exit(phy_exit);
+Index: linux-2.6.10/include/linux/phy.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/phy.h
++++ linux-2.6.10/include/linux/phy.h
+@@ -374,5 +374,4 @@ int phy_start_interrupts(struct phy_devi
+ void phy_print_status(struct phy_device *phydev);
+ 
+ extern struct bus_type mdio_bus_type;
+-extern struct phy_driver genphy_driver;
+ #endif /* __PHY_H */
+Index: linux-2.6.10/mvl_patches/pro-0470.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0470.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(470);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

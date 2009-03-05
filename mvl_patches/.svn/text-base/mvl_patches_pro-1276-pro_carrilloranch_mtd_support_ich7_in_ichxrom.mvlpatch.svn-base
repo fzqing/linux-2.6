@@ -1,0 +1,432 @@
+#! /usr/bin/env bash
+# Patch: -pro_carrilloranch_mtd_support_ich7_in_ichxrom
+# Date: Mon Mar 26 17:51:22 2007
+# Source: MontaVista Software, Inc.
+# MR: 21358
+# Type: Enhancement
+# Disposition: needs submitting to <linux-mtd@lists.infradead.org>.
+# Signed-off-by: Andy Lowe <alowe@mvista.com>
+# Description:
+#     The ichxrom MTD driver supports the BIOS Firmware Hub flash device on Intel
+#     ICH2, ICH3, ICH4, ICH5, and ESB1 chipsets.  The Carrillo Ranch board has an
+#     ICH7 chipset, so support needs to be added to this driver for the ICH7.  The
+#     ICH6, ICH8, and ESB2 chipsets share the same Firmware Hub register layout as
+#     the ICH7, so add support for those chipsets as well.
+# 
+
+PATCHNUM=1276
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 21358
+Type: Enhancement
+Disposition: needs submitting to <linux-mtd@lists.infradead.org>.
+Signed-off-by: Andy Lowe <alowe@mvista.com>
+Description:
+    The ichxrom MTD driver supports the BIOS Firmware Hub flash device on Intel
+    ICH2, ICH3, ICH4, ICH5, and ESB1 chipsets.  The Carrillo Ranch board has an
+    ICH7 chipset, so support needs to be added to this driver for the ICH7.  The
+    ICH6, ICH8, and ESB2 chipsets share the same Firmware Hub register layout as
+    the ICH7, so add support for those chipsets as well.
+
+Index: linux-cr/drivers/mtd/maps/ichxrom.c
+===================================================================
+--- linux-cr.orig/drivers/mtd/maps/ichxrom.c
++++ linux-cr/drivers/mtd/maps/ichxrom.c
+@@ -27,11 +27,39 @@
+ 
+ #define ROM_PROBE_STEP_SIZE (64*1024) /* 64KiB */
+ 
+-#define BIOS_CNTL	0x4e
+-#define FWH_DEC_EN1	0xE3
+-#define FWH_DEC_EN2	0xF0
+-#define FWH_SEL1	0xE8
+-#define FWH_SEL2	0xEE
++/*
++ * Define a structure for offsets to the LPC registers related to the
++ * Firmware Hub.  These registers are at different offsets in different
++ * ICH revisions.
++ */
++struct lpc_fwh_regs {
++	unsigned bios_cntl;
++	unsigned fwh_dec_en1;
++	unsigned fwh_dec_en2;
++	unsigned fwh_sel1;
++	unsigned fwh_sel2;
++};
++
++/*
++ * These offsets apply to the ICH2, ICH3, ICH4, ICH5 and 6300ESB
++ * I/O Controller Hubs.
++ */
++static const struct lpc_fwh_regs ich2_fwh_regs = {
++	.bios_cntl	= 0x4E,	/*  8-bit register */
++	.fwh_dec_en1	= 0xE3,	/*  8-bit register */
++	.fwh_dec_en2	= 0xF0,	/*  8-bit register */
++	.fwh_sel1	= 0xE8,	/* 32-bit register */
++	.fwh_sel2	= 0xEE,	/* 16-bit register */
++};
++
++/* These offsets apply to the ICH6 and ICH7 I/O Controller Hubs. */
++static const struct lpc_fwh_regs ich6_fwh_regs = {
++	.bios_cntl	= 0xDC,	/*  8-bit register */
++	.fwh_dec_en1	= 0xD9, /*  8-bit register */
++	.fwh_dec_en2	= 0xD8, /*  8-bit register */
++	.fwh_sel1	= 0xD0, /* 32-bit register */
++	.fwh_sel2	= 0xD4, /* 16-bit register */
++};
+ 
+ struct ichxrom_window {
+ 	void __iomem* virt;
+@@ -40,6 +68,7 @@ struct ichxrom_window {
+ 	struct list_head maps;
+ 	struct resource rsrc;
+ 	struct pci_dev *pdev;
++	const struct lpc_fwh_regs *regs;
+ };
+ 
+ struct ichxrom_map_info {
+@@ -57,11 +86,15 @@ static struct ichxrom_window ichxrom_win
+ static void ichxrom_cleanup(struct ichxrom_window *window)
+ {
+ 	struct ichxrom_map_info *map, *scratch;
+-	u16 word;
++	const struct lpc_fwh_regs *r;
++	u8 byte;
++
++	/* retrieve the register offsets for this ICH variant */
++	r = window->regs;
+ 
+ 	/* Disable writes through the rom window */
+-	pci_read_config_word(window->pdev, BIOS_CNTL, &word);
+-	pci_write_config_word(window->pdev, BIOS_CNTL, word & ~1);
++	pci_read_config_byte(window->pdev, r->bios_cntl, &byte);
++	pci_write_config_byte(window->pdev, r->bios_cntl, byte & ~1);
+ 
+ 	/* Free all of the mtd devices */
+ 	list_for_each_entry_safe(map, scratch, &window->maps, list) {
+@@ -90,9 +123,12 @@ static int __devinit ichxrom_init_one (s
+ 	static char *rom_probe_types[] = { "cfi_probe", "jedec_probe", NULL };
+ 	struct ichxrom_window *window = &ichxrom_window;
+ 	struct ichxrom_map_info *map = NULL;
++	const struct lpc_fwh_regs *r;
+ 	unsigned long map_top;
+ 	u8 byte;
+-	u16 word;
++
++	/* retrieve the register offsets for this ICH variant */
++	r = (const struct lpc_fwh_regs *) ent->driver_data;
+ 
+ 	/* For now I just handle the ichx and I assume there
+ 	 * are not a lot of resources up at the top of the address
+@@ -105,13 +141,14 @@ static int __devinit ichxrom_init_one (s
+ 	 * but don't currently handle that case either.
+ 	 */
+ 	window->pdev = pdev;
++	window->regs = (const struct lpc_fwh_regs *)ent->driver_data;
+ 
+ 	/* Find a region continuous to the end of the ROM window  */
+ 	window->phys = 0;
+-	pci_read_config_byte(pdev, FWH_DEC_EN1, &byte);
++	pci_read_config_byte(pdev, r->fwh_dec_en1, &byte);
+ 	if (byte == 0xff) {
+ 		window->phys = 0xffc00000;
+-		pci_read_config_byte(pdev, FWH_DEC_EN2, &byte);
++		pci_read_config_byte(pdev, r->fwh_dec_en2, &byte);
+ 		if ((byte & 0x0f) == 0x0f) {
+ 			window->phys = 0xff400000;
+ 		}
+@@ -155,15 +192,15 @@ static int __devinit ichxrom_init_one (s
+ 	window->size = (0xffffffffUL - window->phys) + 1UL;
+ 
+ 	/* Enable writes through the rom window */
+-	pci_read_config_word(pdev, BIOS_CNTL, &word);
+-	if (!(word & 1)  && (word & (1<<1))) {
++	pci_read_config_byte(pdev, r->bios_cntl, &byte);
++	if (!(byte & 1)  && (byte & (1<<1))) {
+ 		/* The BIOS will generate an error if I enable
+ 		 * this device, so don't even try.
+ 		 */
+ 		printk(KERN_ERR MOD_NAME ": firmware access control, I can't enable writes\n");
+ 		goto out;
+ 	}
+-	pci_write_config_word(pdev, BIOS_CNTL, word | 1);
++	pci_write_config_byte(pdev, r->bios_cntl, byte | 1);
+ 
+ 	/*
+ 	 * Try to reserve the window mem region.  If this fails then
+@@ -324,18 +361,29 @@ static void __devexit ichxrom_remove_one
+ 	ichxrom_cleanup(window);
+ }
+ 
++#define INTEL_FWH_DEV(dev, data)	\
++	.vendor = PCI_VENDOR_ID_INTEL,	\
++	.device = (dev),		\
++	.subvendor = PCI_ANY_ID,	\
++	.subdevice = PCI_ANY_ID,	\
++	.driver_data = (unsigned long) (data)
++
+ static struct pci_device_id ichxrom_pci_tbl[] __devinitdata = {
+-	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82801BA_0, 
+-	  PCI_ANY_ID, PCI_ANY_ID, },
+-	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82801CA_0, 
+-	  PCI_ANY_ID, PCI_ANY_ID, },
+-	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82801DB_0, 
+-	  PCI_ANY_ID, PCI_ANY_ID, },
+-	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82801EB_0,
+-	  PCI_ANY_ID, PCI_ANY_ID, },
+-	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ESB_1,
+-	  PCI_ANY_ID, PCI_ANY_ID, },
+-	{ 0, },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_82801BA_0, &ich2_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_82801CA_0, &ich2_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_82801DB_0, &ich2_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_82801EB_0, &ich2_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ESB_1, &ich2_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH6_0, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH6_1, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH7_0, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH7_1, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH7_31, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH8_0, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH8_2, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ICH8_3, &ich6_fwh_regs) },
++	{ INTEL_FWH_DEV(PCI_DEVICE_ID_INTEL_ESB2_0, &ich6_fwh_regs) },
++	{ .vendor = 0, },
+ };
+ 
+ #if 0
+@@ -362,7 +410,7 @@ static int __init init_ichxrom(void)
+ 		}
+ 	}
+ 	if (pdev) {
+-		return ichxrom_init_one(pdev, &ichxrom_pci_tbl[0]);
++		return ichxrom_init_one(pdev, id);
+ 	}
+ 	return -ENXIO;
+ #if 0
+Index: linux-cr/drivers/mtd/maps/Kconfig
+===================================================================
+--- linux-cr.orig/drivers/mtd/maps/Kconfig
++++ linux-cr/drivers/mtd/maps/Kconfig
+@@ -304,11 +304,11 @@ config MTD_AMD76XROM
+ 	  BE VERY CAREFUL.
+ 
+ config MTD_ICHXROM
+-	tristate "BIOS flash chip on Intel Controller Hub 2/3/4/5"
++	tristate "BIOS flash chip on Intel ICH 2/3/4/5/6/7/8 and ESB 1/2"
+ 	depends on X86 && MTD_JEDECPROBE
+ 	help
+-	  Support for treating the BIOS flash chip on ICHX motherboards
+-	  as an MTD device - with this you can reprogram your BIOS.
++	  Support for treating the BIOS flash chip on Intel ICHx and ESBx
++	  motherboards as an MTD device - with this you can reprogram your BIOS.
+ 
+ 	  BE VERY CAREFUL.
+ 
+Index: linux-cr/mvl_patches/pro-1276.c
+===================================================================
+--- /dev/null
++++ linux-cr/mvl_patches/pro-1276.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1276);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

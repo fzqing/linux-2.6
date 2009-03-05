@@ -1,0 +1,1257 @@
+#! /usr/bin/env bash
+# Patch: -pro_davinci_i2c
+# Date: Thu Jul  6 19:19:39 2006
+# Source: MontaVista Software, Inc.
+# MR: 15605
+# Type: Integration
+# Disposition: MontaVista
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+#     Integration of TI DaVinci 0.5.2 drop from TI
+
+PATCHNUM=767
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15605
+Type: Integration
+Disposition: MontaVista
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+    Integration of TI DaVinci 0.5.2 drop from TI
+Index: linux-2.6.10/drivers/i2c/busses/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Kconfig
++++ linux-2.6.10/drivers/i2c/busses/Kconfig
+@@ -503,4 +503,9 @@ config I2C_OMAP
+ 	help
+ 	  Support for TI OMAP I2C driver. Say yes if you want to use the OMAP
+ 	  I2C interface.
++
++config I2C_DAVINCI
++        tristate "Davinci i2c driver"
++        depends on I2C && ARCH_DAVINCI
++
+ endmenu
+Index: linux-2.6.10/drivers/i2c/busses/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Makefile
++++ linux-2.6.10/drivers/i2c/busses/Makefile
+@@ -42,6 +42,7 @@ obj-$(CONFIG_I2C_VOODOO3)	+= i2c-voodoo3
+ obj-$(CONFIG_SCx200_ACB)	+= scx200_acb.o
+ obj-$(CONFIG_SCx200_I2C)	+= scx200_i2c.o
+ obj-$(CONFIG_I2C_OMAP)          += i2c-omap.o
++obj-$(CONFIG_I2C_DAVINCI)       += i2c-davinci.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_BUS),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/drivers/i2c/busses/i2c-davinci.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/busses/i2c-davinci.c
+@@ -0,0 +1,558 @@
++/*
++ * linux/drivers/i2c/i2c-davinci.c
++ *
++ * TI DAVINCI I2C unified algorith+adapter driver
++ *
++ * Copyright (C) 2006 Texas Instruments.
++ *
++ * ----------------------------------------------------------------------------
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ * ----------------------------------------------------------------------------
++ Modifications:
++ ver. 1.0: Feb 2005, Vinod/Sudhakar
++ -
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/ioport.h>
++#include <linux/version.h>
++#include <linux/i2c.h>
++#include <asm/irq.h>
++#include <asm/io.h>
++#include <asm/hardware/clock.h>
++#include <asm/uaccess.h>
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <asm/arch/hardware.h>
++#include <linux/interrupt.h>
++#include <linux/moduleparam.h>
++#include <linux/err.h>
++#include <linux/proc_fs.h>
++#include <linux/sysctl.h>
++#include <linux/wait.h>
++#include <asm/arch/irqs.h>
++#include "i2c-davinci.h"
++
++#define I2C_BASE        IO_ADDRESS(DAVINCI_I2C_BASE)
++#define I2C_IOSIZE      (0x40)
++
++/* For sysctl stuff */
++#define	DAVINCI_I2C_DEBUG	1
++
++/* ----- global defines ----------------------------------------------- */
++#define MODULE_NAME 	        "DaVinci I2C"
++#define DAVINCI_I2C_TIMEOUT     (1*HZ)
++
++/* Undefine this to disable debugging */
++#define	I2C_DAVINCI_DEBUG
++
++#ifdef I2C_DAVINCI_DEBUG
++static int i2c_davinci_debug = 0;
++#define DEB0(format, arg...)	printk(KERN_ALERT MODULE_NAME " DEBUG: " format "\n",  ## arg )
++#define DEB1(format, arg...)	\
++	if (i2c_davinci_debug>=1) {	\
++		printk(KERN_ALERT MODULE_NAME " DEBUG: " format "\n",  ## arg ); \
++	}
++#else
++#define DEB0(fmt, args...)
++#define DEB1(fmt, args...)
++#endif
++
++#define i2c_err(format, arg...) printk(KERN_ERR MODULE_NAME " ERROR: " format "\n",  ## arg )
++#define i2c_warn(format, arg...) printk(KERN_WARNING MODULE_NAME " WARNING: " format "\n",  ## arg )
++
++#define MAX_MESSAGES    65536	/* max number of messages */
++
++#define I2C_DAVINCI_INTR_ALL    (DAVINCI_I2C_ICIMR_AAS_MASK | \
++				 DAVINCI_I2C_ICIMR_SCD_MASK | \
++				 /*DAVINCI_I2C_ICIMR_ICXRDY_MASK | */\
++				 /*DAVINCI_I2C_ICIMR_ICRRDY_MASK | */\
++				 /*DAVINCI_I2C_ICIMR_ARDY_MASK | */\
++				 DAVINCI_I2C_ICIMR_NACK_MASK | \
++				 DAVINCI_I2C_ICIMR_AL_MASK)
++
++/* Following are the default values for the module parameters */
++static int i2c_davinci_busFreq = 20;	/* Default: Fast Mode = 400 KHz, Standard Mode = 100 KHz */
++static unsigned long i2c_davinci_inputClock;	/* For I2C on DaVinci, the input clock frequency has been fixed at 27 MHz */
++static int i2c_davinci_own_addr = 0xa;	/* Randomly assigned own address */
++
++/* Instance of the private I2C device structure */
++static struct i2c_davinci_device i2c_davinci_dev;
++
++static struct clk *i2c_clock;
++
++/*
++ * This functions configures I2C and brings I2C out of reset.
++ * This function is called during I2C init function. This function
++ * also gets called if I2C encounetrs any errors. Clock calculation portion
++ * of this function has been taken from some other driver.
++ */
++static int i2c_davinci_reset(struct i2c_davinci_device *dev)
++{
++	u16 psc;
++	u32 clk;
++
++	/* put I2C into reset */
++	dev->regs->icmdr &= ~DAVINCI_I2C_ICMDR_IRS_MASK;
++
++        /* NOTE: I2C Clock divider programming info
++ 	 * As per I2C specs the following formulas provide prescalar
++         * and low/high divider values
++ 	 *
++ 	 * input clk --> PSC Div -----------> ICCL/H Div --> output clock
++ 	 *                       module clk
++ 	 *
++ 	 * output clk = module clk / (PSC + 1) [ (ICCL + d) + (ICCH + d) ]
++ 	 *
++ 	 * Thus,
++ 	 * (ICCL + ICCH) = clk = (input clk / ((psc +1) * output clk)) - 2d;
++ 	 *
++ 	 * where if PSC == 0, d = 7,
++ 	 *       if PSC == 1, d = 6
++ 	 *       if PSC > 1 , d = 5
++ 	 */
++
++	psc = 26; /* To get 1MHz clock */
++
++        clk = ((i2c_davinci_inputClock/(psc + 1)) / (i2c_davinci_busFreq * 1000)) - 10;
++
++	dev->regs->icpsc = psc;
++	dev->regs->icclkh = (27 * clk) / 100; /* duty cycle should be 27% */
++	dev->regs->icclkl = (clk - dev->regs->icclkh);
++
++	DEB1("CLK  = %d\n", clk);
++	DEB1("PSC  = %d\n", dev->regs->icpsc);
++	DEB1("CLKL = %d\n", dev->regs->icclkl);
++	DEB1("CLKH = %d\n", dev->regs->icclkh);
++
++	/* Set Own Address: */
++	dev->regs->icoar = i2c_davinci_own_addr;
++
++	/* Enable interrupts */
++	dev->regs->icimr = I2C_DAVINCI_INTR_ALL;
++
++	/* Take the I2C module out of reset: */
++	dev->regs->icmdr |= DAVINCI_I2C_ICMDR_IRS_MASK;
++
++	return 0;
++}
++
++/*
++ * Waiting on Bus Busy
++ */
++static int i2c_davinci_wait_for_bb(char allow_sleep)
++{
++	unsigned long timeout;
++
++	timeout = jiffies + DAVINCI_I2C_TIMEOUT;
++	while ((i2c_davinci_dev.regs->icstr) & DAVINCI_I2C_ICSTR_BB_MASK) {
++		if (time_after(jiffies, timeout)) {
++			i2c_warn("timeout waiting for bus ready");
++			return -ETIMEDOUT;
++		}
++		if (allow_sleep)
++			schedule_timeout(1);
++	}
++
++	return 0;
++}
++
++/*
++ * Low level master read/write transaction. This function is called
++ * from i2c_davinci_xfer.
++ */
++static int
++i2c_davinci_xfer_msg(struct i2c_adapter *adap, struct i2c_msg *msg, int stop)
++{
++	struct i2c_davinci_device *dev = i2c_get_adapdata(adap);
++	u8 zero_byte = 0;
++	u32 flag = 0, stat = 0, cnt = 2000;
++
++	DEB1("addr: 0x%04x, len: %d, flags: 0x%x, stop: %d",
++	     msg->addr, msg->len, msg->flags, stop);
++
++	/* Introduce a 20musec delay.  Required for Davinci EVM */
++	while (cnt--);
++
++	/* set the slave address */
++	dev->regs->icsar = msg->addr;
++
++	/* Sigh, seems we can't do zero length transactions. Thus, we
++	 * can't probe for devices w/o actually sending/receiving at least
++	 * a single byte. So we'll set count to 1 for the zero length
++	 * transaction case and hope we don't cause grief for some
++	 * arbitrary device due to random byte write/read during
++	 * probes.
++	 */
++	if (msg->len == 0) {
++		dev->buf = &zero_byte;
++		dev->buf_len = 1;
++	} else {
++		dev->buf = msg->buf;
++		dev->buf_len = msg->len;
++	}
++
++	dev->regs->iccnt = dev->buf_len;
++	dev->cmd_complete = 0;
++	dev->cmd_err = 0;
++
++	/* Clear any pending interrupts by reading the IVR */
++	stat = dev->regs->icivr;
++
++	/* Take I2C out of reset, configure it as master and set the start bit */
++	flag =
++	    DAVINCI_I2C_ICMDR_IRS_MASK | DAVINCI_I2C_ICMDR_MST_MASK |
++	    DAVINCI_I2C_ICMDR_STT_MASK;
++
++	/* if the slave address is ten bit address, enable XA bit */
++	if (msg->flags & I2C_M_TEN)
++		flag |= DAVINCI_I2C_ICMDR_XA_MASK;
++	if (!(msg->flags & I2C_M_RD))
++		flag |= DAVINCI_I2C_ICMDR_TRX_MASK;
++	if (stop)
++		flag |= DAVINCI_I2C_ICMDR_STP_MASK;
++
++	/* write the data into mode register */
++	dev->regs->icmdr = flag;
++
++	/* Enable receive and transmit interrupts */
++	if (msg->flags & I2C_M_RD)
++		dev->regs->icimr |= DAVINCI_I2C_ICIMR_ICRRDY_MASK;
++	else
++		dev->regs->icimr |= DAVINCI_I2C_ICIMR_ICXRDY_MASK;
++
++	/* wait for the transaction to complete */
++	wait_event_timeout (dev->cmd_wait, dev->cmd_complete, DAVINCI_I2C_TIMEOUT);
++
++	dev->buf_len = 0;
++
++	if (!dev->cmd_complete) {
++		i2c_davinci_reset(dev);
++		dev->cmd_complete = 0;
++		return -ETIMEDOUT;
++	}
++	dev->cmd_complete = 0;
++
++	/* no error */
++	if (!dev->cmd_err)
++		return msg->len;
++
++	/* We have an error */
++	if (dev->cmd_err & DAVINCI_I2C_ICSTR_NACK_MASK) {
++		if (msg->flags & I2C_M_IGNORE_NAK)
++			return msg->len;
++		if (stop)
++			dev->regs->icmdr |= DAVINCI_I2C_ICMDR_STP_MASK;
++		return -EREMOTEIO;
++	}
++	if (dev->cmd_err & DAVINCI_I2C_ICSTR_AL_MASK ||
++	    dev->cmd_err & DAVINCI_I2C_ICSTR_RSFULL_MASK) {
++		i2c_davinci_reset(dev);
++		return -EIO;
++	}
++	return msg->len;
++}
++
++/*
++ * Prepare controller for a transaction and call i2c_davinci_xfer_msg
++
++ */
++static int
++i2c_davinci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
++{
++	int count;
++	int ret = 0;
++	char retries = 5;
++
++	DEB1("msgs: %d", num);
++
++	if (num < 1 || num > MAX_MESSAGES)
++		return -EINVAL;
++
++	/* Check for valid parameters in messages */
++	for (count = 0; count < num; count++)
++		if (msgs[count].buf == NULL)
++			return -EINVAL;
++
++	if ((ret = i2c_davinci_wait_for_bb(1)) < 0)
++		return ret;
++
++	for (count = 0; count < num; count++) {
++		DEB1("msg: %d, addr: 0x%04x, len: %d, flags: 0x%x",
++		     count, msgs[count].addr, msgs[count].len,
++		     msgs[count].flags);
++
++		do {
++			ret = i2c_davinci_xfer_msg(adap, &msgs[count],
++					   	   (count == (num - 1)));
++
++			if (ret < 0) {
++				DEB1 ("Retrying ...\n");
++				mdelay (1);
++				retries--;
++			} else
++				break;
++		} while (retries);
++
++		DEB1("ret: %d", ret);
++
++		if (ret != msgs[count].len)
++			break;
++	}
++
++	if (ret >= 0 && num > 1)
++		ret = num;
++
++	DEB1("ret: %d", ret);
++
++	return ret;
++}
++
++static u32 i2c_davinci_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C;
++}
++
++/*
++ * This function marks a transaction as complete.
++ */
++static inline void i2c_davinci_complete_cmd(struct i2c_davinci_device *dev)
++{
++	dev->cmd_complete = 1;
++	wake_up(&dev->cmd_wait);
++}
++
++/*
++ * Interrupt service routine. This gets called whenever an I2C interrupt
++ * occurs.
++ */
++static irqreturn_t
++i2c_davinci_isr(int this_irq, void *dev_id, struct pt_regs *reg)
++{
++	struct i2c_davinci_device *dev = dev_id;
++	u32 stat;
++
++	DEB1("i2c_davinci_isr()\n");
++
++	while ((stat = dev->regs->icivr) != 0) {
++		switch (stat) {
++		case DAVINCI_I2C_ICIVR_INTCODE_AL:
++			dev->cmd_err |= DAVINCI_I2C_ICSTR_AL_MASK;
++			i2c_davinci_complete_cmd(dev);
++			break;
++
++		case DAVINCI_I2C_ICIVR_INTCODE_NACK:
++			dev->cmd_err |= DAVINCI_I2C_ICSTR_NACK_MASK;
++			i2c_davinci_complete_cmd(dev);
++			break;
++
++		case DAVINCI_I2C_ICIVR_INTCODE_RAR:
++                        dev->regs->icstr |= DAVINCI_I2C_ICSTR_ARDY_MASK;
++                        break;
++
++		case DAVINCI_I2C_ICIVR_INTCODE_RDR:
++			if (dev->buf_len) {
++				*dev->buf++ = dev->regs->icdrr;
++				dev->buf_len--;
++				if (dev->buf_len) {
++					continue;
++				} else {
++					dev->regs->icimr &=
++					    ~DAVINCI_I2C_ICIMR_ICRRDY_MASK;
++				}
++			}
++			break;
++
++		case DAVINCI_I2C_ICIVR_INTCODE_TDR:
++			if (dev->buf_len) {
++				dev->regs->icdxr = *dev->buf++;
++				dev->buf_len--;
++				if (dev->buf_len)
++					continue;
++				else {
++					dev->regs->icimr &=
++					    ~DAVINCI_I2C_ICIMR_ICXRDY_MASK;
++				}
++			}
++			break;
++
++		case DAVINCI_I2C_ICIVR_INTCODE_SCD:
++                        dev->regs->icstr |= DAVINCI_I2C_ICSTR_SCD_MASK;
++                        i2c_davinci_complete_cmd(dev);
++                        break;
++
++		case DAVINCI_I2C_ICIVR_INTCODE_AAS:
++			i2c_warn("Address as slave interrupt");
++			break;
++
++		default:
++			break;
++		}		/* switch */
++	}			/* while */
++	return IRQ_HANDLED;
++}
++
++static int davinci_i2c_remove(struct device *dev)
++{
++	return 0;
++}
++
++static void davinci_i2c_device_release(struct device *dev)
++{
++	/* Nothing */
++}
++
++static struct i2c_algorithm i2c_davinci_algo = {
++	.name = "DAVINCI I2C algorithm",
++	.id = I2C_ALGO_EXP,
++	.master_xfer = i2c_davinci_xfer,
++	.smbus_xfer = NULL,
++	.slave_send = NULL,
++	.slave_recv = NULL,
++	.algo_control = NULL,
++	.functionality = i2c_davinci_func,
++};
++
++static struct i2c_adapter i2c_davinci_adap = {
++	.owner = THIS_MODULE,
++	.name = "DAVINCI I2C adapter",
++	.id = I2C_ALGO_EXP,
++	.algo = &i2c_davinci_algo,
++	.algo_data = NULL,
++	.client_register = NULL,
++	.client_unregister = NULL,
++};
++
++static struct device_driver davinci_i2c_driver = {
++	.name = "davinci_i2c",
++	.bus = &platform_bus_type,
++	.remove = davinci_i2c_remove,
++};
++
++static struct platform_device davinci_i2c_device = {
++	.name = "i2c",
++	.id = -1,
++	.dev = {
++		.driver = &davinci_i2c_driver,
++		.release = davinci_i2c_device_release,
++		},
++};
++
++static int __init i2c_davinci_init(void)
++{
++	int status;
++	struct device 	*dev = NULL;
++
++	DEB0("%s %s", __TIME__, __DATE__);
++
++	DEB1("i2c_davinci_init()\n");
++
++#if 0
++	if (i2c_davinci_busFreq > 200)
++		i2c_davinci_busFreq = 400;	/*Fast mode */
++	else
++		i2c_davinci_busFreq = 100;	/*Standard mode */
++#endif
++
++	i2c_clock = clk_get (dev, "I2CCLK");
++
++	if (IS_ERR(i2c_clock))
++        	return -1;
++
++	clk_use (i2c_clock);
++	clk_enable (i2c_clock);
++	i2c_davinci_inputClock = clk_get_rate (i2c_clock);
++
++	DEB1 ("IP CLOCK = %ld\n", i2c_davinci_inputClock);
++
++	memset(&i2c_davinci_dev, 0, sizeof(i2c_davinci_dev));
++	init_waitqueue_head(&i2c_davinci_dev.cmd_wait);
++
++	i2c_davinci_dev.regs = (davinci_i2cregsovly)I2C_BASE;
++
++	status = (int)request_region(I2C_BASE, I2C_IOSIZE, MODULE_NAME);
++	if (!status) {
++		i2c_err("I2C is already in use\n");
++		return -ENODEV;
++	}
++
++	status = request_irq(IRQ_I2C, i2c_davinci_isr, 0, "i2c",
++			     &i2c_davinci_dev);
++	if (status) {
++		i2c_err("failed to request I2C IRQ");
++		goto do_release_region;
++	}
++
++	i2c_set_adapdata(&i2c_davinci_adap, &i2c_davinci_dev);
++	status = i2c_add_adapter(&i2c_davinci_adap);
++	if (status) {
++		i2c_err("failed to add adapter");
++		goto do_free_irq;
++		return status;
++	}
++
++	i2c_davinci_reset(&i2c_davinci_dev);
++
++	if (driver_register(&davinci_i2c_driver) != 0)
++		printk(KERN_ERR "Driver register failed for davinci_i2c\n");
++	if (platform_device_register(&davinci_i2c_device) != 0) {
++		printk(KERN_ERR "Device register failed for i2c\n");
++		driver_unregister(&davinci_i2c_driver);
++	}
++
++	return 0;
++
++      do_free_irq:
++	free_irq(IRQ_I2C, &i2c_davinci_dev);
++      do_release_region:
++	release_region(I2C_BASE, I2C_IOSIZE);
++
++	return status;
++}
++
++static void __exit i2c_davinci_exit(void)
++{
++	struct i2c_davinci_device dev;
++
++        clk_disable (i2c_clock);
++        clk_unuse (i2c_clock);
++	i2c_del_adapter(&i2c_davinci_adap);
++	dev.regs->icmdr = 0;
++	free_irq(IRQ_I2C, &i2c_davinci_dev);
++	release_region(I2C_BASE, I2C_IOSIZE);
++        driver_unregister(&davinci_i2c_driver);
++        platform_device_unregister(&davinci_i2c_device);
++}
++
++MODULE_AUTHOR("Texas Instruments India");
++MODULE_DESCRIPTION("TI DAVINCI I2C bus adapter");
++MODULE_LICENSE("GPL");
++
++module_param(i2c_davinci_busFreq, int, 0);
++MODULE_PARM_DESC(i2c_davinci_busFreq,
++		 "Set I2C bus frequency in KHz: 100 (Standard Mode) or 400 (Fast Mode)");
++
++module_param(i2c_davinci_debug, int, 0);
++MODULE_PARM_DESC(i2c_davinci_debug, "debug level - 0 off; 1 verbose;");
++
++/* i2c may be needed to bring up other drivers */
++subsys_initcall(i2c_davinci_init);
++module_exit(i2c_davinci_exit);
+Index: linux-2.6.10/drivers/i2c/busses/i2c-davinci.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/busses/i2c-davinci.h
+@@ -0,0 +1,150 @@
++/*
++ * linux/drivers/i2c/busses/davinci/i2c_davinci.h
++ *
++ * Copyright (C) 2006 Texas Instruments.
++ *
++ * ----------------------------------------------------------------------------
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ * ----------------------------------------------------------------------------
++ Modifications:
++ ver. 1.0: Feb 2005, Vinod/Sudhakar
++ -
++ *
++ */
++
++#define DAVINCI_I2C_ICOAR_OADDR_MASK        (0x03FFu)
++#define DAVINCI_I2C_ICIMR_AAS_MASK          (0x0040u)
++#define DAVINCI_I2C_ICIMR_SCD_MASK          (0x0020u)
++#define DAVINCI_I2C_ICIMR_ICXRDY_MASK       (0x0010u)
++#define DAVINCI_I2C_ICIMR_ICRRDY_MASK       (0x0008u)
++#define DAVINCI_I2C_ICIMR_ARDY_MASK         (0x0004u)
++#define DAVINCI_I2C_ICIMR_NACK_MASK         (0x0002u)
++#define DAVINCI_I2C_ICIMR_AL_MASK           (0x0001u)
++#define DAVINCI_I2C_ICSTR_SDIR_MASK         (0x4000u)
++#define DAVINCI_I2C_ICSTR_NACKSNT_MASK      (0x2000u)
++#define DAVINCI_I2C_ICSTR_BB_MASK           (0x1000u)
++#define DAVINCI_I2C_ICSTR_RSFULL_MASK       (0x0800u)
++#define DAVINCI_I2C_ICSTR_XSMT_MASK         (0x0400u)
++#define DAVINCI_I2C_ICSTR_AAS_MASK          (0x0200u)
++#define DAVINCI_I2C_ICSTR_AD0_MASK          (0x0100u)
++#define DAVINCI_I2C_ICSTR_SCD_MASK          (0x0020u)
++#define DAVINCI_I2C_ICSTR_ICXRDY_MASK       (0x0010u)
++#define DAVINCI_I2C_ICSTR_ICRRDY_MASK       (0x0008u)
++#define DAVINCI_I2C_ICSTR_ARDY_MASK         (0x0004u)
++#define DAVINCI_I2C_ICSTR_NACK_MASK         (0x0002u)
++#define DAVINCI_I2C_ICSTR_AL_MASK           (0x0001u)
++#define DAVINCI_I2C_ICCLKL_ICCL_MASK        (0xFFFFu)
++#define DAVINCI_I2C_ICCLKH_ICCH_MASK        (0xFFFFu)
++#define DAVINCI_I2C_ICCNT_ICDC_MASK         (0xFFFFu)
++#define DAVINCI_I2C_ICDRR_D_MASK            (0x00FFu)
++#define DAVINCI_I2C_ICSAR_SADDR_MASK        (0x03FFu)
++#define DAVINCI_I2C_ICDXR_D_MASK            (0x00FFu)
++#define DAVINCI_I2C_ICMDR_NACKMOD_MASK      (0x8000u)
++#define DAVINCI_I2C_ICMDR_FREE_MASK         (0x4000u)
++#define DAVINCI_I2C_ICMDR_STT_MASK          (0x2000u)
++#define DAVINCI_I2C_ICMDR_STP_MASK          (0x0800u)
++#define DAVINCI_I2C_ICMDR_MST_MASK          (0x0400u)
++#define DAVINCI_I2C_ICMDR_TRX_MASK          (0x0200u)
++#define DAVINCI_I2C_ICMDR_XA_MASK           (0x0100u)
++#define DAVINCI_I2C_ICMDR_RM_MASK           (0x0080u)
++#define DAVINCI_I2C_ICMDR_DLB_MASK          (0x0040u)
++#define DAVINCI_I2C_ICMDR_IRS_MASK          (0x0020u)
++#define DAVINCI_I2C_ICMDR_STB_MASK          (0x0010u)
++#define DAVINCI_I2C_ICMDR_FDF_MASK          (0x0008u)
++#define DAVINCI_I2C_ICMDR_BC_MASK           (0x0007u)
++#define DAVINCI_I2C_ICIVR_TESTMD_MASK       (0x0F00u)
++#define DAVINCI_I2C_ICIVR_INTCODE_MASK      (0x0007u)
++
++#define DAVINCI_I2C_ICIVR_INTCODE_NONE      (0x0000u)
++#define DAVINCI_I2C_ICIVR_INTCODE_AL        (0x0001u)
++#define DAVINCI_I2C_ICIVR_INTCODE_NACK      (0x0002u)
++#define DAVINCI_I2C_ICIVR_INTCODE_RAR       (0x0003u)
++#define DAVINCI_I2C_ICIVR_INTCODE_RDR       (0x0004u)
++#define DAVINCI_I2C_ICIVR_INTCODE_TDR       (0x0005u)
++#define DAVINCI_I2C_ICIVR_INTCODE_SCD       (0x0006u)
++#define DAVINCI_I2C_ICIVR_INTCODE_AAS       (0x0007u)
++
++#define DAVINCI_I2C_ICEMDR_BCM_MASK         (0x0001u)
++#define DAVINCI_I2C_ICPSC_IPSC_MASK         (0x00FFu)
++#define DAVINCI_I2C_ICPID1_CLASS_MASK       (0xFF00u)
++#define DAVINCI_I2C_ICPID1_REVISION_MASK    (0x00FFu)
++#define DAVINCI_I2C_ICPID2_TYPE_MASK        (0x00FFu)
++#define DAVINCI_I2C_ICPFUNC_PFUNC_MASK      (0x00000001u)
++#define DAVINCI_I2C_ICPDIR_PDIR1_MASK       (0x00000002u)
++#define DAVINCI_I2C_ICPDIR_PDIR0_MASK       (0x00000001u)
++#define DAVINCI_I2C_ICPDIN_PDIN1_MASK       (0x00000002u)
++#define DAVINCI_I2C_ICPDIN_PDIN0_MASK       (0x00000001u)
++#define DAVINCI_I2C_ICPDOUT_PDOUT1_MASK     (0x00000002u)
++#define DAVINCI_I2C_ICPDOUT_PDOUT0_MASK     (0x00000001u)
++#define DAVINCI_I2C_ICPDSET_PDSET1_MASK     (0x00000002u)
++#define DAVINCI_I2C_ICPDSET_PDSET0_MASK     (0x00000001u)
++#define DAVINCI_I2C_ICPDCLR_PDCLR1_MASK     (0x00000002u)
++#define DAVINCI_I2C_ICPDCLR_PDCLR0_MASK     (0x00000001u)
++
++/**************************************************************************\
++* Register Overlay Structure
++\**************************************************************************/
++typedef struct {
++	u16 icoar;
++	u8 rsvd0[2];
++	u16 icimr;
++	u8 rsvd1[2];
++	u16 icstr;
++	u8 rsvd2[2];
++	u16 icclkl;
++	u8 rsvd3[2];
++	u16 icclkh;
++	u8 rsvd4[2];
++	u16 iccnt;
++	u8 rsvd5[2];
++	u16 icdrr;
++	u8 rsvd6[2];
++	u16 icsar;
++	u8 rsvd7[2];
++	u16 icdxr;
++	u8 rsvd8[2];
++	u16 icmdr;
++	u8 rsvd9[2];
++	u16 icivr;
++	u8 rsvd10[2];
++	u16 icemdr;
++	u8 rsvd11[2];
++	u16 icpsc;
++	u8 rsvd12[2];
++	u16 icpid1;
++	u8 rsvd13[2];
++	u16 icpid2;
++	u8 rsvd14[14];
++	u32 ipcfunc;
++	u32 icpdir;
++	u32 icpdin;
++	u32 icpdout;
++	u32 icpdset;
++	u32 icpdclr;
++} davinci_i2cregs;
++
++/**************************************************************************\
++* Overlay structure typedef definition
++\**************************************************************************/
++typedef volatile davinci_i2cregs *davinci_i2cregsovly;
++
++struct i2c_davinci_device {
++	int cmd_complete, cmd_err;
++	wait_queue_head_t cmd_wait;
++	u8 *buf;
++	size_t buf_len;
++	davinci_i2cregsovly regs;
++};
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -397,6 +397,13 @@ config SENSORS_TLV320AIC23
+ 	  If you say yes here you get support for the I2C control
+ 	  interface for Texas Instruments TLV320AIC23 audio codec.
+ 
++config SENSORS_TLV320AIC33
++	tristate "Texas Instruments TLV320AIC33 Codec"
++	depends on I2C && I2C_DAVINCI
++	help
++	  If you say yes here you get support for the I2C control
++	  interface for Texas Instruments TLV320AIC33 audio codec.
++
+ config GPIOEXPANDER_OMAP
+ 	bool "GPIO Expander PCF8574PWR for OMAP"
+ 	depends on I2C && ARCH_OMAP16XX
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -38,6 +38,7 @@ obj-$(CONFIG_SENSORS_W83L785TS)	+= w83l7
+ obj-$(CONFIG_TPS65010)		+= tps65010.o
+ obj-$(CONFIG_ISP1301_OMAP)	+= isp1301_omap.o
+ obj-$(CONFIG_SENSORS_TLV320AIC23) += tlv320aic23.o
++obj-$(CONFIG_SENSORS_TLV320AIC33) += tlv320aic33.o
+ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_expander_omap.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_CHIP),y)
+Index: linux-2.6.10/drivers/i2c/chips/tlv320aic33.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/tlv320aic33.c
+@@ -0,0 +1,251 @@
++/*
++ * drivers/i2c/chips/tlv320aic33.c
++ *
++ * Copyright (C) 2005 Texas Instruments Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/vmalloc.h>
++#include <linux/slab.h>
++#include <linux/proc_fs.h>
++#include <linux/ctype.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++
++
++#include <linux/proc_fs.h>
++#include <linux/sysctl.h>
++
++
++#define I2C_AIC33_REG_SIZE                102
++/**< Number of registers in AIC33                                           */
++
++struct aic33_serial_bus_ops {
++	unsigned char version;
++	int (*init)(void);
++	void (*cleanup)(void);
++	int (*read)(u8 reg, u8 *val);
++	int (*write)(u8 reg, u8 val);
++};
++
++struct aic33_i2c_param {
++	/* I2C parameters */
++	struct i2c_client client;
++	struct i2c_driver driver;
++};
++
++/* Global structure to store the i2c driver info */
++static struct aic33_i2c_param aic33_i2c_dev;
++
++static int
++aic33_i2c_read_reg(u8 reg, u8 *val)
++{
++	int err;
++	struct i2c_client *client = &aic33_i2c_dev.client;
++
++	struct i2c_msg msg[1];
++	unsigned char data[1];
++
++	if (!client->adapter)
++		return -ENODEV;
++
++/*Rishi*/
++	data[0]=reg;
++	msg->addr = client->addr;
++	msg->flags = 0;
++	msg->len = 1;
++	msg->buf = data;
++/*Rishi*/
++	//*data = reg;
++	err = i2c_transfer(client->adapter, msg, 1);
++	if (err >= 0) {
++		msg->flags = I2C_M_RD;
++		err = i2c_transfer(client->adapter, msg, 1);
++	}
++	if (err >= 0) {
++		*val = *data;
++		return 0;
++	}
++
++	return err;
++}
++
++static int
++aic33_i2c_write_reg(u8 reg, u8  val)
++{
++	int err;
++	struct i2c_client *client = &aic33_i2c_dev.client;
++
++	struct i2c_msg msg[1];
++	unsigned char data[2];
++
++	if (!client->adapter)
++		return -ENODEV;
++
++	msg->addr = client->addr;
++	msg->flags = 0;
++	msg->len = 2;
++	msg->buf = data;
++	data[0] = reg;
++	data[1] = val;
++	err = i2c_transfer(client->adapter, msg, 1);
++
++	//printk(KERN_INFO "i2c write: error = %d\n", err);
++
++	if (err >= 0)
++		return 0;
++	else
++		printk(KERN_INFO "i2c write: error = %d\n", err);
++
++	return err;
++}
++
++static int
++aic33_i2c_attach_client(struct i2c_adapter *adap, int addr)
++{
++	struct aic33_i2c_param *aic33_i2c_if = &aic33_i2c_dev;
++	struct i2c_client *client = &aic33_i2c_if->client;
++	int err;
++
++	if (client->adapter)
++		return -EBUSY;  /* our client is already attached */
++
++	client->addr = addr;
++	client->flags = I2C_CLIENT_ALLOW_USE;
++	client->driver = &aic33_i2c_if->driver;
++	client->adapter = adap;
++
++	err = i2c_attach_client(client);
++	if (err) {
++		client->adapter = NULL;
++		return err;
++	}
++
++	return 0;
++}
++
++static int
++aic33_i2c_detach_client(struct i2c_client *client)
++{
++	int err;
++
++	if (!client->adapter)
++		return -ENODEV; /* our client isn't attached */
++
++	err = i2c_detach_client(client);
++	client->adapter = NULL;
++	return err;
++}
++
++static int
++aic33_i2c_probe_adapter(struct i2c_adapter *adap)
++{
++	/* i2c client can be up to 4 devices with device addresses 0x18, 0x19, 0x1A, 0x1B*/
++	return aic33_i2c_attach_client(adap, 0x1B);
++}
++
++static int
++aic33_i2c_init(void)
++{
++	int err;
++	struct i2c_driver *driver = &aic33_i2c_dev.driver;
++
++	driver->owner = THIS_MODULE;
++	strlcpy(driver->name, "Audio Codec I2C driver", sizeof(driver->name));
++	driver->id = I2C_DRIVERID_EXP0;
++	driver->flags = I2C_DF_NOTIFY;
++	driver->attach_adapter = aic33_i2c_probe_adapter;
++	driver->detach_client = aic33_i2c_detach_client;
++
++	err = i2c_add_driver(driver);
++	if (err) {
++		printk(KERN_ERR "Failed to register Audio Codec I2C client.\n");
++		return err;
++	}
++	return 0;
++}
++
++static void aic33_i2c_cleanup (void)
++{
++	struct i2c_driver *driver = &aic33_i2c_dev.driver;
++
++	i2c_detach_client(&aic33_i2c_dev.client);
++	i2c_del_driver(driver);
++	aic33_i2c_dev.client.adapter = NULL;
++
++	return;
++}
++
++struct aic33_serial_bus_ops aic33_i2c_fops = {
++	version : 0x01,
++	init    : aic33_i2c_init,
++	cleanup : aic33_i2c_cleanup,
++	read    : aic33_i2c_read_reg,
++	write   : aic33_i2c_write_reg,
++};
++
++
++int
++ tlv320aic33_write_value(u8 reg, u16 value)
++{
++
++	u8     data1, data2;
++	mdelay(10);
++
++	data2 = value & 0xFF;
++	data1 = reg;
++
++     	if(aic33_i2c_fops.write(data1, data2))
++	{
++	        printk(KERN_INFO "tlv320aic33_write_value: aic33 write failed\n");
++	        return -1;
++	}
++
++	return 0;
++}
++
++int
++ tlv320aic33_read_value(u8 reg, u8 *value)
++{
++#if 0
++	printk(KERN_INFO "%x %x \n", reg, *value);
++
++	if(aic33_i2c_fops.init())
++	{
++	      	printk(KERN_INFO " aic33 init failure\n");
++	      	return -1;
++	}
++
++	if(aic33_i2c_fops.read(reg, value))
++	{
++	      	printk(KERN_INFO "aic33 read failed\n");
++	      	aic33_i2c_fops.cleanup();
++	      	return -1;
++	}
++
++	aic33_i2c_fops.cleanup();
++#endif
++	return 0;
++}
++
++EXPORT_SYMBOL(tlv320aic33_write_value);
++EXPORT_SYMBOL(tlv320aic33_read_value);
++
++module_init(aic33_i2c_init);
++module_exit(aic33_i2c_cleanup);
+Index: linux-2.6.10/mvl_patches/pro-0767.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0767.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(767);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

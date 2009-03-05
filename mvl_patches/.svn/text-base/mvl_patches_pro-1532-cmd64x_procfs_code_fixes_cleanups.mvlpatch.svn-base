@@ -1,0 +1,476 @@
+#! /usr/bin/env bash
+# Patch: -cmd64x_procfs_code_fixes_cleanups
+# Date: Fri Jan  4 18:40:41 2008
+# Source: MontaVista Software, Inc.
+# MR: 23989
+# Type: Defect Fix
+# Disposition: needs submitting to linux-ide@vger.kernel.org
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# cmd64x: procfs code fixes/cleanups (take 2)
+# 
+# Fix several issues with the driver's procfs output:
+# 
+# - when testing if channel is enabled, the code looks at the "simplex" bits, not
+#   at the real enable bits -- add #define for the primary channel enable bit;
+# 
+# - UltraDMA modes 0, 1, 3 for slave drive reported incorrectly due to using the
+#   master drive's clock cycle resolution bit.
+# 
+# While at it, also perform the following cleanups:
+# 
+# - don't print extra newline before the first controller's dump;
+# 
+# - correct the chipset names (from CMDxxx to PCI-xxx)
+# 
+# - don't read from the registers which aren't used for dump;
+# 
+# - better align the table column sizes;
+# 
+# - rework UltraDMA mode dump code;
+# 
+# - remove PIO mode dump code that has never been finished;
+# 
+# - remove the duplicate interrupt status (the MRDMODE register bits mirror those
+#   those in the CFR and ARTTIM23 registers) and fold the dump into single line;
+# 
+# - correct the style of the ?: operators...
+# 
+# commit 5826b318aa02e81575c352ca26f00773c999795b
+# tree 013c54403474c4ee291a5668f316372cfd6646cc
+# parent 7accbffdb8163a59c7bdd3e4eb9a391198979522
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:50 +0200
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:50 +0200
+# 
+#  drivers/ide/pci/cmd64x.c |  129 ++++++++++++++++++++---------------------------
+#  1 files changed, 55 insertions(+), 74 deletions(-)
+# 
+
+PATCHNUM=1532
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 23989
+Type: Defect Fix
+Disposition: needs submitting to linux-ide@vger.kernel.org
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+cmd64x: procfs code fixes/cleanups (take 2)
+
+Fix several issues with the driver's procfs output:
+
+- when testing if channel is enabled, the code looks at the "simplex" bits, not
+  at the real enable bits -- add #define for the primary channel enable bit;
+
+- UltraDMA modes 0, 1, 3 for slave drive reported incorrectly due to using the
+  master drive's clock cycle resolution bit.
+
+While at it, also perform the following cleanups:
+
+- don't print extra newline before the first controller's dump;
+
+- correct the chipset names (from CMDxxx to PCI-xxx)
+
+- don't read from the registers which aren't used for dump;
+
+- better align the table column sizes;
+
+- rework UltraDMA mode dump code;
+
+- remove PIO mode dump code that has never been finished;
+
+- remove the duplicate interrupt status (the MRDMODE register bits mirror those
+  those in the CFR and ARTTIM23 registers) and fold the dump into single line;
+
+- correct the style of the ?: operators...
+
+commit 5826b318aa02e81575c352ca26f00773c999795b
+tree 013c54403474c4ee291a5668f316372cfd6646cc
+parent 7accbffdb8163a59c7bdd3e4eb9a391198979522
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:50 +0200
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:50 +0200
+
+ drivers/ide/pci/cmd64x.c |  129 ++++++++++++++++++++---------------------------
+ mvl_patches/pro-1532.c   |   16 +++++
+ 2 files changed, 71 insertions(+), 74 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/cmd64x.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/cmd64x.c
++++ linux-2.6.10/drivers/ide/pci/cmd64x.c
+@@ -1,5 +1,5 @@
+ /*
+- * linux/drivers/ide/pci/cmd64x.c		Version 1.45	Mar 14, 2007
++ * linux/drivers/ide/pci/cmd64x.c		Version 1.46	Mar 16, 2007
+  *
+  * cmd64x.c: Enable interrupts at initialization time on Ultra/PCI machines.
+  *           Due to massive hardware bugs, UltraDMA is only supported
+@@ -40,9 +40,10 @@
+ #define CFR		0x50
+ #define   CFR_INTR_CH0		0x04
+ #define CNTRL		0x51
+-#define	  CNTRL_DIS_RA0		0x40
+-#define   CNTRL_DIS_RA1		0x80
+-#define	  CNTRL_ENA_2ND		0x08
++#define   CNTRL_ENA_1ST 	0x04
++#define   CNTRL_ENA_2ND 	0x08
++#define   CNTRL_DIS_RA0 	0x40
++#define   CNTRL_DIS_RA1 	0x80
+ 
+ #define	CMDTIM		0x52
+ #define	ARTTIM0		0x53
+@@ -89,86 +90,67 @@ static int n_cmd_devs;
+ static char * print_cmd64x_get_info (char *buf, struct pci_dev *dev, int index)
+ {
+ 	char *p = buf;
+-
+-	u8 reg53 = 0, reg54 = 0, reg55 = 0, reg56 = 0;	/* primary */
+-	u8 reg57 = 0, reg58 = 0, reg5b;			/* secondary */
+ 	u8 reg72 = 0, reg73 = 0;			/* primary */
+ 	u8 reg7a = 0, reg7b = 0;			/* secondary */
+-	u8 reg50 = 0, reg71 = 0;			/* extra */
++	u8 reg50 = 1, reg51 = 1, reg57 = 0, reg71 = 0;	/* extra */
++	u8 rev = 0;
+ 
+ 	p += sprintf(p, "\nController: %d\n", index);
+-	p += sprintf(p, "CMD%x Chipset.\n", dev->device);
++	p += sprintf(p, "PCI-%x Chipset.\n", dev->device);
++
+ 	(void) pci_read_config_byte(dev, CFR,       &reg50);
+-	(void) pci_read_config_byte(dev, ARTTIM0,   &reg53);
+-	(void) pci_read_config_byte(dev, DRWTIM0,   &reg54);
+-	(void) pci_read_config_byte(dev, ARTTIM1,   &reg55);
+-	(void) pci_read_config_byte(dev, DRWTIM1,   &reg56);
+-	(void) pci_read_config_byte(dev, ARTTIM2,   &reg57);
+-	(void) pci_read_config_byte(dev, DRWTIM2,   &reg58);
+-	(void) pci_read_config_byte(dev, DRWTIM3,   &reg5b);
++	(void) pci_read_config_byte(dev, CNTRL,     &reg51);
++	(void) pci_read_config_byte(dev, ARTTIM23,  &reg57);
+ 	(void) pci_read_config_byte(dev, MRDMODE,   &reg71);
+ 	(void) pci_read_config_byte(dev, BMIDESR0,  &reg72);
+ 	(void) pci_read_config_byte(dev, UDIDETCR0, &reg73);
+ 	(void) pci_read_config_byte(dev, BMIDESR1,  &reg7a);
+ 	(void) pci_read_config_byte(dev, UDIDETCR1, &reg7b);
+ 
+-	p += sprintf(p, "--------------- Primary Channel "
+-			"---------------- Secondary Channel "
+-			"-------------\n");
+-	p += sprintf(p, "                %sabled           "
+-			"              %sabled\n",
+-		(reg72&0x80)?"dis":" en",
+-		(reg7a&0x80)?"dis":" en");
+-	p += sprintf(p, "--------------- drive0 "
+-		"--------- drive1 -------- drive0 "
+-		"---------- drive1 ------\n");
+-	p += sprintf(p, "DMA enabled:    %s              %s"
+-			"             %s               %s\n",
+-		(reg72&0x20)?"yes":"no ", (reg72&0x40)?"yes":"no ",
+-		(reg7a&0x20)?"yes":"no ", (reg7a&0x40)?"yes":"no ");
+-
+-	p += sprintf(p, "DMA Mode:       %s(%s)          %s(%s)",
+-		(reg72&0x20)?((reg73&0x01)?"UDMA":" DMA"):" PIO",
+-		(reg72&0x20)?(
+-			((reg73&0x30)==0x30)?(((reg73&0x35)==0x35)?"3":"0"):
+-			((reg73&0x20)==0x20)?(((reg73&0x25)==0x25)?"3":"1"):
+-			((reg73&0x10)==0x10)?(((reg73&0x15)==0x15)?"4":"2"):
+-			((reg73&0x00)==0x00)?(((reg73&0x05)==0x05)?"5":"2"):
+-			"X"):"?",
+-		(reg72&0x40)?((reg73&0x02)?"UDMA":" DMA"):" PIO",
+-		(reg72&0x40)?(
+-			((reg73&0xC0)==0xC0)?(((reg73&0xC5)==0xC5)?"3":"0"):
+-			((reg73&0x80)==0x80)?(((reg73&0x85)==0x85)?"3":"1"):
+-			((reg73&0x40)==0x40)?(((reg73&0x4A)==0x4A)?"4":"2"):
+-			((reg73&0x00)==0x00)?(((reg73&0x0A)==0x0A)?"5":"2"):
+-			"X"):"?");
+-	p += sprintf(p, "         %s(%s)           %s(%s)\n",
+-		(reg7a&0x20)?((reg7b&0x01)?"UDMA":" DMA"):" PIO",
+-		(reg7a&0x20)?(
+-			((reg7b&0x30)==0x30)?(((reg7b&0x35)==0x35)?"3":"0"):
+-			((reg7b&0x20)==0x20)?(((reg7b&0x25)==0x25)?"3":"1"):
+-			((reg7b&0x10)==0x10)?(((reg7b&0x15)==0x15)?"4":"2"):
+-			((reg7b&0x00)==0x00)?(((reg7b&0x05)==0x05)?"5":"2"):
+-			"X"):"?",
+-		(reg7a&0x40)?((reg7b&0x02)?"UDMA":" DMA"):" PIO",
+-		(reg7a&0x40)?(
+-			((reg7b&0xC0)==0xC0)?(((reg7b&0xC5)==0xC5)?"3":"0"):
+-			((reg7b&0x80)==0x80)?(((reg7b&0x85)==0x85)?"3":"1"):
+-			((reg7b&0x40)==0x40)?(((reg7b&0x4A)==0x4A)?"4":"2"):
+-			((reg7b&0x00)==0x00)?(((reg7b&0x0A)==0x0A)?"5":"2"):
+-			"X"):"?" );
+-	p += sprintf(p, "PIO Mode:       %s                %s"
+-			"               %s                 %s\n",
+-			"?", "?", "?", "?");
+-	p += sprintf(p, "                %s                     %s\n",
+-		(reg50 & CFR_INTR_CH0) ? "interrupting" : "polling     ",
+-		(reg57 & ARTTIM23_INTR_CH1) ? "interrupting" : "polling");
+-	p += sprintf(p, "                %s                          %s\n",
+-		(reg71 & MRDMODE_INTR_CH0) ? "pending" : "clear  ",
+-		(reg71 & MRDMODE_INTR_CH1) ? "pending" : "clear");
+-	p += sprintf(p, "                %s                          %s\n",
+-		(reg71 & MRDMODE_BLK_CH0) ? "blocked" : "enabled",
+-		(reg71 & MRDMODE_BLK_CH1) ? "blocked" : "enabled");
++	/* PCI0643/6 originally didn't have the primary channel enable bit */
++	(void) pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
++	if ((dev->device == PCI_DEVICE_ID_CMD_643) ||
++	    (dev->device == PCI_DEVICE_ID_CMD_646 && rev < 3))
++		reg51 |= CNTRL_ENA_1ST;
++
++	p += sprintf(p, "---------------- Primary Channel "
++			"---------------- Secondary Channel ------------\n");
++	p += sprintf(p, "                 %s                         %s\n",
++		 (reg51 & CNTRL_ENA_1ST) ? "enabled " : "disabled",
++		 (reg51 & CNTRL_ENA_2ND) ? "enabled " : "disabled");
++	p += sprintf(p, "---------------- drive0 --------- drive1 "
++			"-------- drive0 --------- drive1 ------\n");
++	p += sprintf(p, "DMA enabled:     %s              %s"
++			"             %s              %s\n",
++		(reg72 & 0x20) ? "yes" : "no ", (reg72 & 0x40) ? "yes" : "no ",
++		(reg7a & 0x20) ? "yes" : "no ", (reg7a & 0x40) ? "yes" : "no ");
++	p += sprintf(p, "UltraDMA mode:   %s (%c)          %s (%c)",
++		( reg73 & 0x01) ? " on" : "off",
++		((reg73 & 0x30) == 0x30) ? ((reg73 & 0x04) ? '3' : '0') :
++		((reg73 & 0x30) == 0x20) ? ((reg73 & 0x04) ? '3' : '1') :
++		((reg73 & 0x30) == 0x10) ? ((reg73 & 0x04) ? '4' : '2') :
++		((reg73 & 0x30) == 0x00) ? ((reg73 & 0x04) ? '5' : '2') : '?',
++		( reg73 & 0x02) ? " on" : "off",
++		((reg73 & 0xC0) == 0xC0) ? ((reg73 & 0x08) ? '3' : '0') :
++		((reg73 & 0xC0) == 0x80) ? ((reg73 & 0x08) ? '3' : '1') :
++		((reg73 & 0xC0) == 0x40) ? ((reg73 & 0x08) ? '4' : '2') :
++		((reg73 & 0xC0) == 0x00) ? ((reg73 & 0x08) ? '5' : '2') : '?');
++	p += sprintf(p, "         %s (%c)          %s (%c)\n",
++		( reg7b & 0x01) ? " on" : "off",
++		((reg7b & 0x30) == 0x30) ? ((reg7b & 0x04) ? '3' : '0') :
++		((reg7b & 0x30) == 0x20) ? ((reg7b & 0x04) ? '3' : '1') :
++		((reg7b & 0x30) == 0x10) ? ((reg7b & 0x04) ? '4' : '2') :
++		((reg7b & 0x30) == 0x00) ? ((reg7b & 0x04) ? '5' : '2') : '?',
++		( reg7b & 0x02) ? " on" : "off",
++		((reg7b & 0xC0) == 0xC0) ? ((reg7b & 0x08) ? '3' : '0') :
++		((reg7b & 0xC0) == 0x80) ? ((reg7b & 0x08) ? '3' : '1') :
++		((reg7b & 0xC0) == 0x40) ? ((reg7b & 0x08) ? '4' : '2') :
++		((reg7b & 0xC0) == 0x00) ? ((reg7b & 0x08) ? '5' : '2') : '?');
++	p += sprintf(p, "Interrupt:       %s, %s                 %s, %s\n",
++		(reg71 & MRDMODE_BLK_CH0  ) ? "blocked" : "enabled",
++		(reg50 & CFR_INTR_CH0	  ) ? "pending" : "clear  ",
++		(reg71 & MRDMODE_BLK_CH1  ) ? "blocked" : "enabled",
++		(reg57 & ARTTIM23_INTR_CH1) ? "pending" : "clear  ");
+ 
+ 	return (char *)p;
+ }
+@@ -178,7 +160,6 @@ static int cmd64x_get_info (char *buffer
+ 	char *p = buffer;
+ 	int i;
+ 
+-	p += sprintf(p, "\n");
+ 	for (i = 0; i < n_cmd_devs; i++) {
+ 		struct pci_dev *dev	= cmd_devs[i];
+ 		p = print_cmd64x_get_info(p, dev, i);
+Index: linux-2.6.10/mvl_patches/pro-1532.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1532.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1532);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,465 @@
+#! /usr/bin/env bash
+# Patch: -mips_ramdisk_parse_cmdline
+# Date: Wed Apr  5 15:07:20 2006
+# Source: MontaVista Software, Inc.
+# MR: 16344
+# Type: Enhancement | Integration
+# Disposition: merged from linux-mips.org | MontaVista
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+# Description:
+#     Enhance support for initioal RAMDISK on MIPS 2.6 to work 
+#     with rd_start/rd_size cmdline options.
+#     
+#     The old (EMBEDDED_RAMDISK) case that is gone upstream
+#     but it was left to work in MV 2.6 linux.
+#     So the related code is wrapped in ifdefs and added the 
+#     disposition MontaVista.
+#     
+#     Verified old initrd (EMBEDDED_RAMDISK) support and new (parse
+#     cmdline options) on PNX8550 based STB810 board.
+# 
+# 
+# 
+#  arch/mips/Kconfig        |   11 ++++
+#  arch/mips/kernel/setup.c |  123 ++++++++++++++++++++++++++++++++++++++---------
+#  2 files changed, 111 insertions(+), 23 deletions(-)
+# 
+
+PATCHNUM=429
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16344
+Type: Enhancement | Integration
+Disposition: merged from linux-mips.org | MontaVista
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+Description:
+    Enhance support for initioal RAMDISK on MIPS 2.6 to work 
+    with rd_start/rd_size cmdline options.
+    
+    The old (EMBEDDED_RAMDISK) case that is gone upstream
+    but it was left to work in MV 2.6 linux.
+    So the related code is wrapped in ifdefs and added the 
+    disposition MontaVista.
+    
+    Verified old initrd (EMBEDDED_RAMDISK) support and new (parse
+    cmdline options) on PNX8550 based STB810 board.
+
+
+
+ arch/mips/Kconfig        |   11 ++++
+ arch/mips/kernel/setup.c |  123 ++++++++++++++++++++++++++++++++++++++---------
+ mvl_patches/pro-0429.c   |   16 ++++++
+ 3 files changed, 127 insertions(+), 23 deletions(-)
+
+Index: linux-2.6.10/arch/mips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/mips/Kconfig
++++ linux-2.6.10/arch/mips/Kconfig
+@@ -1728,6 +1728,17 @@ menu "MIPS initrd options"
+ 
+ config EMBEDDED_RAMDISK
+ 	bool "Embed root filesystem ramdisk into the kernel"
++	help
++	 If you enable this option then the RAMDISK_IMAGE will
++	 be embedded into the kernel image.
++
++	 The other way to use initrd is to add
++	 rd_start=<start address of ramdisk image in the memory>
++	 and rd_size=<size of ramdisk image> to the kernel cmdline
++	 or via bootloader cmdline and load ramdisk image in the
++	 appropriate memory location.
++	 Note that if you enabled both cases then the ramdisk 
++	 location defined by rd_start/rd_size overrides embedded one.
+ 
+ config EMBEDDED_RAMDISK_IMAGE
+ 	string "Filename of gziped ramdisk image"
+Index: linux-2.6.10/arch/mips/kernel/setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/setup.c
++++ linux-2.6.10/arch/mips/kernel/setup.c
+@@ -56,7 +56,9 @@ unsigned int PCI_DMA_BUS_IS_PHYS;
+ 
+ EXPORT_SYMBOL(PCI_DMA_BUS_IS_PHYS);
+ 
++#ifdef CONFIG_EMBEDDED_RAMDISK
+ extern void * __rd_start, * __rd_end;
++#endif
+ 
+ /*
+  * Setup information
+@@ -194,6 +196,68 @@ static inline void parse_cmdline_early(v
+ 	}
+ }
+ 
++static inline int parse_rd_cmdline(unsigned long* rd_start, unsigned long* rd_end)
++{
++	/*
++	 * "rd_start=0xNNNNNNNN" defines the memory address of an initrd
++	 * "rd_size=0xNN" it's size
++	 */
++	unsigned long start = 0;
++	unsigned long size = 0;
++	unsigned long end;
++	char cmd_line[CL_SIZE];
++	char *start_str;
++	char *size_str;
++	char *tmp;
++
++	strcpy(cmd_line, command_line);
++	*command_line = 0;
++	tmp = cmd_line;
++	/* Ignore "rd_start=" strings in other parameters. */
++	start_str = strstr(cmd_line, "rd_start=");
++	if (start_str && start_str != cmd_line && *(start_str - 1) != ' ')
++		start_str = strstr(start_str, " rd_start=");
++	while (start_str) {
++		if (start_str != cmd_line)
++			strncat(command_line, tmp, start_str - tmp);
++		start = memparse(start_str + 9, &start_str);
++		tmp = start_str + 1;
++		start_str = strstr(start_str, " rd_start=");
++	}
++	if (*tmp)
++		strcat(command_line, tmp);
++
++	strcpy(cmd_line, command_line);
++	*command_line = 0;
++	tmp = cmd_line;
++	/* Ignore "rd_size" strings in other parameters. */
++	size_str = strstr(cmd_line, "rd_size=");
++	if (size_str && size_str != cmd_line && *(size_str - 1) != ' ')
++		size_str = strstr(size_str, " rd_size=");
++	while (size_str) {
++		if (size_str != cmd_line)
++			strncat(command_line, tmp, size_str - tmp);
++		size = memparse(size_str + 8, &size_str);
++		tmp = size_str + 1;
++		size_str = strstr(size_str, " rd_size=");
++	}
++	if (*tmp)
++		strcat(command_line, tmp);
++
++#ifdef CONFIG_MIPS64
++	/* HACK: Guess if the sign extension was forgotten */
++	if (start > 0x0000000080000000 && start < 0x00000000ffffffff)
++		start |= 0xffffffff00000000;
++#endif
++
++	end = start + size;
++	if (start && end) {
++		*rd_start = start;
++		*rd_end = end;
++		return 1;
++	}
++	return 0;
++}
+ 
+ #define PFN_UP(x)	(((x) + PAGE_SIZE - 1) >> PAGE_SHIFT)
+ #define PFN_DOWN(x)	((x) >> PAGE_SHIFT)
+@@ -205,31 +269,47 @@ static inline void parse_cmdline_early(v
+ static inline void bootmem_init(void)
+ {
+ 	unsigned long start_pfn;
++	unsigned long reserved_end = (unsigned long)&_end;
+ #ifndef CONFIG_SGI_IP27
+-	unsigned long bootmap_size, max_low_pfn, first_usable_pfn;
++	unsigned long first_usable_pfn;
++	unsigned long bootmap_size;
+ 	int i;
+ #endif
+ #ifdef CONFIG_BLK_DEV_INITRD
+-	unsigned long tmp;
+-	unsigned long *initrd_header;
++	int initrd_reserve_bootmem = 0;
+ 
+-	tmp = (((unsigned long)&_end + PAGE_SIZE-1) & PAGE_MASK) - 8;
+-	if (tmp < (unsigned long)&_end)
+-		tmp += PAGE_SIZE;
+-	initrd_header = (unsigned long *)tmp;
+-	if (initrd_header[0] == 0x494E5244) {
+-		initrd_start = (unsigned long)&initrd_header[2];
+-		initrd_end = initrd_start + initrd_header[1];
++	/* Board specific code should have set up initrd_start and initrd_end */
++ 	ROOT_DEV = Root_RAM0;
++	if (parse_rd_cmdline(&initrd_start, &initrd_end)) {
++		reserved_end = max(reserved_end, initrd_end);
++		initrd_reserve_bootmem = 1;
++#ifdef CONFIG_EMBEDDED_RAMDISK
++	} else if (&__rd_start != &__rd_end) {
++		initrd_start = (unsigned long)&__rd_start;
++		initrd_end = (unsigned long)&__rd_end;
++#endif
++	} else {
++		unsigned long tmp;
++		u32 *initrd_header;
++
++		tmp = ((reserved_end + PAGE_SIZE-1) & PAGE_MASK) - sizeof(u32) * 2;
++		if (tmp < reserved_end)
++			tmp += PAGE_SIZE;
++		initrd_header = (u32 *)tmp;
++		if (initrd_header[0] == 0x494E5244) {
++			initrd_start = (unsigned long)&initrd_header[2];
++			initrd_end = initrd_start + initrd_header[1];
++			reserved_end = max(reserved_end, initrd_end);
++			initrd_reserve_bootmem = 1;
++		}
+ 	}
+-	start_pfn = PFN_UP(CPHYSADDR((&_end)+(initrd_end - initrd_start) + PAGE_SIZE));
+-#else
++#endif	/* CONFIG_BLK_DEV_INITRD */
+ 
+ 	/*
+ 	 * Partially used pages are not usable - thus
+ 	 * we are rounding upwards.
+ 	 */
+-	start_pfn = PFN_UP(CPHYSADDR(&_end));
+-#endif        /* CONFIG_BLK_DEV_INITRD */
++	start_pfn = PFN_UP(CPHYSADDR(reserved_end));
+ 
+ #ifndef CONFIG_SGI_IP27
+ 	/* Find the highest page frame number we have available.  */
+@@ -342,21 +422,14 @@ static inline void bootmem_init(void)
+ 
+ 	/* Reserve the bootmap memory.  */
+ 	reserve_bootmem(PFN_PHYS(first_usable_pfn), bootmap_size);
+-#endif
++#endif /* CONFIG_SGI_IP27 */
+ 
+ #ifdef CONFIG_BLK_DEV_INITRD
+-	/* Board specific code should have set up initrd_start and initrd_end */
+-	ROOT_DEV = Root_RAM0;
+-	if (&__rd_start != &__rd_end) {
+-		initrd_start = (unsigned long)&__rd_start;
+-		initrd_end = (unsigned long)&__rd_end;
+-	}
+ 	initrd_below_start_ok = 1;
+ 	if (initrd_start) {
+ 		unsigned long initrd_size = ((unsigned char *)initrd_end) - ((unsigned char *)initrd_start);
+ 		printk("Initial ramdisk at: 0x%p (%lu bytes)\n",
+-		       (void *)initrd_start,
+-		       initrd_size);
++		       (void *)initrd_start, initrd_size);
+ 
+ 		if (CPHYSADDR(initrd_end) > PFN_PHYS(max_low_pfn)) {
+ 			printk("initrd extends beyond end of memory "
+@@ -366,7 +439,11 @@ static inline void bootmem_init(void)
+ 			       sizeof(long) * 2,
+ 			       (unsigned long long)PFN_PHYS(max_low_pfn));
+ 			initrd_start = initrd_end = 0;
++			initrd_reserve_bootmem = 0;
+ 		}
++
++		if (initrd_reserve_bootmem)
++			reserve_bootmem(CPHYSADDR(initrd_start), initrd_size);
+ 	}
+ #endif /* CONFIG_BLK_DEV_INITRD  */
+ }
+Index: linux-2.6.10/mvl_patches/pro-0429.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0429.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(429);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

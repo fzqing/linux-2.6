@@ -1,0 +1,804 @@
+#! /usr/bin/env bash
+# Patch: -phy-more-cleanups.patch
+# Date: Thu Apr 20 12:20:16 2006
+# commit 2bf69b5fe90b3246ab50064c5a690a363e8c53e2
+# Author: Jeff Garzik <jgarzik@pobox.com>
+# Date:   Thu Aug 11 02:47:54 2005 -0400
+# 
+#     phy subsystem: more cleanups
+#     
+#     - unexport symbols never used outside of home module
+#     - remove dead code
+#     - remove CONFIG_PHYCONTROL, make it unconditionally enabled
+# 
+# 
+
+PATCHNUM=471
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+commit 2bf69b5fe90b3246ab50064c5a690a363e8c53e2
+Author: Jeff Garzik <jgarzik@pobox.com>
+Date:   Thu Aug 11 02:47:54 2005 -0400
+
+    phy subsystem: more cleanups
+    
+    - unexport symbols never used outside of home module
+    - remove dead code
+    - remove CONFIG_PHYCONTROL, make it unconditionally enabled
+
+
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index c2f1bf1..6450bd7 100644
+ drivers/net/phy/Kconfig      |    8 -
+ drivers/net/phy/mdio_bus.c   |   74 ----------------
+ drivers/net/phy/phy.c        |  197 ++-----------------------------------------
+ drivers/net/phy/phy_device.c |  130 ----------------------------
+ include/linux/phy.h          |   17 ---
+ mvl_patches/pro-0471.c       |   16 +++
+ 6 files changed, 28 insertions(+), 414 deletions(-)
+
+Index: linux-2.6.10/drivers/net/phy/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/Kconfig
++++ linux-2.6.10/drivers/net/phy/Kconfig
+@@ -12,14 +12,6 @@ config PHYLIB
+ 	  devices.  This option provides infrastructure for
+ 	  managing PHY devices.
+ 
+-config PHYCONTROL
+-	bool "Support for automatically handling PHY state changes"
+-	depends on PHYLIB
+-	help
+-	  Adds code to perform all the work for keeping PHY link
+-	  state (speed/duplex/etc) up-to-date.  Also handles
+-	  interrupts.
+-
+ comment "MII PHY device drivers"
+ 	depends on PHYLIB
+ 
+Index: linux-2.6.10/drivers/net/phy/mdio_bus.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/mdio_bus.c
++++ linux-2.6.10/drivers/net/phy/mdio_bus.c
+@@ -38,80 +38,6 @@
+ #include <asm/irq.h>
+ #include <asm/uaccess.h>
+ 
+-/* mdiobus_register 
+- *
+- * description: Called by a bus driver to bring up all the PHYs
+- *   on a given bus, and attach them to the bus
+- */
+-int mdiobus_register(struct mii_bus *bus)
+-{
+-	int i;
+-	int err = 0;
+-
+-	spin_lock_init(&bus->mdio_lock);
+-
+-	if (NULL == bus || NULL == bus->name ||
+-			NULL == bus->read ||
+-			NULL == bus->write)
+-		return -EINVAL;
+-
+-	if (bus->reset)
+-		bus->reset(bus);
+-
+-	for (i = 0; i < PHY_MAX_ADDR; i++) {
+-		struct phy_device *phydev;
+-
+-		phydev = get_phy_device(bus, i);
+-
+-		if (IS_ERR(phydev))
+-			return PTR_ERR(phydev);
+-
+-		/* There's a PHY at this address
+-		 * We need to set:
+-		 * 1) IRQ
+-		 * 2) bus_id
+-		 * 3) parent
+-		 * 4) bus
+-		 * 5) mii_bus
+-		 * And, we need to register it */
+-		if (phydev) {
+-			phydev->irq = bus->irq[i];
+-
+-			phydev->dev.parent = bus->dev;
+-			phydev->dev.bus = &mdio_bus_type;
+-			sprintf(phydev->dev.bus_id, "phy%d:%d", bus->id, i);
+-
+-			phydev->bus = bus;
+-
+-			err = device_register(&phydev->dev);
+-
+-			if (err)
+-				printk(KERN_ERR "phy %d failed to register\n",
+-						i);
+-		}
+-
+-		bus->phy_map[i] = phydev;
+-	}
+-
+-	pr_info("%s: probed\n", bus->name);
+-
+-	return err;
+-}
+-EXPORT_SYMBOL(mdiobus_register);
+-
+-void mdiobus_unregister(struct mii_bus *bus)
+-{
+-	int i;
+-
+-	for (i = 0; i < PHY_MAX_ADDR; i++) {
+-		if (bus->phy_map[i]) {
+-			device_unregister(&bus->phy_map[i]->dev);
+-			kfree(bus->phy_map[i]);
+-		}
+-	}
+-}
+-EXPORT_SYMBOL(mdiobus_unregister);
+-
+ /* mdio_bus_match
+  *
+  * description: Given a PHY device, and a PHY driver, return 1 if
+Index: linux-2.6.10/drivers/net/phy/phy.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/phy.c
++++ linux-2.6.10/drivers/net/phy/phy.c
+@@ -40,21 +40,9 @@
+ #include <asm/uaccess.h>
+ 
+ static void phy_timer(unsigned long data);
+-
+-/* Convenience function to print out the current phy status
+- */
+-void phy_print_status(struct phy_device *phydev)
+-{
+-	pr_info("%s: Link is %s", phydev->dev.bus_id,
+-			phydev->link ? "Up" : "Down");
+-	if (phydev->link)
+-		printk(" - %d/%s", phydev->speed,
+-				DUPLEX_FULL == phydev->duplex ?
+-				"Full" : "Half");
+-
+-	printk("\n");
+-}
+-EXPORT_SYMBOL(phy_print_status);
++static int phy_disable_interrupts(struct phy_device *phydev);
++static void phy_sanitize_settings(struct phy_device *phydev);
++static int phy_stop_interrupts(struct phy_device *phydev);
+ 
+ 
+ /* Convenience functions for reading/writing a given PHY
+@@ -133,7 +121,7 @@ static inline int phy_aneg_done(struct p
+  *   and to PHY_FORCING if auto-negotiation is disabled. Unless
+  *   the PHY is currently HALTED.
+  */
+-int phy_start_aneg(struct phy_device *phydev)
++static int phy_start_aneg(struct phy_device *phydev)
+ {
+ 	int err;
+ 
+@@ -161,8 +149,6 @@ out_unlock:
+ 	spin_unlock(&phydev->lock);
+ 	return err;
+ }
+-EXPORT_SYMBOL(phy_start_aneg);
+-
+ 
+ /* A structure for mapping a particular speed and duplex
+  * combination to a particular SUPPORTED and ADVERTISED value */
+@@ -255,7 +241,7 @@ static inline int phy_find_valid(int idx
+  *   duplexes.  Drop down by one in this order:  1000/FULL,
+  *   1000/HALF, 100/FULL, 100/HALF, 10/FULL, 10/HALF
+  */
+-void phy_sanitize_settings(struct phy_device *phydev)
++static void phy_sanitize_settings(struct phy_device *phydev)
+ {
+ 	u32 features = phydev->supported;
+ 	int idx;
+@@ -270,7 +256,6 @@ void phy_sanitize_settings(struct phy_de
+ 	phydev->speed = settings[idx].speed;
+ 	phydev->duplex = settings[idx].duplex;
+ }
+-EXPORT_SYMBOL(phy_sanitize_settings);
+ 
+ /* phy_force_reduction
+  *
+@@ -477,48 +462,22 @@ void phy_error(struct phy_device *phydev
+ 	spin_unlock(&phydev->lock);
+ }
+ 
+-#ifdef CONFIG_PHYCONTROL
+-
+-static void phy_change(void *data);
+-
+-/* phy_interrupt
+- *
+- * description: When a PHY interrupt occurs, the handler disables
+- * interrupts, and schedules a work task to clear the interrupt.
+- */
+-static irqreturn_t phy_interrupt(int irq, void *phy_dat, struct pt_regs *regs)
+-{
+-	struct phy_device *phydev = phy_dat;
+-
+-	/* The MDIO bus is not allowed to be written in interrupt
+-	 * context, so we need to disable the irq here.  A work
+-	 * queue will write the PHY to disable and clear the
+-	 * interrupt, and then reenable the irq line. */
+-	disable_irq_nosync(irq);
+-
+-	schedule_work(&phydev->phy_queue);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-/* Enable the interrupts from the PHY side */
+-int phy_enable_interrupts(struct phy_device *phydev)
++static int phy_stop_interrupts(struct phy_device *phydev)
+ {
+ 	int err;
+ 
+-	err = phy_clear_interrupt(phydev);
++	err = phy_disable_interrupts(phydev);
+ 
+-	if (err < 0)
+-		return err;
++	if (err)
++		phy_error(phydev);
+ 
+-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED);
++	free_irq(phydev->irq, phydev);
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL(phy_enable_interrupts);
+ 
+ /* Disable the PHY interrupts from the PHY side */
+-int phy_disable_interrupts(struct phy_device *phydev)
++static int phy_disable_interrupts(struct phy_device *phydev)
+ {
+ 	int err;
+ 
+@@ -541,140 +500,6 @@ phy_err:
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL(phy_disable_interrupts);
+-
+-/* phy_start_interrupts
+- *
+- * description: Request the interrupt for the given PHY.  If
+- *   this fails, then we set irq to PHY_POLL.
+- *   Otherwise, we enable the interrupts in the PHY.
+- *   Returns 0 on success.
+- *   This should only be called with a valid IRQ number.
+- */
+-int phy_start_interrupts(struct phy_device *phydev)
+-{
+-	int err = 0;
+-
+-	INIT_WORK(&phydev->phy_queue, phy_change, phydev);
+-
+-	if (request_irq(phydev->irq, phy_interrupt,
+-				SA_SHIRQ,
+-				"phy_interrupt",
+-				phydev) < 0) {
+-		printk(KERN_WARNING "%s: Can't get IRQ %d (PHY)\n",
+-				phydev->bus->name,
+-				phydev->irq);
+-		phydev->irq = PHY_POLL;
+-		return 0;
+-	}
+-
+-	err = phy_enable_interrupts(phydev);
+-
+-	return err;
+-}
+-EXPORT_SYMBOL(phy_start_interrupts);
+-
+-int phy_stop_interrupts(struct phy_device *phydev)
+-{
+-	int err;
+-
+-	err = phy_disable_interrupts(phydev);
+-
+-	if (err)
+-		phy_error(phydev);
+-
+-	free_irq(phydev->irq, phydev);
+-
+-	return err;
+-}
+-EXPORT_SYMBOL(phy_stop_interrupts);
+-
+-
+-/* Scheduled by the phy_interrupt/timer to handle PHY changes */
+-static void phy_change(void *data)
+-{
+-	int err;
+-	struct phy_device *phydev = data;
+-
+-	err = phy_disable_interrupts(phydev);
+-
+-	if (err)
+-		goto phy_err;
+-
+-	spin_lock(&phydev->lock);
+-	if ((PHY_RUNNING == phydev->state) || (PHY_NOLINK == phydev->state))
+-		phydev->state = PHY_CHANGELINK;
+-	spin_unlock(&phydev->lock);
+-
+-	enable_irq(phydev->irq);
+-
+-	/* Reenable interrupts */
+-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED);
+-
+-	if (err)
+-		goto irq_enable_err;
+-
+-	return;
+-
+-irq_enable_err:
+-	disable_irq(phydev->irq);
+-phy_err:
+-	phy_error(phydev);
+-}
+-
+-/* Bring down the PHY link, and stop checking the status. */
+-void phy_stop(struct phy_device *phydev)
+-{
+-	spin_lock(&phydev->lock);
+-
+-	if (PHY_HALTED == phydev->state)
+-		goto out_unlock;
+-
+-	if (phydev->irq != PHY_POLL) {
+-		/* Clear any pending interrupts */
+-		phy_clear_interrupt(phydev);
+-
+-		/* Disable PHY Interrupts */
+-		phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
+-	}
+-
+-	phydev->state = PHY_HALTED;
+-
+-out_unlock:
+-	spin_unlock(&phydev->lock);
+-}
+-
+-
+-/* phy_start
+- *
+- * description: Indicates the attached device's readiness to
+- *   handle PHY-related work.  Used during startup to start the
+- *   PHY, and after a call to phy_stop() to resume operation.
+- *   Also used to indicate the MDIO bus has cleared an error
+- *   condition.
+- */
+-void phy_start(struct phy_device *phydev)
+-{
+-	spin_lock(&phydev->lock);
+-
+-	switch (phydev->state) {
+-		case PHY_STARTING:
+-			phydev->state = PHY_PENDING;
+-			break;
+-		case PHY_READY:
+-			phydev->state = PHY_UP;
+-			break;
+-		case PHY_HALTED:
+-			phydev->state = PHY_RESUMING;
+-		default:
+-			break;
+-	}
+-	spin_unlock(&phydev->lock);
+-}
+-EXPORT_SYMBOL(phy_stop);
+-EXPORT_SYMBOL(phy_start);
+-
+-#endif /* CONFIG_PHYCONTROL */
+ 
+ /* PHY timer which handles the state machine */
+ static void phy_timer(unsigned long data)
+Index: linux-2.6.10/drivers/net/phy/phy_device.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/phy/phy_device.c
++++ linux-2.6.10/drivers/net/phy/phy_device.c
+@@ -124,133 +124,6 @@ void phy_prepare_link(struct phy_device 
+ 	phydev->adjust_link = handler;
+ }
+ 
+-#ifdef CONFIG_PHYCONTROL
+-/* phy_connect:
+- *
+- * description: Convenience function for connecting ethernet
+- *   devices to PHY devices.  The default behavior is for
+- *   the PHY infrastructure to handle everything, and only notify
+- *   the connected driver when the link status changes.  If you
+- *   don't want, or can't use the provided functionality, you may
+- *   choose to call only the subset of functions which provide
+- *   the desired functionality.
+- */
+-struct phy_device * phy_connect(struct net_device *dev, const char *phy_id,
+-		void (*handler)(struct net_device *), u32 flags)
+-{
+-	struct phy_device *phydev;
+-
+-	phydev = phy_attach(dev, phy_id, flags);
+-
+-	if (IS_ERR(phydev))
+-		return phydev;
+-
+-	phy_prepare_link(phydev, handler);
+-
+-	phy_start_machine(phydev, NULL);
+-
+-	if (phydev->irq > 0)
+-		phy_start_interrupts(phydev);
+-
+-	return phydev;
+-}
+-EXPORT_SYMBOL(phy_connect);
+-
+-void phy_disconnect(struct phy_device *phydev)
+-{
+-	if (phydev->irq > 0)
+-		phy_stop_interrupts(phydev);
+-
+-	phy_stop_machine(phydev);
+-	
+-	phydev->adjust_link = NULL;
+-
+-	phy_detach(phydev);
+-}
+-EXPORT_SYMBOL(phy_disconnect);
+-
+-#endif /* CONFIG_PHYCONTROL */
+-
+-/* phy_attach:
+- *
+- *   description: Called by drivers to attach to a particular PHY
+- *     device. The phy_device is found, and properly hooked up
+- *     to the phy_driver.  If no driver is attached, then the
+- *     genphy_driver is used.  The phy_device is given a ptr to
+- *     the attaching device, and given a callback for link status
+- *     change.  The phy_device is returned to the attaching
+- *     driver.
+- */
+-static int phy_compare_id(struct device *dev, void *data)
+-{
+-	return strcmp((char *)data, dev->bus_id) ? 0 : 1;
+-}
+-
+-struct phy_device *phy_attach(struct net_device *dev,
+-		const char *phy_id, u32 flags)
+-{
+-	struct bus_type *bus = &mdio_bus_type;
+-	struct phy_device *phydev;
+-	struct device *d;
+-
+-	/* Search the list of PHY devices on the mdio bus for the
+-	 * PHY with the requested name */
+-	d = bus_find_device(bus, NULL, (void *)phy_id, phy_compare_id);
+-
+-	if (d) {
+-		phydev = to_phy_device(d);
+-	} else {
+-		printk(KERN_ERR "%s not found\n", phy_id);
+-		return ERR_PTR(-ENODEV);
+-	}
+-
+-	/* Assume that if there is no driver, that it doesn't
+-	 * exist, and we should use the genphy driver. */
+-	if (NULL == d->driver) {
+-		int err;
+-		down_write(&d->bus->subsys.rwsem);
+-		d->driver = &genphy_driver.driver;
+-
+-		err = d->driver->probe(d);
+-
+-		if (err < 0)
+-			return ERR_PTR(err);
+-
+-		device_bind_driver(d);
+-		up_write(&d->bus->subsys.rwsem);
+-	}
+-
+-	if (phydev->attached_dev) {
+-		printk(KERN_ERR "%s: %s already attached\n",
+-				dev->name, phy_id);
+-		return ERR_PTR(-EBUSY);
+-	}
+-
+-	phydev->attached_dev = dev;
+-
+-	phydev->dev_flags = flags;
+-
+-	return phydev;
+-}
+-EXPORT_SYMBOL(phy_attach);
+-
+-void phy_detach(struct phy_device *phydev)
+-{
+-	phydev->attached_dev = NULL;
+-
+-	/* If the device had no specific driver before (i.e. - it
+-	 * was using the generic driver), we unbind the device
+-	 * from the generic driver so that there's a chance a
+-	 * real driver could be loaded */
+-	if (phydev->dev.driver == &genphy_driver.driver) {
+-		down_write(&phydev->dev.bus->subsys.rwsem);
+-		device_release_driver(&phydev->dev);
+-		up_write(&phydev->dev.bus->subsys.rwsem);
+-	}
+-}
+-EXPORT_SYMBOL(phy_detach);
+-
+-
+ /* Generic PHY support and helper functions */
+ 
+ /* genphy_config_advert
+@@ -259,7 +132,7 @@ EXPORT_SYMBOL(phy_detach);
+  *   after sanitizing the values to make sure we only advertise
+  *   what is supported
+  */
+-int genphy_config_advert(struct phy_device *phydev)
++static int genphy_config_advert(struct phy_device *phydev)
+ {
+ 	u32 advertise;
+ 	int adv;
+@@ -317,7 +190,6 @@ int genphy_config_advert(struct phy_devi
+ 
+ 	return adv;
+ }
+-EXPORT_SYMBOL(genphy_config_advert);
+ 
+ /* genphy_setup_forced
+  *
+Index: linux-2.6.10/include/linux/phy.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/phy.h
++++ linux-2.6.10/include/linux/phy.h
+@@ -334,26 +334,11 @@ int phy_write(struct phy_device *phydev,
+ struct phy_device* get_phy_device(struct mii_bus *bus, int addr);
+ int phy_clear_interrupt(struct phy_device *phydev);
+ int phy_config_interrupt(struct phy_device *phydev, u32 interrupts);
+-struct phy_device * phy_attach(struct net_device *dev,
+-		const char *phy_id, u32 flags);
+-struct phy_device * phy_connect(struct net_device *dev, const char *phy_id,
+-		void (*handler)(struct net_device *), u32 flags);
+-void phy_disconnect(struct phy_device *phydev);
+-void phy_detach(struct phy_device *phydev);
+-void phy_start(struct phy_device *phydev);
+-void phy_stop(struct phy_device *phydev);
+-int phy_start_aneg(struct phy_device *phydev);
+-
+-int mdiobus_register(struct mii_bus *bus);
+-void mdiobus_unregister(struct mii_bus *bus);
+-void phy_sanitize_settings(struct phy_device *phydev);
+-int phy_stop_interrupts(struct phy_device *phydev);
+ 
+ static inline int phy_read_status(struct phy_device *phydev) {
+ 	return phydev->drv->read_status(phydev);
+ }
+ 
+-int genphy_config_advert(struct phy_device *phydev);
+ int genphy_setup_forced(struct phy_device *phydev);
+ int genphy_restart_aneg(struct phy_device *phydev);
+ int genphy_config_aneg(struct phy_device *phydev);
+@@ -370,8 +355,6 @@ int phy_ethtool_sset(struct phy_device *
+ int phy_ethtool_gset(struct phy_device *phydev, struct ethtool_cmd *cmd);
+ int phy_mii_ioctl(struct phy_device *phydev,
+ 		struct mii_ioctl_data *mii_data, int cmd);
+-int phy_start_interrupts(struct phy_device *phydev);
+-void phy_print_status(struct phy_device *phydev);
+ 
+ extern struct bus_type mdio_bus_type;
+ #endif /* __PHY_H */
+Index: linux-2.6.10/mvl_patches/pro-0471.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0471.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(471);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

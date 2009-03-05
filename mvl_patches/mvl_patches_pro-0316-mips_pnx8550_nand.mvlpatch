@@ -1,0 +1,1035 @@
+#! /usr/bin/env bash
+# Patch: -mips_pnx8550_nand
+# Date: Mon Mar  6 10:14:49 2006
+# Source: MontaVista Software, Inc.
+# MR: 16189
+# Type: Integration
+# Disposition: submitted to linux-mtd@lists.infradead.org
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+#     PNX8550 MTD NAND driver
+# 
+#  drivers/mtd/nand/Kconfig             |    6 
+#  drivers/mtd/nand/Makefile            |    1 
+#  drivers/mtd/nand/pnx8550.c           |  694 +++++++++++++++++++++++++++++++++++
+#  include/asm-mips/mach-pnx8550/nand.h |   22 +
+#  4 files changed, 721 insertions(+), 2 deletions(-)
+# 
+
+PATCHNUM=316
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16189
+Type: Integration
+Disposition: submitted to linux-mtd@lists.infradead.org
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+    PNX8550 MTD NAND driver
+
+ drivers/mtd/nand/Kconfig             |    6 
+ drivers/mtd/nand/Makefile            |    1 
+ drivers/mtd/nand/pnx8550.c           |  694 +++++++++++++++++++++++++++++++++++
+ include/asm-mips/mach-pnx8550/nand.h |   22 +
+ mvl_patches/pro-0316.c               |   16 
+ 5 files changed, 737 insertions(+), 2 deletions(-)
+
+Index: linux-2.6.10/drivers/mtd/nand/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/nand/Kconfig
++++ linux-2.6.10/drivers/mtd/nand/Kconfig
+@@ -150,6 +150,12 @@ config MTD_NAND_BAMBOO
+ 	  This enables the NAND flash driver on the IBM/AMCC 440EP Eval Board
+ 	  (Bamboo).
+ 
++config MTD_NAND_PNX8550
++	tristate "NAND Flash support for PNX8550"
++	depends on PNX8550 && MTD_NAND
++	help
++	  This enables the NAND flash controller on the PNX8550.
++
+ config MTD_NAND_DISKONCHIP
+ 	tristate "DiskOnChip 2000, Millennium and Millennium Plus (NAND reimplementation) (EXPERIMENTAL)"
+ 	depends on MTD_NAND && EXPERIMENTAL
+Index: linux-2.6.10/drivers/mtd/nand/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/nand/Makefile
++++ linux-2.6.10/drivers/mtd/nand/Makefile
+@@ -24,5 +24,6 @@ obj-$(CONFIG_MTD_NAND_SHARPSL)		+= sharp
+ obj-$(CONFIG_MTD_NAND_NANDSIM)		+= nandsim.o
+ obj-$(CONFIG_MTD_NAND_OMAP) 		+= omap-nand-flash.o
+ obj-$(CONFIG_MTD_NAND_OMAP_HW)		+= omap-hw.o
++obj-$(CONFIG_MTD_NAND_PNX8550)		+= pnx8550.o
+ 
+ nand-objs = nand_base.o nand_bbt.o
+Index: linux-2.6.10/drivers/mtd/nand/pnx8550.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/nand/pnx8550.c
+@@ -0,0 +1,694 @@
++/*
++ * Copyright (C) 2005 Koninklijke Philips Electronics N.V.
++ * All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ * 
++ * Overview:
++ *   This is a device driver for the NAND flash device found on the
++ *   PNX8550 board which utilizes the Samsung K9F5616U0C part. This is
++ *   a 32MByte (16M x 16 bits) NAND flash device.
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/nand_ecc.h>
++#include <linux/mtd/compatmac.h>
++#include <linux/interrupt.h>
++#include <linux/mtd/partitions.h>
++#include <asm/io.h>
++#include <asm/mach-pnx8550/nand.h>
++
++#define UBTM_NAME                 "microBTM"
++#define UBTM_BLOCK_START         ( 0x00000000)
++#define UBTM_BLOCK_END           ( 0x00004000)	/* 16K size, first block */
++#define UBTM_SIZE                ( UBTM_BLOCK_END - UBTM_BLOCK_START)
++
++#define BOOTLOADER_NAME           "bootloader"
++#define BOOTLOADER_BLOCK_START   ( UBTM_BLOCK_END)
++#define BOOTLOADER_BLOCK_END     ( 0x00040000)	/* 256K -  16K = 240K    */
++#define BOOTLOADER_SIZE          ( BOOTLOADER_BLOCK_END - BOOTLOADER_BLOCK_START)
++
++#define ROMFS_SYS_NAME            "ROMFS-Tools"
++#define ROMFS_SYS_BLOCK_START    ( BOOTLOADER_BLOCK_END)
++#define ROMFS_SYS_BLOCK_END      ( 0x00600000)	/*   6M - 256K = 5.75M   */
++#define ROMFS_SYS_SIZE           ( ROMFS_SYS_BLOCK_END - ROMFS_SYS_BLOCK_START)
++
++#define ROMFS_APP_NAME            "ROMFS-User"
++#define ROMFS_APP_BLOCK_START    ( ROMFS_SYS_BLOCK_END)
++#define ROMFS_APP_BLOCK_END      ( 0x01000000)	/*  16M -   6M = 10M     */
++#define ROMFS_APP_SIZE           ( ROMFS_APP_BLOCK_END - ROMFS_APP_BLOCK_START)
++
++#define USER_NAME                 "User"
++#define USER_BLOCK_START         ( ROMFS_APP_BLOCK_END)
++#define USER_BLOCK_END           ( 0x02000000)	/*  32M -  16M = 16M     */
++#define USER_SIZE                ( USER_BLOCK_END - USER_BLOCK_START)
++
++#define NAND_ADDR(_col, _page) ((_col) & (mtd->oobblock - 1)) + ((_page) << this->page_shift)
++
++#define NAND_ADDR_SEND(_addr) writew(0, pNandAddr + _addr)
++
++#define NAND_TRANSFER_TO(_addr, _buffer, _bytes)   pnx8550_nand_transfer(_buffer, pNandAddr + _addr, _bytes, 1)
++#define NAND_TRANSFER_FROM(_addr, _buffer, _bytes) pnx8550_nand_transfer(pNandAddr + _addr, _buffer, _bytes, 0)
++
++/*
++ * Define partitions for flash device
++ */
++#define NUM_PARTITIONS 5
++const static struct mtd_partition partition_info[NUM_PARTITIONS] = {
++	{
++	 .name = UBTM_NAME,
++	 .offset = UBTM_BLOCK_START,
++	 .size = UBTM_SIZE},
++	{
++	 .name = BOOTLOADER_NAME,
++	 .offset = BOOTLOADER_BLOCK_START,
++	 .size = BOOTLOADER_SIZE},
++	{
++	 .name = ROMFS_SYS_NAME,
++	 .offset = ROMFS_SYS_BLOCK_START,
++	 .size = ROMFS_SYS_SIZE},
++	{
++	 .name = ROMFS_APP_NAME,
++	 .offset = ROMFS_APP_BLOCK_START,
++	 .size = ROMFS_APP_SIZE},
++	{
++	 .name = USER_NAME,
++	 .offset = USER_BLOCK_START,
++	 .size = USER_SIZE}
++};
++
++/* Bad block descriptor for 16Bit nand flash */
++static uint8_t scan_ff_pattern[] = { 0xff, 0xff };
++static struct nand_bbt_descr nand16bit_memorybased = {
++	.options = 0,
++	.offs = 0,
++	.len = 2,
++	.pattern = scan_ff_pattern
++};
++
++/* OOB Placement information that lines up with the boot loader code */
++static struct nand_oobinfo nand16bit_oob_16 = {
++	.useecc = MTD_NANDECC_AUTOPLACE,
++	.eccbytes = 6,
++	.eccpos = {2, 3, 4, 5, 6, 7},
++	.oobfree = {{8, 8}}
++};
++
++/* Pointer into XIO for access to the 16Bit NAND flash device */
++static u8 *pNandAddr;
++
++/* Last command sent to the pnx8550_nand_command function */
++static int last_command = -1;
++/*
++ * Next column address to read/write, set by pnx8550_nand_command
++ * updated by the read/write functions
++ */
++static int last_col_addr = -1;
++/*
++ *  Next page address to read/write, set by pnx8550_nand_command
++ *  updated by the read/write functions
++ */
++static int last_page_addr = -1;
++
++/* 32bit Aligned/DMA buffer */
++static u_char *transferBuffer;
++
++static struct mtd_info pnx8550_mtd;
++static struct nand_chip pnx8550_nand;
++
++/**
++ * Setup the registers in PCIXIO
++ */
++static void pnx8550_nand_register_setup(u_char cmd_no,
++					u_char addr_no,
++					u_char include_data,
++					u_char monitor_ACK,
++					u_char enable64M, int cmd_a, int cmd_b)
++{
++	unsigned int reg_nand = 0;
++	reg_nand |= enable64M ? PNX8550_XIO_FLASH_64MB : 0;
++	reg_nand |= include_data ? PNX8550_XIO_FLASH_INC_DATA : 0;
++	reg_nand |= PNX8550_XIO_FLASH_CMD_PH(cmd_no);
++	reg_nand |= PNX8550_XIO_FLASH_ADR_PH(addr_no);
++	reg_nand |= PNX8550_XIO_FLASH_CMD_A(cmd_a);
++	reg_nand |= PNX8550_XIO_FLASH_CMD_B(cmd_b);
++	PNX8550_XIO_FLASH_CTRL = reg_nand;
++	barrier();
++}
++
++/**
++ * Wait for the device to be ready for the next command
++ */
++static inline void pnx8550_nand_wait_for_dev_ready(void)
++{
++	while ((PNX8550_XIO_CTRL & PNX8550_XIO_CTRL_XIO_ACK) == 0) ;
++}
++
++/**
++ * Transfer data to/from the NAND chip using DMA
++ *
++ * @from:  Address to transfer data from
++ * @to:    Address to transfer the data to
++ * @bytes: Number of bytes to transfer
++ * @toxio: Whether the transfer is going to XIO or not.
++ */
++static void pnx8550_nand_transferDMA(void *from, void *to, int bytes, int toxio)
++{
++	int cmd = 0;
++	u32 internal;
++	u32 external;
++
++	if (toxio) {
++		cmd = PNX8550_DMA_CTRL_PCI_CMD_WRITE;
++		dma_cache_wback((unsigned long)from, bytes);
++		internal = (u32) virt_to_phys(from);
++		external = (u32) to - KSEG1;
++	} else {
++		cmd = PNX8550_DMA_CTRL_PCI_CMD_READ;
++		internal = (u32) virt_to_phys(to);
++		external = (u32) from - KSEG1;
++	}
++
++	local_irq_disable();
++	PNX8550_DMA_TRANS_SIZE = bytes >> 2;	/* Length in words */
++	PNX8550_DMA_EXT_ADDR = external;
++	PNX8550_DMA_INT_ADDR = internal;
++	PNX8550_DMA_INT_CLEAR = 0xffff;
++	PNX8550_DMA_CTRL = PNX8550_DMA_CTRL_BURST_512 |
++	    PNX8550_DMA_CTRL_SND2XIO | PNX8550_DMA_CTRL_INIT_DMA | cmd;
++
++	while ((PNX8550_DMA_INT_STATUS & PNX8550_DMA_INT_COMPL) == 0) ;
++
++	if (!toxio)
++		dma_cache_inv((unsigned long)to, bytes);
++
++	local_irq_enable();
++}
++
++/**
++ * Transfer data to/from the NAND chip.
++ * This function decides whether to use DMA or not depending on
++ * the amount of data to transfer and the alignment of the buffers.
++ *
++ * @from:  Address to transfer data from
++ * @to:    Address to transfer the data to
++ * @bytes: Number of bytes to transfer
++ * @toxio: Whether the transfer is going to XIO or not.
++ */
++static void pnx8550_nand_transfer(void *from, void *to, int bytes, int toxio)
++{
++	u16 *from16 = (u16 *) from;
++	u16 *to16 = (u16 *) to;
++
++	int i;
++
++	if ((u32) from & 3)
++		printk(KERN_INFO "%s: from buffer not 32bit aligned, will not "
++			 "use fastest transfer mechanism\n", __FUNCTION__);
++	if ((u32) to & 3)
++		printk(KERN_INFO "%s: to buffer not 32bit aligned, will not "
++			 "use fastest transfer mechanism\n", __FUNCTION__);
++
++	if (((bytes & 3) || (bytes < 16)) || ((u32) to & 3) || ((u32) from & 3)) {
++		if (((bytes & 1) == 0) &&
++		    (((u32) to & 1) == 0) && (((u32) from & 1) == 0)) {
++			int words = bytes / 2;
++
++			local_irq_disable();
++			for (i = 0; i < words; i++)
++				to16[i] = from16[i];
++			local_irq_enable();
++		} 
++		else
++			printk(KERN_ERR "%s: Transfer failed, "
++			       "byte-aligned transfers no allowed!\n",
++			        __FUNCTION__);
++	} else {
++		pnx8550_nand_transferDMA(from, to, bytes, toxio);
++	}
++}
++
++/**
++ * pnx8550_nand_read_byte - read one byte endianess aware from the chip
++ * @mtd:	MTD device structure
++ */
++static u_char pnx8550_nand_read_byte(struct mtd_info *mtd)
++{
++	struct nand_chip *this = mtd->priv;
++	u16 data = 0;
++	int addr = NAND_ADDR(last_col_addr, last_page_addr);
++	/*
++	 * Read ID is a special case as we have to read BOTH bytes at the same
++	 * time otherwise it doesn't work, once we have both bytes we work out
++	 * which one we want.
++	 */
++	if (last_command == NAND_CMD_READID) {
++		u32 data32;
++		data32 = cpu_to_le32(readl(pNandAddr + 0));
++		if (last_col_addr)
++			data = (u16) (data32 >> 16);
++		else
++			data = (u16) data32;
++	} else {
++		data = readw(pNandAddr + addr);
++		if ((addr & 0x1) == 1)
++			data = (data & 0xff00) >> 16;
++	}
++	/*
++	 * Status is a special case, we don't need to increment the address
++	 * because the address isn't used by the chip
++	 */
++	if (last_command != NAND_CMD_STATUS)
++		last_col_addr++;
++
++	return data & 0xff;
++}
++
++/**
++ * pnx8550_nand_read_word - read one word from the chip
++ * @mtd:	MTD device structure
++ *
++ * Read function for 16bit buswith without
++ * endianess conversion
++ */
++static u16 pnx8550_nand_read_word(struct mtd_info *mtd)
++{
++	struct nand_chip *this = mtd->priv;
++	int addr = NAND_ADDR(last_col_addr, last_page_addr);
++	u16 data = readw(pNandAddr + addr);
++	return data;
++}
++
++/**
++ * pnx8550_nand_write_byte - write one byte endianess aware to the chip
++ * @mtd:	MTD device structure
++ * @byte:	pointer to data byte to write
++ *
++ * Write function for 16bit buswith with
++ * endianess conversion
++ */
++static void pnx8550_nand_write_byte(struct mtd_info *mtd, u_char byte)
++{
++	struct nand_chip *this = mtd->priv;
++	int addr = NAND_ADDR(last_col_addr, last_page_addr);
++	writew(le16_to_cpu((u16) byte), pNandAddr + addr);
++}
++
++/**
++ * pnx8550_nand_write_word - write one word to the chip
++ * @mtd:	MTD device structure
++ * @word:	data word to write
++ *
++ * Write function for 16bit buswith without
++ * endianess conversion
++ */
++static void pnx8550_nand_write_word(struct mtd_info *mtd, u16 word)
++{
++	struct nand_chip *this = mtd->priv;
++	int addr = NAND_ADDR(last_col_addr, last_page_addr);
++	writew(word, pNandAddr + addr);
++}
++
++/**
++ * pnx8550_nand_write_buf - write buffer to chip
++ * @mtd:	MTD device structure
++ * @buf:	data buffer
++ * @len:	number of bytes to write
++ */
++static void pnx8550_nand_write_buf(struct mtd_info *mtd, const u_char * buf,
++				   int len)
++{
++	struct nand_chip *this = mtd->priv;
++	int addr = NAND_ADDR(last_col_addr, last_page_addr);
++	int pageLen;
++	int oobLen = 0;
++	u_char *transBuf = (u_char *) buf;
++
++	/* some sanity checking, word access only please */
++	if (len & 1)
++		pr_debug("%s: non-word aligned length requested!\n",
++			 __FUNCTION__);
++
++	memcpy(transferBuffer, buf, len);
++	transBuf = transferBuffer;
++
++	/*
++	 * Work out whether we are going to write to the OOB area
++	 * after a standard page write.
++	 * This is not the case when the command function is called
++	 * with a column address > page size. Then we write as though
++	 * it is to the page rather than the OOB as the command function
++	 * has already selected the OOB area.
++	 */
++	if ((last_col_addr + len) > mtd->oobblock)
++		oobLen = (last_col_addr + len) - mtd->oobblock;
++	pageLen = len - oobLen;
++
++	/* Clear the done flag */
++	PNX8550_GPXIO_CTRL |= PNX8550_GPXIO_CLR_DONE;
++	if (pageLen > 0)
++		NAND_TRANSFER_TO(addr, transBuf, pageLen);
++
++	if (oobLen > 0) {
++		pnx8550_nand_wait_for_dev_ready();
++
++		pnx8550_nand_register_setup(1, 0, 0, 1, 0, NAND_CMD_READOOB, 0);
++		/* Work out where in the OOB we are going to start to write */
++		addr = NAND_ADDR(last_col_addr - mtd->oobblock, last_page_addr);
++		NAND_ADDR_SEND(addr);
++		pnx8550_nand_register_setup(2, 3, 1, 1, 0, NAND_CMD_SEQIN,
++					    NAND_CMD_PAGEPROG);
++
++		/* Clear the done flag */
++		PNX8550_GPXIO_CTRL |= PNX8550_GPXIO_CLR_DONE;
++		NAND_TRANSFER_TO(addr, transBuf + pageLen, oobLen);
++	}
++
++	/*
++	 * Increment the address so on the next write we write in the
++	 * correct place.
++	 */
++	last_col_addr += len;
++	if (last_col_addr >= mtd->oobblock + mtd->oobsize) {
++		last_col_addr -= mtd->oobblock + mtd->oobsize;
++		last_page_addr++;
++	}
++}
++
++/**
++ * pnx8550_nand_read_buf - read chip data into buffer
++ * @mtd:	MTD device structure
++ * @buf:	buffer to store date
++ * @len:	number of bytes to read
++ */
++static void pnx8550_nand_read_buf(struct mtd_info *mtd, u_char * buf, int len)
++{
++	struct nand_chip *this = mtd->priv;
++	int addr = NAND_ADDR(last_col_addr, last_page_addr);
++	int pageLen;
++	int oobLen = 0;
++	u_char *transBuf = buf;
++
++	/* some sanity checking, word access only please */
++	if (len & 1)
++		pr_debug("%s: non-word aligned length\n", __FUNCTION__);
++
++	transBuf = transferBuffer;
++
++	/*
++	 * Work out whether we are going to read the OOB area
++	 * after a standard page read.
++	 * This is not the case when the command function is called
++	 * with a column address > page size. Then we read as though
++	 * it is from the page rather than the OOB as the command
++	 * function has already selected the OOB area.
++	 */
++	if ((last_col_addr + len) > mtd->oobblock)
++		oobLen = (last_col_addr + len) - mtd->oobblock;
++
++	pageLen = len - oobLen;
++
++	if (pageLen)
++		NAND_TRANSFER_FROM(addr, transBuf, pageLen);
++
++	if (oobLen > 0) {
++		pnx8550_nand_register_setup(1, 3, 1, 1, 0, NAND_CMD_READOOB, 0);
++		addr = NAND_ADDR(last_col_addr - mtd->oobblock, last_page_addr);
++		NAND_TRANSFER_FROM(addr, transBuf + pageLen, oobLen);
++	}
++
++	if (transBuf != buf)
++		memcpy(buf, transBuf, len);
++
++	/*
++	 * Increment the address so on the next read we read from the
++	 * correct place.
++	 */
++	last_col_addr += len;
++	if (last_col_addr > mtd->oobblock + mtd->oobsize) {
++		last_col_addr -= mtd->oobblock + mtd->oobsize;
++		last_page_addr++;
++	}
++	return;
++}
++
++/**
++ * pnx8550_nand_verify_buf -  Verify chip data against buffer
++ * @mtd:	MTD device structure
++ * @buf:	buffer containing the data to compare
++ * @len:	number of bytes to compare
++ *
++ */
++static int pnx8550_nand_verify_buf(struct mtd_info *mtd, const u_char * buf,
++				   int len)
++{
++	int result = 0;
++
++	/* some sanity checking, word access only please */
++	if (len & 1)
++		pr_debug("%s: non-word aligned length\n", __FUNCTION__);
++
++	pnx8550_nand_read_buf(mtd, transferBuffer, len);
++	if (memcmp(buf, transferBuffer, len))
++		result = -EFAULT;
++
++	return result;
++
++}
++
++/**
++ * pnx8550_nand_command - Send command to NAND device
++ * @mtd:	MTD device structure
++ * @command:	the command to be sent
++ * @column:	the column address for this command, -1 if none
++ * @page_addr:	the page address for this command, -1 if none
++ *
++ * Send command to NAND device.
++ */
++static void pnx8550_nand_command(struct mtd_info *mtd, unsigned command,
++				 int column, int page_addr)
++{
++	register struct nand_chip *this = mtd->priv;
++	u_char addr_no = 0;
++	u_char spare = 0;
++	int addr;
++	/*
++	   If we are starting a write work out whether it is to the
++	   OOB or the main page and position the pointer correctly.
++	 */
++	if (command == NAND_CMD_SEQIN) {
++		int readcmd;
++		int col = column;
++		if (column >= mtd->oobblock) {
++			/* OOB area */
++			col -= mtd->oobblock;
++			readcmd = NAND_CMD_READOOB;
++			spare = 1;
++		} else {
++			readcmd = NAND_CMD_READ0;
++		}
++		pnx8550_nand_register_setup(1, 0, 0, 1, 0, readcmd, 0);
++		addr = NAND_ADDR(col, page_addr);
++		NAND_ADDR_SEND(addr);
++	}
++
++	/* Check the number of address bytes */
++	if ((column == -1) && (page_addr == -1)) {
++		addr_no = 0;
++		column = 0;
++		page_addr = 0;
++	} else if ((column == -1) && (page_addr != -1)) {
++		addr_no = 2;
++		column = 0;
++	} else if ((column != -1) && (page_addr == -1)) {
++		addr_no = 1;
++		page_addr = 0;
++	} else {
++		addr_no = 3;
++	}
++
++	last_command = command;
++	last_col_addr = column;
++	last_page_addr = page_addr;
++
++	switch (command) {
++	case NAND_CMD_PAGEPROG:
++		/* Nothing to do, we've already done it! */
++		return;
++
++	case NAND_CMD_SEQIN:
++		if (addr_no != 3)
++			printk(KERN_ERR
++			       "NAND: Command %02x needs 3 byte address,"
++			       "but addr_no = %d\n", command, addr_no);
++		pnx8550_nand_register_setup(2, 3, 1, 1, spare, NAND_CMD_SEQIN,
++					    NAND_CMD_PAGEPROG);
++		return;
++
++	case NAND_CMD_ERASE1:
++		if (addr_no != 2)
++			pr_debug("NAND: Command %02x needs 2 byte" "address,"
++				 "but addr_no = %d\n", command, addr_no);
++		PNX8550_GPXIO_CTRL |= PNX8550_GPXIO_CLR_DONE;
++		pnx8550_nand_register_setup(2, 2, 0, 1, 0, NAND_CMD_ERASE1,
++					    NAND_CMD_ERASE2);
++		addr = NAND_ADDR(column, page_addr);
++		NAND_ADDR_SEND(addr);
++		return;
++
++	case NAND_CMD_ERASE2:
++		/* Nothing to do, we've already done it! */
++		return;
++
++	case NAND_CMD_STATUS:
++		if (addr_no != 0)
++			pr_debug("NAND: Command %02x needs 0 byte address,"
++				 "but addr_no = %d\n", command, addr_no);
++		pnx8550_nand_register_setup(1, 0, 1, 0, 0, NAND_CMD_STATUS, 0);
++		return;
++
++	case NAND_CMD_RESET:
++		if (addr_no != 0)
++			pr_debug("NAND: Command %02x needs 0 byte address,"
++				 "but addr_no = %d\n", command, addr_no);
++		pnx8550_nand_register_setup(1, 0, 0, 0, 0, NAND_CMD_RESET, 0);
++		addr = NAND_ADDR(column, page_addr);
++		NAND_ADDR_SEND(addr);
++		return;
++
++	case NAND_CMD_READ0:
++		if (addr_no != 3)
++			pr_debug("NAND: Command %02x needs 3 byte address,"
++				 "but addr_no = %d\n", command, addr_no);
++		pnx8550_nand_register_setup(1, 3, 1, 1, 0, NAND_CMD_READ0, 0);
++		return;
++
++	case NAND_CMD_READ1:
++		printk(KERN_ERR "Wrong command: %02x\n", command);
++		return;
++
++	case NAND_CMD_READOOB:
++		if (addr_no != 3)
++			pr_debug("NAND: Command %02x needs 3 byte address,"
++				 "but addr_no = %d\n", command, addr_no);
++		pnx8550_nand_register_setup(1, 3, 1, 1, 0, NAND_CMD_READOOB, 0);
++		return;
++
++	case NAND_CMD_READID:
++		if (addr_no != 1)
++			pr_debug("NAND: Command %02x needs 1 byte address,"
++				 "but addr_no = %d\n", command, addr_no);
++		pnx8550_nand_register_setup(1, 1, 1, 0, 0, NAND_CMD_READID, 0);
++		return;
++	}
++}
++
++/**
++ * Return true if the device is ready, false otherwise
++ */
++static int pnx8550_nand_dev_ready(struct mtd_info *mtd)
++{
++	return ((PNX8550_XIO_CTRL & PNX8550_XIO_CTRL_XIO_ACK) != 0);
++}
++
++/**
++ *	hardware specific access to control-lines
++ */
++static void pnx8550_nand_hwcontrol(struct mtd_info *mtd, int cmd)
++{
++	/* Nothing to do here, its all done by the XIO block */
++}
++
++/**
++ * Main initialization routine
++ */
++int __init pnx8550_nand_init(void)
++{
++	struct nand_chip *this;
++
++	/* Get pointer to private data */
++	this = &pnx8550_nand;
++
++	/* Work out address of Nand Flash */
++	pNandAddr = (u8 *) (KSEG1 | (PNX8550_BASE18_ADDR & (~0x7)));
++
++	pNandAddr = (u8 *) (((u32) pNandAddr) +
++			     ((PNX8550_XIO_SEL0 & PNX8550_XIO_SEL0_OFFSET_MASK)
++			      >> PNX8550_XIO_SEL0_OFFSET_SHIFT) * 8 * 1024 *
++			     1024);
++
++	/* Link the private data with the MTD structure */
++	pnx8550_mtd.priv = this;
++	this->chip_delay = 15;
++	this->options = NAND_BUSWIDTH_16;
++	this->cmdfunc = pnx8550_nand_command;
++	this->read_byte = pnx8550_nand_read_byte;
++	this->read_word = pnx8550_nand_read_word;
++	this->read_buf = pnx8550_nand_read_buf;
++	this->write_byte = pnx8550_nand_write_byte;
++	this->write_word = pnx8550_nand_write_word;
++	this->write_buf = pnx8550_nand_write_buf;
++	this->verify_buf = pnx8550_nand_verify_buf;
++	this->dev_ready = pnx8550_nand_dev_ready;
++	this->hwcontrol = pnx8550_nand_hwcontrol;
++	this->eccmode = NAND_ECC_SOFT;
++	this->badblock_pattern = &nand16bit_memorybased;
++	this->autooob = &nand16bit_oob_16;
++
++	transferBuffer =
++	    kmalloc(pnx8550_mtd.oobblock + pnx8550_mtd.oobsize,
++		    GFP_DMA | GFP_KERNEL);
++	if (!transferBuffer) {
++		printk(KERN_ERR
++		       "Unable to allocate NAND data buffer for PNX8550\n");
++		return -ENOMEM;
++	}
++
++	/* Scan to find existence of the device */
++	if (nand_scan(&pnx8550_mtd, 1)) {
++		printk(KERN_ERR "No NAND devices\n");
++		return -ENXIO;
++	}
++
++	add_mtd_partitions(&pnx8550_mtd, partition_info, NUM_PARTITIONS);
++
++	return 0;
++}
++
++module_init(pnx8550_nand_init);
++
++#ifdef MODULE
++static void __exit pnx8550_nand_cleanup(void)
++{
++	nand_release(&pnx8550_mtd);
++	kfree(transferBuffer);
++}
++
++module_exit(pnx8550_nand_cleanup);
++#endif
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Adam Charrett");
++MODULE_DESCRIPTION("Driver for 16Bit NAND Flash on the XIO bus for PNX8550");
+Index: linux-2.6.10/include/asm-mips/mach-pnx8550/nand.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/mach-pnx8550/nand.h
++++ linux-2.6.10/include/asm-mips/mach-pnx8550/nand.h
+@@ -4,10 +4,14 @@
+ #define PNX8550_NAND_BASE_ADDR   0x10000000
+ #define PNX8550_PCIXIO_BASE	 0xBBE40000
+ 
++#define PNX8550_BASE10_ADDR      *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x050)
++#define PNX8550_BASE14_ADDR      *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x054)
++#define PNX8550_BASE18_ADDR      *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x058)
+ #define PNX8550_DMA_EXT_ADDR     *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x800)
+ #define PNX8550_DMA_INT_ADDR     *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x804)
+ #define PNX8550_DMA_TRANS_SIZE   *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x808)
+ #define PNX8550_DMA_CTRL         *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x80c)
++#define PNX8550_XIO_CTRL         *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x810)
+ #define PNX8550_XIO_SEL0         *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x814)
+ #define PNX8550_GPXIO_ADDR       *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x820)
+ #define PNX8550_GPXIO_WR         *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0x824)
+@@ -21,6 +25,8 @@
+ #define PNX8550_DMA_INT_ENABLE   *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0xfd4)
+ #define PNX8550_DMA_INT_CLEAR    *(volatile unsigned long *)(PNX8550_PCIXIO_BASE + 0xfd8)
+ 
++#define PNX8550_XIO_CTRL_XIO_ACK     0x00000002
++
+ #define PNX8550_XIO_SEL0_EN_16BIT    0x00800000
+ #define PNX8550_XIO_SEL0_USE_ACK     0x00400000
+ #define PNX8550_XIO_SEL0_REN_HIGH    0x00100000
+@@ -39,6 +45,9 @@
+ #define PNX8550_XIO_SEL0_SIZE_64MB   0x00000006
+ #define PNX8550_XIO_SEL0_ENAB        0x00000001
+ 
++#define PNX8550_XIO_SEL0_OFFSET_SHIFT 5
++#define PNX8550_XIO_SEL0_OFFSET_MASK  (0xf << PNX8550_XIO_SEL0_OFFSET_SHIFT)
++
+ #define PNX8550_SEL0_DEFAULT ((PNX8550_XIO_SEL0_EN_16BIT)  | \
+                               (PNX8550_XIO_SEL0_REN_HIGH*0)| \
+ 	                      (PNX8550_XIO_SEL0_REN_LOW*2) | \
+@@ -59,11 +68,15 @@
+ 
+ #define PNX8550_XIO_FLASH_64MB       0x00200000
+ #define PNX8550_XIO_FLASH_INC_DATA   0x00100000
+-#define PNX8550_XIO_FLASH_CMD_PH     0x000C0000
++#define PNX8550_XIO_FLASH_CMD_PH_SHIFT 18
++#define PNX8550_XIO_FLASH_CMD_PH_MASK  (3 << PNX8550_XIO_FLASH_CMD_PH_SHIFT)
++#define PNX8550_XIO_FLASH_CMD_PH(_x)   (((_x) << PNX8550_XIO_FLASH_CMD_PH_SHIFT) & PNX8550_XIO_FLASH_CMD_PH_MASK)
++#define PNX8550_XIO_FLASH_ADR_PH_SHIFT 16
++#define PNX8550_XIO_FLASH_ADR_PH_MASK  (3 << PNX8550_XIO_FLASH_ADR_PH_SHIFT)
++#define PNX8550_XIO_FLASH_ADR_PH(_x)   (((_x) << PNX8550_XIO_FLASH_ADR_PH_SHIFT) & PNX8550_XIO_FLASH_ADR_PH_MASK)
+ #define PNX8550_XIO_FLASH_CMD_PH2    0x00080000
+ #define PNX8550_XIO_FLASH_CMD_PH1    0x00040000
+ #define PNX8550_XIO_FLASH_CMD_PH0    0x00000000
+-#define PNX8550_XIO_FLASH_ADR_PH     0x00030000
+ #define PNX8550_XIO_FLASH_ADR_PH3    0x00030000
+ #define PNX8550_XIO_FLASH_ADR_PH2    0x00020000
+ #define PNX8550_XIO_FLASH_ADR_PH1    0x00010000
+@@ -118,4 +131,9 @@
+ #define PNX8550_DMA_INT_CLR_M_ABORT	(1<<2)
+ #define PNX8550_DMA_INT_CLR_T_ABORT	(1<<1)
+ 
++#define PNX8550_DMA_INT_ACK          0x00004000
++#define PNX8550_DMA_INT_COMPL        0x00001000
++#define PNX8550_DMA_INT_NONSUP       0x00000200
++#define PNX8550_DMA_INT_ABORT        0x00000004
++
+ #endif
+Index: linux-2.6.10/mvl_patches/pro-0316.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0316.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(316);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,383 @@
+#! /usr/bin/env bash
+# Patch: -sense_data_helpers_lk_2.6.11_rc1_bk1
+# Date: Fri Jan  4 18:39:22 2008
+# Source: Kernel.org git
+# MR: 23373
+# Type: Defect Fix
+# Disposition: Backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# 
+# From e9eb60382ababfcf460617d1a4494d1334c052af Mon Sep 17 00:00:00 2001
+# From: Douglas Gilbert <dougg@torque.net>
+# Date: Tue, 18 Jan 2005 18:34:55 -0800
+# Subject: [PATCH] [PATCH] sense data helpers lk 2.6.11-rc1-bk1
+# 
+#    - add sense data helper functions:
+#    - scsi_sense_desc_find() to find a given
+#      sense descriptor (e.g. type 0 -> information)
+#    - scsi_get_sense_info_fld() to get the information
+#      field from fixed or descriptor sense data
+# 
+# Kai Makisara proposed the "find" function. For
+# example, it will help the st driver find the Filemark,
+# EOM and ILI flags which have been placed in the
+# "stream commands" sense data descriptor.
+# 
+# Signed-off-by: Douglas Gilbert <dougg@torque.net>
+# Signed-off-by: James Bottomley <James.Bottomley@SteelEye.com>
+# 
+
+PATCHNUM=1516
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Kernel.org git
+MR: 23373
+Type: Defect Fix
+Disposition: Backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+
+From e9eb60382ababfcf460617d1a4494d1334c052af Mon Sep 17 00:00:00 2001
+From: Douglas Gilbert <dougg@torque.net>
+Date: Tue, 18 Jan 2005 18:34:55 -0800
+Subject: [PATCH] [PATCH] sense data helpers lk 2.6.11-rc1-bk1
+
+   - add sense data helper functions:
+   - scsi_sense_desc_find() to find a given
+     sense descriptor (e.g. type 0 -> information)
+   - scsi_get_sense_info_fld() to get the information
+     field from fixed or descriptor sense data
+
+Kai Makisara proposed the "find" function. For
+example, it will help the st driver find the Filemark,
+EOM and ILI flags which have been placed in the
+"stream commands" sense data descriptor.
+
+Signed-off-by: Douglas Gilbert <dougg@torque.net>
+Signed-off-by: James Bottomley <James.Bottomley@SteelEye.com>
+
+Index: linux-2.6.10/drivers/scsi/scsi_error.c
+===================================================================
+--- linux-2.6.10.orig/drivers/scsi/scsi_error.c
++++ linux-2.6.10/drivers/scsi/scsi_error.c
+@@ -1919,3 +1919,96 @@ int scsi_command_normalize_sense(struct 
+ 			sizeof(cmd->sense_buffer), sshdr);
+ }
+ EXPORT_SYMBOL(scsi_command_normalize_sense);
++
++/**
++ * scsi_sense_desc_find - search for a given descriptor type in
++ *			descriptor sense data format.
++ *
++ * @sense_buffer:	byte array of descriptor format sense data
++ * @sb_len:		number of valid bytes in sense_buffer
++ * @desc_type:		value of descriptor type to find
++ *			(e.g. 0 -> information)
++ *
++ * Notes:
++ *	only valid when sense data is in descriptor format
++ *
++ * Return value:
++ *	pointer to start of (first) descriptor if found else NULL
++ **/
++const u8 * scsi_sense_desc_find(const u8 * sense_buffer, int sb_len,
++				int desc_type)
++{
++	int add_sen_len, add_len, desc_len, k;
++	const u8 * descp;
++
++	if ((sb_len < 8) || (0 == (add_sen_len = sense_buffer[7])))
++		return NULL;
++	if ((sense_buffer[0] < 0x72) || (sense_buffer[0] > 0x73))
++		return NULL;
++	add_sen_len = (add_sen_len < (sb_len - 8)) ?
++			add_sen_len : (sb_len - 8);
++	descp = &sense_buffer[8];
++	for (desc_len = 0, k = 0; k < add_sen_len; k += desc_len) {
++		descp += desc_len;
++		add_len = (k < (add_sen_len - 1)) ? descp[1]: -1;
++		desc_len = add_len + 2;
++		if (descp[0] == desc_type)
++			return descp;
++		if (add_len < 0) // short descriptor ??
++			break;
++	}
++	return NULL;
++}
++EXPORT_SYMBOL(scsi_sense_desc_find);
++
++/**
++ * scsi_get_sense_info_fld - attempts to get information field from
++ *			sense data (either fixed or descriptor format)
++ *
++ * @sense_buffer:	byte array of sense data
++ * @sb_len:		number of valid bytes in sense_buffer
++ * @info_out:		pointer to 64 integer where 8 or 4 byte information
++ *			field will be placed if found.
++ *
++ * Return value:
++ *	1 if information field found, 0 if not found.
++ **/
++int scsi_get_sense_info_fld(const u8 * sense_buffer, int sb_len,
++			    u64 * info_out)
++{
++	int j;
++	const u8 * ucp;
++	u64 ull;
++
++	if (sb_len < 7)
++		return 0;
++	switch (sense_buffer[0] & 0x7f) {
++	case 0x70:
++	case 0x71:
++		if (sense_buffer[0] & 0x80) {
++			*info_out = (sense_buffer[3] << 24) +
++				    (sense_buffer[4] << 16) +
++				    (sense_buffer[5] << 8) + sense_buffer[6];
++			return 1;
++		} else
++			return 0;
++	case 0x72:
++	case 0x73:
++		ucp = scsi_sense_desc_find(sense_buffer, sb_len,
++					   0 /* info desc */);
++		if (ucp && (0xa == ucp[1])) {
++			ull = 0;
++			for (j = 0; j < 8; ++j) {
++				if (j > 0)
++					ull <<= 8;
++				ull |= ucp[4 + j];
++			}
++			*info_out = ull;
++			return 1;
++		} else
++			return 0;
++	default:
++		return 0;
++	}
++}
++EXPORT_SYMBOL(scsi_get_sense_info_fld);
+Index: linux-2.6.10/include/scsi/scsi_eh.h
+===================================================================
+--- linux-2.6.10.orig/include/scsi/scsi_eh.h
++++ linux-2.6.10/include/scsi/scsi_eh.h
+@@ -44,6 +44,12 @@ static inline int scsi_sense_is_deferred
+ {
+ 	return ((sshdr->response_code >= 0x70) && (sshdr->response_code & 1));
+ }
++
++extern const u8 * scsi_sense_desc_find(const u8 * sense_buffer, int sb_len,
++				       int desc_type);
++
++extern int scsi_get_sense_info_fld(const u8 * sense_buffer, int sb_len,
++				   u64 * info_out);
+  
+ /*
+  * Reset request from external source
+Index: linux-2.6.10/mvl_patches/pro-1516.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1516.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1516);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

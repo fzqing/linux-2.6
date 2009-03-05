@@ -1,0 +1,640 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_emac_locking
+# Date: Thu Jul  6 19:21:31 2006
+# Source: Texas Instruments, Inc.
+# MR: 18749
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+# Patch descripton from TI:
+# 
+# 1)Cleanup/removal of Rx_Multipacket_complete_notify which featured
+# potential race condition if emac_poll() is re-entered
+# 2)Extension of tx-spinlock to encompass Tx_complete_notifications(as
+# completion entries are stored in a global array)
+# 3) KGDB Fix: modify emac_poll() to invoke netif_rx_complete  only if
+# device resides on poll list. With emac_poll() also being called from
+# netpoll_poll(), its possible that emac_poll() is invoked when the device
+# has not been added to the polling list with netif_rx_schedule()
+# 4)Modified all spin_lock_irq to spin_Lock_irqsave so that flags are
+# restored properly
+# 
+
+PATCHNUM=784
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments, Inc.
+MR: 18749
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+Patch descripton from TI:
+
+1)Cleanup/removal of Rx_Multipacket_complete_notify which featured
+potential race condition if emac_poll() is re-entered
+2)Extension of tx-spinlock to encompass Tx_complete_notifications(as
+completion entries are stored in a global array)
+3) KGDB Fix: modify emac_poll() to invoke netif_rx_complete  only if
+device resides on poll list. With emac_poll() also being called from
+netpoll_poll(), its possible that emac_poll() is invoked when the device
+has not been added to the polling list with netif_rx_schedule()
+4)Modified all spin_lock_irq to spin_Lock_irqsave so that flags are
+restored properly
+
+Index: linux-2.6.10/drivers/net/davinci_emac.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/davinci_emac.c
++++ linux-2.6.10/drivers/net/davinci_emac.c
+@@ -42,11 +42,8 @@
+         COMPLETE VIA ITS CALLBACK IN THE SAME FUNCTION FOR SINGLE
+         PACKET COMPLETE NOTIFY.
+ 
+-    (3) EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY - to support multiple Rx
+-        packets to be given to DDA layer. If this is defined, DDA
+-        should provide the callback function for multiple packets too.
+ 
+-    (4) CONFIG_EMAC_INIT_BUF_MALLOC - Not required for DaVinci driver
++    (3) CONFIG_EMAC_INIT_BUF_MALLOC - Not required for DaVinci driver
+         - feature was added for another TI platform
+ 
+  */
+@@ -127,7 +124,6 @@ typedef void *emac_net_data_token;
+  * defines
+  * --------------------------------------------------------------- */
+ #define EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY
+-#define EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+ 
+ /* NO PHY used in case of external ethernet switches */
+ #define CONFIG_EMAC_NOPHY              9999
+@@ -159,11 +155,6 @@ typedef void *emac_net_data_token;
+    configuration for parameter "maxPktsToProcess" */
+ #define EMAC_MAX_TX_COMPLETE_PKTS_TO_NOTIFY    8
+ 
+-/* If multi packet Rx indication is enabled (via
+-   EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY) Max number of Rx packets that
+-   can be notified - the actual number will depend upon user
+-   configuration for parameter "maxPktsToProcess" */
+-#define EMAC_MAX_RX_COMPLETE_PKTS_TO_NOTIFY    8
+ 
+ /* config macros */
+ #define EMAC_MAX_INSTANCES                     1
+@@ -1460,13 +1451,8 @@ typedef struct _emac_rx_cppi_ch_t {
+ 
+ 	/* packet and buffer objects required for passing up to DDA
+ 	 * layer for the given instance */
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-	net_pkt_obj *pkt_queue;
+-	net_buf_obj *buf_queue;
+-#else
+ 	net_pkt_obj pkt_queue;
+ 	net_buf_obj buf_queue[EMAC_MAX_RX_FRAGMENTS];
+-#endif
+ #ifdef EMAC_MULTIFRAGMENT
+ 	u32 rx_buffer_ptr[EMAC_MAX_RX_FRAGMENTS];
+ 	u32 rx_data_token[EMAC_MAX_RX_FRAGMENTS];
+@@ -1541,8 +1527,9 @@ typedef struct emac_dev_s {
+ 	/* tx_rx_param struct added */
+ 	rx_tx_params napi_rx_tx;
+ 
+-	/* TX lock */
+-	spinlock_t lock;
++	/* TX/RX locks */
++	spinlock_t tx_lock;
++	spinlock_t rx_lock;
+ 
+ 	emac_drv_state drv_state;
+ 
+@@ -1638,12 +1625,10 @@ static int emac_net_tx_complete(emac_dev
+ 				emac_net_data_token * net_data_tokens,
+ 				int num_tokens, u32 channel);
+ 
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-static int emac_net_rx_multiple_cb(emac_dev_t * dev,
+-				   net_pkt_obj * net_pkt_list,
+-				   int num_pkts, void *rx_args);
++static int emac_net_rx_cb(emac_dev_t * dev,
++		   	  net_pkt_obj * net_pkt_list,
++			  void *rx_args);
+ 
+-#endif
+ 
+ static int emac_poll(struct net_device *netdev, int *budget);
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+@@ -3424,7 +3409,8 @@ static int emac_dev_init(struct net_devi
+ 	init_status = 2;	/* instance initialized */
+ 
+ 	/* init spin lock */
+-	spin_lock_init(&dev->lock);
++	spin_lock_init(&dev->tx_lock);
++	spin_lock_init(&dev->rx_lock);
+ 
+ 	/* set as per RFC 2665 */
+ 	dev->link_speed = 100000000;
+@@ -5106,7 +5092,6 @@ static int emac_init_rx_channel(emac_dev
+ 				emac_ch_info * ch_info, void *ch_open_args)
+ {
+ 	emac_dev_t *dev = (emac_dev_t *) _dev;
+-	int ret_code;
+ 	u32 cnt, bd_size;
+ 	char *alloc_mem;
+ 	emac_rx_bd *curr_bd;
+@@ -5137,36 +5122,7 @@ static int emac_init_rx_channel(emac_dev
+ 	rx_cppi->bd_mem = (char *)EMAC_RX_BD_MEM;
+ 	memzero(rx_cppi->bd_mem, rx_cppi->alloc_size);
+ 
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-	/* allocate memory for packet queue on a 4 byte boundry and set to 0 */
+-	emac_malloc(ch_info->service_max * sizeof(net_pkt_obj),
+-		    (void **)&rx_cppi->pkt_queue);
+-
+-	ret_code = emac_malloc((ch_info->service_max * sizeof(net_buf_obj) *
+-				EMAC_MAX_RX_FRAGMENTS),
+-			       (void **)&rx_cppi->buf_queue);
+-	if (ret_code) {
+-		emac_free(rx_cppi->pkt_queue);
+-		emac_free(rx_cppi);
+-
+-		return ret_code;
+-	}
+-
+-	/* build the packet-buffer structures */
+-	{
+-		net_pkt_obj *curr_pkt = &rx_cppi->pkt_queue[0];
+-		net_buf_obj *curr_buf = &rx_cppi->buf_queue[0];
+-
+-		/* bind pkt and buffer queue data structures */
+-		for (cnt = 0; cnt < ch_info->service_max; cnt++) {
+-			curr_pkt->buf_list = curr_buf;
+-			++curr_pkt;
+-			curr_buf += EMAC_MAX_RX_FRAGMENTS;
+-		}
+-	}
+-#else
+ 	rx_cppi->pkt_queue.buf_list = &rx_cppi->buf_queue[0];
+-#endif
+ 
+ 	/* allocate RX buffer and initialize the BD linked list */
+ 	alloc_mem = (char *)(((u32) rx_cppi->bd_mem + 0xF) & ~0xF);
+@@ -6110,6 +6066,7 @@ static int emac_pkt_process_end(emac_dev
+ static int emac_send(emac_dev_t * _dev, net_pkt_obj * pkt,
+ 		     int channel, void *send_args)
+ {
++	unsigned long flags;
+ 	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int ret_val = EMAC_SUCCESS;
+ 	emac_tx_bd *curr_bd;
+@@ -6140,7 +6097,7 @@ static int emac_send(emac_dev_t * _dev, 
+ 		    (EMAC_MIN_ETHERNET_PKT_SIZE - pkt->pkt_length);
+ 		pkt->pkt_length = EMAC_MIN_ETHERNET_PKT_SIZE;
+ 	}
+-	spin_lock_irq(&dev->lock);
++	spin_lock_irqsave(&dev->tx_lock, flags);
+ 
+ 	/* only one tx BD for the packet to be sent */
+ 	curr_bd = tx_cppi->bd_pool_head;
+@@ -6210,7 +6167,7 @@ static int emac_send(emac_dev_t * _dev, 
+ #endif
+ 
+       exit_emac_send:
+-	spin_unlock_irq(&dev->lock);
++	spin_unlock_irqrestore(&dev->tx_lock, flags);
+ 
+ 	if (dev->tx_interrupt_disable == TRUE) {
+ 		if (--dev->tx_int_threshold[channel] <= 0) {
+@@ -6240,6 +6197,7 @@ static int emac_send(emac_dev_t * _dev, 
+ static int emac_tx_bdproc(emac_dev_t * _dev, u32 channel,
+ 			  u32 * handle_pkts_and_status, bool * is_eoq)
+ {
++	unsigned long flags;
+ 	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_tx_bd *curr_bd;
+ 	emac_tx_cppi_ch *tx_cppi;
+@@ -6271,7 +6229,7 @@ static int emac_tx_bdproc(emac_dev_t * _
+ #ifdef EMAC_GETSTATS
+ 	++tx_cppi->proc_count;
+ #endif
+-	spin_lock_irq(&dev->lock);
++	spin_lock_irqsave(&dev->tx_lock, flags);
+ 
+ 	/* get first BD to process */
+ 	curr_bd = tx_cppi->active_queue_head;
+@@ -6281,7 +6239,7 @@ static int emac_tx_bdproc(emac_dev_t * _
+ #ifdef EMAC_GETSTATS
+ 		tx_cppi->no_active_pkts++;
+ #endif
+-		spin_unlock_irq(&dev->lock);
++		spin_unlock_irqrestore(&dev->tx_lock, flags);
+ 
+ 		return (EMAC_SUCCESS);
+ 	}
+@@ -6338,7 +6296,6 @@ static int emac_tx_bdproc(emac_dev_t * _
+ 	if (curr_bd) {
+ 		*is_eoq = FALSE;
+ 	}
+-	spin_unlock_irq(&dev->lock);
+ 
+ #ifdef EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY
+ 	/* multiple packet TX complete notify - this function is NOT
+@@ -6347,6 +6304,7 @@ static int emac_tx_bdproc(emac_dev_t * _
+ 			     (emac_net_data_token *) & tx_cppi->
+ 			     tx_complete[0], tx_complete_cnt, channel);
+ #endif
++	spin_unlock_irqrestore(&dev->tx_lock, flags);
+ 
+ 	return (pkts_processed);
+ }
+@@ -6385,7 +6343,6 @@ static void emac_add_bdto_rx_queue(emac_
+ 		emac_rx_bd *tail_bd;
+ 		u32 frame_status;
+ 
+-		spin_lock_irq(&dev->lock);
+ 		tail_bd = rx_cppi->active_queue_tail;
+ 		rx_cppi->active_queue_tail = curr_bd;
+ 		tail_bd->next = (void *)curr_bd;
+@@ -6401,7 +6358,7 @@ static void emac_add_bdto_rx_queue(emac_
+ 			++rx_cppi->end_of_queue_add;
+ #endif
+ 		}
+-		spin_unlock_irq(&dev->lock);
++		
+ 	}
+ 
+ #ifdef EMAC_GETSTATS
+@@ -6418,6 +6375,7 @@ static void emac_add_bdto_rx_queue(emac_
+ static int emac_rx_bdproc(emac_dev_t * _dev, u32 channel,
+ 			  int *handle_pkts_and_status)
+ {
++	unsigned long flags;
+ 	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_rx_cppi_ch *rx_cppi;
+ 	emac_rx_bd *curr_bd, *last_bd;
+@@ -6426,11 +6384,9 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 	emac_net_data_token new_buf_token;
+ 	net_buf_obj *rx_buf_obj;
+ 	u32 pkts_processed;
+-	net_pkt_obj *curr_pkt;
++	net_pkt_obj *curr_pkt,pkt_obj;
++	net_buf_obj buf_obj;
+ 	u32 pkts_to_be_processed = *handle_pkts_and_status;
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-	u32 rx_complete_cnt = 0;
+-#endif
+ 
+ 	/* Here no need to validate channel number, since it is taken
+ 	   from the interrupt register instead channel structure
+@@ -6451,11 +6407,11 @@ static int emac_rx_bdproc(emac_dev_t * _
+ #endif
+ 	*handle_pkts_and_status = 0;
+ 	pkts_processed = 0;
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-	curr_pkt = &rx_cppi->pkt_queue[0];
+-#else
+-	curr_pkt = &rx_cppi->pkt_queue;
+-#endif
++	
++	spin_lock_irqsave(&dev->rx_lock, flags);
++	
++	pkt_obj.buf_list = &buf_obj;
++	curr_pkt = &pkt_obj;
+ 	curr_bd = rx_cppi->active_queue_head;
+ 	BD_CACHE_INVALIDATE(curr_bd, EMAC_BD_LENGTH_FOR_CACHE);
+ 	frame_status = curr_bd->mode;
+@@ -6510,28 +6466,23 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 				rx_cppi->queue_active = FALSE;	/* clear software RX queue */
+ 			}
+ 		}
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-		/* only queue the packet here - and give it to DDA
+-		 * layer before returning */
+-		++curr_pkt;
+-		++rx_complete_cnt;
+-#else
+-		/* return the packet to the user - BD ptr passed in
+-		 * last parameter for potential *future* use */
+-		dev->dda_if->dda_net_if.dda_netrx_cb(dev, curr_pkt,
+-						     (void *)channel,
+-						     (void *)last_bd);
+-#endif
+-		++pkts_processed;
+-
++		
+ 		/* recycle BD */
+ 		emac_add_bdto_rx_queue(_dev, rx_cppi, last_bd, new_buffer,
+ 				       new_buf_token);
++
++		/* return the packet to the user - BD ptr passed in
++		 * last parameter for potential *future* use */
++		spin_unlock_irqrestore(&dev->rx_lock, flags);
++		emac_net_rx_cb(dev,curr_pkt,(void*)channel);
++		spin_lock_irqsave(&dev->rx_lock, flags);
++		
++		curr_bd = rx_cppi->active_queue_head;
+ 		if (curr_bd) {
+ 			BD_CACHE_INVALIDATE(curr_bd, EMAC_BD_LENGTH_FOR_CACHE);
+ 			frame_status = curr_bd->mode;
+ 		}
+-
++		++pkts_processed;
+ 	}
+ 
+ 	if ((curr_bd) && ((frame_status & EMAC_CPPI_OWNERSHIP_BIT) == 0)) {
+@@ -6539,15 +6490,7 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 	}
+ 
+       end_emac_rx_bdproc:
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
+-	/* return the packet to the user - channel number passed in last parameter for potential *future* use */
+-	if (rx_complete_cnt > 0) {
+-		emac_net_rx_multiple_cb(dev,
+-					&rx_cppi->pkt_queue[0],
+-					rx_complete_cnt, (void *)channel);
+-	}
+-#endif
+-
++	spin_unlock_irqrestore(&dev->rx_lock, flags);
+ 	return (pkts_processed);
+ }
+ 
+@@ -6575,7 +6518,9 @@ static int emac_poll(struct net_device *
+ 		/* if more packets reschedule the tasklet or call
+ 		 * pkt_process_end */
+ 		if (!pkts_pending) {
+-			netif_rx_complete(netdev);
++			if (test_bit(__LINK_STATE_RX_SCHED, &netdev->state)) {
++				netif_rx_complete(netdev);
++			}
+ 			emac_pkt_process_end(dev, NULL);
+ 			return 0;
+ 		} else if (!test_bit(0, &dev->set_to_close)) {
+@@ -6644,44 +6589,40 @@ static int emac_net_free_rx_buf(emac_dev
+ 	return (EMAC_SUCCESS);
+ }
+ 
+-#ifdef EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY
++
+ /*
+- * Multiple packet receive
++ * Packet receive notification
+  *
+- * This function get multiple received packets via the netPktList and
+- * it queues these packets into the higher layer queue
++ * This function gets received packet via the netPktList and
++ * it queues the packet into the higher layer queue
+  *
+  * Note that rxArgs contains "channel" and is ignored for this
+  * implementation
+ */
+-static int emac_net_rx_multiple_cb(emac_dev_t * dev,
+-				   net_pkt_obj * net_pkt_list,
+-				   int num_pkts, void *rx_args)
++static int emac_net_rx_cb(emac_dev_t * dev,
++		          net_pkt_obj * net_pkt_list,
++			  void *rx_args)
+ {
+-	u32 cnt;
+ 
+-	for (cnt = 0; cnt < num_pkts; cnt++) {
+-		struct sk_buff *p_skb =
+-		    (struct sk_buff *)net_pkt_list->pkt_token;
++	struct sk_buff *p_skb;
++	
++	p_skb = (struct sk_buff *)net_pkt_list->pkt_token;
+ 
+-		/* set length of packet */
+-		skb_put(p_skb, net_pkt_list->pkt_length);
++	/* set length of packet */
++	skb_put(p_skb, net_pkt_list->pkt_length);
+ #ifndef EMAC_CACHE_INVALIDATE_FIX
+-		/* invalidate cache */
+-		EMAC_CACHE_INVALIDATE((unsigned long)p_skb->data, p_skb->len);
++	/* invalidate cache */
++	EMAC_CACHE_INVALIDATE((unsigned long)p_skb->data, p_skb->len);
+ #endif
+-		p_skb->protocol = eth_type_trans(p_skb, dev->owner);
+-		p_skb->dev->last_rx = jiffies;
+-		netif_receive_skb(p_skb);
+-		dev->net_dev_stats.rx_bytes += net_pkt_list->pkt_length;
+-		++net_pkt_list;
+-	}
+-	dev->net_dev_stats.rx_packets += num_pkts;
++	p_skb->protocol = eth_type_trans(p_skb, dev->owner);
++	p_skb->dev->last_rx = jiffies;
++	netif_receive_skb(p_skb);
++	dev->net_dev_stats.rx_bytes += net_pkt_list->pkt_length;
++	dev->net_dev_stats.rx_packets++;
+ 
+ 	return (0);
+ }
+ 
+-#endif				/*  EMAC_MULTIPACKET_RX_COMPLETE_NOTIFY */
+ 
+ /* transmit complete callback */
+ static int emac_net_tx_complete(emac_dev_t * dev,
+Index: linux-2.6.10/mvl_patches/pro-0784.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0784.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(784);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

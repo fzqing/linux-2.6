@@ -1,0 +1,347 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc_xilinx_emac_xenet_start_xmit_fifo_fix
+# Date: Fri Aug 17 13:35:26 2007
+# Source: MontaVista Software, Inc.
+# MR: 22859
+# Type: Defect Fix
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     The patch fixes two problems:
+#     1) If there is not enough room in the FIFO to hold the packet
+#        XEmac_FifoSend() returns XST_PFIFO_NO_ROOM, not XST_FIFO_NO_ROOM.
+#        The XST_PFIFO_NO_ROOM case should be handled exactly the same
+#        way XST_FIFO_NO_ROOM is. No need to return -EIO.
+#     2) In the hard_start_xmit driver method the skb to be sent was always
+#        freed by the driver. Even when the driver returned -EIO for transmission
+#        error different from XST_FIFO_NO_ROOM. This made the kernel to retransmit
+#        the skb (after it was freed by the driver!) thus leading to
+#        "Oops: kernel access of bad area".
+# 
+
+PATCHNUM=1356
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 22859
+Type: Defect Fix
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    The patch fixes two problems:
+    1) If there is not enough room in the FIFO to hold the packet
+       XEmac_FifoSend() returns XST_PFIFO_NO_ROOM, not XST_FIFO_NO_ROOM.
+       The XST_PFIFO_NO_ROOM case should be handled exactly the same
+       way XST_FIFO_NO_ROOM is. No need to return -EIO.
+    2) In the hard_start_xmit driver method the skb to be sent was always
+       freed by the driver. Even when the driver returned -EIO for transmission
+       error different from XST_FIFO_NO_ROOM. This made the kernel to retransmit
+       the skb (after it was freed by the driver!) thus leading to
+       "Oops: kernel access of bad area".
+
+Index: linux-2.6.10/drivers/net/xilinx_emac/adapter_fifo.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/xilinx_emac/adapter_fifo.c
++++ linux-2.6.10/drivers/net/xilinx_emac/adapter_fifo.c
+@@ -47,9 +47,6 @@ static struct sk_buff * align_skb_data(s
+ 	skb_put(new_skb, len);
+ 	memcpy(new_skb->data, skb->data, len);
+ 
+-	/* get rid of the original skb. */
+-	dev_kfree_skb(skb);
+-
+ 	return new_skb;
+ }
+ 
+@@ -62,6 +59,7 @@ void FifoSendHandler(void *CallbackRef)
+ 	struct net_local *lp = netdev_priv(ndev);
+ 	struct sk_buff *tskb;
+ 	unsigned long flags;
++	int retval;
+ 
+ 	/* Make sure that the timeout handler and we don't both free the skb. */
+ 	spin_lock_irqsave(&lp->skb_lock, flags);
+@@ -70,11 +68,13 @@ void FifoSendHandler(void *CallbackRef)
+ 	spin_unlock_irqrestore(&lp->skb_lock, flags);
+ 
+ 	if (tskb) {
+-		if (XEmac_FifoSend(&lp->Emac, (u8 *) tskb->data, tskb->len)
+-		    != XST_SUCCESS) {
++		retval = XEmac_FifoSend(&lp->Emac, (u8 *) tskb->data,
++					tskb->len);
++		if (retval != XST_SUCCESS) {
+ 			lp->net_stats.tx_errors++;
+-			printk(KERN_ERR "%s: Could not transmit buffer.\n",
+-			       ndev->name);
++			printk(KERN_ERR
++			       "%s: Could not transmit buffer (error %d).\n",
++			       ndev->name, retval);
+ 		}
+ 		dev_kfree_skb(tskb);
+ 		netif_wake_queue(ndev);
+@@ -90,7 +90,8 @@ int xenet_start_xmit_fifo(struct sk_buff
+ 
+ 	len = skb->len;
+ 
+-	new_skb = align_skb_data(skb); /* if new_skb != skb, skb is freed */
++	new_skb = align_skb_data(skb); /* if new_skb != skb, new_skb has been
++					* allocated */
+ 
+ 	if (!new_skb) {
+ 		/* We couldn't get the new, "aligned" skb. */
+@@ -104,28 +105,44 @@ int xenet_start_xmit_fifo(struct sk_buff
+ 	retval = XEmac_FifoSend(&lp->Emac, (u8 *) new_skb->data, len);
+ 	switch (retval) {
+ 	case XST_FIFO_NO_ROOM:
++	case XST_PFIFO_NO_ROOM:
+ 		netif_stop_queue(ndev);
+ 		spin_lock_irq(&lp->skb_lock);
+-		if (unlikely(lp->saved_skb))
+-			BUG();
++		if (unlikely(lp->saved_skb)) {
++			spin_unlock_irq(&lp->skb_lock);
++			/* get rid of the aligned copy. */
++			if (new_skb != skb) dev_kfree_skb(new_skb);
++			lp->net_stats.tx_errors++;
++			printk(KERN_ERR "%s: Couldn't transmit buffer "
++			       "(XST_%sFIFO_NO_ROOM).\n",
++			       ndev->name,
++			       (retval == XST_FIFO_NO_ROOM) ? "" : "P");
++			return -EIO;
++		}
+ 		lp->saved_skb = new_skb;
+ 		spin_unlock_irq(&lp->skb_lock);
++		/* get rid of the unaligned skb. */
++		if (new_skb != skb) dev_kfree_skb(skb);
+ 		break;
+ 
+ 	case XST_SUCCESS:
++		/* get rid of the new and the original skbs. */
++		if (new_skb != skb) dev_kfree_skb(skb);
++		dev_kfree_skb(new_skb);
+ 		/*
+ 		 * We have to update the counters early as we can't
+ 		 * track the length of every packet pending transmission.
+ 		 */
+-		dev_kfree_skb(new_skb);
+ 		lp->net_stats.tx_bytes += len;
+ 		lp->net_stats.tx_packets++;
+ 		break;
+ 
+ 	default:	/* transmission error */
+-		dev_kfree_skb(new_skb);
++		/* get rid of the aligned copy. */
++		if (new_skb != skb) dev_kfree_skb(new_skb);
+ 		lp->net_stats.tx_errors++;
+-		printk(KERN_ERR "%s: Could not transmit buffer.\n", ndev->name);
++		printk(KERN_ERR "%s: Could not transmit buffer (%d).\n",
++		       ndev->name, retval);
+ 		return -EIO;
+ 	}
+ 
+Index: linux-2.6.10/mvl_patches/pro-1356.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1356.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1356);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

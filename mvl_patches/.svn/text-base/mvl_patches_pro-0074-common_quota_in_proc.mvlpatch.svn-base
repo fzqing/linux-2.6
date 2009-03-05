@@ -1,0 +1,630 @@
+#! /usr/bin/env bash
+# Patch: -common_quota_in_proc
+# Date: Wed Dec 28 14:56:55 2005
+
+PATCHNUM=74
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Index: linux-2.6.10/fs/xfs/xfs_vfsops.c
+===================================================================
+--- linux-2.6.10.orig/fs/xfs/xfs_vfsops.c
++++ linux-2.6.10/fs/xfs/xfs_vfsops.c
+@@ -1851,6 +1851,8 @@ xfs_showargs(
+ 		{ XFS_MOUNT_OSYNCISOSYNC,	"," MNTOPT_OSYNCISOSYNC },
+ 		{ XFS_MOUNT_NOLOGFLUSH,		"," MNTOPT_NOLOGFLUSH },
+ 		{ XFS_MOUNT_IDELETE,		"," MNTOPT_NOIKEEP },
++		{ XFS_UQUOTA_ACTIVE,		"," "usrquota" },
++		{ XFS_GQUOTA_ACTIVE,		"," "grpquota" },
+ 		{ 0, NULL }
+ 	};
+ 	struct proc_xfs_info	*xfs_infop;
+Index: linux-2.6.10/fs/ext3/super.c
+===================================================================
+--- linux-2.6.10.orig/fs/ext3/super.c
++++ linux-2.6.10/fs/ext3/super.c
+@@ -35,6 +35,7 @@
+ #include <linux/mount.h>
+ #include <linux/namei.h>
+ #include <linux/quotaops.h>
++#include <linux/seq_file.h>
+ #include <asm/uaccess.h>
+ #include "xattr.h"
+ #include "acl.h"
+@@ -510,8 +511,41 @@ static void ext3_clear_inode(struct inod
+ 	ext3_discard_reservation(inode);
+ }
+ 
+-#ifdef CONFIG_QUOTA
++static int ext3_show_options(struct seq_file *seq, struct vfsmount *vfs)
++{
++	struct ext3_sb_info *sbi = EXT3_SB(vfs->mnt_sb);
++
++	if (sbi->s_mount_opt & EXT3_MOUNT_JOURNAL_DATA)
++		seq_puts(seq, ",data=journal");
++
++	if (sbi->s_mount_opt & EXT3_MOUNT_ORDERED_DATA)
++		seq_puts(seq, ",data=ordered");
++
++	if (sbi->s_mount_opt & EXT3_MOUNT_WRITEBACK_DATA)
++		seq_puts(seq, ",data=writeback");
++
++#if defined(CONFIG_QUOTA)
++	if (sbi->s_jquota_fmt)
++		seq_printf(seq, ",jqfmt=%s",
++		(sbi->s_jquota_fmt == QFMT_VFS_OLD) ? "vfsold": "vfsv0");
++
++	if (sbi->s_qf_names[USRQUOTA])
++		seq_printf(seq, ",usrjquota=%s", sbi->s_qf_names[USRQUOTA]);
++
++	if (sbi->s_qf_names[GRPQUOTA])
++		seq_printf(seq, ",grpjquota=%s", sbi->s_qf_names[GRPQUOTA]);
++
++	if (sbi->s_mount_opt & EXT3_MOUNT_USRQUOTA)
++		seq_puts(seq, ",usrquota");
++
++	if (sbi->s_mount_opt & EXT3_MOUNT_GRPQUOTA)
++		seq_puts(seq, ",grpquota");
++#endif
+ 
++	return 0;
++}
++
++#ifdef CONFIG_QUOTA
+ #define QTYPE2NAME(t) ((t)==USRQUOTA?"user":"group")
+ #define QTYPE2MOPT(on, t) ((t)==USRQUOTA?((on)##USRJQUOTA):((on)##GRPJQUOTA))
+ 
+@@ -567,6 +601,7 @@ static struct super_operations ext3_sops
+ 	.statfs		= ext3_statfs,
+ 	.remount_fs	= ext3_remount,
+ 	.clear_inode	= ext3_clear_inode,
++	.show_options	= ext3_show_options
+ };
+ 
+ struct dentry *ext3_get_parent(struct dentry *child);
+@@ -583,8 +618,8 @@ enum {
+ 	Opt_commit, Opt_journal_update, Opt_journal_inum,
+ 	Opt_abort, Opt_data_journal, Opt_data_ordered, Opt_data_writeback,
+ 	Opt_usrjquota, Opt_grpjquota, Opt_offusrjquota, Opt_offgrpjquota,
+-	Opt_jqfmt_vfsold, Opt_jqfmt_vfsv0,
+-	Opt_ignore, Opt_barrier, Opt_err, Opt_resize,
++	Opt_jqfmt_vfsold, Opt_jqfmt_vfsv0, Opt_usrquota, Opt_grpquota,
++	Opt_ignore, Opt_barrier, Opt_err, Opt_resize, Opt_quota
+ };
+ 
+ static match_table_t tokens = {
+@@ -627,10 +662,10 @@ static match_table_t tokens = {
+ 	{Opt_grpjquota, "grpjquota=%s"},
+ 	{Opt_jqfmt_vfsold, "jqfmt=vfsold"},
+ 	{Opt_jqfmt_vfsv0, "jqfmt=vfsv0"},
+-	{Opt_ignore, "grpquota"},
++	{Opt_grpquota, "grpquota"},
+ 	{Opt_ignore, "noquota"},
+-	{Opt_ignore, "quota"},
+-	{Opt_ignore, "usrquota"},
++	{Opt_quota, "quota"},
++	{Opt_usrquota, "usrquota"},
+ 	{Opt_barrier, "barrier=%u"},
+ 	{Opt_err, NULL},
+ 	{Opt_resize, "resize"},
+@@ -889,7 +924,17 @@ clear_qf_name:
+ 		case Opt_jqfmt_vfsv0:
+ 			sbi->s_jquota_fmt = QFMT_VFS_V0;
+ 			break;
++		case Opt_quota:
++		case Opt_usrquota:
++			set_opt(sbi->s_mount_opt, USRQUOTA);
++			break;
++		case Opt_grpquota:
++			set_opt(sbi->s_mount_opt, GRPQUOTA);
++			break;
+ #else
++		case Opt_quota:
++		case Opt_usrquota:
++		case Opt_grpquota:
+ 		case Opt_usrjquota:
+ 		case Opt_grpjquota:
+ 		case Opt_offusrjquota:
+@@ -931,12 +976,43 @@ clear_qf_name:
+ 		}
+ 	}
+ #ifdef CONFIG_QUOTA
+-	if (!sbi->s_jquota_fmt && (sbi->s_qf_names[USRQUOTA] ||
+-	    sbi->s_qf_names[GRPQUOTA])) {
+-		printk(KERN_ERR
++	if (sbi->s_qf_names[USRQUOTA] || sbi->s_qf_names[GRPQUOTA]) {
++		if ((sbi->s_mount_opt & EXT3_MOUNT_USRQUOTA) &&
++		     sbi->s_qf_names[USRQUOTA]) {
++			clear_opt(sbi->s_mount_opt, USRQUOTA);
++		}
++
++		if ((sbi->s_mount_opt & EXT3_MOUNT_GRPQUOTA) &&
++		     sbi->s_qf_names[GRPQUOTA]) {
++			clear_opt(sbi->s_mount_opt, GRPQUOTA);
++		}
++
++		if ((sbi->s_qf_names[USRQUOTA] &&
++			(sbi->s_mount_opt & EXT3_MOUNT_GRPQUOTA)) ||
++		    (sbi->s_qf_names[GRPQUOTA] &&
++				(sbi->s_mount_opt & EXT3_MOUNT_USRQUOTA))) {
++			printk(KERN_ERR
++				"EXT3-fs: old and new quota formal mixing.\n");
++
++			return 0;
++		}
++
++		if (!sbi->s_jquota_fmt) {
++			printk(KERN_ERR
+ 			"EXT3-fs: journalled quota format not specified.\n");
+-		return 0;
++
++			return 0;
++		}
+ 	}
++	else {
++		if (sbi->s_jquota_fmt) {
++			printk(KERN_ERR
++"EXT3-fs: journalled quota format specified with no journalling enabled.\n");
++
++			return 0;
++		}
++	}
++
+ #endif
+ 
+ 	return 1;
+Index: linux-2.6.10/fs/ext2/super.c
+===================================================================
+--- linux-2.6.10.orig/fs/ext2/super.c
++++ linux-2.6.10/fs/ext2/super.c
+@@ -19,6 +19,7 @@
+ #include <linux/config.h>
+ #include <linux/module.h>
+ #include <linux/string.h>
++#include <linux/fs.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
+ #include <linux/blkdev.h>
+@@ -27,6 +28,8 @@
+ #include <linux/buffer_head.h>
+ #include <linux/smp_lock.h>
+ #include <linux/vfs.h>
++#include <linux/seq_file.h>
++#include <linux/mount.h>
+ #include <asm/uaccess.h>
+ #include "ext2.h"
+ #include "xattr.h"
+@@ -202,6 +205,25 @@ static void ext2_clear_inode(struct inod
+ 		ext2_discard_prealloc(inode);
+ }
+ 
++static int ext2_show_options(struct seq_file *seq, struct vfsmount *vfs)
++{
++	struct ext2_sb_info *sbi = EXT2_SB(vfs->mnt_sb);
++
++	if (sbi->s_mount_opt & EXT2_MOUNT_GRPID)
++		seq_puts(seq, ",grpid");
++	else
++		seq_puts(seq, ",nogrpid");
++
++#if defined(CONFIG_QUOTA)
++	if (sbi->s_mount_opt & EXT2_MOUNT_USRQUOTA)
++		seq_puts(seq, ",usrquota");
++
++	if (sbi->s_mount_opt & EXT2_MOUNT_GRPQUOTA)
++		seq_puts(seq, ",grpquota");
++#endif
++
++	return 0;
++}
+ 
+ static struct super_operations ext2_sops = {
+ 	.alloc_inode	= ext2_alloc_inode,
+@@ -214,6 +236,7 @@ static struct super_operations ext2_sops
+ 	.statfs		= ext2_statfs,
+ 	.remount_fs	= ext2_remount,
+ 	.clear_inode	= ext2_clear_inode,
++	.show_options   = ext2_show_options
+ };
+ 
+ /* Yes, most of these are left as NULL!!
+@@ -248,10 +271,11 @@ static unsigned long get_sb_block(void *
+ 
+ enum {
+ 	Opt_bsd_df, Opt_minix_df, Opt_grpid, Opt_nogrpid,
+-	Opt_resgid, Opt_resuid, Opt_sb, Opt_err_cont, Opt_err_panic, Opt_err_ro,
+-	Opt_nouid32, Opt_check, Opt_nocheck, Opt_debug, Opt_oldalloc, Opt_orlov, Opt_nobh,
+-	Opt_user_xattr, Opt_nouser_xattr, Opt_acl, Opt_noacl,
+-	Opt_ignore, Opt_err,
++	Opt_resgid, Opt_resuid, Opt_sb, Opt_err_cont, Opt_err_panic,
++	Opt_err_ro, Opt_nouid32, Opt_check, Opt_nocheck, Opt_debug,
++	Opt_oldalloc, Opt_orlov, Opt_nobh, Opt_user_xattr, Opt_nouser_xattr,
++	Opt_acl, Opt_noacl, Opt_ignore, Opt_err, Opt_usrquota, Opt_grpquota,
++	Opt_quota
+ };
+ 
+ static match_table_t tokens = {
+@@ -279,10 +303,10 @@ static match_table_t tokens = {
+ 	{Opt_nouser_xattr, "nouser_xattr"},
+ 	{Opt_acl, "acl"},
+ 	{Opt_noacl, "noacl"},
+-	{Opt_ignore, "grpquota"},
++	{Opt_grpquota, "grpquota"},
+ 	{Opt_ignore, "noquota"},
+-	{Opt_ignore, "quota"},
+-	{Opt_ignore, "usrquota"},
++	{Opt_quota, "quota"},
++	{Opt_usrquota, "usrquota"},
+ 	{Opt_err, NULL}
+ };
+ 
+@@ -390,6 +414,27 @@ static int parse_options (char * options
+ 			printk("EXT2 (no)acl options not supported\n");
+ 			break;
+ #endif
++
++#if defined(CONFIG_QUOTA)
++		case Opt_quota:
++		case Opt_usrquota:
++			set_opt(sbi->s_mount_opt, USRQUOTA);
++			break;
++
++		case Opt_grpquota:
++			set_opt(sbi->s_mount_opt, GRPQUOTA);
++			break;
++			break;
++#else
++		case Opt_quota:
++		case Opt_usrquota:
++		case Opt_grpquota:
++			printk(KERN_ERR
++				"EXT2-fs: quota operations not supported.\n");
++
++			break;
++#endif
++
+ 		case Opt_ignore:
+ 			break;
+ 		default:
+Index: linux-2.6.10/fs/jfs/super.c
+===================================================================
+--- linux-2.6.10.orig/fs/jfs/super.c
++++ linux-2.6.10/fs/jfs/super.c
+@@ -23,7 +23,9 @@
+ #include <linux/parser.h>
+ #include <linux/completion.h>
+ #include <linux/vfs.h>
++#include <linux/mount.h>
+ #include <linux/moduleparam.h>
++#include <linux/seq_file.h>
+ #include <asm/uaccess.h>
+ 
+ #include "jfs_incore.h"
+@@ -215,7 +217,8 @@ static void jfs_put_super(struct super_b
+ 
+ enum {
+ 	Opt_integrity, Opt_nointegrity, Opt_iocharset, Opt_resize,
+-	Opt_resize_nosize, Opt_errors, Opt_ignore, Opt_err,
++	Opt_resize_nosize, Opt_errors, Opt_ignore, Opt_err, Opt_quota,
++	Opt_usrquota, Opt_grpquota
+ };
+ 
+ static match_table_t tokens = {
+@@ -226,9 +229,9 @@ static match_table_t tokens = {
+ 	{Opt_resize_nosize, "resize"},
+ 	{Opt_errors, "errors=%s"},
+ 	{Opt_ignore, "noquota"},
+-	{Opt_ignore, "quota"},
+-	{Opt_ignore, "usrquota"},
+-	{Opt_ignore, "grpquota"},
++	{Opt_quota, "quota"},
++	{Opt_usrquota, "usrquota"},
++	{Opt_grpquota, "grpquota"},
+ 	{Opt_err, NULL}
+ };
+ 
+@@ -311,6 +314,24 @@ static int parse_options(char *options, 
+ 			}
+ 			break;
+ 		}
++
++#if defined(CONFIG_QUOTA)
++		case Opt_quota:
++		case Opt_usrquota:
++			*flag |= JFS_USRQUOTA;
++			break;
++		case Opt_grpquota:
++			*flag |= JFS_GRPQUOTA;
++			break;
++#else
++		case Opt_quota:
++		case Opt_usrquota:
++		case Opt_grpquota:
++			printk(KERN_ERR
++			       "JFS: quota operations not supported\n");
++			break;
++#endif
++
+ 		default:
+ 			printk("jfs: Unrecognized mount option \"%s\" "
+ 					" or missing value\n", p);
+@@ -528,6 +549,26 @@ static int jfs_sync_fs(struct super_bloc
+ 	return 0;
+ }
+ 
++static int jfs_show_options(struct seq_file *seq, struct vfsmount *vfs)
++{
++	struct jfs_sb_info *sbi = JFS_SBI(vfs->mnt_sb);
++
++	if (sbi->flag & JFS_NOINTEGRITY)
++		seq_puts(seq, ",nointegrity");
++	else
++		seq_puts(seq, ",integrity");
++
++#if defined(CONFIG_QUOTA)
++	if (sbi->flag & JFS_USRQUOTA)
++		seq_puts(seq, ",usrquota");
++
++	if (sbi->flag & JFS_GRPQUOTA)
++		seq_puts(seq, ",grpquota");
++#endif
++
++	return 0;
++}
++
+ static struct super_operations jfs_super_operations = {
+ 	.alloc_inode	= jfs_alloc_inode,
+ 	.destroy_inode	= jfs_destroy_inode,
+@@ -541,6 +582,7 @@ static struct super_operations jfs_super
+ 	.unlockfs       = jfs_unlockfs,
+ 	.statfs		= jfs_statfs,
+ 	.remount_fs	= jfs_remount,
++	.show_options	= jfs_show_options
+ };
+ 
+ static struct export_operations jfs_export_operations = {
+Index: linux-2.6.10/include/linux/ext3_fs.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ext3_fs.h
++++ linux-2.6.10/include/linux/ext3_fs.h
+@@ -355,6 +355,8 @@ struct ext3_inode {
+ #define EXT3_MOUNT_POSIX_ACL		0x08000	/* POSIX Access Control Lists */
+ #define EXT3_MOUNT_RESERVATION		0x10000	/* Preallocation */
+ #define EXT3_MOUNT_BARRIER		0x20000 /* Use block barriers */
++#define EXT3_MOUNT_USRQUOTA		0x40000 /* "old style" user quotas */
++#define EXT3_MOUNT_GRPQUOTA		0x80000 /* "old style" group quotas */
+ 
+ /* Compatibility, for having both ext2_fs.h and ext3_fs.h included at once */
+ #ifndef _LINUX_EXT2_FS_H
+Index: linux-2.6.10/include/linux/ext2_fs.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ext2_fs.h
++++ linux-2.6.10/include/linux/ext2_fs.h
+@@ -312,6 +312,8 @@ struct ext2_inode {
+ #define EXT2_MOUNT_NO_UID32		0x0200  /* Disable 32-bit UIDs */
+ #define EXT2_MOUNT_XATTR_USER		0x4000	/* Extended user attributes */
+ #define EXT2_MOUNT_POSIX_ACL		0x8000	/* POSIX Access Control Lists */
++#define EXT2_MOUNT_USRQUOTA		0x10000	/* user quota */
++#define EXT2_MOUNT_GRPQUOTA		0x20000	/* group quota */
+ 
+ #define clear_opt(o, opt)		o &= ~EXT2_MOUNT_##opt
+ #define set_opt(o, opt)			o |= EXT2_MOUNT_##opt
+Index: linux-2.6.10/fs/jfs/jfs_filsys.h
+===================================================================
+--- linux-2.6.10.orig/fs/jfs/jfs_filsys.h
++++ linux-2.6.10/fs/jfs/jfs_filsys.h
+@@ -37,6 +37,9 @@
+ #define JFS_ERR_CONTINUE   0x00000004   /* continue */
+ #define JFS_ERR_PANIC      0x00000008   /* panic */
+ 
++#define	JFS_USRQUOTA	0x00000010
++#define	JFS_GRPQUOTA	0x00000020
++
+ /* platform option (conditional compilation) */
+ #define JFS_AIX		0x80000000	/* AIX support */
+ /*	POSIX name/directory  support */
+Index: linux-2.6.10/mvl_patches/pro-0074.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0074.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(74);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

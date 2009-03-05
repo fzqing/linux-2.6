@@ -1,0 +1,322 @@
+#! /usr/bin/env bash
+# Patch: -arm-remove-udivdi3-from-nwfpe
+# Date: Mon Mar 20 17:12:47 2006
+
+PATCHNUM=375
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree c1241c4c3a1507d76c7b987130f2f02f53ecc09f (from bf1b8ab6f21e1adbab1abd1b4e71c35fe65dc5fe)
+Author: Nicolas Pitre <nico@cam.org>
+Date:   Thu Jun 23 21:56:46 2005 +0100
+
+    [PATCH] ARM: 2722/1: remove reliance on udivdi3 for nwfpe
+    
+    Patch from Nicolas Pitre
+    
+    Signed-off-by: Nicolas Pitre <nico@cam.org>
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+diff --git a/arch/arm/nwfpe/softfloat-macros b/arch/arm/nwfpe/softfloat-macros
+index 5469989..5a060f9 100644
+ arch/arm/nwfpe/softfloat-macros |   22 ++++++++++++++++++----
+ arch/arm/nwfpe/softfloat.c      |   12 ++++++++++--
+ mvl_patches/pro-0375.c          |   16 ++++++++++++++++
+ 3 files changed, 44 insertions(+), 6 deletions(-)
+
+Index: linux-2.6.10/arch/arm/nwfpe/softfloat-macros
+===================================================================
+--- linux-2.6.10.orig/arch/arm/nwfpe/softfloat-macros
++++ linux-2.6.10/arch/arm/nwfpe/softfloat-macros
+@@ -563,8 +563,14 @@ static bits64 estimateDiv128To64( bits64
+     bits64 rem0, rem1, term0, term1;
+     bits64 z;
+     if ( b <= a0 ) return LIT64( 0xFFFFFFFFFFFFFFFF );
+-    b0 = b>>32;
+-    z = ( b0<<32 <= a0 ) ? LIT64( 0xFFFFFFFF00000000 ) : ( a0 / b0 )<<32;
++    b0 = b>>32;  /* hence b0 is 32 bits wide now */
++    if ( b0<<32 <= a0 ) {
++        z = LIT64( 0xFFFFFFFF00000000 );
++    }  else {
++        z = a0;
++        do_div( z, b0 );
++        z <<= 32;
++    }
+     mul64To128( b, z, &term0, &term1 );
+     sub128( a0, a1, term0, term1, &rem0, &rem1 );
+     while ( ( (sbits64) rem0 ) < 0 ) {
+@@ -573,7 +579,12 @@ static bits64 estimateDiv128To64( bits64
+         add128( rem0, rem1, b0, b1, &rem0, &rem1 );
+     }
+     rem0 = ( rem0<<32 ) | ( rem1>>32 );
+-    z |= ( b0<<32 <= rem0 ) ? 0xFFFFFFFF : rem0 / b0;
++    if ( b0<<32 <= rem0 ) {
++        z |= 0xFFFFFFFF;
++    } else {
++        do_div( rem0, b0 );
++        z |= rem0;
++    }
+     return z;
+ 
+ }
+@@ -601,6 +612,7 @@ static bits32 estimateSqrt32( int16 aExp
+     };
+     int8 index;
+     bits32 z;
++    bits64 A;
+ 
+     index = ( a>>27 ) & 15;
+     if ( aExp & 1 ) {
+@@ -614,7 +626,9 @@ static bits32 estimateSqrt32( int16 aExp
+         z = ( 0x20000 <= z ) ? 0xFFFF8000 : ( z<<15 );
+         if ( z <= a ) return (bits32) ( ( (sbits32) a )>>1 );
+     }
+-    return ( (bits32) ( ( ( (bits64) a )<<31 ) / z ) ) + ( z>>1 );
++    A = ( (bits64) a )<<31;
++    do_div( A, z );
++    return ( (bits32) A ) + ( z>>1 );
+ 
+ }
+ 
+Index: linux-2.6.10/arch/arm/nwfpe/softfloat.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/nwfpe/softfloat.c
++++ linux-2.6.10/arch/arm/nwfpe/softfloat.c
+@@ -28,6 +28,8 @@ this code that are retained.
+ ===============================================================================
+ */
+ 
++#include <asm/div64.h>
++
+ #include "fpa11.h"
+ //#include "milieu.h"
+ //#include "softfloat.h"
+@@ -1331,7 +1333,11 @@ float32 float32_div( float32 a, float32 
+         aSig >>= 1;
+         ++zExp;
+     }
+-    zSig = ( ( (bits64) aSig )<<32 ) / bSig;
++    {
++        bits64 tmp = ( (bits64) aSig )<<32;
++        do_div( tmp, bSig );
++        zSig = tmp;
++    }
+     if ( ( zSig & 0x3F ) == 0 ) {
+         zSig |= ( ( (bits64) bSig ) * zSig != ( (bits64) aSig )<<32 );
+     }
+@@ -1397,7 +1403,9 @@ float32 float32_rem( float32 a, float32 
+         q = ( bSig <= aSig );
+         if ( q ) aSig -= bSig;
+         if ( 0 < expDiff ) {
+-            q = ( ( (bits64) aSig )<<32 ) / bSig;
++            bits64 tmp = ( (bits64) aSig )<<32;
++            do_div( tmp, bSig );
++            q = tmp;
+             q >>= 32 - expDiff;
+             bSig >>= 2;
+             aSig = ( ( aSig>>1 )<<( expDiff - 1 ) ) - bSig * q;
+Index: linux-2.6.10/mvl_patches/pro-0375.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0375.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(375);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

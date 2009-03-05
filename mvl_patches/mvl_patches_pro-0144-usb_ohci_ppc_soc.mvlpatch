@@ -1,0 +1,577 @@
+#! /usr/bin/env bash
+# Patch: -usb_ohci_ppc_soc
+# Date: Wed Dec 28 14:59:19 2005
+# ChangeSet@1.1994.7.49, 2005-03-07 23:17:43-08:00, david-b@pacbell.net
+#   [PATCH] USB: ohci ppc driver (2/2):  ohci-ppc-soc.c
+#   
+#   This adds drivers/usb/host/ohci-ppc-soc.c, the USB OHCI glue file
+#   for two PPC SOC implementations.
+#   
+#   Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+#   Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+#   Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+# 
+#  drivers/usb/host/ohci-hcd.c     |    5 
+#  drivers/usb/host/ohci-ppc-soc.c |  308 ++++++++++++++++++++++++++++++++++++++++
+#  2 files changed, 313 insertions(+)
+# 
+
+PATCHNUM=144
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+ChangeSet@1.1994.7.49, 2005-03-07 23:17:43-08:00, david-b@pacbell.net
+  [PATCH] USB: ohci ppc driver (2/2):  ohci-ppc-soc.c
+  
+  This adds drivers/usb/host/ohci-ppc-soc.c, the USB OHCI glue file
+  for two PPC SOC implementations.
+  
+  Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+  Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+  Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+ drivers/usb/host/ohci-hcd.c     |    5 
+ drivers/usb/host/ohci-ppc-soc.c |  308 ++++++++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0144.c          |   16 ++
+ 3 files changed, 329 insertions(+)
+
+Index: linux-2.6.10/drivers/usb/host/ohci-hcd.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/host/ohci-hcd.c
++++ linux-2.6.10/drivers/usb/host/ohci-hcd.c
+@@ -905,12 +905,17 @@ MODULE_LICENSE ("GPL");
+ #include "ohci-au1xxx.c"
+ #endif
+ 
++#ifdef CONFIG_USB_OHCI_HCD_PPC_SOC
++#include "ohci-ppc-soc.c"
++#endif
++
+ #if !(defined(CONFIG_PCI) \
+       || defined(CONFIG_SA1111) \
+       || defined(CONFIG_ARCH_OMAP) \
+       || defined (CONFIG_ARCH_LH7A404) \
+       || defined (CONFIG_PXA27x) \
+       || defined (CONFIG_SOC_AU1X00) \
++      || defined (CONFIG_USB_OHCI_HCD_PPC_SOC) \
+ 	)
+ #error "missing bus glue for ohci-hcd"
+ #endif
+Index: linux-2.6.10/drivers/usb/host/ohci-ppc-soc.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/host/ohci-ppc-soc.c
+@@ -0,0 +1,308 @@
++/*
++ * OHCI HCD (Host Controller Driver) for USB.
++ *
++ * (C) Copyright 1999 Roman Weissgaerber <weissg@vienna.at>
++ * (C) Copyright 2000-2002 David Brownell <dbrownell@users.sourceforge.net>
++ * (C) Copyright 2002 Hewlett-Packard Company
++ * (C) Copyright 2003-2005 MontaVista Software Inc.
++ *
++ * Bus Glue for PPC On-Chip OHCI driver
++ * Tested on Freescale MPC5200 and IBM STB04xxx
++ *
++ * Modified by Dale Farnsworth <dale@farnsworth.org> from ohci-sa1111.c
++ *
++ * This file is licenced under the GPL.
++ */
++
++#include <asm/usb.h>
++
++static void usb_hcd_ppc_soc_remove(struct usb_hcd *, struct platform_device *);
++
++/* configure so an HC device and id are always provided */
++/* always called with process context; sleeping is OK */
++
++/**
++ * usb_hcd_ppc_soc_probe - initialize On-Chip HCDs
++ * Context: !in_interrupt()
++ *
++ * Allocates basic resources for this USB host controller, and
++ * then invokes the start() method for the HCD associated with it
++ * through the hotplug entry's driver_data.
++ *
++ * Store this function in the HCD's struct pci_driver as probe().
++ */
++static int usb_hcd_ppc_soc_probe(const struct hc_driver *driver,
++			  struct usb_hcd **hcd_out,
++			  struct platform_device *pdev)
++{
++	int retval;
++	struct usb_hcd *hcd = 0;
++	struct ohci_hcd	*ohci;
++	struct resource *res;
++	int irq;
++	struct usb_hcd_platform_data *pd = pdev->dev.platform_data;
++
++	pr_debug("initializing PPC-SOC USB Controller\n");
++
++	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	if (!res) {
++		pr_debug(__FILE__ ": no irq\n");
++		return -ENODEV;
++	}
++	irq = res->start;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		pr_debug(__FILE__ ": no reg addr\n");
++		return -ENODEV;
++	}
++	if (!request_mem_region(res->start, res->end - res->start + 1,
++					hcd_name)) {
++		pr_debug(__FILE__ ": request_mem_region failed\n");
++		return -EBUSY;
++	}
++
++	if (pd->start && (retval = pd->start(pdev)))
++		goto err0;
++	hcd = driver->hcd_alloc ();
++	if (!hcd){
++		pr_debug(__FILE__ ": hcd_alloc failed\n");
++		retval = -ENOMEM;
++		goto err1;
++	}
++
++	ohci = hcd_to_ohci(hcd);
++
++	ohci->flags |= OHCI_BIG_ENDIAN;
++
++	hcd->driver = (struct hc_driver *) driver;
++	hcd->description = driver->description;
++	hcd->irq = irq;
++	hcd->regs = (struct ohci_regs *) ioremap(res->start,
++						res->end - res->start + 1);
++	if (!hcd->regs) {
++		pr_debug(__FILE__ ": ioremap failed\n");
++		retval = -ENOMEM;
++		goto err2;
++	}
++
++	hcd->self.controller = &pdev->dev;
++
++	retval = hcd_buffer_create(hcd);
++	if (retval) {
++		pr_debug(__FILE__ ": pool alloc fail\n");
++		goto err3;
++	}
++
++	retval = request_irq(hcd->irq, usb_hcd_irq, SA_INTERRUPT,
++				hcd_name, hcd);
++	if (retval) {
++		pr_debug(__FILE__ ": request_irq failed, returned %d\n",
++								retval);
++		retval = -EBUSY;
++		goto err4;
++	}
++
++	info("%s (PPC-SOC) at 0x%p, irq %d\n",
++	      hcd_name, hcd->regs, hcd->irq);
++
++	usb_bus_init(&hcd->self);
++	hcd->self.op = &usb_hcd_operations;
++	hcd->self.release = & usb_hcd_release;
++	hcd->self.hcpriv = (void *) hcd;
++	hcd->self.bus_name = "PPC-SOC USB";
++	hcd->product_desc = "PPC-SOC OHCI";
++
++	INIT_LIST_HEAD(&hcd->dev_list);
++
++	usb_register_bus(&hcd->self);
++
++	if ((retval = driver->start(hcd)) < 0) {
++		usb_hcd_ppc_soc_remove(hcd, pdev);
++		return retval;
++	}
++
++	*hcd_out = hcd;
++	return 0;
++
++ err4:
++	hcd_buffer_destroy(hcd);
++ err3:
++	iounmap(hcd->regs);
++ err2:
++	dev_set_drvdata(&pdev->dev, NULL);
++ err1:
++	pr_debug("Removing PPC-SOC USB Controller\n");
++	if (pd && pd->stop)
++		pd->stop(pdev);
++ err0:
++	release_mem_region(res->start, res->end - res->start + 1);
++	return retval;
++}
++
++
++/* may be called without controller electrically present */
++/* may be called with controller, bus, and devices active */
++
++/**
++ * usb_hcd_ppc_soc_remove - shutdown processing for On-Chip HCDs
++ * @pdev: USB Host Controller being removed
++ * Context: !in_interrupt()
++ *
++ * Reverses the effect of usb_hcd_ppc_soc_probe(), first invoking
++ * the HCD's stop() method.  It is always called from a thread
++ * context, normally "rmmod", "apmd", or something similar.
++ *
++ */
++static void usb_hcd_ppc_soc_remove(struct usb_hcd *hcd, struct platform_device *pdev)
++{
++	struct resource *res;
++	struct usb_hcd_platform_data *pd = pdev->dev.platform_data;
++
++	pr_debug(__FILE__ ": remove: %s, state %x\n", hcd->self.bus_name,
++								hcd->state);
++	if (in_interrupt())
++		BUG();
++
++	hcd->state = USB_STATE_QUIESCING;
++
++	pr_debug("%s: roothub graceful disconnect\n", hcd->self.bus_name);
++	usb_disconnect(&hcd->self.root_hub);
++
++	hcd->driver->stop(hcd);
++	hcd->state = USB_STATE_HALT;
++
++	free_irq(hcd->irq, hcd);
++	hcd_buffer_destroy(hcd);
++
++	usb_deregister_bus(&hcd->self);
++
++	iounmap(hcd->regs);
++	kfree(hcd);
++
++	pr_debug("stopping PPC-SOC USB Controller\n");
++
++	if (pd && pd->stop)
++		pd->stop(pdev);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	release_mem_region(res->start, res->end - res->start + 1);
++}
++
++static int __devinit
++ohci_ppc_soc_start(struct usb_hcd *hcd)
++{
++	struct ohci_hcd	*ohci = hcd_to_ohci(hcd);
++	int		ret;
++
++	if ((ret = ohci_init(ohci)) < 0)
++		return ret;
++
++	if ((ret = ohci_run(ohci)) < 0) {
++		err("can't start %s", ohci->hcd.self.bus_name);
++		ohci_stop(hcd);
++		return ret;
++	}
++
++	return 0;
++}
++
++static const struct hc_driver ohci_ppc_soc_hc_driver = {
++	.description =		hcd_name,
++
++	/*
++	 * generic hardware linkage
++	 */
++	.irq =			ohci_irq,
++	.flags =		HCD_USB11,
++
++	/*
++	 * basic lifecycle operations
++	 */
++	.start =		ohci_ppc_soc_start,
++	.stop =			ohci_stop,
++
++	/*
++	 * memory lifecycle (except per-request)
++	 */
++	.hcd_alloc = ohci_hcd_alloc,
++
++	/*
++	 * managing i/o requests and associated device resources
++	 */
++	.urb_enqueue =		ohci_urb_enqueue,
++	.urb_dequeue =		ohci_urb_dequeue,
++	.endpoint_disable =	ohci_endpoint_disable,
++
++	/*
++	 * scheduling support
++	 */
++	.get_frame_number =	ohci_get_frame,
++
++	/*
++	 * root hub support
++	 */
++	.hub_status_data =	ohci_hub_status_data,
++	.hub_control =		ohci_hub_control,
++#ifdef	CONFIG_USB_SUSPEND
++	.hub_suspend =		ohci_hub_suspend,
++	.hub_resume =		ohci_hub_resume,
++#endif
++	.start_port_reset =	ohci_start_port_reset,
++};
++
++static int ohci_hcd_ppc_soc_drv_probe(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct usb_hcd *hcd = NULL;
++	int ret;
++
++	if (usb_disabled())
++		return -ENODEV;
++
++	ret = usb_hcd_ppc_soc_probe(&ohci_ppc_soc_hc_driver, &hcd, pdev);
++
++	if (ret == 0)
++		dev_set_drvdata(dev, hcd);
++
++	return ret;
++}
++
++static int ohci_hcd_ppc_soc_drv_remove(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct usb_hcd *hcd = dev_get_drvdata(dev);
++
++	usb_hcd_ppc_soc_remove(hcd, pdev);
++
++	dev_set_drvdata(dev, NULL);
++	return 0;
++}
++
++static struct device_driver ohci_hcd_ppc_soc_driver = {
++	.name		= "ppc-soc-ohci",
++	.bus		= &platform_bus_type,
++	.probe		= ohci_hcd_ppc_soc_drv_probe,
++	.remove		= ohci_hcd_ppc_soc_drv_remove,
++#if	defined(CONFIG_USB_SUSPEND) || defined(CONFIG_PM)
++	/*.suspend	= ohci_hcd_ppc_soc_drv_suspend,*/
++	/*.resume	= ohci_hcd_ppc_soc_drv_resume,*/
++#endif
++};
++
++static int __init ohci_hcd_ppc_soc_init(void)
++{
++	pr_debug(DRIVER_INFO " (PPC SOC)\n");
++	pr_debug("block sizes: ed %d td %d\n", sizeof(struct ed),
++							sizeof(struct td));
++
++	return driver_register(&ohci_hcd_ppc_soc_driver);
++}
++
++static void __exit ohci_hcd_ppc_soc_cleanup(void)
++{
++	driver_unregister(&ohci_hcd_ppc_soc_driver);
++}
++
++module_init(ohci_hcd_ppc_soc_init);
++module_exit(ohci_hcd_ppc_soc_cleanup);
+Index: linux-2.6.10/mvl_patches/pro-0144.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0144.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(144);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

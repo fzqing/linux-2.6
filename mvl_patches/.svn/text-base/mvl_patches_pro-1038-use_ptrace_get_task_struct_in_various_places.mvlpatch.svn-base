@@ -1,0 +1,818 @@
+#! /usr/bin/env bash
+# Patch: -use_ptrace_get_task_struct_in_various_places
+# Date: Tue Feb  6 08:13:48 2007
+# MR: 18617
+# 
+# commit 6b9c7ed84837753a436415097063232422e29a35
+# Author: Christoph Hellwig <hch@lst.de>
+# Date:   Sun Jan 8 01:02:33 2006 -0800
+# 
+#     [PATCH] use ptrace_get_task_struct in various places
+#     
+#     The ptrace_get_task_struct() helper that I added as part of the ptrace
+#     consolidation is useful in variety of places that currently opencode it.
+#     Switch them to the common helpers.
+#     
+#     Add a ptrace_traceme() helper that needs to be explicitly called, and simplify
+#     the ptrace_get_task_struct() interface.  We don't need the request argument
+#     now, and we return the task_struct directly, using ERR_PTR() for error
+#     returns.  It's a bit more code in the callers, but we have two sane routines
+#     that do one thing well now.
+#     
+#     Signed-off-by: Christoph Hellwig <hch@lst.de>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1038
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18617
+
+commit 6b9c7ed84837753a436415097063232422e29a35
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Sun Jan 8 01:02:33 2006 -0800
+
+    [PATCH] use ptrace_get_task_struct in various places
+    
+    The ptrace_get_task_struct() helper that I added as part of the ptrace
+    consolidation is useful in variety of places that currently opencode it.
+    Switch them to the common helpers.
+    
+    Add a ptrace_traceme() helper that needs to be explicitly called, and simplify
+    the ptrace_get_task_struct() interface.  We don't need the request argument
+    now, and we return the task_struct directly, using ERR_PTR() for error
+    returns.  It's a bit more code in the callers, but we have two sane routines
+    that do one thing well now.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/alpha/kernel/ptrace.c b/arch/alpha/kernel/ptrace.c
+index bbd3753..9969d21 100644
+
+Index: linux-2.6.10/arch/alpha/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/alpha/kernel/ptrace.c
++++ linux-2.6.10/arch/alpha/kernel/ptrace.c
+@@ -264,30 +264,16 @@ do_sys_ptrace(long request, long pid, lo
+ 	lock_kernel();
+ 	DBG(DBG_MEM, ("request=%ld pid=%ld addr=0x%lx data=0x%lx\n",
+ 		      request, pid, addr, data));
+-	ret = -EPERM;
+ 	if (request == PTRACE_TRACEME) {
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED)
+-			goto out_notsk;
+-		ret = security_ptrace(current->parent, current);
+-		if (ret)
+-			goto out_notsk;
+-		/* set the ptrace bit in the process ptrace flags. */
+-		current->ptrace |= PT_PTRACED;
+-		ret = 0;
++		ret = ptrace_traceme();
+ 		goto out_notsk;
+ 	}
+-	if (pid == 1)		/* you may not mess with init */
+-		goto out_notsk;
+ 
+-	ret = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (!child)
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
+ 		goto out_notsk;
++	}
+ 
+ 	if (request == PTRACE_ATTACH) {
+ 		ret = ptrace_attach(child);
+Index: linux-2.6.10/arch/ia64/ia32/sys_ia32.c
+===================================================================
+--- linux-2.6.10.orig/arch/ia64/ia32/sys_ia32.c
++++ linux-2.6.10/arch/ia64/ia32/sys_ia32.c
+@@ -1790,21 +1790,15 @@ sys32_ptrace (int request, pid_t pid, un
+ 
+ 	lock_kernel();
+ 	if (request == PTRACE_TRACEME) {
+-		ret = sys_ptrace(request, pid, addr, data, arg4, arg5, arg6, arg7, stack);
++		ret = ptrace_traceme();
+ 		goto out;
+ 	}
+ 
+-	ret = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (!child)
++	child = ptrace_get_task_struct(pid);
++	if (!child) {
++		ret = PTR_ERR(child);
+ 		goto out;
+-	ret = -EPERM;
+-	if (pid == 1)		/* no messing around with init! */
+-		goto out_tsk;
++	}
+ 
+ 	if (request == PTRACE_ATTACH) {
+ 		ret = sys_ptrace(request, pid, addr, data, arg4, arg5, arg6, arg7, stack);
+Index: linux-2.6.10/arch/ia64/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/ia64/kernel/ptrace.c
++++ linux-2.6.10/arch/ia64/kernel/ptrace.c
+@@ -1300,14 +1300,7 @@ sys_ptrace (long request, pid_t pid, uns
+ 	lock_kernel();
+ 	ret = -EPERM;
+ 	if (request == PTRACE_TRACEME) {
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED)
+-			goto out;
+-		ret = security_ptrace(current->parent, current);
+-		if (ret)
+-			goto out;
+-		current->ptrace |= PT_PTRACED;
+-		ret = 0;
++		ret = ptrace_traceme();
+ 		goto out;
+ 	}
+ 
+Index: linux-2.6.10/arch/m32r/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/m32r/kernel/ptrace.c
++++ linux-2.6.10/arch/m32r/kernel/ptrace.c
+@@ -789,28 +789,16 @@ asmlinkage int sys_ptrace(long request, 
+ 	int ret;
+ 
+ 	lock_kernel();
+-	ret = -EPERM;
+ 	if (request == PTRACE_TRACEME) {
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED)
+-			goto out;
+-		/* set the ptrace bit in the process flags. */
+-		current->ptrace |= PT_PTRACED;
+-		ret = 0;
++		ret = ptrace_traceme();
+ 		goto out;
+ 	}
+-	ret = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (!child)
+-		goto out;
+ 
+-	ret = -EPERM;
+-	if (pid == 1)		/* you may not mess with init */
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
+ 		goto out;
++	}
+ 
+ 	if (request == PTRACE_ATTACH) {
+ 		ret = ptrace_attach(child);
+Index: linux-2.6.10/arch/mips/kernel/ptrace32.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/ptrace32.c
++++ linux-2.6.10/arch/mips/kernel/ptrace32.c
+@@ -49,30 +49,16 @@ asmlinkage int sys32_ptrace(int request,
+ 	       (unsigned long) data);
+ #endif
+ 	lock_kernel();
+-	ret = -EPERM;
+ 	if (request == PTRACE_TRACEME) {
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED)
+-			goto out;
+-		if ((ret = security_ptrace(current->parent, current)))
+-			goto out;
+-		/* set the ptrace bit in the process flags. */
+-		current->ptrace |= PT_PTRACED;
+-		ret = 0;
++		ret = ptrace_traceme();
+ 		goto out;
+ 	}
+-	ret = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (!child)
+-		goto out;
+ 
+-	ret = -EPERM;
+-	if (pid == 1)		/* you may not mess with init */
+-		goto out_tsk;
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
++		goto out;
++	}
+ 
+ 	if (request == PTRACE_ATTACH) {
+ 		ret = ptrace_attach(child);
+Index: linux-2.6.10/arch/s390/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/s390/kernel/ptrace.c
++++ linux-2.6.10/arch/s390/kernel/ptrace.c
+@@ -672,35 +672,18 @@ sys_ptrace(long request, long pid, long 
+ 	int ret;
+ 
+ 	lock_kernel();
+-
+ 	if (request == PTRACE_TRACEME) {
+-		/* are we already being traced? */
+-		ret = -EPERM;
+-		if (current->ptrace & PT_PTRACED)
+-			goto out;
+-		ret = security_ptrace(current->parent, current);
+-		if (ret)
+-			goto out;
+-		/* set the ptrace bit in the process flags. */
+-		current->ptrace |= PT_PTRACED;
+-		goto out;
++		 ret = ptrace_traceme();
++		 goto out;
+ 	}
+ 
+-	ret = -EPERM;
+-	if (pid == 1)		/* you may not mess with init */
+-		goto out;
+-
+-	ret = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (!child)
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
+ 		goto out;
++	}
+ 
+ 	ret = do_ptrace(child, request, addr, data);
+-
+ 	put_task_struct(child);
+ out:
+ 	unlock_kernel();
+Index: linux-2.6.10/arch/sparc/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/sparc/kernel/ptrace.c
++++ linux-2.6.10/arch/sparc/kernel/ptrace.c
+@@ -285,40 +285,16 @@ asmlinkage void do_ptrace(struct pt_regs
+ 			       s, (int) request, (int) pid, addr, data, addr2);
+ 	}
+ #endif
+-	if(request == PTRACE_TRACEME) {
+-		int ret;
+-
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED) {
+-			pt_error_return(regs, EPERM);
+-			goto out;
+-		}
+-		ret = security_ptrace(current->parent, current);
+-		if (ret) {
+-			pt_error_return(regs, -ret);
+-			goto out;
+-		}
+-
+-		/* set the ptrace bit in the process flags. */
+-		current->ptrace |= PT_PTRACED;
++	if (request == PTRACE_TRACEME) {
++		ret = ptrace_traceme();
+ 		pt_succ_return(regs, 0);
+ 		goto out;
+ 	}
+-#ifndef ALLOW_INIT_TRACING
+-	if(pid == 1) {
+-		/* Can't dork with init. */
+-		pt_error_return(regs, EPERM);
+-		goto out;
+-	}
+-#endif
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+ 
+-	if (!child) {
+-		pt_error_return(regs, ESRCH);
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
++		pt_error_return(regs, -ret);
+ 		goto out;
+ 	}
+ 
+Index: linux-2.6.10/arch/sparc64/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/arch/sparc64/kernel/ptrace.c
++++ linux-2.6.10/arch/sparc64/kernel/ptrace.c
+@@ -137,39 +137,15 @@ asmlinkage void do_ptrace(struct pt_regs
+ 	}
+ #endif
+ 	if (request == PTRACE_TRACEME) {
+-		int ret;
+-
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED) {
+-			pt_error_return(regs, EPERM);
+-			goto out;
+-		}
+-		ret = security_ptrace(current->parent, current);
+-		if (ret) {
+-			pt_error_return(regs, -ret);
+-			goto out;
+-		}
+-
+-		/* set the ptrace bit in the process flags. */
+-		current->ptrace |= PT_PTRACED;
++		ret = ptrace_traceme();
+ 		pt_succ_return(regs, 0);
+ 		goto out;
+ 	}
+-#ifndef ALLOW_INIT_TRACING
+-	if (pid == 1) {
+-		/* Can't dork with init. */
+-		pt_error_return(regs, EPERM);
+-		goto out;
+-	}
+-#endif
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+ 
+-	if (!child) {
+-		pt_error_return(regs, ESRCH);
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
++		pt_error_return(regs, -ret);
+ 		goto out;
+ 	}
+ 
+Index: linux-2.6.10/arch/x86_64/ia32/ptrace32.c
+===================================================================
+--- linux-2.6.10.orig/arch/x86_64/ia32/ptrace32.c
++++ linux-2.6.10/arch/x86_64/ia32/ptrace32.c
+@@ -196,36 +196,6 @@ static int getreg32(struct task_struct *
+ 
+ #undef R32
+ 
+-static struct task_struct *find_target(int request, int pid, int *err)
+-{ 
+-	struct task_struct *child;
+-
+-	*err = -EPERM; 
+-	if (pid == 1)
+-		return NULL; 
+-
+-	*err = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (child) { 
+-		*err = -EPERM;
+-		if (child->pid == 1) 
+-			goto out;
+-		*err = ptrace_check_attach(child, request == PTRACE_KILL); 
+-		if (*err < 0) 
+-			goto out;
+-		return child; 
+-	} 
+- out:
+-	if (child)
+-	put_task_struct(child);
+-	return NULL; 
+-	
+-} 
+-
+ asmlinkage long sys32_ptrace(long request, u32 pid, u32 addr, u32 data)
+ {
+ 	struct task_struct *child;
+@@ -254,9 +224,16 @@ asmlinkage long sys32_ptrace(long reques
+ 		break;
+ 	} 
+ 
+-	child = find_target(request, pid, &ret);
+-	if (!child)
+-		return ret;
++	if (request == PTRACE_TRACEME)
++		return ptrace_traceme();
++
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child))
++		return PTR_ERR(child);
++
++	ret = ptrace_check_attach(child, request == PTRACE_KILL);
++	if (ret < 0)
++		goto out;
+ 
+ 	childregs = (struct pt_regs *)(child->thread.rsp0 - sizeof(struct pt_regs)); 
+ 
+@@ -373,6 +350,7 @@ asmlinkage long sys32_ptrace(long reques
+ 		break;
+ 	}
+ 
++ out:
+ 	put_task_struct(child);
+ 	return ret;
+ }
+Index: linux-2.6.10/include/linux/ptrace.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ptrace.h
++++ linux-2.6.10/include/linux/ptrace.h
+@@ -78,6 +78,8 @@
+ 
+ 
+ extern long arch_ptrace(struct task_struct *child, long request, long addr, long data);
++extern struct task_struct *ptrace_get_task_struct(pid_t pid);
++extern int ptrace_traceme(void);
+ extern int ptrace_readdata(struct task_struct *tsk, unsigned long src, char __user *dst, int len);
+ extern int ptrace_writedata(struct task_struct *tsk, char __user *src, unsigned long dst, int len);
+ extern int ptrace_attach(struct task_struct *tsk);
+Index: linux-2.6.10/kernel/ptrace.c
+===================================================================
+--- linux-2.6.10.orig/kernel/ptrace.c
++++ linux-2.6.10/kernel/ptrace.c
+@@ -422,54 +422,62 @@ int ptrace_request(struct task_struct *c
+ 	return ret;
+ }
+ 
+-#ifndef __ARCH_SYS_PTRACE
+-static int ptrace_get_task_struct(long request, long pid,
+-		struct task_struct **childp)
++/**
++ * ptrace_traceme  --  helper for PTRACE_TRACEME
++ *
++ * Performs checks and sets PT_PTRACED.
++ * Should be used by all ptrace implementations for PTRACE_TRACEME.
++ */
++int ptrace_traceme(void)
+ {
+-	struct task_struct *child;
+ 	int ret;
+ 
+ 	/*
+-	 * Callers use child == NULL as an indication to exit early even
+-	 * when the return value is 0, so make sure it is non-NULL here.
++	 * Are we already being traced?
++	 */
++	if (current->ptrace & PT_PTRACED)
++		return -EPERM;
++	ret = security_ptrace(current->parent, current);
++	if (ret)
++		return -EPERM;
++	/*
++	 * Set the ptrace bit in the process ptrace flags.
+ 	 */
+-	*childp = NULL;
++	current->ptrace |= PT_PTRACED;
++	return 0;
++}
+ 
+-	if (request == PTRACE_TRACEME) {
+-		/*
+-		 * Are we already being traced?
+-		 */
+-		if (current->ptrace & PT_PTRACED)
+-			return -EPERM;
+-		ret = security_ptrace(current->parent, current);
+-		if (ret)
+-			return -EPERM;
+-		/*
+-		 * Set the ptrace bit in the process ptrace flags.
+-		 */
+-		current->ptrace |= PT_PTRACED;
+-		return 0;
+-	}
++/**
++ * ptrace_get_task_struct  --  grab a task struct reference for ptrace
++ * @pid:       process id to grab a task_struct reference of
++ *
++ * This function is a helper for ptrace implementations.  It checks
++ * permissions and then grabs a task struct for use of the actual
++ * ptrace implementation.
++ *
++ * Returns the task_struct for @pid or an ERR_PTR() on failure.
++ */
++struct task_struct *ptrace_get_task_struct(pid_t pid)
++{
++	struct task_struct *child;
+ 
+ 	/*
+-	 * You may not mess with init
++	 * Tracing init is not allowed.
+ 	 */
+ 	if (pid == 1)
+-		return -EPERM;
++		return ERR_PTR(-EPERM);
+ 
+-	ret = -ESRCH;
+ 	read_lock(&tasklist_lock);
+ 	child = find_task_by_pid(pid);
+ 	if (child)
+ 		get_task_struct(child);
+ 	read_unlock(&tasklist_lock);
+ 	if (!child)
+-		return -ESRCH;
+-
+-	*childp = child;
+-	return 0;
++		return ERR_PTR(-ESRCH);
++	return child;
+ }
+ 
++#ifndef __ARCH_SYS_PTRACE
+ asmlinkage long sys_ptrace(long request, long pid, long addr, long data)
+ {
+ 	struct task_struct *child;
+@@ -479,9 +487,16 @@ asmlinkage long sys_ptrace(long request,
+ 	 * This lock_kernel fixes a subtle race with suid exec
+ 	 */
+ 	lock_kernel();
+-	ret = ptrace_get_task_struct(request, pid, &child);
+-	if (!child)
++	if (request == PTRACE_TRACEME) {
++		ret = ptrace_traceme();
+ 		goto out;
++	}
++
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
++		goto out;
++	}
+ 
+ 	if (request == PTRACE_ATTACH) {
+ 		ret = ptrace_attach(child);
+Index: linux-2.6.10/arch/ppc64/kernel/ptrace32.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc64/kernel/ptrace32.c
++++ linux-2.6.10/arch/ppc64/kernel/ptrace32.c
+@@ -41,33 +41,19 @@
+ int sys32_ptrace(long request, long pid, unsigned long addr, unsigned long data)
+ {
+ 	struct task_struct *child;
+-	int ret = -EPERM;
++	int ret;
+ 
+ 	lock_kernel();
+ 	if (request == PTRACE_TRACEME) {
+-		/* are we already being traced? */
+-		if (current->ptrace & PT_PTRACED)
+-			goto out;
+-		ret = security_ptrace(current->parent, current);
+-		if (ret)
+-			goto out;
+-		/* set the ptrace bit in the process flags. */
+-		current->ptrace |= PT_PTRACED;
+-		ret = 0;
++		ret = ptrace_traceme();
+ 		goto out;
+ 	}
+-	ret = -ESRCH;
+-	read_lock(&tasklist_lock);
+-	child = find_task_by_pid(pid);
+-	if (child)
+-		get_task_struct(child);
+-	read_unlock(&tasklist_lock);
+-	if (!child)
+-		goto out;
+ 
+-	ret = -EPERM;
+-	if (pid == 1)		/* you may not mess with init */
+-		goto out_tsk;
++	child = ptrace_get_task_struct(pid);
++	if (IS_ERR(child)) {
++		ret = PTR_ERR(child);
++		goto out;
++	}
+ 
+ 	if (request == PTRACE_ATTACH) {
+ 		ret = ptrace_attach(child);
+Index: linux-2.6.10/mvl_patches/pro-1038.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1038.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1038);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

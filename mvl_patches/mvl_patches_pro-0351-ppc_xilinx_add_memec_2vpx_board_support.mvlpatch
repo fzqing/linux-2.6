@@ -1,0 +1,705 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_add_memec_2vpx_board_support
+# Date: Mon Mar  6 15:03:52 2006
+# Source: MontaVista Software, Inc.
+# MR: 16930
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded mailing list 
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     Add Insight Memec 2VP4/2VP7 board support.
+# 
+
+PATCHNUM=351
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16930
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded mailing list 
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    Add Insight Memec 2VP4/2VP7 board support.
+
+ arch/ppc/boot/simple/embed_config.c                   |    5 
+ arch/ppc/platforms/4xx/Kconfig                        |    9 
+ arch/ppc/platforms/4xx/Makefile                       |    1 
+ arch/ppc/platforms/4xx/memec_2vpx.c                   |  136 ++++++++++++++
+ arch/ppc/platforms/4xx/memec_2vpx.h                   |   48 +++++
+ arch/ppc/platforms/4xx/xparameters/xparameters.h      |    3 
+ arch/ppc/platforms/4xx/xparameters/xparameters_2vpx.h |  171 ++++++++++++++++++
+ include/asm-ppc/ibm4xx.h                              |    4 
+ mvl_patches/pro-0351.c                                |   16 +
+ 9 files changed, 389 insertions(+), 4 deletions(-)
+
+Index: linux-2.6.10/arch/ppc/boot/simple/embed_config.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/boot/simple/embed_config.c
++++ linux-2.6.10/arch/ppc/boot/simple/embed_config.c
+@@ -742,7 +742,8 @@ embed_config(bd_t **bdp)
+ }
+ #endif /* WILLOW */
+ 
+-#if defined(CONFIG_XILINX_ML300) || defined(CONFIG_XILINX_ML403)
++#if defined(CONFIG_XILINX_ML300) || defined(CONFIG_XILINX_ML403) \
++    || defined(CONFIG_MEMEC_2VPX)
+ 
+ static int get_mac_addr(unsigned char *mac)
+ {
+@@ -801,7 +802,7 @@ embed_config(bd_t ** bdp)
+ 	timebase_period_ns = 1000000000 / bd->bi_tbfreq;
+ 	/* see bi_tbfreq definition in arch/ppc/platforms/4xx/xilinx_mlxxx.h */
+ }
+-#endif /* CONFIG_XILINX_ML300 || CONFIG_XILINX_ML403 */
++#endif /* CONFIG_XILINX_ML300 || CONFIG_XILINX_ML403 || CONFIG_MEMEC_2VPX */
+ 
+ #ifdef CONFIG_IBM_OPENBIOS
+ /* This could possibly work for all treeboot roms.
+Index: linux-2.6.10/arch/ppc/platforms/4xx/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/4xx/Kconfig
++++ linux-2.6.10/arch/ppc/platforms/4xx/Kconfig
+@@ -31,6 +31,11 @@ config EP405
+ 	help
+ 	  This option enables support for the EP405/EP405PC boards.
+ 
++config MEMEC_2VPX
++	bool "Memec-2VPx"
++	help
++	  This option enables support for the Memec-2VP4/2VP7 boards.
++
+ config OAK
+ 	bool "Oak"
+ 	help
+@@ -218,7 +223,7 @@ config 405GPR
+ 
+ config XILINX_VIRTEX_II_PRO
+ 	bool
+-	depends on XILINX_ML300
++	depends on XILINX_ML300 || MEMEC_2VPX
+ 	default y
+ 
+ config VIRTEX_II_PRO_TLB_FIX
+@@ -254,7 +259,7 @@ config STB03xxx
+ 
+ config EMBEDDEDBOOT
+ 	bool
+-	depends on EP405 || XILINX_ML300 || XILINX_ML403
++	depends on EP405 || XILINX_ML300 || XILINX_ML403 || MEMEC_2VPX
+ 	default y
+ 
+ config IBM_OPENBIOS
+Index: linux-2.6.10/arch/ppc/platforms/4xx/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/4xx/Makefile
++++ linux-2.6.10/arch/ppc/platforms/4xx/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_SYCAMORE)		+= sycamore.o
+ obj-$(CONFIG_WALNUT)		+= walnut.o
+ obj-$(CONFIG_XILINX_ML300)	+= xilinx_mlxxx.o
+ obj-$(CONFIG_XILINX_ML403)	+= xilinx_mlxxx.o
++obj-$(CONFIG_MEMEC_2VPX)	+= memec_2vpx.o
+ 
+ obj-$(CONFIG_405GP)		+= ibm405gp.o
+ obj-$(CONFIG_REDWOOD_5)		+= ibmstb4.o
+Index: linux-2.6.10/arch/ppc/platforms/4xx/memec_2vpx.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/platforms/4xx/memec_2vpx.c
+@@ -0,0 +1,136 @@
++/*
++ * arch/ppc/platforms/4xx/memec_2vpx.c
++ *
++ * Memec Virtex-II Pro 2VP7/2VP4 development board initialization
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2006 (c) MontaVista Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/tty.h>
++#include <linux/serial.h>
++#include <linux/serial_core.h>
++#include <linux/serialP.h>
++#include <linux/kgdb.h>
++#include <asm/io.h>
++#include <asm/machdep.h>
++#include <asm/ocp.h>
++
++#include <platforms/4xx/virtex.h>	/* for NR_SER_PORTS */
++
++/*
++ * As an overview of how the following functions (platform_init,
++ * memec2vpx_map_io, memec2vpx_setup_arch and memec2vpx_init_IRQ) fit into the
++ * kernel startup procedure, here's a call tree:
++ *
++ * start_here					arch/ppc/kernel/head_4xx.S
++ *  early_init					arch/ppc/kernel/setup.c
++ *  machine_init				arch/ppc/kernel/setup.c
++ *    platform_init				this file
++ *      ppc4xx_init				arch/ppc/syslib/ppc4xx_setup.c
++ *        parse_bootinfo
++ *          find_bootinfo
++ *        "setup some default ppc_md pointers"
++ *  MMU_init					arch/ppc/mm/init.c
++ *    *ppc_md.setup_io_mappings == memec2vpx_map_io	this file
++ *      ppc4xx_map_io				arch/ppc/syslib/ppc4xx_setup.c
++ *  start_kernel				init/main.c
++ *    setup_arch				arch/ppc/kernel/setup.c
++ *      *ppc_md.setup_arch == memec2vpx_setup_arch	this file
++ *        ppc4xx_setup_arch			arch/ppc/syslib/ppc4xx_setup.c
++ *          ppc4xx_find_bridges			arch/ppc/syslib/ppc405_pci.c
++ *    init_IRQ					arch/ppc/kernel/irq.c
++ *      *ppc_md.init_IRQ == memec2vpx_init_IRQ	this file
++ *        ppc4xx_init_IRQ			arch/ppc/syslib/ppc4xx_setup.c
++ *          ppc4xx_pic_init			arch/ppc/syslib/xilinx_pic.c
++ */
++
++void __init
++memec2vpx_map_io(void)
++{
++	ppc4xx_map_io();
++}
++
++static void __init
++memec2vpx_early_serial_map(void)
++{
++	struct serial_state old_ports[] = { SERIAL_PORT_DFNS };
++	struct uart_port port;
++	int i;
++
++	/* Setup ioremapped serial port access */
++	for (i = 0; i < ARRAY_SIZE(old_ports); i++ ) {
++		memset(&port, 0, sizeof(port));
++		port.membase = ioremap((phys_addr_t)(old_ports[i].iomem_base), 16);
++		port.irq = old_ports[i].irq;
++		port.uartclk = old_ports[i].baud_base * 16;
++		port.regshift = old_ports[i].iomem_reg_shift;
++		port.iotype = SERIAL_IO_MEM;
++		port.flags = ASYNC_BOOT_AUTOCONF | ASYNC_SKIP_TEST;
++		port.line = i;
++		port.lock = SPIN_LOCK_UNLOCKED;
++
++#ifdef CONFIG_SERIAL_8250
++		if (early_serial_setup(&port) != 0)
++			printk("Early serial init of port %d failed\n", i);
++#endif
++#ifdef CONFIG_KGDB_8250
++		kgdb8250_add_port(i, &port);
++#endif
++	}
++}
++
++void __init
++memec2vpx_setup_arch(void)
++{
++	ppc4xx_setup_arch();	/* calls ppc4xx_find_bridges() */
++
++	memec2vpx_early_serial_map();
++
++	/* Identify the system */
++	printk(KERN_INFO XILINX_SYS_ID_STR);
++	printk(KERN_INFO "Port by MontaVista Software, Inc. (source@mvista.com)\n");
++}
++
++/* Called after board_setup_irq from ppc4xx_init_IRQ(). */
++void __init
++memec2vpx_init_irq(void)
++{
++	unsigned int i;
++
++	ppc4xx_init_IRQ();
++
++	/*
++	 * For PowerPC 405 cores the default value for NR_IRQS is 32.
++	 * See include/asm-ppc/irq.h for details.
++	 * This is just fine for Memec 2VPx.
++	 */
++#if (NR_IRQS != 32)
++#error NR_IRQS must be 32 for Memec 2VPx
++#endif
++
++	for (i = 0; i < NR_IRQS; i++) {
++		if (XPAR_INTC_0_KIND_OF_INTR & (0x80000000 >> i))
++			irq_desc[i].status &= ~IRQ_LEVEL;
++		else
++			irq_desc[i].status |= IRQ_LEVEL;
++	}
++}
++
++void __init
++platform_init(unsigned long r3, unsigned long r4, unsigned long r5,
++	      unsigned long r6, unsigned long r7)
++{
++	ppc4xx_init(r3, r4, r5, r6, r7);
++
++	ppc_md.setup_arch = memec2vpx_setup_arch;
++	ppc_md.setup_io_mappings = memec2vpx_map_io;
++	ppc_md.init_IRQ = memec2vpx_init_irq;
++}
+Index: linux-2.6.10/arch/ppc/platforms/4xx/memec_2vpx.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/platforms/4xx/memec_2vpx.h
+@@ -0,0 +1,48 @@
++/*
++ * memec_2vpx.h
++ *
++ * Include file that defines the Memec Virtex-II Pro 2VP7/2VP4 development board
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2004 (c) MontaVista, Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#ifdef __KERNEL__
++#ifndef __MEMEC_2VPX_H__
++#define __MEMEC_2VPX_H__
++
++/* 2VP7/2VP4 have a Xilinx Virtex-II Pro processor */
++#include <platforms/4xx/virtex.h>
++
++#ifndef __ASSEMBLY__
++
++#include <linux/types.h>
++
++typedef struct board_info {
++	unsigned int	 bi_memsize;		/* DRAM installed, in bytes */
++	unsigned char	 bi_enetaddr[6];	/* Local Ethernet MAC address */
++	unsigned int	 bi_intfreq;		/* Processor speed, in Hz */
++	unsigned int	 bi_busfreq;		/* PLB Bus speed, in Hz */
++	unsigned int	 bi_pci_busfreq;	/* PCI Bus speed, in Hz */
++} bd_t;
++
++/* Some 4xx parts use a different timebase frequency from the internal clock.
++*/
++#define bi_tbfreq bi_intfreq
++
++#endif /* !__ASSEMBLY__ */
++
++/* We don't need anything mapped.  Size of zero will accomplish that. */
++#define PPC4xx_ONB_IO_PADDR	0u
++#define PPC4xx_ONB_IO_VADDR	0u
++#define PPC4xx_ONB_IO_SIZE	0u
++
++#define PPC4xx_MACHINE_NAME "Memec 2VP4/P7 FG456/FF672"
++#define XILINX_SYS_ID_STR "Memec Virtex-II Pro 2VP7/2VP4 development board\n"
++
++#endif				/* __MEMEC_2VPX_H__ */
++#endif				/* __KERNEL__ */
+Index: linux-2.6.10/arch/ppc/platforms/4xx/xparameters/xparameters.h
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/4xx/xparameters/xparameters.h
++++ linux-2.6.10/arch/ppc/platforms/4xx/xparameters/xparameters.h
+@@ -19,3 +19,6 @@
+ #if defined(CONFIG_XILINX_ML403)
+ #include <platforms/4xx/xparameters/xparameters_ml403.h>
+ #endif
++#if defined(CONFIG_MEMEC_2VPX)
++#include <platforms/4xx/xparameters/xparameters_2vpx.h>
++#endif
+Index: linux-2.6.10/arch/ppc/platforms/4xx/xparameters/xparameters_2vpx.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/platforms/4xx/xparameters/xparameters_2vpx.h
+@@ -0,0 +1,171 @@
++/******************************************************************/
++/* xparameters.h file for ank_demo_010 design                     */
++/******************************************************************/
++
++/*******************************************************************
++*
++* CAUTION: This file is automatically generated by libgen.
++* Version: Xilinx EDK 6.2.1 EDK_Gm.12.3
++* DO NOT EDIT.
++*
++* Copyright (c) 2003 Xilinx, Inc.  All rights reserved.
++*
++* Description: Driver parameters
++*
++*******************************************************************/
++
++#define XPAR_XUARTNS550_NUM_INSTANCES 2
++#define XPAR_XUARTNS550_CLOCK_HZ 100000000
++#define XPAR_RS232_BASEADDR 0xFE800000
++#define XPAR_RS232_HIGHADDR 0xFE801FFF
++#define XPAR_RS232_DEVICE_ID 0
++#define XPAR_RS232_P160_BASEADDR 0xFE802000
++#define XPAR_RS232_P160_HIGHADDR 0xFE803FFF
++#define XPAR_RS232_P160_DEVICE_ID 1
++
++/******************************************************************/
++
++#define XPAR_XEMC_NUM_INSTANCES 1
++#define XPAR_FLASH_2MX32_BASEADDR 0xFE804000
++#define XPAR_FLASH_2MX32_HIGHADDR 0xFE80401F
++#define XPAR_FLASH_2MX32_DEVICE_ID 0
++#define XPAR_FLASH_2MX32_NUM_BANKS_MEM 1
++
++/******************************************************************/
++
++#define XPAR_FLASH_2MX32_MEM0_BASEADDR 0xFE000000
++#define XPAR_FLASH_2MX32_MEM0_HIGHADDR 0xFE7FFFFF
++
++/******************************************************************/
++
++#define XPAR_XGPIO_NUM_INSTANCES 3
++#define XPAR_LEDS_4BIT_BASEADDR 0xFE804200
++#define XPAR_LEDS_4BIT_HIGHADDR 0xFE8043FF
++#define XPAR_LEDS_4BIT_DEVICE_ID 0
++#define XPAR_PUSH_BUTTONS_3BIT_BASEADDR 0xFE804400
++#define XPAR_PUSH_BUTTONS_3BIT_HIGHADDR 0xFE8045FF
++#define XPAR_PUSH_BUTTONS_3BIT_DEVICE_ID 1
++#define XPAR_DIP_SWITCHES_8BIT_BASEADDR 0xFE804600
++#define XPAR_DIP_SWITCHES_8BIT_HIGHADDR 0xFE8047FF
++#define XPAR_DIP_SWITCHES_8BIT_DEVICE_ID 2
++
++/******************************************************************/
++
++#define XPAR_INTC_MAX_NUM_INTR_INPUTS 3
++#define XPAR_XINTC_HAS_IPR 1
++#define XPAR_XINTC_USE_DCR 0
++#define XPAR_XINTC_NUM_INSTANCES 1
++#define XPAR_OPB_INTC_0_BASEADDR 0xFE804020
++#define XPAR_OPB_INTC_0_HIGHADDR 0xFE80403F
++#define XPAR_OPB_INTC_0_DEVICE_ID 0
++#define XPAR_OPB_INTC_0_KIND_OF_INTR 0x00000000
++
++/******************************************************************/
++
++#define XPAR_INTC_SINGLE_BASEADDR 0xFE804020
++#define XPAR_INTC_SINGLE_HIGHADDR 0xFE80403F
++#define XPAR_INTC_SINGLE_DEVICE_ID XPAR_OPB_INTC_0_DEVICE_ID
++#define XPAR_ETHERNET_MAC_IP2INTC_IRPT_MASK 0X000001
++#define XPAR_OPB_INTC_0_ETHERNET_MAC_IP2INTC_IRPT_INTR 0
++#define XPAR_RS232_P160_IP2INTC_IRPT_MASK 0X000002
++#define XPAR_OPB_INTC_0_RS232_P160_IP2INTC_IRPT_INTR 1
++#define XPAR_RS232_IP2INTC_IRPT_MASK 0X000004
++#define XPAR_OPB_INTC_0_RS232_IP2INTC_IRPT_INTR 2
++
++/******************************************************************/
++
++#define XPAR_OPB_LCD_INTERFACE_0_BASEADDR 0xFE804800
++#define XPAR_OPB_LCD_INTERFACE_0_HIGHADDR 0xFE8048FF
++
++/******************************************************************/
++
++#define XPAR_XEMAC_NUM_INSTANCES 1
++#define XPAR_ETHERNET_MAC_BASEADDR 0xFFFF0000
++#define XPAR_ETHERNET_MAC_HIGHADDR 0xFFFF3FFF
++#define XPAR_ETHERNET_MAC_DEVICE_ID 0
++#define XPAR_ETHERNET_MAC_ERR_COUNT_EXIST 1
++#define XPAR_ETHERNET_MAC_DMA_PRESENT 3
++#define XPAR_ETHERNET_MAC_MII_EXIST 1
++#define XPAR_ETHERNET_0_CAM_EXIST 0
++#define XPAR_ETHERNET_0_JUMBO_EXIST 0
++
++/******************************************************************/
++
++#define XPAR_SDRAM_8MX32_BASEADDR 0x00000000
++#define XPAR_SDRAM_8MX32_HIGHADDR 0x01FFFFFF
++
++/******************************************************************/
++
++#define XPAR_PLB_BRAM_IF_CNTLR_1_BASEADDR 0xFFFFC000
++#define XPAR_PLB_BRAM_IF_CNTLR_1_HIGHADDR 0xFFFFFFFF
++
++/******************************************************************/
++
++#define XPAR_CPU_PPC405_CORE_CLOCK_FREQ_HZ 300000000
++
++/******************************************************************/
++
++
++/******************************************************************/
++
++/* Linux Redefines */
++
++/******************************************************************/
++
++#define XPAR_UARTNS550_0_BASEADDR (XPAR_RS232_BASEADDR+0x1000)
++#define XPAR_UARTNS550_0_HIGHADDR XPAR_RS232_HIGHADDR
++#define XPAR_UARTNS550_0_CLOCK_FREQ_HZ XPAR_XUARTNS550_CLOCK_HZ
++#define XPAR_UARTNS550_0_DEVICE_ID XPAR_RS232_DEVICE_ID
++#define XPAR_UARTNS550_1_BASEADDR (XPAR_RS232_P160_BASEADDR+0x1000)
++#define XPAR_UARTNS550_1_HIGHADDR XPAR_RS232_P160_HIGHADDR
++#define XPAR_UARTNS550_1_CLOCK_FREQ_HZ XPAR_XUARTNS550_CLOCK_HZ
++#define XPAR_UARTNS550_1_DEVICE_ID XPAR_RS232_P160_DEVICE_ID
++
++/******************************************************************/
++
++#define XPAR_EMAC_0_BASEADDR XPAR_ETHERNET_MAC_BASEADDR
++#define XPAR_EMAC_0_HIGHADDR XPAR_ETHERNET_MAC_HIGHADDR
++#define XPAR_EMAC_0_DMA_PRESENT XPAR_ETHERNET_MAC_DMA_PRESENT
++#define XPAR_EMAC_0_MII_EXIST XPAR_ETHERNET_MAC_MII_EXIST
++#define XPAR_EMAC_0_ERR_COUNT_EXIST XPAR_ETHERNET_MAC_ERR_COUNT_EXIST
++#define XPAR_EMAC_0_DEVICE_ID XPAR_ETHERNET_MAC_DEVICE_ID
++#define XPAR_EMAC_0_CAM_EXIST XPAR_ETHERNET_0_CAM_EXIST
++#define XPAR_EMAC_0_JUMBO_EXIST XPAR_ETHERNET_0_JUMBO_EXIST
++
++/******************************************************************/
++
++#define XPAR_GPIO_0_BASEADDR XPAR_LEDS_4BIT_BASEADDR
++#define XPAR_GPIO_0_HIGHADDR XPAR_LEDS_4BIT_HIGHADDR
++#define XPAR_GPIO_0_DEVICE_ID XPAR_LEDS_4BIT_DEVICE_ID
++#define XPAR_GPIO_1_BASEADDR XPAR_PUSH_BUTTONS_3BIT_BASEADDR
++#define XPAR_GPIO_1_HIGHADDR XPAR_PUSH_BUTTONS_3BIT_HIGHADDR
++#define XPAR_GPIO_1_DEVICE_ID XPAR_PUSH_BUTTONS_3BIT_DEVICE_ID
++#define XPAR_GPIO_2_BASEADDR XPAR_DIP_SWITCHES_8BIT_BASEADDR
++#define XPAR_GPIO_2_HIGHADDR XPAR_DIP_SWITCHES_8BIT_HIGHADDR
++#define XPAR_GPIO_2_DEVICE_ID XPAR_DIP_SWITCHES_8BIT_DEVICE_ID
++
++/******************************************************************/
++
++#define XPAR_INTC_0_BASEADDR XPAR_OPB_INTC_0_BASEADDR
++#define XPAR_INTC_0_HIGHADDR XPAR_OPB_INTC_0_HIGHADDR
++#define XPAR_INTC_0_KIND_OF_INTR XPAR_OPB_INTC_0_KIND_OF_INTR
++#define XPAR_INTC_0_DEVICE_ID XPAR_OPB_INTC_0_DEVICE_ID
++
++/******************************************************************/
++
++#define XPAR_INTC_0_EMAC_0_VEC_ID XPAR_OPB_INTC_0_ETHERNET_MAC_IP2INTC_IRPT_INTR
++#define XPAR_INTC_0_UARTNS550_1_VEC_ID XPAR_OPB_INTC_0_RS232_P160_IP2INTC_IRPT_INTR
++#define XPAR_INTC_0_UARTNS550_0_VEC_ID XPAR_OPB_INTC_0_RS232_IP2INTC_IRPT_INTR
++
++/******************************************************************/
++
++#define XPAR_PLB_CLOCK_FREQ_HZ 100000000
++#define XPAR_CORE_CLOCK_FREQ_HZ XPAR_CPU_PPC405_CORE_CLOCK_FREQ_HZ
++#define XPAR_DDR_0_SIZE 0x2000000
++
++/******************************************************************/
++
++#define XPAR_PCI_0_CLOCK_FREQ_HZ    0
++
++/******************************************************************/
++
+Index: linux-2.6.10/include/asm-ppc/ibm4xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/ibm4xx.h
++++ linux-2.6.10/include/asm-ppc/ibm4xx.h
+@@ -35,6 +35,10 @@
+ #include <platforms/4xx/ep405.h>
+ #endif
+ 
++#if defined(CONFIG_MEMEC_2VPX)
++#include <platforms/4xx/memec_2vpx.h>
++#endif
++
+ #if defined(CONFIG_OAK)
+ #include <platforms/4xx/oak.h>
+ #endif
+Index: linux-2.6.10/mvl_patches/pro-0351.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0351.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(351);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,611 @@
+#! /usr/bin/env bash
+# Patch: -common_ppc32_compat_semaphore
+# Date: Wed Dec 28 15:00:45 2005
+# Source: MontaVista Software, Inc.
+# MR: 13523 
+# Type: Defect Fix
+# Disposition: merged from Real-Time Preempt 
+# Signed-off-by: Daniel Walker <dwalker@mvista.com>
+# Signed-off-by: Tom Rini <trini@mvista.com>
+# Description:
+# 
+# 	This is the PPC specific changes needed to expose the system semaphore.
+# 
+
+PATCHNUM=186
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 13523 
+Type: Defect Fix
+Disposition: merged from Real-Time Preempt 
+Signed-off-by: Daniel Walker <dwalker@mvista.com>
+Signed-off-by: Tom Rini <trini@mvista.com>
+Description:
+
+	This is the PPC specific changes needed to expose the system semaphore.
+
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -17,11 +17,10 @@ config GENERIC_HARDIRQS
+ 
+ config RWSEM_GENERIC_SPINLOCK
+ 	bool
+-	depends on !PREEMPT_RT
++	default y
+ 
+ config ASM_SEMAPHORES
+ 	bool
+-	depends on !PREEMPT_RT
+ 	default y
+ 
+ config RWSEM_XCHGADD_ALGORITHM
+Index: linux-2.6.10/arch/ppc/kernel/ppc_ksyms.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/ppc_ksyms.c
++++ linux-2.6.10/arch/ppc/kernel/ppc_ksyms.c
+@@ -296,9 +296,9 @@ EXPORT_SYMBOL(xmon);
+ EXPORT_SYMBOL(xmon_printf);
+ #endif
+ #ifdef CONFIG_ASM_SEMAPHORES
+-EXPORT_SYMBOL(__up);
+-EXPORT_SYMBOL(__down);
+-EXPORT_SYMBOL(__down_interruptible);
++EXPORT_SYMBOL(__compat_up);
++EXPORT_SYMBOL(__compat_down);
++EXPORT_SYMBOL(__compat_down_interruptible);
+ #endif
+ 
+ #if defined(CONFIG_KGDB) || defined(CONFIG_XMON)
+Index: linux-2.6.10/arch/ppc/kernel/semaphore.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/semaphore.c
++++ linux-2.6.10/arch/ppc/kernel/semaphore.c
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/sched.h>
+ #include <linux/init.h>
++#include <linux/module.h>
+ #include <asm/atomic.h>
+ #include <asm/semaphore.h>
+ #include <asm/errno.h>
+@@ -29,7 +30,7 @@
+  *	sem->count = tmp;
+  *	return old_count;
+  */
+-static inline int __sem_update_count(struct semaphore *sem, int incr)
++static inline int __sem_update_count(struct compat_semaphore *sem, int incr)
+ {
+ 	int old_count, tmp;
+ 
+@@ -48,7 +49,7 @@ static inline int __sem_update_count(str
+ 	return old_count;
+ }
+ 
+-void __up(struct semaphore *sem)
++void __compat_up(struct compat_semaphore *sem)
+ {
+ 	/*
+ 	 * Note that we incremented count in up() before we came here,
+@@ -70,7 +71,7 @@ void __up(struct semaphore *sem)
+  * Thus it is only when we decrement count from some value > 0
+  * that we have actually got the semaphore.
+  */
+-void __sched __down(struct semaphore *sem)
++void __sched __compat_down(struct compat_semaphore *sem)
+ {
+ 	struct task_struct *tsk = current;
+ 	DECLARE_WAITQUEUE(wait, tsk);
+@@ -100,7 +101,7 @@ void __sched __down(struct semaphore *se
+ 	wake_up(&sem->wait);
+ }
+ 
+-int __sched __down_interruptible(struct semaphore * sem)
++int __sched __compat_down_interruptible(struct compat_semaphore * sem)
+ {
+ 	int retval = 0;
+ 	struct task_struct *tsk = current;
+@@ -129,3 +130,9 @@ int __sched __down_interruptible(struct 
+ 	wake_up(&sem->wait);
+ 	return retval;
+ }
++
++int compat_sem_is_locked(struct compat_semaphore *sem)
++{
++	return (int) atomic_read(&sem->count) < 0;
++}
++EXPORT_SYMBOL(compat_sem_is_locked);
+Index: linux-2.6.10/include/asm-ppc/rwsem.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/rwsem.h
++++ linux-2.6.10/include/asm-ppc/rwsem.h
+@@ -7,6 +7,10 @@
+ #ifndef _PPC_RWSEM_H
+ #define _PPC_RWSEM_H
+ 
++#ifndef _LINUX_RWSEM_H
++#error "please don't include asm/rwsem.h directly, use linux/rwsem.h instead"
++#endif
++
+ #ifdef __KERNEL__
+ #include <linux/list.h>
+ #include <linux/spinlock.h>
+@@ -16,7 +20,7 @@
+ /*
+  * the semaphore definition
+  */
+-struct rw_semaphore {
++struct compat_rw_semaphore {
+ 	/* XXX this should be able to be an atomic_t  -- paulus */
+ 	signed long		count;
+ #define RWSEM_UNLOCKED_VALUE		0x00000000
+@@ -41,20 +45,20 @@ struct rw_semaphore {
+ #define __RWSEM_DEBUG_INIT	/* */
+ #endif
+ 
+-#define __RWSEM_INITIALIZER(name) \
++#define __COMPAT_RWSEM_INITIALIZER(name) \
+ 	{ RWSEM_UNLOCKED_VALUE, RAW_SPIN_LOCK_UNLOCKED, \
+ 	  LIST_HEAD_INIT((name).wait_list) \
+ 	  __RWSEM_DEBUG_INIT }
+ 
+-#define DECLARE_RWSEM(name)		\
+-	struct rw_semaphore name = __RWSEM_INITIALIZER(name)
++#define COMPAT_DECLARE_RWSEM(name)		\
++	struct compat_rw_semaphore name = __COMPAT_RWSEM_INITIALIZER(name)
+ 
+-extern struct rw_semaphore *rwsem_down_read_failed(struct rw_semaphore *sem);
+-extern struct rw_semaphore *rwsem_down_write_failed(struct rw_semaphore *sem);
+-extern struct rw_semaphore *rwsem_wake(struct rw_semaphore *sem);
+-extern struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem);
++extern struct compat_rw_semaphore *rwsem_down_read_failed(struct compat_rw_semaphore *sem);
++extern struct compat_rw_semaphore *rwsem_down_write_failed(struct compat_rw_semaphore *sem);
++extern struct compat_rw_semaphore *rwsem_wake(struct compat_rw_semaphore *sem);
++extern struct compat_rw_semaphore *rwsem_downgrade_wake(struct compat_rw_semaphore *sem);
+ 
+-static inline void init_rwsem(struct rw_semaphore *sem)
++static inline void compat_init_rwsem(struct compat_rw_semaphore *sem)
+ {
+ 	sem->count = RWSEM_UNLOCKED_VALUE;
+ 	spin_lock_init(&sem->wait_lock);
+@@ -67,7 +71,7 @@ static inline void init_rwsem(struct rw_
+ /*
+  * lock for reading
+  */
+-static inline void __down_read(struct rw_semaphore *sem)
++static inline void __down_read(struct compat_rw_semaphore *sem)
+ {
+ 	if (atomic_inc_return((atomic_t *)(&sem->count)) > 0)
+ 		smp_wmb();
+@@ -75,7 +79,7 @@ static inline void __down_read(struct rw
+ 		rwsem_down_read_failed(sem);
+ }
+ 
+-static inline int __down_read_trylock(struct rw_semaphore *sem)
++static inline int __down_read_trylock(struct compat_rw_semaphore *sem)
+ {
+ 	int tmp;
+ 
+@@ -92,7 +96,7 @@ static inline int __down_read_trylock(st
+ /*
+  * lock for writing
+  */
+-static inline void __down_write(struct rw_semaphore *sem)
++static inline void __down_write(struct compat_rw_semaphore *sem)
+ {
+ 	int tmp;
+ 
+@@ -104,7 +108,7 @@ static inline void __down_write(struct r
+ 		rwsem_down_write_failed(sem);
+ }
+ 
+-static inline int __down_write_trylock(struct rw_semaphore *sem)
++static inline int __down_write_trylock(struct compat_rw_semaphore *sem)
+ {
+ 	int tmp;
+ 
+@@ -117,7 +121,7 @@ static inline int __down_write_trylock(s
+ /*
+  * unlock after reading
+  */
+-static inline void __up_read(struct rw_semaphore *sem)
++static inline void __up_read(struct compat_rw_semaphore *sem)
+ {
+ 	int tmp;
+ 
+@@ -130,7 +134,7 @@ static inline void __up_read(struct rw_s
+ /*
+  * unlock after writing
+  */
+-static inline void __up_write(struct rw_semaphore *sem)
++static inline void __up_write(struct compat_rw_semaphore *sem)
+ {
+ 	smp_wmb();
+ 	if (atomic_sub_return(RWSEM_ACTIVE_WRITE_BIAS,
+@@ -141,7 +145,7 @@ static inline void __up_write(struct rw_
+ /*
+  * implement atomic add functionality
+  */
+-static inline void rwsem_atomic_add(int delta, struct rw_semaphore *sem)
++static inline void rwsem_atomic_add(int delta, struct compat_rw_semaphore *sem)
+ {
+ 	atomic_add(delta, (atomic_t *)(&sem->count));
+ }
+@@ -149,7 +153,7 @@ static inline void rwsem_atomic_add(int 
+ /*
+  * downgrade write lock to read lock
+  */
+-static inline void __downgrade_write(struct rw_semaphore *sem)
++static inline void __downgrade_write(struct compat_rw_semaphore *sem)
+ {
+ 	int tmp;
+ 
+@@ -162,7 +166,7 @@ static inline void __downgrade_write(str
+ /*
+  * implement exchange and add functionality
+  */
+-static inline int rwsem_atomic_update(int delta, struct rw_semaphore *sem)
++static inline int rwsem_atomic_update(int delta, struct compat_rw_semaphore *sem)
+ {
+ 	smp_mb();
+ 	return atomic_add_return(delta, (atomic_t *)(&sem->count));
+Index: linux-2.6.10/include/asm-ppc/semaphore.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/semaphore.h
++++ linux-2.6.10/include/asm-ppc/semaphore.h
+@@ -1,6 +1,9 @@
+ #ifndef _PPC_SEMAPHORE_H
+ #define _PPC_SEMAPHORE_H
+ 
++#include <linux/config.h>
++#include <linux/linkage.h>
++
+ /*
+  * Swiped from asm-sparc/semaphore.h and modified
+  * -- Cort (cort@cs.nmt.edu)
+@@ -16,61 +19,66 @@
+ 
+ #ifdef __KERNEL__
+ 
+-#ifdef CONFIG_PREEMPT_RT
+-# include <linux/rt_lock.h>
+-#else
++/*
++ * On !PREEMPT_RT all semaphores are compat:
++ */
++#ifndef CONFIG_PREEMPT_RT
++# define compat_semaphore semaphore
++#endif
+ 
+ #include <asm/atomic.h>
+ #include <asm/system.h>
+ #include <linux/wait.h>
+ #include <linux/rwsem.h>
+ 
+-struct semaphore {
++struct compat_semaphore {
+ 	/*
+ 	 * Note that any negative value of count is equivalent to 0,
+ 	 * but additionally indicates that some process(es) might be
+ 	 * sleeping on `wait'.
+ 	 */
+ 	atomic_t count;
++	int sleepers;
+ 	wait_queue_head_t wait;
+ };
+ 
+-#define __SEMAPHORE_INITIALIZER(name, n)				\
++#define __COMPAT_SEMAPHORE_INITIALIZER(name, n)				\
+ {									\
+ 	.count		= ATOMIC_INIT(n),				\
+ 	.wait		= __WAIT_QUEUE_HEAD_INITIALIZER((name).wait)	\
+ }
+ 
+-#define __MUTEX_INITIALIZER(name) \
+-	__SEMAPHORE_INITIALIZER(name, 1)
++#define __COMPAT_MUTEX_INITIALIZER(name) \
++	__COMPAT_SEMAPHORE_INITIALIZER(name, 1)
+ 
+-#define __DECLARE_SEMAPHORE_GENERIC(name, count) \
+-	struct semaphore name = __SEMAPHORE_INITIALIZER(name,count)
++#define __COMPAT_DECLARE_SEMAPHORE_GENERIC(name, count) \
++	struct compat_semaphore name = __COMPAT_SEMAPHORE_INITIALIZER(name,count)
+ 
+-#define DECLARE_MUTEX(name)		__DECLARE_SEMAPHORE_GENERIC(name, 1)
+-#define DECLARE_MUTEX_LOCKED(name)	__DECLARE_SEMAPHORE_GENERIC(name, 0)
++#define COMPAT_DECLARE_MUTEX(name)		__COMPAT_DECLARE_SEMAPHORE_GENERIC(name, 1)
++#define COMPAT_DECLARE_MUTEX_LOCKED(name)	__COMPAT_DECLARE_SEMAPHORE_GENERIC(name, 0)
+ 
+-static inline void sema_init (struct semaphore *sem, int val)
++static inline void compat_sema_init (struct compat_semaphore *sem, int val)
+ {
+ 	atomic_set(&sem->count, val);
++	sem->sleepers = 0;
+ 	init_waitqueue_head(&sem->wait);
+ }
+ 
+-static inline void init_MUTEX (struct semaphore *sem)
++static inline void compat_init_MUTEX (struct compat_semaphore *sem)
+ {
+-	sema_init(sem, 1);
++	compat_sema_init(sem, 1);
+ }
+ 
+-static inline void init_MUTEX_LOCKED (struct semaphore *sem)
++static inline void compat_init_MUTEX_LOCKED (struct compat_semaphore *sem)
+ {
+-	sema_init(sem, 0);
++	compat_sema_init(sem, 0);
+ }
+ 
+-extern void __down(struct semaphore * sem);
+-extern int  __down_interruptible(struct semaphore * sem);
+-extern void __up(struct semaphore * sem);
++extern void __compat_down(struct compat_semaphore * sem);
++extern int  __compat_down_interruptible(struct compat_semaphore * sem);
++extern void __compat_up(struct compat_semaphore * sem);
+ 
+-extern inline void down(struct semaphore * sem)
++extern inline void compat_down(struct compat_semaphore * sem)
+ {
+ 	might_sleep();
+ 
+@@ -78,23 +86,23 @@ extern inline void down(struct semaphore
+ 	 * Try to get the semaphore, take the slow path if we fail.
+ 	 */
+ 	if (atomic_dec_return(&sem->count) < 0)
+-		__down(sem);
++		__compat_down(sem);
+ 	smp_wmb();
+ }
+ 
+-extern inline int down_interruptible(struct semaphore * sem)
++extern inline int compat_down_interruptible(struct compat_semaphore * sem)
+ {
+ 	int ret = 0;
+ 
+ 	might_sleep();
+ 
+ 	if (atomic_dec_return(&sem->count) < 0)
+-		ret = __down_interruptible(sem);
++		ret = __compat_down_interruptible(sem);
+ 	smp_wmb();
+ 	return ret;
+ }
+ 
+-extern inline int down_trylock(struct semaphore * sem)
++extern inline int compat_down_trylock(struct compat_semaphore * sem)
+ {
+ 	int ret;
+ 
+@@ -103,14 +111,19 @@ extern inline int down_trylock(struct se
+ 	return ret;
+ }
+ 
+-extern inline void up(struct semaphore * sem)
++extern inline void compat_up(struct compat_semaphore * sem)
+ {
+ 	smp_wmb();
+ 	if (atomic_inc_return(&sem->count) <= 0)
+-		__up(sem);
++		__compat_up(sem);
+ }
+ 
+-#endif /* CONFIG_PREEMPT_RT */
++extern int compat_sem_is_locked(struct compat_semaphore *sem);
++
++#define compat_sema_count(sem) atomic_read(&(sem)->count)
++
++#include <linux/semaphore.h>
++
+ #endif /* __KERNEL__ */
+ 
+ #endif /* !(_PPC_SEMAPHORE_H) */
+Index: linux-2.6.10/mvl_patches/pro-0186.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0186.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(186);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,392 @@
+#! /usr/bin/env bash
+# Patch: -ide_claim_extra_dma_ports_regardless_of_channel
+# Date: Fri May 26 10:17:19 2006
+# Source: MontaVista Software, Inc.
+# MR: 17554
+# Type: Defect Fix
+# Disposition: accepted into 2.6.17-rc1-mm1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Description:
+# 
+# - Claim extra DMA I/O ports regardless of what IDE channels are
+#   present/enabled.
+# 
+# - Remove extra ports handling from ide_mapped_mmio_dma() since it's not
+#   applicable to the custom-mapping IDE drivers.
+# 
+#  drivers/ide/ide-dma.c |   29 ++++++++++++++++++++---------
+#  drivers/ide/ide.c     |   14 +++++++++-----
+#  include/linux/ide.h   |    4 +++-
+#  3 files changed, 32 insertions(+), 15 deletions(-)
+# 
+
+PATCHNUM=559
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 17554
+Type: Defect Fix
+Disposition: accepted into 2.6.17-rc1-mm1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Description:
+
+- Claim extra DMA I/O ports regardless of what IDE channels are
+  present/enabled.
+
+- Remove extra ports handling from ide_mapped_mmio_dma() since it's not
+  applicable to the custom-mapping IDE drivers.
+
+ drivers/ide/ide-dma.c  |   29 ++++++++++++++++++++---------
+ drivers/ide/ide.c      |   14 +++++++++-----
+ include/linux/ide.h    |    4 +++-
+ mvl_patches/pro-0559.c |   16 ++++++++++++++++
+ 4 files changed, 48 insertions(+), 15 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/ide-dma.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/ide-dma.c
++++ linux-2.6.10/drivers/ide/ide-dma.c
+@@ -810,9 +810,9 @@ static int ide_release_dma_engine(ide_hw
+ 
+ static int ide_release_iomio_dma(ide_hwif_t *hwif)
+ {
+-	if ((hwif->dma_extra) && (hwif->channel == 0))
+-		release_region((hwif->dma_base + 16), hwif->dma_extra);
+ 	release_region(hwif->dma_base, 8);
++	if (hwif->extra_ports)
++		release_region(hwif->extra_base, hwif->extra_ports);
+ 	if (hwif->dma_base2)
+ 		release_region(hwif->dma_base, 8);
+ 	return 1;
+@@ -855,9 +855,6 @@ static int ide_mapped_mmio_dma(ide_hwif_
+ 
+ 	hwif->dma_base = base;
+ 
+-	if (hwif->cds && hwif->cds->extra && hwif->channel == 0)
+-		hwif->dma_extra = hwif->cds->extra;
+-
+ 	if(hwif->mate)
+ 		hwif->dma_master = (hwif->channel) ? hwif->mate->dma_base : base;
+ 	else
+@@ -868,15 +865,27 @@ static int ide_mapped_mmio_dma(ide_hwif_
+ static int ide_iomio_dma(ide_hwif_t *hwif, unsigned long base, unsigned int ports)
+ {
+ 	printk(KERN_INFO "    %s: BM-DMA at 0x%04lx-0x%04lx",
+-		hwif->name, base, base + ports - 1);
++	       hwif->name, base, base + ports - 1);
++
+ 	if (!request_region(base, ports, hwif->name)) {
+ 		printk(" -- Error, ports in use.\n");
+ 		return 1;
+ 	}
++
+ 	hwif->dma_base = base;
+-	if (hwif->cds && (hwif->cds->extra) && (hwif->channel == 0)) {
+-		request_region(base+16, hwif->cds->extra, hwif->cds->name);
+-		hwif->dma_extra = hwif->cds->extra;
++
++	if (hwif->cds && hwif->cds->extra) {
++		hwif->extra_base = base + (hwif->channel ? 8 : 16);
++
++		if (!hwif->mate || !hwif->mate->extra_ports) {
++			if (!request_region(hwif->extra_base,
++					    hwif->cds->extra, hwif->cds->name)) {
++				printk(" -- Error, extra ports in use.\n");
++				release_region(base, ports);
++				return 1;
++			}
++			hwif->extra_ports = hwif->cds->extra;
++		}
+ 	}
+ 	
+ 	if(hwif->mate)
+@@ -888,6 +897,8 @@ static int ide_iomio_dma(ide_hwif_t *hwi
+ 		{
+ 			printk(" -- Error, secondary ports in use.\n");
+ 			release_region(base, ports);
++			if (hwif->extra_ports)
++				release_region(hwif->extra_base, hwif->extra_ports);
+ 			return 1;
+ 		}
+ 	}
+Index: linux-2.6.10/drivers/ide/ide.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/ide.c
++++ linux-2.6.10/drivers/ide/ide.c
+@@ -644,7 +644,7 @@ void ide_hwif_release_regions(ide_hwif_t
+  *	@hwif: hwif to update
+  *	@tmp_hwif: template
+  *
+- *	Restore hwif to a previous state by copying most settngs
++ *	Restore hwif to a previous state by copying most settings
+  *	from the template.
+  */
+ 
+@@ -733,9 +733,10 @@ static void ide_hwif_restore(ide_hwif_t 
+ 	hwif->dma_vendor3		= tmp_hwif->dma_vendor3;
+ 	hwif->dma_prdtable		= tmp_hwif->dma_prdtable;
+ 
+-	hwif->dma_extra			= tmp_hwif->dma_extra;
+ 	hwif->config_data		= tmp_hwif->config_data;
+ 	hwif->select_data		= tmp_hwif->select_data;
++	hwif->extra_base		= tmp_hwif->extra_base;
++	hwif->extra_ports		= tmp_hwif->extra_ports;
+ 	hwif->autodma			= tmp_hwif->autodma;
+ 	hwif->udma_four			= tmp_hwif->udma_four;
+ 	hwif->no_dsc			= tmp_hwif->no_dsc;
+@@ -744,7 +745,7 @@ static void ide_hwif_restore(ide_hwif_t 
+ }
+ 
+ /**
+- *	ide_unregister		-	free an ide interface
++ *	ide_unregister		-	free an IDE interface
+  *	@index: index of interface (will change soon to a pointer)
+  *
+  *	Perform the final unregister of an IDE interface. At the moment
+@@ -757,8 +758,8 @@ static void ide_hwif_restore(ide_hwif_t 
+  *	deadlocking the IDE layer. The shutdown callback is called
+  *	before we take the lock and free resources. It is up to the
+  *	caller to be sure there is no pending I/O here, and that
+- *	the interfce will not be reopened (present/vanishing locking
+- *	isnt yet done btw). After we commit to the final kill we
++ *	the interface will not be reopened (present/vanishing locking
++ *	isn't yet done BTW). After we commit to the final kill we
+  *	call the cleanup callback with the ide locks held.
+  *
+  *	Unregister restores the hwif structures to the default state.
+@@ -917,6 +918,9 @@ void ide_unregister(unsigned int index)
+ 		hwif->dma_status = 0;
+ 		hwif->dma_vendor3 = 0;
+ 		hwif->dma_prdtable = 0;
++
++		hwif->extra_base  = 0;
++		hwif->extra_ports = 0;
+ 	}
+ 
+ 	/* copy original settings */
+Index: linux-2.6.10/include/linux/ide.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ide.h
++++ linux-2.6.10/include/linux/ide.h
+@@ -897,10 +897,12 @@ typedef struct hwif_s {
+ 	unsigned long	dma_prdtable;	/* actual prd table address */
+ 	unsigned long	dma_base2;	/* extended base addr for dma ports */
+ 
+-	unsigned	dma_extra;	/* extra addr for dma ports */
+ 	unsigned long	config_data;	/* for use by chipset-specific code */
+ 	unsigned long	select_data;	/* for use by chipset-specific code */
+ 
++	unsigned long	extra_base;	/* extra addr for dma ports */
++	unsigned	extra_ports;	/* number of extra dma ports */
++
+ 	unsigned	noprobe    : 1;	/* don't probe for this interface */
+ 	unsigned	present    : 1;	/* this interface exists */
+ 	unsigned	hold       : 1; /* this interface is always present */
+Index: linux-2.6.10/mvl_patches/pro-0559.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0559.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(559);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

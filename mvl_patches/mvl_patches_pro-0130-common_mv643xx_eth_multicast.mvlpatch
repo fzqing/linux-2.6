@@ -1,0 +1,474 @@
+#! /usr/bin/env bash
+# Patch: -common_mv643xx_eth_multicast
+# Date: Wed Dec 28 14:58:51 2005
+# Source: MontaVista Software, Inc. (version of code was in humboldt)
+# MR: 14912
+# Type: Defect Fix
+# Disposition: will post to netdev list
+# Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+# Description:
+# Add multicast support.
+# 
+# A version of this code has been in alternative (GPL) mv643xx_enet drivers
+# for some time.
+# 
+# Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+# 
+
+PATCHNUM=130
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. (version of code was in humboldt)
+MR: 14912
+Type: Defect Fix
+Disposition: will post to netdev list
+Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+Description:
+Add multicast support.
+
+A version of this code has been in alternative (GPL) mv643xx_enet drivers
+for some time.
+
+Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -76,6 +76,7 @@
+ static int eth_port_link_is_up(unsigned int eth_port_num);
+ static void eth_port_uc_addr_get(struct net_device *dev,
+ 						unsigned char *MacAddr);
++static void eth_port_set_multicast_list(struct net_device *);
+ static int mv643xx_eth_real_open(struct net_device *);
+ static int mv643xx_eth_real_stop(struct net_device *);
+ static int mv643xx_eth_change_mtu(struct net_device *, int);
+@@ -266,6 +267,8 @@ static void mv643xx_eth_set_rx_mode(stru
+ 	else
+ 		config_reg &= ~(u32) MV643XX_ETH_UNICAST_PROMISCUOUS_MODE;
+ 	ethernet_set_config_reg(mp->port_num, config_reg);
++
++	eth_port_set_multicast_list(dev);
+ }
+ 
+ /*
+@@ -2054,6 +2057,197 @@ static int eth_port_uc_addr(unsigned int
+ 	return 1;
+ }
+ 
++static void eth_port_set_filter_table_entry(int table, unsigned char entry)
++{
++	unsigned int table_reg;
++	unsigned int tbl_offset;
++	unsigned int reg_offset;
++
++	tbl_offset = (entry / 4) * 4;	/* Register offset of DA table entry */
++	reg_offset = entry % 4;		/* Entry offset within the register */
++
++	/* Set "accepts frame bit" at specified table entry */
++	table_reg = mv_read(table + tbl_offset);
++	table_reg |= 0x01 << (8 * reg_offset);
++	mv_write(table + tbl_offset, table_reg);
++}
++
++/*******************************************************************************
++* eth_port_mc_addr - Multicast address settings.
++*
++* DESCRIPTION:
++*	This function controls the MV device MAC multicast support.
++*	The MV device supports multicast using two tables:
++*	1) Special Multicast Table for MAC addresses of the form
++*	   0x01-00-5E-00-00-XX (where XX is between 0x00 and 0x_FF).
++*	   The MAC DA[7:0] bits are used as a pointer to the Special Multicast
++*	   Table entries in the DA-Filter table.
++*	2) Other Multicast Table for multicast of another type. A CRC-8bit
++*	   is used as an index to the Other Multicast Table entries in the
++*	   DA-Filter table.  This function calculates the CRC-8bit value.
++*	In either case, eth_port_set_filter_table_entry() is then called
++*	to set to set the actual table entry.
++* INPUT:
++*	unsigned int 	eth_port_num	Port number.
++*	unsigned char 	*p_addr		Unicast MAC Address.
++*
++* OUTPUT:
++*	See description.
++*
++* RETURN:
++*	None.
++*
++*******************************************************************************/
++static void eth_port_mc_addr(unsigned int eth_port_num, unsigned char *p_addr)
++{
++	unsigned int mac_h;
++	unsigned int mac_l;
++	unsigned char crc_result = 0;
++	int table;
++	int mac_array[48];
++	int crc[8];
++	int i;
++
++	if ((p_addr[0] == 0x01) && (p_addr[1] == 0x00) &&
++	    (p_addr[2] == 0x5E) && (p_addr[3] == 0x00) && (p_addr[4] == 0x00)) {
++		table = MV643XX_ETH_DA_FILTER_SPECIAL_MULTICAST_TABLE_BASE
++					(eth_port_num);
++		eth_port_set_filter_table_entry(table, p_addr[5]);
++		return;
++	}
++
++	/* Calculate CRC-8 out of the given address */
++	mac_h = (p_addr[0] << 8) | (p_addr[1]);
++	mac_l = (p_addr[2] << 24) | (p_addr[3] << 16) |
++			(p_addr[4] << 8) | (p_addr[5] << 0);
++
++	for (i = 0; i < 32; i++)
++		mac_array[i] = (mac_l >> i) & 0x1;
++	for (i = 32; i < 48; i++)
++		mac_array[i] = (mac_h >> (i - 32)) & 0x1;
++
++	crc[0] = mac_array[45] ^ mac_array[43] ^ mac_array[40] ^ mac_array[39] ^
++		 mac_array[35] ^ mac_array[34] ^ mac_array[31] ^ mac_array[30] ^
++		 mac_array[28] ^ mac_array[23] ^ mac_array[21] ^ mac_array[19] ^
++		 mac_array[18] ^ mac_array[16] ^ mac_array[14] ^ mac_array[12] ^
++		 mac_array[8]  ^ mac_array[7]  ^ mac_array[6]  ^ mac_array[0];
++
++	crc[1] = mac_array[46] ^ mac_array[45] ^ mac_array[44] ^ mac_array[43] ^
++		 mac_array[41] ^ mac_array[39] ^ mac_array[36] ^ mac_array[34] ^
++		 mac_array[32] ^ mac_array[30] ^ mac_array[29] ^ mac_array[28] ^
++		 mac_array[24] ^ mac_array[23] ^ mac_array[22] ^ mac_array[21] ^
++		 mac_array[20] ^ mac_array[18] ^ mac_array[17] ^ mac_array[16] ^
++		 mac_array[15] ^ mac_array[14] ^ mac_array[13] ^ mac_array[12] ^
++		 mac_array[9]  ^ mac_array[6]  ^ mac_array[1]  ^ mac_array[0];
++
++	crc[2] = mac_array[47] ^ mac_array[46] ^ mac_array[44] ^ mac_array[43] ^
++		 mac_array[42] ^ mac_array[39] ^ mac_array[37] ^ mac_array[34] ^
++		 mac_array[33] ^ mac_array[29] ^ mac_array[28] ^ mac_array[25] ^
++		 mac_array[24] ^ mac_array[22] ^ mac_array[17] ^ mac_array[15] ^
++		 mac_array[13] ^ mac_array[12] ^ mac_array[10] ^ mac_array[8]  ^
++		 mac_array[6]  ^ mac_array[2]  ^ mac_array[1]  ^ mac_array[0];
++
++	crc[3] = mac_array[47] ^ mac_array[45] ^ mac_array[44] ^ mac_array[43] ^
++		 mac_array[40] ^ mac_array[38] ^ mac_array[35] ^ mac_array[34] ^
++		 mac_array[30] ^ mac_array[29] ^ mac_array[26] ^ mac_array[25] ^
++		 mac_array[23] ^ mac_array[18] ^ mac_array[16] ^ mac_array[14] ^
++		 mac_array[13] ^ mac_array[11] ^ mac_array[9]  ^ mac_array[7]  ^
++		 mac_array[3]  ^ mac_array[2]  ^ mac_array[1];
++
++	crc[4] = mac_array[46] ^ mac_array[45] ^ mac_array[44] ^ mac_array[41] ^
++		 mac_array[39] ^ mac_array[36] ^ mac_array[35] ^ mac_array[31] ^
++		 mac_array[30] ^ mac_array[27] ^ mac_array[26] ^ mac_array[24] ^
++		 mac_array[19] ^ mac_array[17] ^ mac_array[15] ^ mac_array[14] ^
++		 mac_array[12] ^ mac_array[10] ^ mac_array[8]  ^ mac_array[4]  ^
++		 mac_array[3]  ^ mac_array[2];
++
++	crc[5] = mac_array[47] ^ mac_array[46] ^ mac_array[45] ^ mac_array[42] ^
++		 mac_array[40] ^ mac_array[37] ^ mac_array[36] ^ mac_array[32] ^
++		 mac_array[31] ^ mac_array[28] ^ mac_array[27] ^ mac_array[25] ^
++		 mac_array[20] ^ mac_array[18] ^ mac_array[16] ^ mac_array[15] ^
++		 mac_array[13] ^ mac_array[11] ^ mac_array[9]  ^ mac_array[5]  ^
++		 mac_array[4]  ^ mac_array[3];
++
++	crc[6] = mac_array[47] ^ mac_array[46] ^ mac_array[43] ^ mac_array[41] ^
++		 mac_array[38] ^ mac_array[37] ^ mac_array[33] ^ mac_array[32] ^
++		 mac_array[29] ^ mac_array[28] ^ mac_array[26] ^ mac_array[21] ^
++		 mac_array[19] ^ mac_array[17] ^ mac_array[16] ^ mac_array[14] ^
++		 mac_array[12] ^ mac_array[10] ^ mac_array[6]  ^ mac_array[5]  ^
++		 mac_array[4];
++
++	crc[7] = mac_array[47] ^ mac_array[44] ^ mac_array[42] ^ mac_array[39] ^
++		 mac_array[38] ^ mac_array[34] ^ mac_array[33] ^ mac_array[30] ^
++		 mac_array[29] ^ mac_array[27] ^ mac_array[22] ^ mac_array[20] ^
++		 mac_array[18] ^ mac_array[17] ^ mac_array[15] ^ mac_array[13] ^
++		 mac_array[11] ^ mac_array[7]  ^ mac_array[6]  ^ mac_array[5];
++
++	for (i = 0; i < 8; i++)
++		crc_result = crc_result | (crc[i] << i);
++
++	table = MV643XX_ETH_DA_FILTER_OTHER_MULTICAST_TABLE_BASE(eth_port_num);
++	eth_port_set_filter_table_entry(table, crc_result);
++}
++
++/** Set the entire multicast list base on dev->mc_list. **/
++static void eth_port_set_multicast_list(struct net_device *dev)
++{
++
++	struct dev_mc_list	*mc_list;
++	int			i;
++	int			table_index;
++	struct mv643xx_private	*mp = netdev_priv(dev);
++	unsigned int		eth_port_num = mp->port_num;
++
++	/** If the device is in promiscuous mode or in all multicast mode,
++	 ** we will fully populate both multicast tables with accept.
++	 ** This is guaranteed to yield a match on all multicast addresses...
++	 **/
++	if ((dev->flags & IFF_PROMISC) || (dev->flags & IFF_ALLMULTI)) {
++		for (table_index = 0; table_index <= 0xFC; table_index += 4) {
++			 /** Set all entries in DA filter special multicast
++			  ** table (Ex_dFSMT)
++			  ** Set for ETH_Q0 for now
++			  ** Bits
++			  ** 0	  Accept=1, Drop=0
++			  ** 3-1  Queue	 ETH_Q0=0
++			  ** 7-4  Reserved = 0;
++			  **/
++			 mv_write(MV643XX_ETH_DA_FILTER_SPECIAL_MULTICAST_TABLE_BASE(eth_port_num) + table_index, 0x01010101);
++
++			 /** Set all entries in DA filter other multicast
++			  ** table (Ex_dFOMT)
++			  ** Set for ETH_Q0 for now
++			  ** Bits
++			  ** 0	  Accept=1, Drop=0
++			  ** 3-1  Queue	 ETH_Q0=0
++			  ** 7-4  Reserved = 0;
++			  **/
++			 mv_write(MV643XX_ETH_DA_FILTER_OTHER_MULTICAST_TABLE_BASE(eth_port_num) + table_index, 0x01010101);
++       	}
++		return;
++	}
++
++	/** We will clear out multicast tables everytime we get the list.
++	 ** Then add the entire new list...
++	 **/
++	for (table_index = 0; table_index <= 0xFC; table_index += 4) {
++		/* Clear DA filter special multicast table (Ex_dFSMT) */
++		mv_write(MV643XX_ETH_DA_FILTER_SPECIAL_MULTICAST_TABLE_BASE
++				(eth_port_num) + table_index, 0);
++
++		/* Clear DA filter other multicast table (Ex_dFOMT) */
++		mv_write(MV643XX_ETH_DA_FILTER_OTHER_MULTICAST_TABLE_BASE
++				(eth_port_num) + table_index, 0);
++	}
++
++	/** Get pointer to net_device multicast list and add each one... **/
++	for(i = 0, mc_list = dev->mc_list;
++			(i < 256) && (mc_list != NULL) && (i < dev->mc_count);
++			i++, mc_list = mc_list->next)
++		if (mc_list->dmi_addrlen == 6)
++			eth_port_mc_addr(eth_port_num, mc_list->dmi_addr);
++}
++
+ /*
+  * eth_port_init_mac_tables - Clear all entrance in the UC, SMC and OMC tables
+  *
+@@ -2081,11 +2275,11 @@ static void eth_port_init_mac_tables(uns
+ 
+ 	for (table_index = 0; table_index <= 0xFC; table_index += 4) {
+ 		/* Clear DA filter special multicast table (Ex_dFSMT) */
+-		mv_write((MV643XX_ETH_DA_FILTER_SPECIAL_MULTICAST_TABLE_BASE
+-					(eth_port_num) + table_index), 0);
++		mv_write(MV643XX_ETH_DA_FILTER_SPECIAL_MULTICAST_TABLE_BASE
++					(eth_port_num) + table_index, 0);
+ 		/* Clear DA filter other multicast table (Ex_dFOMT) */
+-		mv_write((MV643XX_ETH_DA_FILTER_OTHER_MULTICAST_TABLE_BASE
+-					(eth_port_num) + table_index), 0);
++		mv_write(MV643XX_ETH_DA_FILTER_OTHER_MULTICAST_TABLE_BASE
++					(eth_port_num) + table_index, 0);
+ 	}
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-0130.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0130.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(130);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

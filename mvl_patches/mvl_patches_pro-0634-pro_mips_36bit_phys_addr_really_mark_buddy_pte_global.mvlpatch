@@ -1,0 +1,445 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_36bit_phys_addr_really_mark_buddy_pte_global
+# Date: Tue Jun 20 13:37:06 2006
+# Source: MontaVista Software, Inc.
+# MR: 15450
+# Type: Defect Fix
+# Disposition: accepted into 2.6.17-rc6
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+# Description:
+# 
+# [MIPS] Fix marking buddy of pte global for MIPS32 w/36-bit physical address
+# 
+# In case of CONFIG_64BIT_PHYS_ADDR, set_pte() and pte_clear() functions
+# only set _PAGE_GLOBAL bit in the pte_low field of the buddy PTEs,
+# forgetting to propagate ito to pte_high. Thus, the both pages might not
+# really be made global for the CPU (since it AND's the G-bit of the
+# odd / even PTEs together to decide whether they're global or not). Thus,
+# if only a single page is allocated via vmalloc() or ioremap(), it's not
+# really global for CPU (and it must be, since this is kernel mapping),
+# and thus its ASID is compared against the current process' one -- so,
+# we'll get into trouble sooner or later...  Also, pte_none() will fail
+# on global pages because _PAGE_GLOBAL bit is set in both pte_low and
+# pte_high, and pte_val() will return u64 value consisting of those fields
+# concatenated.
+# 
+# commit 6e9538917c5f62c1a1598da9b898702800801b98
+# tree 03ee3776796394870e60f74773f6b23b090dad83
+# parent 343fdc39713d9c2fe836523e8f2dfc6a3ac39122
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sun, 16 Apr 2006 23:27:21 +0400
+# committer Ralf Baechle <ralf@linux-mips.org> Thu, 01 Jun 2006 00:28:30 +0100
+# 
+#  include/asm-mips/pgtable.h |   88 +++++++++++++++++++++++++--------------------
+#  1 files changed, 49 insertions(+), 39 deletions(-)
+# 
+
+PATCHNUM=634
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15450
+Type: Defect Fix
+Disposition: accepted into 2.6.17-rc6
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+Description:
+
+[MIPS] Fix marking buddy of pte global for MIPS32 w/36-bit physical address
+
+In case of CONFIG_64BIT_PHYS_ADDR, set_pte() and pte_clear() functions
+only set _PAGE_GLOBAL bit in the pte_low field of the buddy PTEs,
+forgetting to propagate ito to pte_high. Thus, the both pages might not
+really be made global for the CPU (since it AND's the G-bit of the
+odd / even PTEs together to decide whether they're global or not). Thus,
+if only a single page is allocated via vmalloc() or ioremap(), it's not
+really global for CPU (and it must be, since this is kernel mapping),
+and thus its ASID is compared against the current process' one -- so,
+we'll get into trouble sooner or later...  Also, pte_none() will fail
+on global pages because _PAGE_GLOBAL bit is set in both pte_low and
+pte_high, and pte_val() will return u64 value consisting of those fields
+concatenated.
+
+commit 6e9538917c5f62c1a1598da9b898702800801b98
+tree 03ee3776796394870e60f74773f6b23b090dad83
+parent 343fdc39713d9c2fe836523e8f2dfc6a3ac39122
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sun, 16 Apr 2006 23:27:21 +0400
+committer Ralf Baechle <ralf@linux-mips.org> Thu, 01 Jun 2006 00:28:30 +0100
+
+ include/asm-mips/pgtable.h |   88 +++++++++++++++++++++++++--------------------
+ mvl_patches/pro-0634.c     |   16 ++++++++
+ 2 files changed, 65 insertions(+), 39 deletions(-)
+
+Index: linux-2.6.10/include/asm-mips/pgtable.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/pgtable.h
++++ linux-2.6.10/include/asm-mips/pgtable.h
+@@ -77,10 +77,11 @@ extern void paging_init(void);
+ #define pmd_page(pmd)		(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
+ #define pmd_page_kernel(pmd)	pmd_val(pmd)
+ 
+-#define pte_none(pte)		(!(pte_val(pte) & ~_PAGE_GLOBAL))
+-#define pte_present(pte)	(pte_val(pte) & _PAGE_PRESENT)
+-
+ #if defined(CONFIG_64BIT_PHYS_ADDR) && defined(CONFIG_CPU_MIPS32)
++
++#define pte_none(pte)		(!(((pte).pte_low | (pte).pte_high) & ~_PAGE_GLOBAL))
++#define pte_present(pte)	((pte).pte_low & _PAGE_PRESENT)
++
+ static inline void set_pte(pte_t *ptep, pte_t pte)
+ {
+ 	ptep->pte_high = pte.pte_high;
+@@ -88,26 +89,34 @@ static inline void set_pte(pte_t *ptep, 
+ 	ptep->pte_low = pte.pte_low;
+ 	//printk("pte_high %x pte_low %x\n", ptep->pte_high, ptep->pte_low);
+ 
+-	if (pte_val(pte) & _PAGE_GLOBAL) {
++	if (pte.pte_low & _PAGE_GLOBAL) {
+ 		pte_t *buddy = ptep_buddy(ptep);
+ 		/*
+ 		 * Make sure the buddy is global too (if it's !none,
+ 		 * it better already be global)
+ 		 */
+-		if (pte_none(*buddy))
+-			buddy->pte_low |= _PAGE_GLOBAL;
++		if (pte_none(*buddy)) {
++			buddy->pte_low  |= _PAGE_GLOBAL;
++			buddy->pte_high |= _PAGE_GLOBAL;
++		}
+ 	}
+ }
+ 
+ static inline void pte_clear(pte_t *ptep)
+ {
++	pte_t null = __pte(0);
++
+ 	/* Preserve global status for the pair */
+-	if (pte_val(*ptep_buddy(ptep)) & _PAGE_GLOBAL)
+-		set_pte(ptep, __pte(_PAGE_GLOBAL));
+-	else
+-		set_pte(ptep, __pte(0));
++	if (ptep_buddy(ptep)->pte_low & _PAGE_GLOBAL)
++		null.pte_low = null.pte_high = _PAGE_GLOBAL;
++
++	set_pte(ptep, null);
+ }
+ #else
++
++#define pte_none(pte)		(!(pte_val(pte) & ~_PAGE_GLOBAL))
++#define pte_present(pte)	(pte_val(pte) & _PAGE_PRESENT)
++
+ /*
+  * Certain architectures need to do special things when pte's
+  * within a page table are directly modified.  Thus, the following
+@@ -160,75 +169,76 @@ extern pgd_t swapper_pg_dir[PTRS_PER_PGD
+  */
+ static inline int pte_user(pte_t pte)	{ BUG(); return 0; }
+ #if defined(CONFIG_64BIT_PHYS_ADDR) && defined(CONFIG_CPU_MIPS32)
+-static inline int pte_read(pte_t pte)	{ return (pte).pte_low & _PAGE_READ; }
+-static inline int pte_write(pte_t pte)	{ return (pte).pte_low & _PAGE_WRITE; }
+-static inline int pte_dirty(pte_t pte)	{ return (pte).pte_low & _PAGE_MODIFIED; }
+-static inline int pte_young(pte_t pte)	{ return (pte).pte_low & _PAGE_ACCESSED; }
+-static inline int pte_file(pte_t pte)	{ return (pte).pte_low & _PAGE_FILE; }
++static inline int pte_read(pte_t pte)	{ return pte.pte_low & _PAGE_READ; }
++static inline int pte_write(pte_t pte)	{ return pte.pte_low & _PAGE_WRITE; }
++static inline int pte_dirty(pte_t pte)	{ return pte.pte_low & _PAGE_MODIFIED; }
++static inline int pte_young(pte_t pte)	{ return pte.pte_low & _PAGE_ACCESSED; }
++static inline int pte_file(pte_t pte)	{ return pte.pte_low & _PAGE_FILE; }
++
+ static inline pte_t pte_wrprotect(pte_t pte)
+ {
+-	(pte).pte_low &= ~(_PAGE_WRITE | _PAGE_SILENT_WRITE);
+-	(pte).pte_high &= ~_PAGE_SILENT_WRITE;
++	pte.pte_low  &= ~(_PAGE_WRITE | _PAGE_SILENT_WRITE);
++	pte.pte_high &= ~_PAGE_SILENT_WRITE;
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_rdprotect(pte_t pte)
+ {
+-	(pte).pte_low &= ~(_PAGE_READ | _PAGE_SILENT_READ);
+-	(pte).pte_high &= ~_PAGE_SILENT_READ;
++	pte.pte_low  &= ~(_PAGE_READ | _PAGE_SILENT_READ);
++	pte.pte_high &= ~_PAGE_SILENT_READ;
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_mkclean(pte_t pte)
+ {
+-	(pte).pte_low &= ~(_PAGE_MODIFIED|_PAGE_SILENT_WRITE);
+-	(pte).pte_high &= ~_PAGE_SILENT_WRITE;
++	pte.pte_low  &= ~(_PAGE_MODIFIED | _PAGE_SILENT_WRITE);
++	pte.pte_high &= ~_PAGE_SILENT_WRITE;
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_mkold(pte_t pte)
+ {
+-	(pte).pte_low &= ~(_PAGE_ACCESSED|_PAGE_SILENT_READ);
+-	(pte).pte_high &= ~_PAGE_SILENT_READ;
++	pte.pte_low  &= ~(_PAGE_ACCESSED | _PAGE_SILENT_READ);
++	pte.pte_high &= ~_PAGE_SILENT_READ;
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_mkwrite(pte_t pte)
+ {
+-	(pte).pte_low |= _PAGE_WRITE;
+-	if ((pte).pte_low & _PAGE_MODIFIED) {
+-		(pte).pte_low |= _PAGE_SILENT_WRITE;
+-		(pte).pte_high |= _PAGE_SILENT_WRITE;
++	pte.pte_low |= _PAGE_WRITE;
++	if (pte.pte_low & _PAGE_MODIFIED) {
++		pte.pte_low  |= _PAGE_SILENT_WRITE;
++		pte.pte_high |= _PAGE_SILENT_WRITE;
+ 	}
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_mkread(pte_t pte)
+ {
+-	(pte).pte_low |= _PAGE_READ;
+-	if ((pte).pte_low & _PAGE_ACCESSED) {
+-		(pte).pte_low |= _PAGE_SILENT_READ;
+-		(pte).pte_high |= _PAGE_SILENT_READ;
++	pte.pte_low |= _PAGE_READ;
++	if (pte.pte_low & _PAGE_ACCESSED) {
++		pte.pte_low  |= _PAGE_SILENT_READ;
++		pte.pte_high |= _PAGE_SILENT_READ;
+ 	}
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_mkdirty(pte_t pte)
+ {
+-	(pte).pte_low |= _PAGE_MODIFIED;
+-	if ((pte).pte_low & _PAGE_WRITE) {
+-		(pte).pte_low |= _PAGE_SILENT_WRITE;
+-		(pte).pte_high |= _PAGE_SILENT_WRITE;
++	pte.pte_low |= _PAGE_MODIFIED;
++	if (pte.pte_low & _PAGE_WRITE) {
++		pte.pte_low  |= _PAGE_SILENT_WRITE;
++		pte.pte_high |= _PAGE_SILENT_WRITE;
+ 	}
+ 	return pte;
+ }
+ 
+ static inline pte_t pte_mkyoung(pte_t pte)
+ {
+-	(pte).pte_low |= _PAGE_ACCESSED;
+-	if ((pte).pte_low & _PAGE_READ)
+-		(pte).pte_low |= _PAGE_SILENT_READ;
+-		(pte).pte_high |= _PAGE_SILENT_READ;
++	pte.pte_low |= _PAGE_ACCESSED;
++	if (pte.pte_low & _PAGE_READ)
++		pte.pte_low  |= _PAGE_SILENT_READ;
++		pte.pte_high |= _PAGE_SILENT_READ;
+ 	return pte;
+ }
+ #else
+Index: linux-2.6.10/mvl_patches/pro-0634.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0634.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(634);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,567 @@
+#! /usr/bin/env bash
+# Patch: -pro_mphysmap_updates
+# Date: Wed Aug 16 10:50:36 2006
+# Source: MontaVista Software, Inc.
+# MR: 19269
+# Type: Integration
+# Disposition: backported from "cvs -d :ext:anoncvs@cvs.infradead.org:/home/cvs co -D 20060724 mtd/drivers/mtd/maps"
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+#     The current mphysmap driver in pro4.0 is broken.
+#     So merge to gleixner's updates.
+# 
+
+PATCHNUM=868
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 19269
+Type: Integration
+Disposition: backported from "cvs -d :ext:anoncvs@cvs.infradead.org:/home/cvs co -D 20060724 mtd/drivers/mtd/maps"
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+    The current mphysmap driver in pro4.0 is broken.
+    So merge to gleixner's updates.
+
+Index: linux-2.6.10/drivers/mtd/maps/mphysmap.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/mphysmap.c
++++ linux-2.6.10/drivers/mtd/maps/mphysmap.c
+@@ -1,5 +1,5 @@
+ /*
+- * $Id$
++ * $Id: mphysmap.c,v 1.4 2005/11/07 11:14:27 gleixner Exp $
+  *
+  * Several mappings of NOR chips
+  *
+@@ -9,10 +9,11 @@
+ #include <linux/module.h>
+ #include <linux/mtd/map.h>
+ #include <linux/mtd/mtd.h>
++#ifdef CONFIG_MTD_PARTITIONS
++#include <linux/mtd/partitions.h>
++#endif
+ 
+-
+-#define NO_DEVICES 8
+-struct map_info maps[NO_DEVICES] = {
++static struct map_info mphysmap_static_maps[] = {
+ #if CONFIG_MTD_MULTI_PHYSMAP_1_WIDTH
+ 	{
+ 		.name		= CONFIG_MTD_MULTI_PHYSMAP_1_NAME,
+@@ -45,24 +46,39 @@ struct map_info maps[NO_DEVICES] = {
+ 		.bankwidth	= CONFIG_MTD_MULTI_PHYSMAP_4_WIDTH,
+ 	},
+ #endif
+-	{
+-		.name = NULL,
+-	},
+ };
++
+ DECLARE_MUTEX(map_mutex);
+ 
+ 
+-static int map_one(struct map_info *map)
++static int mphysmap_map_device(struct map_info *map)
+ {
+-	struct mtd_info *mtd;
+-
++	static const char *rom_probe_types[] = { "cfi_probe", "jedec_probe", "map_rom", NULL };
++	const char **type;
++	struct mtd_info* mtd;
++#ifdef CONFIG_MTD_PARTITIONS
++       struct mtd_partition* mtd_parts;
++       int mtd_parts_nb;
++       static const char *part_probes[] __initdata = {
++#ifdef CONFIG_MTD_CMDLINE_PARTS
++       "cmdlinepart",
++#endif
++#ifdef CONFIG_MTD_REDBOOT_PARTS
++       "RedBoot",
++#endif
++       NULL};
++#endif
+ 	map->virt = ioremap(map->phys, map->size);
+ 	if (!map->virt)
+ 		return -EIO;
+ 
+ 	simple_map_init(map);
++	mtd = NULL;
++	type = rom_probe_types;
++	for(; !mtd && *type; type++) {
++		mtd = do_map_probe(*type, map);
++	}
+ 
+-	mtd = do_map_probe("cfi_probe", map);
+ 	if (!mtd) {
+ 		iounmap(map->virt);
+ 		return -ENXIO;
+@@ -70,25 +86,48 @@ static int map_one(struct map_info *map)
+ 
+ 	map->map_priv_1 = (unsigned long)mtd;
+ 	mtd->owner = THIS_MODULE;
+-	/* TODO: partitioning */
+-	return add_mtd_device(mtd);
++
++#ifdef CONFIG_MTD_PARTITIONS
++	mtd_parts_nb = parse_mtd_partitions(mtd, part_probes,
++					    &mtd_parts, 0);
++	if (mtd_parts_nb > 0)
++	{
++		add_mtd_partitions (mtd, mtd_parts, mtd_parts_nb);
++		map->map_priv_2=(unsigned long)mtd_parts;
++	}
++	else
++	{
++		add_mtd_device(mtd);
++		map->map_priv_2=(unsigned long)NULL;
++        };
++#else
++	add_mtd_device(mtd);
++#endif
++	return 0;
+ }
+ 
+ 
+-static void unmap_one(struct map_info *map)
++static void mphysmap_unmap_device(struct map_info *map)
+ {
+-	struct mtd_info *mtd = (struct mtd_info*)map->map_priv_1;
+-
+-	if (map->map_priv_2)
+-		kfree(map->name);
+-
++	struct mtd_info* mtd = (struct mtd_info*)map->map_priv_1;
++#ifdef CONFIG_MTD_PARTITIONS
++       struct mtd_partition* mtd_parts=(struct mtd_partition*)map->map_priv_2;
++#endif
++	BUG_ON(!mtd);
+ 	if (!map->virt)
+ 		return;
+ 
+-	BUG_ON(!mtd);
+-	BUG_ON(map->map_priv_2 > 1);
+-
++#ifdef CONFIG_MTD_PARTITIONS
++	if (mtd_parts)
++	{
++		del_mtd_partitions(mtd);
++		kfree(mtd_parts);
++	}
++	else
++	    del_mtd_device(mtd);
++#else
+ 	del_mtd_device(mtd);
++#endif
+ 	map_destroy(mtd);
+ 	iounmap(map->virt);
+ 
+@@ -98,165 +137,23 @@ static void unmap_one(struct map_info *m
+ }
+ 
+ 
+-static struct map_info *next_free_map(void)
+-{
+-	int i;
+-	for (i=0; i<NO_DEVICES; i++) {
+-		struct map_info *map = &maps[i];
+-		if (!map->virt)
+-			return map;
+-	}
+-	return NULL;
+-}
+-
+-
+-static int add_one_map(const char *name, unsigned long start,
+-		unsigned long len, int width)
+-{
+-	struct map_info *map = next_free_map();
+-	if (!map)
+-		return -ENOSPC;
+-	
+-	map->name = kmalloc(strlen(name)+1, GFP_KERNEL);
+-	if (!name)
+-		return -ENOMEM;
+-
+-	strcpy(map->name, name);
+-	map->phys = start;
+-	map->size = len;
+-	map->bankwidth = width;
+-	map->map_priv_2 = 1; /* marker to free map->name */
+-
+-	return map_one(map);
+-}
+-
+-
+-static int parse_ulong(unsigned long *num, const char *token)
+-{
+-	char *endp;
+-	unsigned long n;
+-
+-	n = ustrtoul(token, &endp, 0);
+-	if (*endp)
+-		return -EINVAL;
+-
+-	*num = n;
+-	return 0;
+-}
+-
+-
+-static int parse_uint(unsigned int *num, const char *token)
+-{
+-	char *endp;
+-	unsigned long n;
+-
+-	n = ustrtoul(token, &endp, 0);
+-	if (*endp)
+-		return -EINVAL;
+-	if ((int)n != n)
+-		return -EINVAL;
+-
+-	*num = n;
+-	return 0;
+-}
+-
+-
+-static int parse_name(char **pname, const char *token, int limit)
+-{
+-	size_t len;
+-	char *name;
+-
+-	len = strlen(token) + 1;
+-	if (len > limit)
+-		return -ENOSPC;
+-
+-	name = kmalloc(len, GFP_KERNEL);
+-	if (!name)
+-		return -ENOMEM;
+-
+-	memcpy(name, token, len);
+-
+-	*pname = name;
+-	return 0;
+-}
+-
+-
+-static inline void kill_final_newline(char *str)
+-{
+-	char *newline = strrchr(str, '\n');
+-	if (newline && !newline[1])
+-		*newline = 0;
+-}
+-
+-
+-#define parse_err(fmt, args...) do {	\
+-	printk(KERN_ERR fmt "\n", ## args);	\
+-	return 0;			\
+-} while(0)
+-
+-/* mphysmap=name,start,len,width */
+-static int mphysmap_setup(const char *val, struct kernel_param *kp)
+-{
+-	char buf[64+14+14+14], *str = buf;
+-	char *token[4];
+-	char *name;
+-	unsigned long start;
+-	unsigned long len;
+-	unsigned int width;
+-	int i, ret;
+-
+-	if (strnlen(val, sizeof(buf)) >= sizeof(buf))
+-		parse_err("parameter too long");
+-
+-	strcpy(str, val);
+-	kill_final_newline(str);
+-
+-	for (i=0; i<4; i++)
+-		token[i] = strsep(&str, ",");
+-
+-	if (str)
+-		parse_err("too many arguments");
+-	if (!token[3])
+-		parse_err("not enough arguments");
+-
+-	ret = parse_name(&name, token[0], 64);
+-	if (ret == -ENOMEM)
+-		parse_err("out of memory");
+-	if (ret == -ENOSPC)
+-		parse_err("name too long");
+-	if (ret)
+-		parse_err("illegal name: %d", ret);
+-
+-	ret = parse_ulong(&start, token[1]);
+-	if (ret)
+-		parse_err("illegal start address");
+-
+-	ret = parse_ulong(&len, token[2]);
+-	if (ret)
+-		parse_err("illegal length");
+-
+-	ret = parse_uint(&width, token[3]);
+-	if (ret)
+-		parse_err("illegal bus width");
+-
+-	down(&map_mutex);
+-	ret = add_one_map(name, start, len, width);
+-	up(&map_mutex);
+-	if (ret == -ENOSPC)
+-		parse_err("no free space for new map");
+-	if (ret)
+-		parse_err("error while mapping: %d", ret);
+-
+-	return 0;
+-}
+ 
+ 
+ static int __init mphysmap_init(void)
+ {
+ 	int i;
+ 	down(&map_mutex);
+-	for (i=0; i<NO_DEVICES; i++)
+-		map_one(&maps[i]);
++	for (i=0;
++	     i<sizeof(mphysmap_static_maps)/sizeof(mphysmap_static_maps[0]);
++	     i++)
++	{
++	        if (strcmp(mphysmap_static_maps[i].name,"")!=0 &&
++		    mphysmap_static_maps[i].size!=0 &&
++		    mphysmap_static_maps[i].bankwidth!=0)
++		{
++		    mphysmap_map_device(&mphysmap_static_maps[i]);
++		};
++	};
+ 	up(&map_mutex);
+ 	return 0;
+ }
+@@ -266,14 +163,21 @@ static void __exit mphysmap_exit(void)
+ {
+ 	int i;
+ 	down(&map_mutex);
+-	for (i=0; i<NO_DEVICES; i++)
+-		unmap_one(&maps[i]);
++	for (i=0;
++	     i<sizeof(mphysmap_static_maps)/sizeof(mphysmap_static_maps[0]);
++	     i++)
++	{
++	        if (strcmp(mphysmap_static_maps[i].name,"")!=0 &&
++		    mphysmap_static_maps[i].size!=0 &&
++		    mphysmap_static_maps[i].bankwidth!=0)
++		{
++		    mphysmap_unmap_device(&mphysmap_static_maps[i]);
++		};
++	};
+ 	up(&map_mutex);
+ }
+ 
+ 
+-__module_param_call("", mphysmap, mphysmap_setup, NULL, NULL, 0600);
+-
+ module_init(mphysmap_init);
+ module_exit(mphysmap_exit);
+ 
+Index: linux-2.6.10/mvl_patches/pro-0868.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0868.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(868);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

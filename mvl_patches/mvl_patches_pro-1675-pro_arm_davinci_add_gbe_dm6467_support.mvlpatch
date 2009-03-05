@@ -1,0 +1,4242 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_add_gbe_dm6467_support
+# Date: Mon Jan 21 23:05:54 2008
+# Source: MontaVista Software, Inc. and Texas Instruments Inc.
+# MR: 23536
+# Type: Enhancement
+# Disposition: local
+# Signed-off-by: Steve Chen <schen@mvista.com>
+# Description:
+# The updates to TI DaVinci EMAC drivers include
+#  1.  Enable TI EMAC to support DaVinci HD (DM6467).  This include a new
+#      ewrap register overlay structure and associated updates.
+#  2.  Add giga-bit Ethernet support as DM6467 EMAC has gbe cabilities.
+#  3.  Add ethtool interface.
+#  4.  Code clean up/update from TI.
+# 
+# The common file include
+# drivers/net/Kconfig
+#  * Please note that another instance of TI_DAVINCI_EMAC is created in 
+#  the Ethernet (1000 Mbit) area of the kernel config.  This is to inform 
+#  users that the EMAC supports 1000Mbps for DM6467.  The original 
+#  DaVinci is unchanged in the Ethernet (100 Mbit) section.
+# 
+# The DaVinci specific file include
+# drivers/net/davinci_emac.c
+# drivers/net/davinci_emac_phy.c
+# drivers/net/davinci_emac_phy.h
+# 
+# The patches (from DM355/DM6467 series) obsolete by this patch include
+# pro_arm_davinci_emac.patch
+# pro_arm_davinci_emac-common.patch
+# pro_arm_davinci_emac_gbe.patch
+# pro_arm_davinci_emac_ethtool_support.patch
+# pro_arm_davinci_gbe-fixup.patch
+# 
+
+PATCHNUM=1675
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. and Texas Instruments Inc.
+MR: 23536
+Type: Enhancement
+Disposition: local
+Signed-off-by: Steve Chen <schen@mvista.com>
+Description:
+The updates to TI DaVinci EMAC drivers include
+ 1.  Enable TI EMAC to support DaVinci HD (DM6467).  This include a new
+     ewrap register overlay structure and associated updates.
+ 2.  Add giga-bit Ethernet support as DM6467 EMAC has gbe cabilities.
+ 3.  Add ethtool interface.
+ 4.  Code clean up/update from TI.
+
+The common file include
+drivers/net/Kconfig
+ * Please note that another instance of TI_DAVINCI_EMAC is created in 
+ the Ethernet (1000 Mbit) area of the kernel config.  This is to inform 
+ users that the EMAC supports 1000Mbps for DM6467.  The original 
+ DaVinci is unchanged in the Ethernet (100 Mbit) section.
+
+The DaVinci specific file include
+drivers/net/davinci_emac.c
+drivers/net/davinci_emac_phy.c
+drivers/net/davinci_emac_phy.h
+
+The patches (from DM355/DM6467 series) obsolete by this patch include
+pro_arm_davinci_emac.patch
+pro_arm_davinci_emac-common.patch
+pro_arm_davinci_emac_gbe.patch
+pro_arm_davinci_emac_ethtool_support.patch
+pro_arm_davinci_gbe-fixup.patch
+
+Index: linux-2.6.10/drivers/net/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/Kconfig
++++ linux-2.6.10/drivers/net/Kconfig
+@@ -2260,6 +2260,15 @@ config CAVIUM_ETHERNET
+ 	depends on CPU_CAVIUM_OCTEON
+ 	help
+ 	  This enables support for Cavium Octeon Gigabit  Ethernet.
++
++config TI_DAVINCI_EMAC
++	tristate "TI DaVinci DM6467 EMAC Support"
++	depends on NETDEVICES && MACH_DAVINCI_HD_EVM
++	help
++	  This driver supports TI's DaVinci DM6467 Ethernet .
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called ti_davinci_emac.  This is recommended.
+ endmenu
+ 
+ #
+Index: linux-2.6.10/drivers/net/davinci_emac.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/davinci_emac.c
++++ linux-2.6.10/drivers/net/davinci_emac.c
+@@ -30,27 +30,22 @@
+                              EMAC_IOCTL_READ_PHY_REG in emac_control() -
+                              the phy_num and reg_addr args were swapped
+                              in call to emac_mdio_read().
++      5.0 Sriramakrishnan - Modified and added support for dm6467
+  */
+ 
+ /*
+     Driver Features:
+ 
+-    The following flags should be defined by the make file for support
++    The following flags should be defined either through  make file
++    or defined explcitily here for support
+     of the features:
+-
+-    (1) EMAC_CACHE_WRITEBACK_MODE to support write back cache mode.
+-
+-    (2) EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY - to support of multiple
++    (1) EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY - to support of multiple
+         Tx complete notifications. If this is defined the Tx complete
+         DDA callback function contains multiple packet Tx complete
+         events.  Note: BY DEFAULT THIS DRIVER HANDLES MULTIPLE TX
+         COMPLETE VIA ITS CALLBACK IN THE SAME FUNCTION FOR SINGLE
+         PACKET COMPLETE NOTIFY.
+ 
+-
+-    (3) CONFIG_EMAC_INIT_BUF_MALLOC - Not required for DaVinci driver
+-        - feature was added for another TI platform
+-
+  */
+ #include <linux/config.h>
+ #include <linux/module.h>
+@@ -75,6 +70,7 @@
+ #include <linux/version.h>
+ #include <linux/spinlock.h>
+ #include <linux/dma-mapping.h>
++#include <linux/compiler.h>
+ #include <asm/irq.h>
+ #include <asm/bitops.h>
+ #include <asm/io.h>
+@@ -83,6 +79,7 @@
+ #include <asm/hardware/clock.h>
+ #include <asm/page.h>
+ #include <asm/arch/memory.h>
++#include <asm/arch/cpu.h>
+ #include <asm/arch/hardware.h>
+ 
+ #include "davinci_emac_phy.h"
+@@ -96,7 +93,7 @@ MODULE_DESCRIPTION("DaVinci Ethernet dri
+ 
+ static int cfg_link_speed = 0;
+ MODULE_PARM(cfg_link_speed, "i");
+-MODULE_PARM_DESC(cfg_link_speed, "Fixed speed of the Link: <100/10>");
++MODULE_PARM_DESC(cfg_link_speed, "Fixed speed of the Link: <1000/100/10>");
+ 
+ static char *cfg_link_mode = "auto";
+ MODULE_PARM(cfg_link_mode, "1-3s");
+@@ -107,16 +104,14 @@ MODULE_PARM(debug_mode, "i");
+ MODULE_PARM_DESC(debug_mode, "Turn on debug info: <0/1>. Default is 0 (off)");
+ 
+ /* version info */
+-#define EMAC_MAJOR_VERSION         4
+-#define EMAC_MINOR_VERSION         0
+-#define EMAC_MODULE_VERSION "4.0"
++#define EMAC_MAJOR_VERSION      5
++#define EMAC_MINOR_VERSION      0
++#define EMAC_MODULE_VERSION 	"5.0"
+ MODULE_VERSION(EMAC_MODULE_VERSION);
+-const char emac_version_string[] = "TI DaVinci EMAC Linux version updated 4.0";
++const char emac_version_string[] = "TI DaVinci EMAC Linux version updated 5.0";
+ 
+ /* Debug options */
+ #define EMAC_DEBUG
+-#define EMAC_CACHE_WRITEBACK_MODE
+-#define EMAC_CACHE_INVALIDATE_FIX
+ 
+ /* ---------------------------------------------------------------
+  * types
+@@ -130,22 +125,39 @@ typedef void *emac_net_data_token;
+ /* ---------------------------------------------------------------
+  * defines
+  * --------------------------------------------------------------- */
+-#define EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY
+ 
+-/* NO PHY used in case of external ethernet switches */
++/* NO PHY : Choose this option if the MAC is directly connected over
++   (G)MII interface to external ethernet switch */
++
++/* Pick 9999 so the value can differ from other possible speed values -
++   0, 10000000, 100000000, or 1000000000 */
+ #define CONFIG_EMAC_NOPHY              9999
+ 
+ /* DaVinci specific configuration */
++/* Base address is the same across different versions of Davinci */
+ #define EMAC_BASE_ADDR         IO_ADDRESS(DAVINCI_EMAC_CNTRL_REGS_BASE)
+ #define EMAC_WRAPPER_REGS_ADDR IO_ADDRESS(DAVINCI_EMAC_WRAPPER_CNTRL_REGS_BASE)
+ #define EMAC_WRAPPER_RAM_ADDR  IO_ADDRESS(DAVINCI_EMAC_WRAPPER_RAM_BASE)
+ #define EMAC_WRAPPER_RAM_SIZE  (8 << 10)
+ #define EMAC_MDIO_BASE_ADDR    IO_ADDRESS(DAVINCI_MDIO_CNTRL_REGS_BASE)
+ 
+-#define EMAC_INTERRUPT         13
+-#define EMAC_BUS_FREQUENCY     76500000	/* PLL/6 i.e 76.5 MHz */
+-#define EMAC_MDIO_FREQUENCY    2200000	/* PHY bus frequency */
+-#define EMAC_PHY_MASK          0x2	/* PHY chip is located at address 1 */
++/* following section contains definitions that vary from
++ * one version of davinci to another  */
++
++/* DM646X defines */
++#define EMAC_DM646X_INTERRUPT         24
++#define EMAC_DM646X_NUM_INTERRUPTS    4
++/* NOTE:: on DavinciHD emac freqency is PLL0/4 = ARM Freq/2, update */
++#define EMAC_DM646X_BUS_FREQUENCY     148500000	/* PLL/4 i.e 148.5 MHz */
++#define EMAC_DM646X_MDIO_FREQUENCY    2200000	/* PHY bus frequency */
++#define EMAC_DM646X_PHY_MASK          0x3	/* PHY chip is at address 1 */
++
++/* DM644X defines */
++#define EMAC_DM644X_INTERRUPT		13
++#define EMAC_DM644X_NUM_INTERRUPTS	1
++#define EMAC_DM644X_BUS_FREQUENCY	76500000	/* PLL/6 i.e 76.5 MHz */
++#define EMAC_DM644X_MDIO_FREQUENCY    2200000	/* PHY bus frequency */
++#define EMAC_DM644X_PHY_MASK          0x3	/* PHY chip is at address 1 */
+ 
+ /* Note: For DaVinci, Buffer Descriptors are located in Wrapper RAM
+  * (4K).  Half of the Wrapper memory is for RX BD's and other half for
+@@ -156,23 +168,23 @@ typedef void *emac_net_data_token;
+ 
+ /* feature macros here */
+ 
+-/* If multi packet Tx complete notifications is enabled (via
+-   EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY), Max number of Tx packets that
+-   can be notified - the actual number will depend upon user
+-   configuration for parameter "maxPktsToProcess" */
++/* EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY - If this is defined the Tx complete
++   callback function contains multiple packet Tx complete events.
++   Note: BY DEFAULT THIS DRIVER HANDLES MULTIPLE TX COMPLETE VIA
++   ITS CALLBACK IN THE SAME FUNCTION FOR SINGLE PACKET COMPLETE NOTIFY.
++   Max Number of Tx Packets that can be notified depends on config
++   parameter EMAC_MAX_TX_COMPLETE_PKTS_TO_NOTIFY*/
++#define EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY
+ #define EMAC_MAX_TX_COMPLETE_PKTS_TO_NOTIFY    8
+ 
+-
+ /* config macros */
+ #define EMAC_MAX_INSTANCES                     1
+-#define EMAC_MIN_ETHERNET_PKT_SIZE             60
+ 
+-/* max RX fragments calculation - 1500 byte packet and 64 byte
+-   buffer. fragments=1500/64=24 */
+-#define EMAC_MAX_RX_FRAGMENTS                  24
+-
+-/* theoratically TX max fragments are equal to 24 */
+-#define EMAC_MAX_TX_FRAGMENTS                  8
++/* On the transmit path the MAC is configured to generate the checksum in
++   H/W. Hence to honor the minimum frame size, the S/W pads up data frames
++   less than 64-4=60 bytes. This define is used in checking for frame size
++   on transmit path and hence is set to 60 */
++#define EMAC_MIN_ETHERNET_PKT_SIZE             60
+ 
+ /* EMAC hardware specific */
+ #define EMAC_RESET_CLOCKS_WAIT                 64
+@@ -294,6 +306,7 @@ typedef void *emac_net_data_token;
+ #define EMAC_RXMBP_CHMASK                      0x7
+ 
+ /* mac control register bit fields */
++#define EMAC_MACCONTROL_GIG_FORCE_SHIFT        17
+ #define EMAC_MACCONTROL_TXSHORTGAPEN_SHIFT     10
+ #define EMAC_MACCONTROL_TXSHORTGAPEN_MASK      (0x1 << 10)
+ #define EMAC_MACCONTROL_TXPTYPE_SHIFT          9
+@@ -332,10 +345,39 @@ typedef void *emac_net_data_token;
+ #define EMAC_RX_BUFFER_OFFSET_MASK             0xFFFF
+ 
+ /* MAC_IN_VECTOR (0x180) register bit fields */
+-#define EMAC_MAC_IN_VECTOR_HOST_INT            (0x20000)
+-#define EMAC_MAC_IN_VECTOR_STATPEND_INT        (0x10000)
+-#define EMAC_MAC_IN_VECTOR_RX_INT_VEC          (0xFF00)
+-#define EMAC_MAC_IN_VECTOR_TX_INT_VEC          (0xFF)
++
++#define EMAC_DM644X_MAC_IN_VECTOR_HOST_INT            (0x20000)
++#define EMAC_DM644X_MAC_IN_VECTOR_STATPEND_INT        (0x10000)
++#define EMAC_DM644X_MAC_IN_VECTOR_RX_INT_VEC          (0xFF00)
++#define EMAC_DM644X_MAC_IN_VECTOR_TX_INT_VEC          (0xFF)
++#define EMAC_DM644X_MAC_IN_VECTOR_TX_INT_SHIFT        (0)
++#define EMAC_DM644X_MAC_IN_VECTOR_RX_INT_SHIFT	       (8)
++
++/** NOTE:: For davincihd the IN_VECTOR has changed*/
++#define EMAC_DM646X_MAC_IN_VECTOR_HOST_INT            (0x04000000)
++#define EMAC_DM646X_MAC_IN_VECTOR_STATPEND_INT        (0x08000000)
++#define EMAC_DM646X_MAC_IN_VECTOR_RX_INT_VEC          (0xFF)
++#define EMAC_DM646X_MAC_IN_VECTOR_TX_INT_VEC          (0xFF0000)
++#define EMAC_DM646X_MAC_IN_VECTOR_TX_INT_SHIFT        (16)
++#define EMAC_DM646X_MAC_IN_VECTOR_RX_INT_SHIFT	       (0)
++
++/* EMAC EOI codes for C0 */
++#define EMAC_DM646X_MAC_EOI_C0_RXTHRESH               (0x00)
++#define EMAC_DM646X_MAC_EOI_C0_RXEN 	             (0x01)
++#define EMAC_DM646X_MAC_EOI_C0_TXEN	             (0x02)
++#define EMAC_DM646X_MAC_EOI_C0_MISCEN	             (0x03)
++
++/* EMAC EOI codes for C1 */
++#define EMAC_DM646X_MAC_EOI_C1_RXTHRESH               (0x04)
++#define EMAC_DM646X_MAC_EOI_C1_RXEN 	             (0x05)
++#define EMAC_DM646X_MAC_EOI_C1_TXEN	             (0x06)
++#define EMAC_DM646X_MAC_EOI_C1_MISCEN	             (0x07)
++
++/* EMAC EOI codes for C2 */
++#define EMAC_DM646X_MAC_EOI_C2_RXTHRESH               (0x08)
++#define EMAC_DM646X_MAC_EOI_C2_RXEN 	             (0x09)
++#define EMAC_DM646X_MAC_EOI_C2_TXEN	             (0x0a)
++#define EMAC_DM646X_MAC_EOI_C2_MISCEN	             (0x0b)
+ 
+ /* CPPI bit positions */
+ #define EMAC_CPPI_SOP_BIT                      (1 << 31)
+@@ -345,7 +387,7 @@ typedef void *emac_net_data_token;
+ #define EMAC_CPPI_TEARDOWN_COMPLETE_BIT        (1 << 27)
+ #define EMAC_CPPI_PASS_CRC_BIT                 (1 << 26)
+ 
+-/* defining the macro EMAC_INSTANCE_CODE to 0 so that it can be usable in DDA */
++/* error code indicators*/
+ #define EMAC_INSTANCE_CODE                     0
+ #define EMAC_ERROR_CODE                        (EMAC_INSTANCE_CODE << 16)
+ #define EMAC_ERROR_INFO                        (EMAC_ERROR_CODE)
+@@ -429,13 +471,18 @@ typedef void *emac_net_data_token;
+ #define SNWAY_FD10          (1<<6)
+ #define SNWAY_HD10          (1<<5)
+ #define SNWAY_AUTO          (1<<0)
+-#define SNWAY_AUTOALL       (SNWAY_AUTO|SNWAY_FD100|SNWAY_FD10|SNWAY_HD100|SNWAY_HD10)
++#define DM644X_SNWAY_AUTOALL       (SNWAY_AUTO|SNWAY_FD100|SNWAY_FD10|\
++				SNWAY_HD100|SNWAY_HD10)
++#define DM646X_SNWAY_AUTOALL       (SNWAY_AUTO|SNWAY_FD1000|SNWAY_HD1000|\
++				SNWAY_FD100|SNWAY_FD10|SNWAY_HD100|SNWAY_HD10)
++#define SNWAY_AUTOALL ((cpu_is_davinci_dm6467()) ? DM646X_SNWAY_AUTOALL : \
++		DM644X_SNWAY_AUTOALL)
+ 
+ /**
+- *  DDC Status Ioctl - Error status
++ *  Status Ioctl - Error status
+  *
+  *  Note that each error code is a bit position so that multiple
+- *  errors can be clubbed together and passed in a integer value
++ *  errors can be logically OR'ed together and passed in a integer value
+  */
+ #define EMAC_NO_ERROR          0
+ #define EMAC_TX_HOST_ERROR     0x1	/* MSB 8 bits: err code, channel no */
+@@ -443,9 +490,7 @@ typedef void *emac_net_data_token;
+ 
+ #define EGRESS_TRAILOR_LEN                  0
+ 
+-#define CFG_START_LINK_SPEED                (SNWAY_AUTOALL)	/* auto nego */
+-
+-/* defaut configuration values required for passing on to DDC */
++/* Defaut configuration values */
+ #define EMAC_DEFAULT_MLINK_MASK                        0
+ #define EMAC_DEFAULT_PASS_CRC                          FALSE
+ #define EMAC_DEFAULT_QOS_ENABLE                        FALSE
+@@ -465,7 +510,7 @@ typedef void *emac_net_data_token;
+ #define EMAC_DEFAULT_RX_FLOW_ENABLE                    FALSE
+ #define EMAC_DEFAULT_LOOPBACK_ENABLE                   FALSE
+ #define EMAC_DEFAULT_FULL_DUPLEX_ENABLE                TRUE
+-#define EMAC_DEFAULT_TX_INTERRUPT_DISABLE              TRUE
++#define EMAC_DEFAULT_TX_INTERRUPT_DISABLE              FALSE
+ #define CONFIG_EMAC_MIB_TIMER_TIMEOUT                  5000	/* 5 seconds */
+ 
+ #define EMAC_DEFAULT_PROMISCOUS_ENABLE                 0
+@@ -509,7 +554,7 @@ typedef void *emac_net_data_token;
+ #define EMAC_DEFAULT_RX_NUM_BD         128
+ 
+ /* default RX max service BD's */
+-#define EMAC_DEFAULT_RX_MAX_SERVICE    32	/* should = netdev->weight */
++#define EMAC_DEFAULT_RX_MAX_SERVICE    64	/* should = netdev->weight */
+ 
+ #if ((EMAC_DEFAULT_TX_NUM_BD +EMAC_DEFAULT_RX_NUM_BD)  > 256)
+ #error "Error. DaVinci has space for no more than 256 TX+RX BD's"
+@@ -531,11 +576,6 @@ typedef void *emac_net_data_token;
+ 
+ /* ENV variable names for obtaining MAC addresses */
+ #define EMAC_MAC_ADDR_A    "maca"
+-#define EMAC_MAC_ADDR_B    "macb"
+-#define EMAC_MAC_ADDR_C    "macc"
+-#define EMAC_MAC_ADDR_D    "macd"
+-#define EMAC_MAC_ADDR_E    "mace"
+-#define EMAC_MAC_ADDR_F    "macf"
+ 
+ /* Maximum multicast addresses list to be handled by the driver - If
+  * this is not restricted then the driver will spend considerable time
+@@ -622,35 +662,6 @@ char emac_4byte_align[] = { 0x0, 0x03, 0
+ #define EMAC_BD_LENGTH_FOR_CACHE               16	/* only CPPI bytes */
+ #define EMAC_RX_BD_PKT_LENGTH_MASK             0xFFFF
+ 
+-#define CFG_START_LINK_SPEED                   (SNWAY_AUTOALL)	/* auto nego */
+-
+-/* defaut configuration values required for passing on to DDC */
+-#define EMAC_DEFAULT_MLINK_MASK                        0
+-#define EMAC_DEFAULT_PASS_CRC                          FALSE
+-#define EMAC_DEFAULT_QOS_ENABLE                        FALSE
+-#define EMAC_DEFAULT_NO_BUFFER_CHAINING                FALSE
+-#define EMAC_DEFAULT_COPY_MAC_CONTROL_FRAMES_ENABLE    FALSE
+-#define EMAC_DEFAULT_COPY_SHORT_FRAMES_ENABLE          FALSE
+-#define EMAC_DEFAULT_COPY_ERROR_FRAMES_ENABLE          FALSE
+-#define EMAC_DEFAULT_PROMISCOUS_CHANNEL                0
+-#define EMAC_DEFAULT_BROADCAST_CHANNEL                 0
+-#define EMAC_DEFAULT_MULTICAST_CHANNEL                 0
+-#define EMAC_DEFAULT_BUFFER_OFFSET                     0
+-#define EMAC_DEFAULT_TX_PRIO_TYPE                      EMAC_TXPRIO_FIXED
+-#define EMAC_DEFAULT_TX_SHORT_GAP_ENABLE               FALSE
+-#define EMAC_DEFAULT_TX_PACING_ENABLE                  FALSE
+-#define EMAC_DEFAULT_MII_ENABLE                        TRUE
+-#define EMAC_DEFAULT_TX_FLOW_ENABLE                    FALSE
+-#define EMAC_DEFAULT_RX_FLOW_ENABLE                    FALSE
+-#define EMAC_DEFAULT_LOOPBACK_ENABLE                   FALSE
+-#define EMAC_DEFAULT_FULL_DUPLEX_ENABLE                TRUE
+-#define EMAC_DEFAULT_TX_INTERRUPT_DISABLE              TRUE
+-#define CONFIG_EMAC_MIB_TIMER_TIMEOUT                  5000	/* 5 sec */
+-
+-#define EMAC_DEFAULT_PROMISCOUS_ENABLE                 0
+-#define EMAC_DEFAULT_BROADCAST_ENABLE                  1
+-#define EMAC_DEFAULT_MULTICAST_ENABLE                  1
+-
+ /* ---------------------------------------------------------------
+  * structs, enums
+  * --------------------------------------------------------------- */
+@@ -743,6 +754,7 @@ typedef struct {
+ 	u32 tx_int_mask_set;
+ 	u32 tx_int_mask_clear;
+ 	u32 mac_in_vector;
++	/*NOTE :: EOI_vector field not in the datasheet, not used by driver */
+ 	u32 mac_EOI_vector;
+ 	u32 pad3[2];
+ 	u32 rx_int_stat_raw;
+@@ -827,174 +839,25 @@ typedef struct {
+ } emac_regs;
+ typedef volatile emac_regs *emac_regs_ovly;
+ 
+-/**
+- *  EMAC Peripheral Device Register Enumerations
++/** NOTE:: there are 3 CFGs possible with the cpgmac peripheral
++ * CFIG1 : TxCellDepth=3,RxCellDepth=3,AddressMatchingLogic=1
++ * CFIG2 : TxCellDepth=3,RxCellDepth=3,AddressMatchingLogic=2
++ * CFIG3 : TxCellDepth=24,RxCellDepth=68,AddressMatchingLogic=2
++ *
++ * Address Matching Logic 1 : Based on Unicast address programmed per channel
++ * Address Matching Logic 2 : based on entries written to internal RAM
+  */
+-typedef enum {
+-	tx_id_ver = 0,
+-	tx_control,
+-	tx_teardown,
+-	rx_id_ver = 4,
+-	rx_control,
+-	rx_teardown,
+-	rx_MBP_enable = 64,
+-	rx_unicast_set,
+-	rx_unicast_clear,
+-	rx_maxlen,
+-	rx_buffer_offset,
+-
+-	rx_filter_low_thresh,
+-	rx0_flow_thresh = 72,
+-	rx1_flow_thresh,
+-	rx2_flow_thresh,
+-	rx3_flow_thresh,
+-	rx4_flow_thresh,
+-
+-	rx5_flow_thresh,
+-	rx6_flow_thresh,
+-	rx7_flow_thresh,
+-	rx0_free_buffer,
+-
+-	rx1_free_buffer,
+-	rx2_free_buffer,
+-	rx3_free_buffer,
+-	rx4_free_buffer,
+-
+-	rx5_free_buffer,
+-	rx6_free_buffer,
+-	rx7_free_buffer,
+-	mac_control,
+-	mac_status,
+-
+-	EMControl,
+-	tx_fifo_control,
+-	tx_int_stat_raw,
+-	tx_int_stat_masked,
+-
+-	tx_int_mask_set,
+-	tx_int_mask_clear,
+-	mac_in_vector,
+-	mac_EOI_vector,
+-	mac_cfig,
+-
+-	rx_int_stat_raw = 100,
+-	rx_int_stat_masked,
+-	rx_int_mask_set,
+-	rx_int_mask_clear,
+-	mac_int_stat_raw,
+-
+-	mac_int_stat_masked,
+-	mac_int_mask_set,
+-	mac_int_mask_clear,
+-	mac_src_addr_lo = 116,
+-	mac_src_addr_hi,
+-	mac_hash1,
+-	mac_hash2,
+-	boff_test,
+-	tpace_test,
+-	rx_pause,
+-
+-	tx_pause,
+-	rx_good_frames = 128,
+-	rx_broadcast_frames,
+-	rx_multicast_frames,
+-	rx_pause_frames,
+-	rx_crcerrors,
+-
+-	rx_align_code_errors,
+-	rx_oversized_frames,
+-	rx_jabber_frames,
+-	rx_undersized_frames,
+-
+-	rx_fragments,
+-	rx_filtered_frames,
+-	rx_qos_filtered_frames,
+-	rx_octets,
+-
+-	tx_good_frames,
+-	tx_broadcast_frames,
+-	tx_multicast_frames,
+-	tx_pause_frames,
+-
+-	tx_deferred_frames,
+-	tx_collision_frames,
+-	tx_single_coll_frames,
+-	tx_mult_coll_frames,
+-
+-	tx_excessive_collisions,
+-	tx_late_collisions,
+-	tx_underrun,
+-	tx_carrier_sense_errors,
+-
+-	tx_octets,
+-	reg64octet_frames,
+-	reg65t127octet_frames,
+-	reg128t255octet_frames,
+-
+-	reg256t511octet_frames,
+-	reg512t1023octet_frames,
+-	reg1024t_upoctet_frames,
+-
+-	net_octets,
+-	rx_sof_overruns,
+-	rx_mof_overruns,
+-	rx_dma_overruns,
+-
+-	RX_FIFO_processor_test_access = 192,	/* first word of RX FIFO */
+-	TX_FIFO_processor_test_access = 256,	/* first word of TX FIFO */
+-	mac_addr_lo = 320,
+-	mac_addr_hi,
+-	mac_index,
+-	tx0_HDP = 384,
+-	tx1_HDP,
+-	tx2_HDP,
+-	tx3_HDP,
+-	tx4_HDP,
+-	tx5_HDP,
+-	tx6_HDP,
+-
+-	tx7_HDP,
+-	rx0_HDP,
+-	rx1_HDP,
+-	rx2_HDP,
+-	rx3_HDP,
+-	rx4_HDP,
+-
+-	rx5_HDP,
+-	rx6_HDP,
+-	rx7_HDP,
+-	tx0_CP,
+-	tx1_CP,
+-	tx2_CP,
+-	tx3_CP,
+-
+-	tx4_CP,
+-	tx5_CP,
+-	tx6_CP,
+-	tx7_CP,
+-	rx0_CP,
+-	rx1_CP,
+-	rx2_CP,
+-
+-	rx3_CP,
+-	rx4_CP,
+-	rx5_CP,
+-	rx6_CP,
+-	rx7_CP,
+-	stateram_test_access = 448	/* first word of state RAM */
+-} emac_reg_ids;
+ 
+ /**
+  *  EMAC Addressing Type
+  *
+- *  Addressing type based upon cfig register. For EMAC peripheral cfig
++ *  Addressing type based upon cfig register. For older EMAC peripheral cfig
+  *  register reads a value of 0 i.e Type 0 addressing
+  */
+ typedef enum {
+ 	RX_ADDR_TYPE0 = 0,	/* old style used in (EMAC) */
+ 	RX_ADDR_TYPE1 = 1,	/* new CPGMAC style */
+ 	RX_ADDR_TYPE2 = 2,	/* new CPGMAC "filtering" style */
+-	RX_ADDR_TYPE3 = 3	/* new CPGMAC "filtering" style */
+ } emac_rx_addr_type;
+ 
+ /**
+@@ -1048,7 +911,6 @@ typedef struct {
+ 	u32 channel;		/* channel to which this filtering params apply */
+ 	char *mac_address;	/* mac address for filtering */
+ 	int index;		/* index of filtering list to update */
+-	bool valid;		/* entry valid */
+ 	int match;		/* entry matching  */
+ } emac_type2_3_addr_filter_params;
+ 
+@@ -1226,7 +1088,7 @@ typedef struct {
+ 	u32 hw_status;
+ 	u32 hw_err_info;
+ 	u32 phy_linked;		/* link status: 1=linked, 0=no link */
+-	u32 phy_duplex;		/* duplex status: 3=full duplex, 2=half duplex */
++	u32 phy_duplex;		/* duplex stat: 1=full duplex, 0=half duplex */
+ 
+ 	u32 phy_speed;		/* link speed = 10, 100, 1000 */
+ 	u32 phy_num;		/* phy number - useful if phy number is discovered */
+@@ -1239,9 +1101,9 @@ typedef struct {
+  * Used to pass channel config info from DDA to DDC for EMAC channels
+  */
+ typedef struct {
+-	int ch_num;		/* DDC_net_ch_info: channel number */
+-	net_ch_dir ch_dir;	/* DDC_net_ch_info: channel direction */
+-	net_ch_state ch_state;	/* DDC_net_ch_info: channel state */
++	int ch_num;		/* channel number */
++	net_ch_dir ch_dir;	/* channel direction */
++	net_ch_state ch_state;	/* channel state */
+ 	int num_bd;		/* number of BD (& buffers for RX) */
+ 	int service_max;	/* maximum BD's processed in one go */
+ 	int buf_size;		/* buffer size (applicable for RX only) */
+@@ -1301,10 +1163,8 @@ typedef struct {
+ /**
+  *  EMAC Init Configuration
+  *
+- *  Configuration information provided to DDC layer during
+- *  initialization.  DDA gets the config information from the OS/PAL
+- *  layer and passes the relevant config to the DDC during
+- *  initialization. The config info can come from various sources -
++ *  Configuration information provided during
++ *  initialization.The config info can come from various sources -
+  *  static compiled in info, boot time (ENV, Flash) info etc.
+  */
+ typedef struct {
+@@ -1315,10 +1175,8 @@ typedef struct {
+ 	u32 base_address;
+ 	u32 e_wrap_base_address;
+ 	u32 intr_line;
+-	u32 reset_line;
++	u32 num_intr_lines;
+ 	u32 mdio_base_address;
+-	u32 mdio_reset_line;
+-	u32 mdio_intr_line;
+ 	u32 phy_mask;
+ 	u32 MLink_mask;
+ 	u32 mdio_bus_frequency;
+@@ -1360,12 +1218,54 @@ typedef struct {
+ } emac_drv_stats;
+ 
+ /**************************************************************************
+- * Register Overlay Structure
++ * Register Overlay Structure for wrapper part
+  **************************************************************************/
+-typedef struct {
++typedef volatile struct {
++	u32 IDVER;
++	u32 SOFTRST;
++	u32 EMCTRL;
++	u32 INTCTRL;
++	u32 C0_RXTHRESHEN;
++	u32 C0_RXINTEN;
++	u32 C0_TXINTEN;
++	u32 C0_MISCEN;
++	u32 C1_RXTHRESHEN;
++	u32 C1_RXINTEN;
++	u32 C1_TXINTEN;
++	u32 C1_MISCEN;
++	u32 C2_RXTHRESHEN;
++	u32 C2_RXINTEN;
++	u32 C2_TXINTEN;
++	u32 C2_MISCEN;
++	u32 C0_RXTHRESHSTAT;
++	u32 C0_RXINTSTAT;
++	u32 C0_TXINTSTAT;
++	u32 C0_MISCSTAT;
++	u32 C1_RXTHRESHSTAT;
++	u32 C1_RXINTSTAT;
++	u32 C1_TXINTSTAT;
++	u32 C1_MISCSTAT;
++	u32 C2_RXTHRESHSTAT;
++	u32 C2_RXINTSTAT;
++	u32 C2_TXINTSTAT;
++	u32 C2_MISCSTAT;
++	u32 C0_RXIMAX;
++	u32 C0_TXIMAX;
++	u32 C1RXIMAX;
++	u32 C1_TXIMAX;
++	u32 C2_RXIMAX;
++	u32 C2_TXIMAX;
++} ewrap_dm646x_regs;
++
++typedef volatile struct {
+ 	u32 RSVD0;
+ 	u32 EWCTL;
+-	u32 EWINTTCNT;
++	u32 EWINTCNT;
++} ewrap_dm644x_regs;
++
++typedef union {
++	ewrap_dm646x_regs wrapper_646x_regs;
++	ewrap_dm644x_regs wrapper_644x_regs;
+ } ewrap_regs;
+ 
+ /*
+@@ -1381,7 +1281,6 @@ typedef struct {
+ 				 * Qstarv, length */
+ 	void *next;		/* next TX buffer descriptor (linked list) */
+ 	emac_net_data_token buf_token;
+-	void *eop_bd;		/* pointer to end of packet BD */
+ } emac_tx_bd;
+ 
+ /* forward declaration */
+@@ -1459,11 +1358,7 @@ typedef struct _emac_rx_cppi_ch_t {
+ 	/* packet and buffer objects required for passing up to DDA
+ 	 * layer for the given instance */
+ 	net_pkt_obj pkt_queue;
+-	net_buf_obj buf_queue[EMAC_MAX_RX_FRAGMENTS];
+-#ifdef EMAC_MULTIFRAGMENT
+-	u32 rx_buffer_ptr[EMAC_MAX_RX_FRAGMENTS];
+-	u32 rx_data_token[EMAC_MAX_RX_FRAGMENTS];
+-#endif
++	net_buf_obj buf_queue;
+ 	/** statistics */
+ 	u32 proc_count;		/* number of times emac_rx_bdproc is called */
+ 	u32 processed_bd;	/* number of BD's processed */
+@@ -1543,10 +1438,6 @@ typedef struct emac_dev_s {
+ 	/** EMAC specific parameters - DDC device specifics */
+ 	emac_tx_cppi_ch *tx_cppi[EMAC_MAX_TX_CHANNELS];
+ 	emac_rx_cppi_ch *rx_cppi[EMAC_MAX_RX_CHANNELS];
+-	bool tx_is_created[EMAC_MAX_TX_CHANNELS];
+-	bool rx_is_created[EMAC_MAX_RX_CHANNELS];
+-	bool tx_is_open[EMAC_MAX_TX_CHANNELS];
+-	bool rx_is_open[EMAC_MAX_RX_CHANNELS];
+ 	bool tx_teardown_pending[EMAC_MAX_TX_CHANNELS];
+ 	bool rx_teardown_pending[EMAC_MAX_RX_CHANNELS];
+ 	int tx_int_threshold[EMAC_MAX_TX_CHANNELS];
+@@ -1572,6 +1463,12 @@ typedef struct emac_dev_s {
+ 	ewrap_regs *e_wrap_regs;
+ 
+ 	struct mib2_if_hccounters mib2if_hccounter;
++
++	/*Interrupt enable Mask state variables */
++	u32 rx_thresh_en;
++	u32 rx_en;
++	u32 tx_en;
++	u32 misc_en;
+ } emac_dev_t;
+ 
+ /* ---------------------------------------------------------------
+@@ -1586,7 +1483,6 @@ static int emac_debug_mode = 0;
+ static int g_link_speed = 0;	/* 0=auto negotiate, 100=100mbps, 10=10mbps */
+ static int g_link_mode = 0;	/* 0=Auto Negotiate, Full Duplex = 3;
+ 				 * Half Duplex = 2 Unknown = 1 */
+-static int g_init_enable_flag = 0;
+ 
+ /* global device array */
+ static struct net_device *emac_net_dev[EMAC_MAX_INSTANCES] = { NULL };
+@@ -1596,8 +1492,6 @@ static int emac_devices_installed = 0;	/
+ 
+ static struct proc_dir_entry *gp_stats_file = NULL;	/* proc entries */
+ 
+-static char emac_cfg[EMAC_MAX_INSTANCES][200];
+-
+ /* clock frequency for EMAC */
+ static struct clk *emac_clk;
+ static unsigned long emac_bus_frequency;
+@@ -1607,7 +1501,7 @@ static unsigned char emac_eth_string[20]
+ 
+ static const char emac_ddcversion_string[] = "EMAC DDC version 0.5";
+ 
+-static u32 emac_debug = 0x0;	/* no debug flags by default */
++static u32 emac_debug;		/* no debug flags by default */
+ static u32 emac_wrapper_ptr = EMAC_WRAPPER_RAM_ADDR;
+ 
+ /* ---------------------------------------------------------------
+@@ -1633,9 +1527,7 @@ static int emac_net_tx_complete(emac_dev
+ 				int num_tokens, u32 channel);
+ 
+ static int emac_net_rx_cb(emac_dev_t * dev,
+-		   	  net_pkt_obj * net_pkt_list,
+-			  void *rx_args);
+-
++			  net_pkt_obj *net_pkt_list, void *rx_args);
+ 
+ static int emac_poll(struct net_device *netdev, int *budget);
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+@@ -1692,6 +1584,10 @@ static void emac_p_tick_timer_expiry(ema
+ 
+ static int emac_dev_set_mac_addr(struct net_device *netdev, void *addr);
+ 
++static void emac_disable_interrupt(emac_dev_t *edev);
++
++static void emac_enable_interrupt(emac_dev_t *edev, int ack_eoi);
++
+ /* function prototype for emac_p_tick_timer_expiry() function as per
+  * linux timer API */
+ typedef void (*timer_tick_func) (unsigned long);
+@@ -1709,29 +1605,17 @@ static int emac_tick(emac_dev_t * dev, v
+ static int emac_pkt_process(emac_dev_t * dev, int *pkts_pending,
+ 			    void *pkt_args);
+ 
+-static int emac_pkt_process_end(emac_dev_t * dev, void *proc_args);
+-
+ static int emac_tx_bdproc(emac_dev_t * dev, u32 channel, u32 * more_pkts,
+ 			  bool * is_eoq);
+ 
+ static int emac_rx_bdproc(emac_dev_t * dev, u32 channel, int *more_pkts);
+ 
+-#ifdef EMAC_MULTIFRAGMENT
+-static void emac_add_bdto_rx_queue(emac_dev_t * dev, emac_rx_cppi_ch * rx_cppi,
+-				   emac_rx_bd * sop_bd, emac_rx_bd * eop_bd,
+-				   u32 * buffer,
+-				   emac_net_data_token * buf_token, u32 num_bd);
+-
+-#else
+ static void emac_add_bdto_rx_queue(emac_dev_t * dev, emac_rx_cppi_ch * rx_cppi,
+ 				   emac_rx_bd * curr_bd, char *buffer,
+ 				   emac_net_data_token buf_token);
+-#endif
+ 
+ static int emac_update_phy_status(emac_dev_t * dev);
+ 
+-static int emac_init(emac_dev_t * dev, emac_init_config * init_cfg);
+-
+ static int emac_de_init(emac_dev_t * dev, void *param);
+ 
+ static int emac_open(emac_dev_t * dev, void *param);
+@@ -1798,7 +1682,7 @@ static inline int emac_malloc(u32 n, voi
+ {
+ 	void *tmp = kcalloc(n, 1, GFP_KERNEL);
+ 
+-	if (!tmp) {
++	if (unlikely(!tmp)) {
+ 		printk(KERN_ERR "emac_malloc(): kmalloc() failed.\n");
+ 		dump_stack();
+ 		return -1;
+@@ -1810,7 +1694,8 @@ static inline int emac_malloc(u32 n, voi
+ 
+ static inline void emac_free(void *ptr)
+ {
+-	kfree(ptr);
++	if (ptr)
++		kfree(ptr);
+ }
+ 
+ #define EMAC_CACHE_INVALIDATE(addr, size) consistent_sync((void *)addr, size, DMA_FROM_DEVICE)
+@@ -1852,43 +1737,14 @@ static void emac_str_to_ethaddr(unsigned
+ 	}
+ }
+ 
+-static int emac_cfg_build(int connect, int external_switch)
+-{
+-
+-	static int cfg_instance = 0;
+-
+-	unsigned int speed = 0;
+-
+-	speed = (external_switch) ? CONFIG_EMAC_NOPHY : 0;
+-
+-	sprintf(emac_cfg[cfg_instance],
+-		"%d:%x:%d:%d:%u:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%x:%d:%d:%u:%u:%x:%d",
+-		cfg_instance, EMAC_BASE_ADDR,
+-		EMAC_INTERRUPT, 0, EMAC_BUS_FREQUENCY,
+-		g_link_speed, g_link_mode, EMAC_DEFAULT_PROMISCOUS_ENABLE,
+-		EMAC_DEFAULT_BROADCAST_ENABLE,
+-		EMAC_DEFAULT_MULTICAST_ENABLE,
+-		EMAC_DEFAULT_MAX_FRAME_SIZE,
+-		EMAC_DEFAULT_TX_NUM_BD,
+-		EMAC_DEFAULT_TX_MAX_SERVICE, EMAC_DEFAULT_RX_NUM_BD,
+-		EMAC_DEFAULT_RX_MAX_SERVICE, 0,
+-		EMAC_MDIO_BASE_ADDR, 0, 0,
+-		EMAC_BUS_FREQUENCY, EMAC_MDIO_FREQUENCY, EMAC_PHY_MASK, 10);
+-
+-	DBG("Driver Config:\n%s\n", emac_cfg[cfg_instance]);
+-
+-	cfg_instance++;
+-
+-	return (0);
+-
+-}
+-
+ /* emac_eth_setup() invokes a board specific function that provides
+  * MAC address for this adapter. For DaVinci EVM, the function invoked
+  * is davinci_get_macaddr();
+  */
+ static int emac_eth_setup(void)
+ {
++	/**NOTE::Does the same strategy work on davinciHd also? */
++
+ 	if (davinci_get_macaddr(&emac_eth_string[0]) != 0) {
+ 		printk("TI DaVinci EMAC: Error getting board specific "
+ 		       "MAC address\n");
+@@ -1901,16 +1757,6 @@ static int emac_eth_setup(void)
+ 	return (0);
+ }
+ 
+-static int emac_cfg_probe(void)
+-{
+-
+-	/* for DaVinci there is only 1 EMAC instance */
+-	if (emac_cfg_build(0, 0))
+-		return (-1);
+-	else
+-		return (0);
+-}
+-
+ /******************************************************************************
+  *  DDA Callback functions
+  *****************************************************************************/
+@@ -1919,6 +1765,8 @@ static int emac_cfg_probe(void)
+ static int emac_control_cb(emac_dev_t * dev, int cmd,
+ 			   void *cmd_arg, void *param)
+ {
++	emac_mac_config *cfg;
++
+ 	switch (cmd) {
+ 	case EMAC_IOCTL_TIMER_START:
+ 		{
+@@ -1970,12 +1818,21 @@ static int emac_control_cb(emac_dev_t * 
+ 				if (!netif_carrier_ok(netdev)) {
+ 					netif_carrier_on(netdev);
+ 				}
+-				dev->link_speed =
+-				    ((status->
+-				      phy_speed == 100) ? 100000000 : 10000000);
++
++				cfg = &dev->init_cfg.mac_cfg;
++				cfg->giga_bit_enable = FALSE;
++				if (status->phy_speed == 1000) {
++					dev->link_speed = 1000000000;
++					cfg->giga_bit_enable = TRUE;
++				} else if (status->phy_speed == 100) {
++					dev->link_speed = 100000000;
++				} else {
++					dev->link_speed = 10000000;
++				}
++
+ 				dev->link_mode =
+ 				    ((status->phy_duplex == PHY_DUPLEX_FULL) ?
+-					PHY_DUPLEX_FULL : PHY_DUPLEX_HALF);
++				     PHY_DUPLEX_FULL : PHY_DUPLEX_HALF);
+ 
+ 				/* reactivate the transmit queue if it
+ 				 * is stopped */
+@@ -2006,8 +1863,9 @@ static int emac_control_cb(emac_dev_t * 
+ 				    status->phy_num,
+ 				    ((status->phy_duplex == PHY_DUPLEX_FULL) ?
+ 				     "Full Duplex" : "Half Duplex"),
+-				    ((status->phy_speed == 100) ?
+-				     "100 Mbps" : "10 Mbps"),
++				    ((status->phy_speed > 10) ?
++				     ((status->phy_speed > 100) ?
++				      "1000 Mbps" : "100 Mbps") : "10 Mbps"),
+ 				    ((status->phy_linked) ?
+ 				     "Linked" : "NO LINK"));
+ 		}
+@@ -2063,132 +1921,49 @@ static int emac_control_cb(emac_dev_t * 
+  */
+ static int emac_net_get_config(emac_dev_t * dev)
+ {
+-#define EMAC_TOKEN_PARSE(str) \
+-  { if ((tok = (char *)strsep ((str), ":")) == NULL) return -1; }
+-#define EMAC_TOKEN_GET_INTEGER simple_strtoul (tok, NULL, 10)
+-#define EMAC_TOKEN_GET_HEX     simple_strtoul (tok, NULL, 16)
+ 	emac_init_config *i_cfg = &dev->init_cfg;
+ 	emac_ch_info *tx_ch_cfg = &dev->tx_ch_info[0];
+ 	emac_ch_info *rx_ch_cfg = &dev->rx_ch_info[0];
+-	int speed, duplex, extra;
+-	char local_string_val[200];
+-	char *local_string = NULL;
+-	char *tok;
+-	char *p_holder = NULL;
++	int speed, duplex, extra = 0;
++	static int cfg_instance;
++
++	/* we have only one instance here */
++	i_cfg->inst_id = cfg_instance++;
++	i_cfg->base_address = EMAC_BASE_ADDR;
++
++	if (cpu_is_davinci_dm6467()) {
++		i_cfg->intr_line = EMAC_DM646X_INTERRUPT;
++		i_cfg->num_intr_lines = EMAC_DM646X_NUM_INTERRUPTS;
++		i_cfg->emac_bus_frequency = EMAC_DM646X_BUS_FREQUENCY;
++		i_cfg->mdio_bus_frequency = EMAC_DM646X_BUS_FREQUENCY;
++		i_cfg->mdio_clock_frequency = EMAC_DM646X_MDIO_FREQUENCY;
++		i_cfg->phy_mask = EMAC_DM646X_PHY_MASK;
++	} else {
++		i_cfg->intr_line = EMAC_DM644X_INTERRUPT;
++		i_cfg->num_intr_lines = EMAC_DM644X_NUM_INTERRUPTS;
++		i_cfg->emac_bus_frequency = EMAC_DM644X_BUS_FREQUENCY;
++		i_cfg->mdio_bus_frequency = EMAC_DM644X_BUS_FREQUENCY;
++		i_cfg->mdio_clock_frequency = EMAC_DM644X_MDIO_FREQUENCY;
++		i_cfg->phy_mask = EMAC_DM644X_PHY_MASK;
+ 
+-	/* use static config string */
+-	switch (dev->instance_num) {
+-	case 0:
+-		local_string = emac_cfg[0];
+-		break;
+-	case 1:
+-		local_string = emac_cfg[1];
+-		break;
+-	default:
+-		local_string = emac_cfg[0];
+-		break;
+ 	}
+ 
+-	strcpy(&local_string_val[0], local_string);
+-	local_string = &local_string_val[0];
+-	p_holder = NULL;
+-	tok = (char *)strsep(&local_string, ":");
+-	if (tok == NULL)
+-		return (-1);
++	speed = g_link_speed;
++	duplex = g_link_mode;
++
++	i_cfg->rx_cfg.promiscous_enable = EMAC_DEFAULT_PROMISCOUS_ENABLE;
++	i_cfg->rx_cfg.broadcast_enable = EMAC_DEFAULT_BROADCAST_ENABLE;
++	i_cfg->rx_cfg.multicast_enable = EMAC_DEFAULT_MULTICAST_ENABLE;
++	i_cfg->rx_cfg.max_rx_pkt_length = EMAC_DEFAULT_MAX_FRAME_SIZE;
+ 
+-	i_cfg->inst_id = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("i_cfg->instId=%d", i_cfg->inst_id);
+-
+-	i_cfg->base_address = EMAC_TOKEN_GET_HEX;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->baseAddress=%08X", i_cfg->base_address);
+-
+-	i_cfg->intr_line = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->intrLine=%d", i_cfg->intr_line);
+-
+-	i_cfg->reset_line = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->resetLine=%d", i_cfg->reset_line);
+-
+-	i_cfg->emac_bus_frequency = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->emacBusFrequency=%d", i_cfg->emac_bus_frequency);
+-
+-	speed = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\nspeed=%d", speed);
+-
+-	duplex = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\nduplex=%d", duplex);
+-
+-	i_cfg->rx_cfg.promiscous_enable = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->rxCfg.promiscousEnable=%d",
+-	    i_cfg->rx_cfg.promiscous_enable);
+-
+-	i_cfg->rx_cfg.broadcast_enable = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->rxCfg.broadcastEnable=%d",
+-	    i_cfg->rx_cfg.broadcast_enable);
+-
+-	i_cfg->rx_cfg.multicast_enable = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->rxCfg.multicastEnable=%d",
+-	    i_cfg->rx_cfg.multicast_enable);
+-
+-	i_cfg->rx_cfg.max_rx_pkt_length = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->rxCfg.maxRxPktLength=%d",
+-	    i_cfg->rx_cfg.max_rx_pkt_length);
+-
+-	tx_ch_cfg->num_bd = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ntx_ch_cfg->num_bd=%d", tx_ch_cfg->num_bd);
+-
+-	tx_ch_cfg->service_max = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ntx_ch_cfg->service_max=%d", tx_ch_cfg->service_max);
+-
+-	rx_ch_cfg->num_bd = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\nrx_ch_cfg->num_bd=%d", rx_ch_cfg->num_bd);
+-
+-	rx_ch_cfg->service_max = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\nrx_ch_cfg->service_max=%d", rx_ch_cfg->service_max);
+-
+-	extra = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\nextra=%d", extra);
+-
+-	i_cfg->mdio_base_address = EMAC_TOKEN_GET_HEX;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->mdioBaseAddress=%08X", i_cfg->mdio_base_address);
+-
+-	i_cfg->mdio_intr_line = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->mdioIntrLine=%d", i_cfg->mdio_intr_line);
+-
+-	i_cfg->mdio_reset_line = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->mdioResetLine=%d", i_cfg->mdio_reset_line);
+-
+-	i_cfg->mdio_bus_frequency = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->MdioBusFrequency=%d", i_cfg->mdio_bus_frequency);
+-
+-	i_cfg->mdio_clock_frequency = EMAC_TOKEN_GET_INTEGER;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->MdioClockFrequency=%d", i_cfg->mdio_clock_frequency);
+-
+-	i_cfg->phy_mask = EMAC_TOKEN_GET_HEX;
+-	EMAC_TOKEN_PARSE(&local_string);
+-	DBG("\ni_cfg->PhyMask=%08X", i_cfg->phy_mask);
++	tx_ch_cfg->num_bd = EMAC_DEFAULT_TX_NUM_BD;
++	tx_ch_cfg->service_max = EMAC_DEFAULT_TX_MAX_SERVICE;
++	rx_ch_cfg->num_bd = EMAC_DEFAULT_RX_NUM_BD;
++	rx_ch_cfg->service_max = EMAC_DEFAULT_RX_MAX_SERVICE;
+ 
+-	i_cfg->mdio_tick_msec = EMAC_TOKEN_GET_INTEGER;
++	i_cfg->mdio_base_address = EMAC_MDIO_BASE_ADDR;
++
++	i_cfg->mdio_tick_msec = 10;
+ 	DBG("\ni_cfg->MdioTickMSec=%d", i_cfg->mdio_tick_msec);
+ 	DBG("\n");
+ 
+@@ -2224,11 +1999,23 @@ static int emac_net_get_config(emac_dev_
+ 			} else {
+ 				i_cfg->phy_mode = SNWAY_HD100 | SNWAY_FD100;
+ 			}
++		} else if (speed == 1000) {
++			if (duplex == 2) {
++				i_cfg->phy_mode = SNWAY_HD1000;
++			} else if (duplex == 3) {
++				i_cfg->phy_mode = SNWAY_FD1000;
++			} else {
++				i_cfg->phy_mode = SNWAY_HD1000 | SNWAY_FD1000;
++			}
+ 		} else {
+ 			if (duplex == PHY_DUPLEX_FULL) {
+ 				i_cfg->phy_mode = SNWAY_FD10 | SNWAY_FD100;
++				if (cpu_is_davinci_dm6467())
++					i_cfg->phy_mode |= SNWAY_FD1000;
+ 			} else {
+ 				i_cfg->phy_mode = SNWAY_HD10 | SNWAY_HD100;
++				if (cpu_is_davinci_dm6467())
++					i_cfg->phy_mode |= SNWAY_HD1000;
+ 			}
+ 		}
+ 	}
+@@ -2295,7 +2082,8 @@ static int __init emac_p_detect_manual_c
+ 		DBG("auto negotiation selected\n");
+ 	}
+ 
+-	if (!link_speed || (link_speed != 10 && link_speed != 100)) {
++	if (!link_speed || (link_speed != 10 && link_speed != 100
++			    && link_speed != 1000)) {
+ 		g_link_speed = 0;
+ 		g_link_mode = 0;
+ 		DBG("Invalid or No value of link speed specified,"
+@@ -2322,6 +2110,9 @@ static int __init emac_p_detect_manual_c
+ 	} else if ((link_speed == 100) && (!strcmp(link_mode, "hd"))) {
+ 		g_link_speed = 100;
+ 		g_link_mode = 2;
++	} else if ((link_speed == 1000) && (!strcmp(link_mode, "fd"))) {
++		g_link_speed = 1000;
++		g_link_mode = 3;
+ 	} else {
+ 		g_link_speed = 0;
+ 		g_link_mode = 0;
+@@ -2330,7 +2121,8 @@ static int __init emac_p_detect_manual_c
+ 	DBG("Link is set to the speed of"
+ 	    "%s speed and %s mode.\n",
+ 	    ((g_link_speed ==
+-	      0) ? "auto" : ((g_link_speed == 100) ? "100" : "10")),
++	      0) ? "auto" : ((g_link_speed == 100) ? "100" :
++			     ((g_link_speed == 1000) ? "1000" : "10"))),
+ 	    ((g_link_mode ==
+ 	      0) ? "auto" : ((g_link_mode == 2) ? "half" : "full")));
+ 
+@@ -2363,7 +2155,7 @@ static int emac_p_read_link(char *buf, c
+ 		dev = NETDEV_PRIV(netdev);
+ 
+ 		/*  this prints them out from high to low because of
+-		    how the devices are linked */
++		   how the devices are linked */
+ 		if (netif_carrier_ok(netdev)) {
+ 			len +=
+ 			    sprintf(buf + len,
+@@ -2372,7 +2164,9 @@ static int emac_p_read_link(char *buf, c
+ 				    dev->instance_num, "UP",
+ 				    dev->ddc_status.phy_num,
+ 				    (dev->link_speed ==
+-				     100000000) ? "100" : "10",
++				     100000000) ? "100" :
++				    ((dev->link_speed == 10000000) ?
++				     "10" : "1000"),
+ 				    (dev->link_mode == 2) ? "Half" : "Full");
+ 
+ 		} else {
+@@ -2445,18 +2239,12 @@ static int emac_dump_config(char *buf, c
+ 		    sprintf(buf + len, "intrLine           = %d\n",
+ 			    dev->init_cfg.intr_line);
+ 		len +=
+-		    sprintf(buf + len, "resetLine          = %d\n",
+-			    dev->init_cfg.reset_line);
++		    sprintf(buf + len, "num_intr_lines     = %d\n",
++			    dev->init_cfg.num_intr_lines);
+ 		len +=
+ 		    sprintf(buf + len, "mdioBaseAddress    = %08X\n",
+ 			    dev->init_cfg.mdio_base_address);
+ 		len +=
+-		    sprintf(buf + len, "mdioResetLine      = %d\n",
+-			    dev->init_cfg.mdio_reset_line);
+-		len +=
+-		    sprintf(buf + len, "mdioIntrLine       = %d\n",
+-			    dev->init_cfg.mdio_intr_line);
+-		len +=
+ 		    sprintf(buf + len, "PhyMask            = %08X\n",
+ 			    dev->init_cfg.phy_mask);
+ 		len +=
+@@ -2723,13 +2511,15 @@ static int emac_p_write_stats(struct fil
+ 	char local_buf[31];
+ 	int ret_val = 0;
+ 
+-	if (count > 30) {
++	if (unlikely(count > 30)) {
+ 		printk("Error : Buffer Overflow\n");
+ 		printk("Use \"echo 0 > emac_stat\" to reset the statistics\n");
+ 		return -EFAULT;
+ 	}
+ 
+-	copy_from_user(local_buf, buf, count);
++	ret_val = copy_from_user(local_buf, buf, count);
++	if (ret_val)
++		return ret_val;
+ 	local_buf[count - 1] = '\0';	/* ignoring last \n char */
+ 	ret_val = count;
+ 	if (strcmp("0", local_buf) == 0) {
+@@ -3344,6 +3134,97 @@ static void emac_tx_timeout(struct net_d
+ 	dev->net_dev_stats.tx_errors++;
+ }
+ 
++#include "davinci_emac_phy.h"
++
++static int
++emac_netdev_set_ecmd(struct net_device *dev, struct ethtool_cmd *ecmd)
++{
++	int speed_duplex = 0;
++	unsigned int phy_mode = 0;
++
++	if (ecmd->autoneg)
++		phy_mode |= SNWAY_AUTO;
++
++	/*             { 10, 100 }   { 0, 1 } */
++	speed_duplex = ecmd->speed + ecmd->duplex;
++	switch (speed_duplex) {
++	case 10:		/* HD10 */
++		phy_mode |= SNWAY_HD10;
++		break;
++	case 11:		/* FD10 */
++		phy_mode |= SNWAY_FD10;
++		break;
++	case 100:		/* HD100 */
++		phy_mode |= SNWAY_HD100;
++		break;
++	case 101:		/* FD100 */
++		phy_mode |= SNWAY_FD100;
++		break;
++	case 1001:		/* FD1000 */
++		phy_mode |= SNWAY_FD1000;
++		break;
++	default:
++		return -1;
++	}
++	emac_mdio_set_phy_mode(phy_mode);
++	return 0;
++}
++
++static int
++emac_netdev_get_ecmd(struct net_device *dev, struct ethtool_cmd *ecmd)
++{
++	int dplx = emac_mdio_get_duplex();
++
++	/* Hard-coded, but should perhaps be retrieved from davinci_emac_phy */
++	ecmd->supported = emac_mdio_supported_rate();
++	ecmd->advertising = emac_mdio_autoneg_rate();
++	ecmd->autoneg = emac_mdio_get_autoneg();
++	ecmd->speed = emac_mdio_get_speed();
++	ecmd->transceiver = XCVR_EXTERNAL;
++	ecmd->port = PORT_MII;
++	ecmd->phy_address = emac_mdio_get_phy_num();
++	ecmd->duplex = (dplx == 3) ? DUPLEX_FULL : DUPLEX_HALF;
++	return 0;
++}
++
++static void emac_get_drvinfo(struct net_device *dev,
++			     struct ethtool_drvinfo *info)
++{
++	strcpy(info->driver, "davinci_emac");
++	strcpy(info->version, EMAC_MODULE_VERSION);
++}
++
++static int emac_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
++{
++	int ret;
++
++	ret = emac_netdev_get_ecmd(dev, ecmd);
++	return ret;
++}
++
++static int emac_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
++{
++	int ret;
++
++	ret = emac_netdev_set_ecmd(dev, ecmd);
++	return ret;
++}
++
++static u32 emac_get_link(struct net_device *dev)
++{
++	u32 ret;
++
++	ret = emac_mdio_is_linked();
++	return ret;
++}
++
++static const struct ethtool_ops ethtool_ops = {
++	.get_drvinfo = emac_get_drvinfo,
++	.get_settings = emac_get_settings,
++	.set_settings = emac_set_settings,
++	.get_link = emac_get_link,
++};
++
+ /***************************************************************
+  *  emac_dev_init
+  *
+@@ -3396,7 +3277,6 @@ static int emac_dev_init(struct net_devi
+ 	dev->set_to_close = 1;
+ 
+ 	/* get configuration information for this instance */
+-	/* when config service is available, use it */
+ 	if (emac_net_get_config(dev) != 0) {
+ 		ERR("Could not fetch configuration information\n");
+ 		goto emac_dev_init_exit;
+@@ -3406,16 +3286,6 @@ static int emac_dev_init(struct net_devi
+ 	dev->drv_state = DRV_CREATED;
+ 	init_status = 1;	/* instance created */
+ 
+-	/* initialize instance by passing initial configuration struct */
+-	ret_code = emac_init(dev, &dev->init_cfg);
+-
+-	if (ret_code != EMAC_SUCCESS) {
+-		ERR("Error %08X from Init()\n", ret_code);
+-		goto emac_dev_init_exit;
+-	}
+-
+-	init_status = 2;	/* instance initialized */
+-
+ 	/* init spin lock */
+ 	spin_lock_init(&dev->tx_lock);
+ 	spin_lock_init(&dev->rx_lock);
+@@ -3449,6 +3319,7 @@ static int emac_dev_init(struct net_devi
+ 	netdev->tx_timeout = emac_tx_timeout;
+ 	netdev->set_mac_address = emac_dev_set_mac_addr;
+ 	netdev->poll = emac_poll;
++	SET_ETHTOOL_OPS(netdev, &ethtool_ops);
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	netdev->poll_controller = emac_poll_controller;
+ #endif
+@@ -3463,21 +3334,13 @@ static int emac_dev_init(struct net_devi
+ 		netdev->flags |= IFF_MULTICAST;
+ 
+ 	netif_carrier_off(netdev);
++	/* store the first interrupt line number */
+ 	netdev->irq = dev->init_cfg.intr_line;
+-
+ 	/* request memory region from the kernel */
+ 	netdev->base_addr = dev->init_cfg.base_address;
+ 	request_mem_region(netdev->base_addr, EMAC_DEFAULT_EMAC_SIZE,
+ 			   netdev->name);
+ 
+-	/* if following flag ON then open DDC */
+-	if (g_init_enable_flag) {
+-		if (emac_p_dev_enable(dev)) {
+-			ERR("device could not OPEN\n");
+-			goto emac_dev_init_exit;
+-		}
+-	}
+-
+ 	return (0);
+ 
+       emac_dev_init_exit:
+@@ -3506,28 +3369,32 @@ static int emac_dev_init(struct net_devi
+ static int emac_dev_open(struct net_device *netdev)
+ {
+ 	emac_dev_t *dev = NETDEV_PRIV(netdev);
++	int i;
+ 
+-	if (!g_init_enable_flag) {
+-		if (emac_p_dev_enable(dev)) {
+-			ERR("%s error: device could not OPEN\n", netdev->name);
+-			return (-1);
+-		}
++	if (emac_p_dev_enable(dev)) {
++		ERR("%s error: device could not OPEN\n", netdev->name);
++		return (-1);
+ 	}
+ 
+-	if (request_irq(dev->init_cfg.intr_line, emac_hal_isr, SA_INTERRUPT,
+-			"EMAC", dev)) {
+-		ERR("Failed to register the irq %d for TI DaVinci EMAC %s.\n",
+-		    dev->init_cfg.intr_line, netdev->name);
++	/** NOTE: we can have multiple interrupt lines running to the CPU */
++	for (i = 0; i < dev->init_cfg.num_intr_lines; i++) {
+ 
+-		return (-1);
++		if (request_irq
++		    ((dev->init_cfg.intr_line + i), emac_hal_isr, SA_INTERRUPT,
++		     "EMAC", dev)) {
++			ERR("Failed to register the irq %d for TI DaVinci EMAC "
++			    "%s.\n", dev->init_cfg.intr_line + i, netdev->name);
++			return (-1);
++		}
+ 	}
++
+ 	if (netif_carrier_ok(netdev))
+ 		netif_start_queue(netdev);
+ 	else
+ 		netif_stop_queue(netdev);
+ 
+ 	dev->device_stats.start_tick = jiffies;
+-	DBG("Started the network queue for %s.\n", netdev->name);
++	/* DBG("Started the network queue for %s.\n", netdev->name); */
+ 	return (0);
+ }
+ 
+@@ -3535,12 +3402,15 @@ static int emac_dev_open(struct net_devi
+ static int emac_dev_close(struct net_device *netdev)
+ {
+ 	emac_dev_t *dev = NETDEV_PRIV(netdev);
++	int i;
+ 
+-	if (!g_init_enable_flag)
+-		emac_p_dev_disable(dev);
++	emac_p_dev_disable(dev);
+ 
+-	/* free ISR */
+-	free_irq(dev->init_cfg.intr_line, dev);
++	/* Unregister ISR */
++	/* NOTE: we can have multiple interrupt lines running to the CPU */
++	for (i = 0; i < dev->init_cfg.num_intr_lines; i++) {
++		free_irq((dev->init_cfg.intr_line + i), dev);
++	}
+ 
+ 	return (0);
+ }
+@@ -3600,6 +3470,9 @@ static int emac_ioctl(struct net_device 
+ 				 * function */
+ 				local_irq_save(irq_flags);
+ 
++				/**NOTE:: revisit copy_to_user can page fault
++				 * Hence can it be called with interrupts turned off*/
++
+ 				if (emac_control(dev,
+ 						 EMAC_IOCTL_READ_PHY_REG,
+ 						 (void *)&phy_params,
+@@ -3780,9 +3653,8 @@ static int emac_ioctl(struct net_device 
+ 				struct mib2_eth_params local_params;
+ 
+ 				local_params.eth_duplex_status =
+-				    ((dev->link_mode ==
+-				      PHY_DUPLEX_FULL) ?
+-					MIB2_FULL_DUPLEX : MIB2_HALF_DUPLEX);
++				    ((dev->link_mode == PHY_DUPLEX_FULL) ?
++				     MIB2_FULL_DUPLEX : MIB2_HALF_DUPLEX);
+ 
+ 				/* now copy the counters to the user data */
+ 				if (copy_to_user
+@@ -3834,9 +3706,8 @@ static u32 hash_get(u8 * addr)
+  * - Returns negative if error, 0 if no change to registers, >0 if
+  *   hash registers need to change
+  */
+-static int hash_add(emac_dev_t * _dev, u8 * mac_address)
++static int hash_add(emac_dev_t *dev, u8 *mac_address)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 hash_value;
+ 	u32 hash_bit;
+ 	u32 status = 0;
+@@ -3873,9 +3744,8 @@ static int hash_add(emac_dev_t * _dev, u
+  * - Returns negative if error, 0 if no change to registers, >0 if
+  *   hash registers need to change
+  */
+-static int hash_del(emac_dev_t * _dev, u8 * mac_address)
++static int hash_del(emac_dev_t *dev, u8 *mac_address)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 hash_value;
+ 	u32 hash_bit;
+ 
+@@ -3906,19 +3776,20 @@ static int hash_del(emac_dev_t * _dev, u
+ 
+ /* updates hash register bits with single multicast address add/delete
+  * operation */
+-static void emac_single_multi(emac_dev_t * _dev, emac_single_multi_oper oper,
++static void emac_single_multi(emac_dev_t *dev, emac_single_multi_oper oper,
+ 			      u8 * addr)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int status = -1;
+ 
++	/* Evaluate if RX_ADDR RAM can be used for filtering */
++
+ 	switch (oper) {
+ 	case EMAC_MULTICAST_ADD:
+-		status = hash_add(_dev, addr);
++		status = hash_add(dev, addr);
+ 		break;
+ 
+ 	case EMAC_MULTICAST_DEL:
+-		status = hash_del(_dev, addr);
++		status = hash_del(dev, addr);
+ 		break;
+ 
+ 	default:
+@@ -3934,9 +3805,8 @@ static void emac_single_multi(emac_dev_t
+ }
+ 
+ /* updates hash register bits for all multi operation (set/clear) */
+-static void emac_all_multi(emac_dev_t * _dev, emac_all_multi_oper oper)
++static void emac_all_multi(emac_dev_t *dev, emac_all_multi_oper oper)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	switch (oper) {
+ 	case EMAC_ALL_MULTI_SET:
+@@ -3946,8 +3816,9 @@ static void emac_all_multi(emac_dev_t * 
+ 	case EMAC_ALL_MULTI_CLR:
+ 		dev->mac_hash1 = 0;
+ 		dev->mac_hash2 = 0;
+-		memset(&(dev->multicast_hash_cnt[0]), 0 ,
+-		sizeof(dev->multicast_hash_cnt[0]) * EMAC_NUM_MULTICAST_BITS);
++		memset(&(dev->multicast_hash_cnt[0]), 0,
++		       sizeof(dev->multicast_hash_cnt[0]) *
++		       EMAC_NUM_MULTICAST_BITS);
+ 		break;
+ 	default:
+ 		LOGERR("Unhandled All multi operation %d", oper);
+@@ -3961,9 +3832,8 @@ static void emac_all_multi(emac_dev_t * 
+ /************************ PHY related functions ************************/
+ 
+ /* Cpmac Update Phy Status - updates phy status variables in hDDC->status "CpmacDDCStatus" structure */
+-static int emac_update_phy_status(emac_dev_t * _dev)
++static int emac_update_phy_status(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 set_phy_mode;
+ 
+ 	LOGMSG(EMAC_DEBUG_BUSY_FUNCTION_ENTRY, "");
+@@ -3981,7 +3851,7 @@ static int emac_update_phy_status(emac_d
+ 		/*  no phy condition, always linked */
+ 		dev->status.phy_linked = 1;
+ 		dev->status.phy_speed = 100;
+-		dev->status.phy_duplex = PHY_DUPLEX_FULL;
++		dev->status.phy_duplex = PHY_DUPLEX_UNKNOWN;
+ 		dev->status.phy_num = 0xFFFFFFFF;	/* no phy */
+ 		dev->mac_control |= (1 << EMAC_MACCONTROL_FULLDUPLEXEN_SHIFT);
+ 
+@@ -4004,7 +3874,7 @@ static int emac_update_phy_status(emac_d
+ 	if (dev->status.phy_linked) {
+ 		/*  retreive duplex and speed and the phy number  */
+ 		if (set_phy_mode & SNWAY_LPBK) {
+-			dev->status.phy_duplex = PHY_DUPLEX_FULL;
++			dev->status.phy_duplex = PHY_DUPLEX_UNKNOWN;
+ 		} else {
+ 			dev->status.phy_duplex = emac_mdio_get_duplex();
+ 		}
+@@ -4020,6 +3890,17 @@ static int emac_update_phy_status(emac_d
+ 			    ~(1 << EMAC_MACCONTROL_FULLDUPLEXEN_SHIFT);
+ 		}
+ 
++		if (dev->status.phy_speed == 1000) {
++
++			dev->mac_control |=
++			    ((0x1 << EMAC_MACCONTROL_GIGABITEN_SHIFT) |
++			     (0x1 << EMAC_MACCONTROL_GIG_FORCE_SHIFT));
++
++		} else {
++			dev->mac_control &=
++			    ~((0x1 << EMAC_MACCONTROL_GIGABITEN_SHIFT) |
++			      (0x1 << EMAC_MACCONTROL_GIG_FORCE_SHIFT));
++		}
+ 	}
+ 
+ 	/* write mac control register from stored value */
+@@ -4027,9 +3908,8 @@ static int emac_update_phy_status(emac_d
+ 
+       emac_update_phy_status_exit:
+ 	LOGMSG(EMAC_DEBUG_PORT_UPDATE,
+-	       "MacControl=%08X, Status: Phy=%d, Speed=%s, Duplex=%s",
+-	       dev->mac_control, dev->status.phy_num,
+-	       (dev->status.phy_speed == 100) ? "100" : "10",
++	       "MacControl=%08X, Status: Phy=%d, Speed=%d, Duplex=%s",
++	       dev->mac_control, dev->status.phy_num, dev->status.phy_speed,
+ 	       (dev->status.phy_duplex == PHY_DUPLEX_FULL) ? "Full" : "Half");
+ 	LOGMSG(EMAC_DEBUG_BUSY_FUNCTION_EXIT, "");
+ 
+@@ -4037,9 +3917,8 @@ static int emac_update_phy_status(emac_d
+ }
+ 
+ /* set phy mode */
+-static int emac_set_phy_mode(emac_dev_t * _dev)
++static int emac_set_phy_mode(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 set_phy_mode;
+ 	u32 phy_mode;
+ 
+@@ -4059,10 +3938,14 @@ static int emac_set_phy_mode(emac_dev_t 
+ 		phy_mode |= NWAY_FD10;
+ 	if (set_phy_mode & SNWAY_FD100)
+ 		phy_mode |= NWAY_FD100;
++	if (set_phy_mode & SNWAY_FD1000)
++		phy_mode |= NWAY_FD1000;
+ 	if (set_phy_mode & SNWAY_HD10)
+ 		phy_mode |= NWAY_HD10;
+ 	if (set_phy_mode & SNWAY_HD100)
+ 		phy_mode |= NWAY_HD100;
++	if (set_phy_mode & SNWAY_HD1000)
++		phy_mode |= NWAY_HD1000;
+ 	if (set_phy_mode & SNWAY_LPBK)
+ 		phy_mode |= NWAY_LPBK;
+ 	if (set_phy_mode & SNWAY_AUTOMDIX)
+@@ -4086,19 +3969,27 @@ static int emac_set_phy_mode(emac_dev_t 
+ 			       "100Mbps support. CANNOT SUPPORT 100Mbps",
+ 			       dev->init_cfg.emac_bus_frequency,
+ 			       EMAC_MIN_FREQUENCY_FOR_100MBPS);
++	} else if ((set_phy_mode & SNWAY_FD1000) ||
++		   (set_phy_mode & SNWAY_HD1000)) {
++		if (dev->init_cfg.emac_bus_frequency <=
++		    EMAC_MIN_FREQUENCY_FOR_1000MBPS)
++
++			LOGERR("freq(%d) is less than required %d freq for "
++			       "1000Mbps support. CANNOT SUPPORT 1000Mbps",
++			       dev->init_cfg.emac_bus_frequency,
++			       EMAC_MIN_FREQUENCY_FOR_1000MBPS);
+ 	}
+ 
+-	/* TODO: check for gigabit mode when PHY mode defines for
+-	 * gigabit are available */
+ 	LOGMSG(EMAC_DEBUG_PORT_UPDATE,
+ 	       "MdioPhyMode=%08X, PhyMode=%08d, Auto:%d, FD10:%d, "
+-	       "HD10:%d, FD100:%d, HD100:%d",
++	       "HD10:%d, FD100:%d, HD100:%d FD1000:%d HD1000:%d",
+ 	       set_phy_mode, phy_mode,
+ 	       (phy_mode & NWAY_AUTO), (phy_mode & NWAY_FD10),
+ 	       (phy_mode & NWAY_HD10),
+-	       (phy_mode & NWAY_FD100), (phy_mode & NWAY_HD100));
++	       (phy_mode & NWAY_FD100), (phy_mode & NWAY_HD100),
++	       (phy_mode & NWAY_FD1000), (phy_mode & NWAY_HD1000));
+ 	emac_mdio_set_phy_mode(phy_mode);
+-	emac_update_phy_status(_dev);
++	emac_update_phy_status(dev);
+ 	LOGMSG(EMAC_DEBUG_BUSY_FUNCTION_EXIT, "");
+ 
+ 	return (EMAC_SUCCESS);
+@@ -4107,9 +3998,8 @@ static int emac_set_phy_mode(emac_dev_t 
+ /***************** MAC ADDRESSING MODE SUPPORT FUNCTIONS ********************/
+ 
+ /* this function sets / clears the unicast flag in hardware */
+-static void emac_rx_uni_cast(emac_dev_t * _dev, u32 channel, bool enable)
++static void emac_rx_uni_cast(emac_dev_t *dev, u32 channel, bool enable)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	/* update local copy of register to save cycles in reading the
+ 	 * register */
+@@ -4133,37 +4023,24 @@ static void emac_rx_uni_cast(emac_dev_t 
+  * EMAC Add Type 0 Address
+  *  - set mac address for type 0 addressing (EMAC)
+  *
+- * This is an internal function of the DDC called from channel
+- * enable API which does channel number range checking and hence its
+- * not required.  It is assumed that this function will get the
+- * correct channel number always
+  */
+-static void emac_add_type0addr(emac_dev_t * _dev, u32 channel,
+-			       char *mac_address)
++static void emac_add_type0addr(emac_dev_t *dev, u32 channel, char *mac_address)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	dev->regs->mac_src_addr_lo = (mac_address[0] << 8) | (mac_address[1]);
+ 	dev->regs->mac_src_addr_hi = (mac_address[2] << 24) |
+-		(mac_address[3] << 16) | (mac_address[4] << 8) |
+-		(mac_address[5]);
++	    (mac_address[3] << 16) | (mac_address[4] << 8) | (mac_address[5]);
+ 
+ 	/* enable unicast */
+-	emac_rx_uni_cast(_dev, channel, TRUE);
++	emac_rx_uni_cast(dev, channel, TRUE);
+ }
+ 
+ /**
+  * EMAC Add Type 1 Address
+  *  - set mac address for type 1 addressing (EMAC)
+- *
+- * This is an internal function of the DDC called from channel enable
+- * API which does channel number range checking and hence its not required.
+- * It is assumed that this function will get the correct channel number always
+  */
+-static void emac_add_type1addr(emac_dev_t * _dev, u32 channel,
+-			       char *mac_address)
++static void emac_add_type1addr(emac_dev_t *dev, u32 channel, char *mac_address)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	/* set mac_index register with channel number */
+ 	dev->regs->mac_index = channel;
+@@ -4176,33 +4053,44 @@ static void emac_add_type1addr(emac_dev_
+ 	/* set mac_addr_lo register */
+ 	dev->regs->mac_addr_lo = ((mac_address[5] << 8) | mac_address[4]);
+ 
+-	/* set mac hash */
+-	dev->regs->mac_hash1 = 0;
+-	dev->regs->mac_hash2 = 0;
+-
+-	/* As per discussion with hardware folks, it is mandatory to
+-	   set the source address of the mac, else correct behaviour
+-	   is not guaranteed */
+-	emac_add_type0addr(_dev, channel, mac_address);
+-
+-	/* enable unicast */
+-	emac_rx_uni_cast(_dev, channel, TRUE);
+ }
+ 
++/** NOTE:: It is assumed that the index provided to this function
++ * can be written to directly - no checking is done to see
++ * whether the slot is free or holds a valid entry already
++ * Free entry management needs to be done outside this function.
++ *
++ * To guarantee MAC address addition, the management scheme needs to
++ * reserve first RX_MAX_CHANNELS slots for addition of MAC address
++ * corresponding to each of the Rx channels. Remaining entries can be
++ * used for specifying addresses with match/filter crititeria- use for
++ * multicast address matching??.
++ */
+ /* CPGMAC CFIG 2/3 type addressing - filtering */
+-static void emac_add_type2addr(emac_dev_t * _dev, u32 channel,
+-			       char *mac_address,
+-			       int index, bool valid, int match)
++static void emac_add_type2addr(emac_dev_t *dev, u32 channel,
++			       char *mac_address, int index, int match)
+ {
+-	/* not supported in DaVinci */
++
++	/* set mac_index register with channel number */
++	dev->regs->mac_index = index;
++
++	/* set mac_addr_hi register */
++	dev->regs->mac_addr_hi =
++	    (mac_address[3] << 24) | (mac_address[2] << 16) |
++	    (mac_address[1] << 8) | (mac_address[0]);
++
++	/* set mac_addr_lo register */
++	dev->regs->mac_addr_lo = ((mac_address[5] << 8) | mac_address[4]
++				  | ((channel & 0x7) << 16) | (match << 19)
++				  | (1 << 20));
++
+ }
+ 
+ /************************ HARDWARE CONFIGURATION SUPPORT FUNCTIONS ************************/
+ 
+ /* set RX hardware configuration */
+-void emac_set_rx_hw_cfg(emac_dev_t * _dev)
++void emac_set_rx_hw_cfg(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_rx_config *rx_cfg;
+ 	u32 rx_mbp_enable;
+ 
+@@ -4226,14 +4114,14 @@ void emac_set_rx_hw_cfg(emac_dev_t * _de
+ 	      copy_error_frames_enable & 0x1) << EMAC_RXMBP_CEFEN_SHIFT) |
+ 	    ((rx_cfg->
+ 	      promiscous_enable & 0x1) << EMAC_RXMBP_CAFEN_SHIFT) |
+-		((rx_cfg->promiscous_channel & EMAC_RXMBP_CHMASK)
+-		 << EMAC_RXMBP_PROMCH_SHIFT) |
+-		((rx_cfg->broadcast_enable & 0x1) << EMAC_RXMBP_BROADEN_SHIFT)|
+-		((rx_cfg->broadcast_channel & EMAC_RXMBP_CHMASK) <<
+-		 EMAC_RXMBP_BROADCH_SHIFT) |
+-		((rx_cfg->multicast_enable & 0x1) << EMAC_RXMBP_MULTIEN_SHIFT)|
+-		((rx_cfg-> multicast_channel & EMAC_RXMBP_CHMASK) <<
+-		 EMAC_RXMBP_MULTICH_SHIFT);
++	    ((rx_cfg->promiscous_channel & EMAC_RXMBP_CHMASK)
++	     << EMAC_RXMBP_PROMCH_SHIFT) |
++	    ((rx_cfg->broadcast_enable & 0x1) << EMAC_RXMBP_BROADEN_SHIFT) |
++	    ((rx_cfg->broadcast_channel & EMAC_RXMBP_CHMASK) <<
++	     EMAC_RXMBP_BROADCH_SHIFT) |
++	    ((rx_cfg->multicast_enable & 0x1) << EMAC_RXMBP_MULTIEN_SHIFT) |
++	    ((rx_cfg->multicast_channel & EMAC_RXMBP_CHMASK) <<
++	     EMAC_RXMBP_MULTICH_SHIFT);
+ 
+ 	if (rx_cfg->promiscous_enable) {
+ 		/* disable mcast bcast and unicast:  H/W limitation */
+@@ -4242,12 +4130,11 @@ void emac_set_rx_hw_cfg(emac_dev_t * _de
+ 
+ 		/* disable unicast - warning!! assuming only one
+ 		 * channel open */
+-		emac_rx_uni_cast(_dev, (dev->rx_cppi[0])->ch_info.ch_num,
+-				 FALSE);
++		emac_rx_uni_cast(dev, (dev->rx_cppi[0])->ch_info.ch_num, FALSE);
+ 	} else {
+ 		/* enable unicast - warning!! assuming only one
+ 		 * channel open */
+-		emac_rx_uni_cast(_dev, (dev->rx_cppi[0])->ch_info.ch_num, TRUE);
++		emac_rx_uni_cast(dev, (dev->rx_cppi[0])->ch_info.ch_num, TRUE);
+ 	}
+ 
+ 	if (dev->rx_MBP_enable != rx_mbp_enable) {
+@@ -4268,9 +4155,8 @@ void emac_set_rx_hw_cfg(emac_dev_t * _de
+ }
+ 
+ /* set MAC configuration - MACControl register */
+-static void emac_set_mac_hw_cfg(emac_dev_t * _dev)
++static void emac_set_mac_hw_cfg(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_mac_config *mac_cfg;
+ 	u32 mac_control;
+ 
+@@ -4306,38 +4192,11 @@ static void emac_set_mac_hw_cfg(emac_dev
+ 	}
+ }
+ 
+-/**
+- * EMAC Init
+- *  - validates max TX/RX channels and stores initial configuration
+- *
+- * Initial configuration passed by via the "init_cfg" parameter
+- */
+-static int emac_init(emac_dev_t * _dev, emac_init_config * init_cfg)
+-{
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+-
+-	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY, "");
+-
+-	/* validate num_tx and num_rx channels */
+-	if ((init_cfg->num_tx_channels > EMAC_MAX_TX_CHANNELS) ||
+-	    (init_cfg->num_rx_channels > EMAC_MAX_RX_CHANNELS)) {
+-		LOGERR("Invalid number of TX/RX channels");
+-		return (EMAC_INVALID_PARAM);
+-	}
+-
+-	/* save config info for later use */
+-	dev->init_cfg = *init_cfg;	/* structure copy */
+-
+-	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "");
+-	return (EMAC_SUCCESS);
+-}
+-
+ /* EMAC DDC DeInit
+  * Stub function - no functionality required as per this implementation
+  */
+-static int emac_de_init(emac_dev_t * _dev, void *param)
++static int emac_de_init(emac_dev_t *dev, void *param)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY, "");
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "");
+@@ -4355,13 +4214,16 @@ static int emac_de_init(emac_dev_t * _de
+  *
+  * "param" not used in this implementation
+  */
+-static int emac_open(emac_dev_t * _dev, void *param)
++static int emac_open(emac_dev_t *dev, void *param)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 channel;
+ 	u32 mii_mod_id, mii_rev_maj, mii_rev_min;
+ 	int ret_val;
+ 	emac_init_config *init_cfg;
++	ewrap_dm646x_regs *dm646x_wrap = NULL;
++	ewrap_dm644x_regs *dm644x_wrap = NULL;
++	bool device_is_dm646x = FALSE;
++	bool device_is_dm644x = FALSE;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY, "");
+ 
+@@ -4375,14 +4237,29 @@ static int emac_open(emac_dev_t * _dev, 
+ 	dev->regs = (emac_regs_ovly) init_cfg->base_address;
+ 	dev->e_wrap_regs = (ewrap_regs *) init_cfg->e_wrap_base_address;
+ 
++	if (cpu_is_davinci_dm6467()) {
++		dm646x_wrap = &dev->e_wrap_regs->wrapper_646x_regs;
++		device_is_dm646x = TRUE;
++	} else {
++		dm644x_wrap = &dev->e_wrap_regs->wrapper_644x_regs;
++		device_is_dm644x = TRUE;
++	}
++
+ 	/* set the BD memory pointer */
+ 	emac_wrapper_ptr = EMAC_WRAPPER_RAM_ADDR;
+ 
+-	/* bring EMAC out of reset - for clean implementation, reset
+-	 * and then unreset the module */
+-	/* for EMAC 2.6 and beyond, reset is internal to the module */
+-	dev->regs->soft_reset = 1;
++	if (device_is_dm646x) {
++		/* bring EMAC out of reset - for clean implementation, reset
++		 * and then unreset the module */
++		/* for EMAC 2.6 and beyond, reset is internal to the module */
++		/* reset wrapper first */
++		dm646x_wrap->SOFTRST = 1;
++		while (dm646x_wrap->SOFTRST) {
++			/* wait for reset to complete */
++		}
++	}
+ 
++	dev->regs->soft_reset = 1;
+ 	while (dev->regs->soft_reset) {
+ 		/* wait for reset to complete - do nothing */
+ 	}
+@@ -4408,12 +4285,18 @@ static int emac_open(emac_dev_t * _dev, 
+ 
+ 	/* enable adapter check interrupts - disable stats interupt */
+ 	dev->regs->mac_int_mask_set = EMAC_MAC_HOST_ERR_INTMASK_VAL;
++	/* update wrapper book-keeping fields */
++	dev->misc_en = (EMAC_MAC_HOST_ERR_INTMASK_VAL);
++
++	if (device_is_dm646x) {
++		dm646x_wrap->C0_MISCEN = EMAC_MAC_HOST_ERR_INTMASK_VAL;
++	}
+ 
+ 	/* set device state - opened - useful when opening channels */
+ 	dev->drv_state = DRV_OPENED;
+ 
+ 	/* set the mac_control register */
+-	emac_set_mac_hw_cfg(_dev);
++	emac_set_mac_hw_cfg(dev);
+ 
+ 	/* start MDIO autonegotiation and set phy mode */
+ 	emac_mdio_get_ver(init_cfg->mdio_base_address,
+@@ -4437,7 +4320,7 @@ static int emac_open(emac_dev_t * _dev, 
+ 
+ 	/* set the PHY to a given mode - as per config parameters and
+ 	 * update DDA layer */
+-	emac_set_phy_mode(_dev);
++	emac_set_phy_mode(dev);
+ 
+ 	emac_control_cb(dev,
+ 			EMAC_IOCTL_STATUS_UPDATE, (void *)&dev->status, NULL);
+@@ -4451,7 +4334,7 @@ static int emac_open(emac_dev_t * _dev, 
+ 	for (channel = 0; channel < EMAC_MAX_TX_CHANNELS; channel++) {
+ 		if (dev->tx_cppi[channel] != NULL) {
+ 			ret_val =
+-			    emac_enable_channel(_dev, channel, NET_CH_DIR_TX);
++			    emac_enable_channel(dev, channel, NET_CH_DIR_TX);
+ 			if (ret_val != EMAC_SUCCESS) {
+ 				LOGERR("Error enabling TX channel %d", channel);
+ 
+@@ -4471,12 +4354,12 @@ static int emac_open(emac_dev_t * _dev, 
+ 	dev->regs->rx_unicast_clear = EMAC_RX_UNICAST_CLEAR_ALL;
+ 
+ 	/* set MAC hash register */
+-	dev->regs->mac_hash1 = dev->mac_hash1;
+-	dev->regs->mac_hash2 = dev->mac_hash2;
++	dev->regs->mac_hash1 = dev->mac_hash1 = 0;
++	dev->regs->mac_hash2 = dev->mac_hash2 = 0;
+ 
+ 	/* RX MBP, RX pkt length and RX buffer offset registers taken
+ 	 * care by this function */
+-	emac_set_rx_hw_cfg(_dev);
++	emac_set_rx_hw_cfg(dev);
+ 
+ 	/* read RX address matching/filtering type (0/1/2) */
+ 	dev->rx_addr_type = (dev->regs->mac_cfig >> 8) & 0xFF;
+@@ -4485,7 +4368,7 @@ static int emac_open(emac_dev_t * _dev, 
+ 	for (channel = 0; channel < EMAC_MAX_RX_CHANNELS; channel++) {
+ 		if (dev->rx_cppi[channel] != NULL) {
+ 			ret_val =
+-			    emac_enable_channel(_dev, channel, NET_CH_DIR_RX);
++			    emac_enable_channel(dev, channel, NET_CH_DIR_RX);
+ 			if (ret_val != EMAC_SUCCESS) {
+ 				LOGERR("Error enabling RX channel %d", channel);
+ 
+@@ -4512,7 +4395,7 @@ static int emac_open(emac_dev_t * _dev, 
+ 			(void *)init_cfg->mib64cnt_msec, NULL);
+ 
+ 	/* enable interrupts via module control (wrapper) */
+-	((volatile ewrap_regs *)dev->e_wrap_regs)->EWCTL = 0x1;
++	emac_enable_interrupt(dev, 1);
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "");
+ 
+@@ -4529,9 +4412,8 @@ static int emac_open(emac_dev_t * _dev, 
+  *
+  * "param" not used in this implementation
+  */
+-static int emac_close(emac_dev_t * _dev, void *param)
++static int emac_close(emac_dev_t *dev, void *param)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int ret_val;
+ 	int err_val = EMAC_SUCCESS;
+ 	u32 channel;
+@@ -4552,7 +4434,7 @@ static int emac_close(emac_dev_t * _dev,
+ 	for (channel = 0; channel < EMAC_MAX_TX_CHANNELS; channel++) {
+ 		if (dev->tx_cppi[channel] != NULL) {
+ 			ret_val =
+-			    emac_ch_close(_dev, channel, NET_CH_DIR_TX, NULL);
++			    emac_ch_close(dev, channel, NET_CH_DIR_TX, NULL);
+ 			if (ret_val != EMAC_SUCCESS) {
+ 				LOGERR("Error closing TX channel %d", channel);
+ 
+@@ -4568,7 +4450,7 @@ static int emac_close(emac_dev_t * _dev,
+ 	for (channel = 0; channel < EMAC_MAX_RX_CHANNELS; channel++) {
+ 		if (dev->rx_cppi[channel] != NULL) {
+ 			ret_val =
+-			    emac_ch_close(_dev, channel, NET_CH_DIR_RX, NULL);
++			    emac_ch_close(dev, channel, NET_CH_DIR_RX, NULL);
+ 
+ 			if (ret_val != EMAC_SUCCESS) {
+ 				LOGERR("Error closing RX channel %d", channel);
+@@ -4582,7 +4464,7 @@ static int emac_close(emac_dev_t * _dev,
+ 	}
+ 
+ 	/* disable interrupts via module control (wrapper) */
+-	((volatile ewrap_regs *)dev->e_wrap_regs)->EWCTL = 0x0;
++	emac_disable_interrupt(dev);
+ 
+ 	/* put EMAC in reset */
+ 	dev->regs->soft_reset = 1;
+@@ -4610,29 +4492,19 @@ static int emac_close(emac_dev_t * _dev,
+  *
+  * "param" not used in this implementation
+  */
+-static int emac_control(emac_dev_t * _dev, int cmd, void *cmd_arg, void *param)
++static int emac_control(emac_dev_t *dev, int cmd, void *cmd_arg, void *param)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	/* sanity check */
+-	if (dev->drv_state != DRV_OPENED) {
++	if (unlikely(dev->drv_state != DRV_OPENED)) {
+ 		LOGERR("ioctl called when device is NOT open");
+ 		return (EMAC_ERR_DEV_NOT_OPEN);
+ 	}
+ 
+ 	switch (cmd) {
+ 	case EMAC_IOCTL_GET_HWVER:
+-		/* read hardware versions only if device is in open
+-		 * state */
+-		/* cmd is a ptr to an integer that will contain Tx Id
+-		   ver and param is a pointer to an integer that will
+-		   contain rx id ver after this call */
+-		if (dev->drv_state == DRV_OPENED) {
+-			*((u32 *) cmd_arg) = dev->regs->tx_id_ver;
+-			*((u32 *) param) = dev->regs->rx_id_ver;
+-		} else {
+-			return (EMAC_ERR_DEV_NOT_OPEN);
+-		}
++		*((u32 *) cmd_arg) = dev->regs->tx_id_ver;
++		*((u32 *) param) = dev->regs->rx_id_ver;
+ 		break;
+ 
+ 	case EMAC_IOCTL_SET_RXCFG:
+@@ -4640,7 +4512,7 @@ static int emac_control(emac_dev_t * _de
+ 		 * pointed by cmd_arg, params not used */
+ 		if (cmd_arg != NULL) {
+ 			dev->init_cfg.rx_cfg = *((emac_rx_config *) cmd_arg);
+-			emac_set_rx_hw_cfg(_dev);
++			emac_set_rx_hw_cfg(dev);
+ 		} else {
+ 			return (EMAC_INVALID_PARAM);
+ 		}
+@@ -4651,7 +4523,7 @@ static int emac_control(emac_dev_t * _de
+ 		 * pointed by cmd_arg, params not used */
+ 		if (cmd_arg != NULL) {
+ 			dev->init_cfg.mac_cfg = *((emac_mac_config *) cmd_arg);
+-			emac_set_mac_hw_cfg(_dev);
++			emac_set_mac_hw_cfg(dev);
+ 		} else {
+ 			return (EMAC_INVALID_PARAM);
+ 		}
+@@ -4691,8 +4563,8 @@ static int emac_control(emac_dev_t * _de
+ 			/* \warning: Write to the phy registers - Note
+ 			   that this code loops on a completion bit in
+ 			   the phy so there are chances of hanging" */
+-			emac_mdio_write(phy_params->reg_addr,
+-					phy_params->phy_num, phy_params->data);
++			emac_mdio_write(phy_params->phy_num,
++					phy_params->reg_addr, phy_params->data);
+ 		}
+ 		break;
+ 
+@@ -4724,7 +4596,7 @@ static int emac_control(emac_dev_t * _de
+ 			for (cnt = 0; cnt < EMAC_NUM_STAT_REGS; cnt++, addr++) {
+ 				*addr = EMAC_STAT_CLEAR;	/* 0xFFFFFFFF value */
+ 			}
+-			emac_ddcifcnt_clear(_dev);
++			emac_ddcifcnt_clear(dev);
+ 		}
+ 		break;
+ 
+@@ -4733,7 +4605,7 @@ static int emac_control(emac_dev_t * _de
+ 		 * to multicast address - u8 */
+ 		{
+ 			u8 *addr = (u8 *) param;
+-			emac_single_multi(_dev,
++			emac_single_multi(dev,
+ 					  (emac_single_multi_oper) cmd_arg,
+ 					  addr);
+ 		}
+@@ -4741,7 +4613,7 @@ static int emac_control(emac_dev_t * _de
+ 
+ 	case EMAC_IOCTL_ALL_MULTI:
+ 		/* cmd_arg= emac_all_multi_oper enum, param=not used */
+-		emac_all_multi(_dev, (emac_all_multi_oper) cmd_arg);
++		emac_all_multi(dev, (emac_all_multi_oper) cmd_arg);
+ 		break;
+ 
+ 	case EMAC_IOCTL_TYPE2_3_FILTERING:
+@@ -4753,10 +4625,12 @@ static int emac_control(emac_dev_t * _de
+ 
+ 			addr_params =
+ 			    (emac_type2_3_addr_filter_params *) cmd_arg;
+-			emac_add_type2addr(_dev, addr_params->channel,
++			/* Add a check here to prevent overwriting of Rx
++			 * channel MAC address that are programmed by
++			 * driver */
++			emac_add_type2addr(dev, addr_params->channel,
+ 					   addr_params->mac_address,
+ 					   addr_params->index,
+-					   addr_params->valid,
+ 					   addr_params->match);
+ 		}
+ 		break;
+@@ -4790,24 +4664,24 @@ static int emac_control(emac_dev_t * _de
+ 				    addr_params->mac_address[cnt];
+ 
+ 			/* set interface MAC address */
+-			emac_set_mac_address(_dev, addr_params->channel,
++			emac_set_mac_address(dev, addr_params->channel,
+ 					     addr_params->mac_address);
+ 		}
+ 		break;
+ 
+ 	case EMAC_IOCTL_IF_COUNTERS:
+-		emac_ddcifcnt_updt(_dev);
++		emac_ddcifcnt_updt(dev);
+ 
+ 		memcpy(cmd_arg, &dev->mib2if_hccounter.mib2if_counter,
+ 		       sizeof(struct mib2_if_counters));
+ 		break;
+ 
+ 	case EMAC_IOCTL_ETHER_COUNTERS:
+-		emac_ddcphycnt(_dev, cmd_arg);
++		emac_ddcphycnt(dev, cmd_arg);
+ 		break;
+ 
+ 	case EMAC_IOCTL_IF_PARAMS_UPDT:
+-		emac_ddcifcnt_updt(_dev);
++		emac_ddcifcnt_updt(dev);
+ 		break;
+ 
+ 	default:
+@@ -4827,10 +4701,9 @@ static int emac_control(emac_dev_t * _de
+  * 1. If DDC instance is in "Opened" state, the channel is enabled in hardware
+  *       2. "chOpenArgs" is used only for opening RX channel
+  */
+-static int emac_ch_open(emac_dev_t * _dev, emac_ch_info * ch_info,
++static int emac_ch_open(emac_dev_t *dev, emac_ch_info * ch_info,
+ 			void *ch_open_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int ret_val;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY,
+@@ -4856,14 +4729,9 @@ static int emac_ch_open(emac_dev_t * _de
+ 			return (EMAC_ERR_TX_CH_INVALID);
+ 		}
+ 
+-		if (dev->tx_is_created[ch_info->ch_num] == TRUE) {
+-			LOGERR("TX Channel %d already open", ch_info->ch_num);
+-			return (EMAC_ERR_TX_CH_ALREADY_INIT);
+-		}
+-
+ 		/* allocate channel memory and perform other book-keep
+ 		 * functions for the channel */
+-		ret_val = emac_init_tx_channel(_dev, ch_info, ch_open_args);
++		ret_val = emac_init_tx_channel(dev, ch_info, ch_open_args);
+ 		if (ret_val != EMAC_SUCCESS) {
+ 			LOGERR
+ 			    ("Error in initializing TX channel %d",
+@@ -4878,14 +4746,9 @@ static int emac_ch_open(emac_dev_t * _de
+ 			return (EMAC_ERR_RX_CH_INVALID);
+ 		}
+ 
+-		if (dev->rx_is_created[ch_info->ch_num] == TRUE) {
+-			LOGERR("RX Channel %d already open", ch_info->ch_num);
+-			return (EMAC_ERR_RX_CH_ALREADY_INIT);
+-		}
+-
+ 		/* allocate channel memory and perform other book-keep
+ 		 * functions for the channel */
+-		ret_val = emac_init_rx_channel(_dev, ch_info, ch_open_args);
++		ret_val = emac_init_rx_channel(dev, ch_info, ch_open_args);
+ 
+ 		if (ret_val != EMAC_SUCCESS) {
+ 			LOGERR
+@@ -4898,7 +4761,7 @@ static int emac_ch_open(emac_dev_t * _de
+ 	/* if device is opened already, enable this channel for use */
+ 	if (dev->drv_state == DRV_OPENED) {
+ 		ret_val =
+-		    emac_enable_channel(_dev, ch_info->ch_num, ch_info->ch_dir);
++		    emac_enable_channel(dev, ch_info->ch_num, ch_info->ch_dir);
+ 		if (ret_val != EMAC_SUCCESS) {
+ 			LOGERR
+ 			    ("Error enabling channel %d in %d direction",
+@@ -4920,10 +4783,9 @@ static int emac_ch_open(emac_dev_t * _de
+  *  - If DDC instance is in "Opened" state, disable the channel in hardware
+  *  - Un-initialize the channel (free memory previously allocated)
+  */
+-static int emac_ch_close(emac_dev_t * _dev, int channel,
++static int emac_ch_close(emac_dev_t *dev, int channel,
+ 			 int direction, void *ch_close_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int ret_val;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY,
+@@ -4932,7 +4794,7 @@ static int emac_ch_close(emac_dev_t * _d
+ 
+ 	/* disable this channel */
+ 	if (dev->drv_state == DRV_OPENED) {
+-		ret_val = emac_disable_channel(_dev, channel, direction);
++		ret_val = emac_disable_channel(dev, channel, direction);
+ 		if (ret_val != EMAC_SUCCESS) {
+ 			LOGERR
+ 			    ("Error disabling channel %d in %s direction",
+@@ -4944,7 +4806,7 @@ static int emac_ch_close(emac_dev_t * _d
+ 
+ 	/* un_init channel */
+ 	if (direction == NET_CH_DIR_TX) {
+-		ret_val = emac_un_init_tx_channel(_dev, channel, ch_close_args);
++		ret_val = emac_un_init_tx_channel(dev, channel, ch_close_args);
+ 		if (ret_val != EMAC_SUCCESS) {
+ 			LOGERR("Error in UnInit of TX channel %d", channel);
+ 			return (ret_val);
+@@ -4952,7 +4814,7 @@ static int emac_ch_close(emac_dev_t * _d
+ 	}
+ 
+ 	else if (direction == NET_CH_DIR_RX) {
+-		ret_val = emac_un_init_rx_channel(_dev, channel, ch_close_args);
++		ret_val = emac_un_init_rx_channel(dev, channel, ch_close_args);
+ 		if (ret_val != EMAC_SUCCESS) {
+ 			LOGERR("Error in UnInit of TX channel %d", channel);
+ 			return (ret_val);
+@@ -4979,10 +4841,9 @@ static int emac_ch_close(emac_dev_t * _d
+  * not do any error check on these parameters to avoid duplicate error
+  * checks (done in caller function).
+  */
+-static int emac_init_tx_channel(emac_dev_t * _dev,
++static int emac_init_tx_channel(emac_dev_t *dev,
+ 				emac_ch_info * ch_info, void *ch_open_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 cnt, bd_size;
+ 	char *alloc_mem;
+ 	emac_tx_bd *curr_bd;
+@@ -5033,7 +4894,6 @@ static int emac_init_tx_channel(emac_dev
+ 	tx_cppi->out_of_tx_bd = 0;
+ 	tx_cppi->no_active_pkts = 0;
+ 	tx_cppi->active_queue_count = 0;
+-	dev->tx_is_created[ch_info->ch_num] = TRUE;
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "ChannelNo=%d", ch_info->ch_num);
+ 
+ 	return (EMAC_SUCCESS);
+@@ -5050,20 +4910,13 @@ static int emac_init_tx_channel(emac_dev
+  * and this function will not do any error check to avoid duplicate
+  * error checks (done in caller function).
+  */
+-static int emac_un_init_tx_channel(emac_dev_t * _dev, u32 channel,
++static int emac_un_init_tx_channel(emac_dev_t *dev, u32 channel,
+ 				   void *ch_close_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_tx_cppi_ch *tx_cppi;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY, "ChannelNo=%d", channel);
+ 
+-	/* check if channel structure is already de-allocated */
+-	if (dev->tx_is_created[channel] == FALSE) {
+-		LOGERR("TX CPPI Channel %d structure already freed", channel);
+-		return (EMAC_ERR_TX_CH_ALREADY_CLOSED);
+-	}
+-
+ 	tx_cppi = dev->tx_cppi[channel];
+ 
+ 	/* free the buffer descriptors memory */
+@@ -5078,7 +4931,6 @@ static int emac_un_init_tx_channel(emac_
+ 	/* free the TX channel structure */
+ 	emac_free(tx_cppi);
+ 	dev->tx_cppi[channel] = NULL;
+-	dev->tx_is_created[channel] = FALSE;
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "ChannelNo=%d", channel);
+ 
+ 	return (EMAC_SUCCESS);
+@@ -5097,10 +4949,9 @@ static int emac_un_init_tx_channel(emac_
+  * not do any error check on these parameters to avoid duplicate error
+  * checks (done in caller function).
+  */
+-static int emac_init_rx_channel(emac_dev_t * _dev,
++static int emac_init_rx_channel(emac_dev_t *dev,
+ 				emac_ch_info * ch_info, void *ch_open_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 cnt, bd_size;
+ 	char *alloc_mem;
+ 	emac_rx_bd *curr_bd;
+@@ -5131,7 +4982,7 @@ static int emac_init_rx_channel(emac_dev
+ 	rx_cppi->bd_mem = (char *)EMAC_RX_BD_MEM;
+ 	memzero(rx_cppi->bd_mem, rx_cppi->alloc_size);
+ 
+-	rx_cppi->pkt_queue.buf_list = &rx_cppi->buf_queue[0];
++	rx_cppi->pkt_queue.buf_list = &rx_cppi->buf_queue;
+ 
+ 	/* allocate RX buffer and initialize the BD linked list */
+ 	alloc_mem = (char *)(((u32) rx_cppi->bd_mem + 0xF) & ~0xF);
+@@ -5171,7 +5022,6 @@ static int emac_init_rx_channel(emac_dev
+ 	/* At this point rxCppi->activeQueueHead points to the first
+ 	   RX BD ready to be given to RX HDP and
+ 	   rx_cppi->active_queue_tail points to the last RX BD */
+-	dev->rx_is_created[ch_info->ch_num] = TRUE;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "ChannelNo=%d", ch_info->ch_num);
+ 
+@@ -5189,21 +5039,14 @@ static int emac_init_rx_channel(emac_dev
+  * and this function will not do any error check to avoid duplicate
+  * error checks (done in caller function).
+  */
+-static int emac_un_init_rx_channel(emac_dev_t * _dev, u32 channel,
++static int emac_un_init_rx_channel(emac_dev_t *dev, u32 channel,
+ 				   void *ch_close_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_rx_cppi_ch *rx_cppi;
+ 	emac_rx_bd *curr_bd;
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY, "ChannelNo=%d", channel);
+ 
+-	/* check if channel structure is already de-allocated */
+-	if (dev->rx_is_created[channel] == FALSE) {
+-		LOGERR("RX CPPI Channel %d structure already freed", channel);
+-		return (EMAC_ERR_RX_CH_ALREADY_CLOSED);
+-	}
+-
+ 	rx_cppi = dev->rx_cppi[channel];
+ 
+ 	/* free the receive buffers previously allocated */
+@@ -5226,7 +5069,6 @@ static int emac_un_init_rx_channel(emac_
+ 	/* free the RX channel structure */
+ 	emac_free(rx_cppi);
+ 	dev->rx_cppi[channel] = NULL;
+-	dev->rx_is_created[channel] = FALSE;
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT, "ChannelNo=%d", channel);
+ 
+ 	return (EMAC_SUCCESS);
+@@ -5239,20 +5081,32 @@ static int emac_un_init_rx_channel(emac_
+  *
+  * 1. It is assumed that the channel is already "initialized"
+  */
+-static void emac_set_mac_address(emac_dev_t * _dev, u32 channel, char *mac_addr)
++static void emac_set_mac_address(emac_dev_t *dev, u32 channel, char *mac_addr)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+-
+-	/* enable unicast on this channel */
+-	dev->regs->rx_unicast_set = (1 << channel);
+ 
+ 	/* program MAC address for the channel depending upon emac/cpgmac */
+-	if (dev->rx_addr_type == RX_ADDR_TYPE0)
+-		emac_add_type0addr(_dev, channel, mac_addr);
+-	else if (dev->rx_addr_type == RX_ADDR_TYPE1)
+-		emac_add_type1addr(_dev, channel, mac_addr);
+-	else if (dev->rx_addr_type == RX_ADDR_TYPE2)
+-		emac_add_type2addr(_dev, channel, mac_addr, 0, 1, 1);
++	if (dev->rx_addr_type == RX_ADDR_TYPE0) {
++		/* we just program the MAC SRC Addr registers and
++		 * enable Unicast on the channel*/
++		emac_add_type0addr(dev, channel, mac_addr);
++	} else if (dev->rx_addr_type == RX_ADDR_TYPE1) {
++		/* program the channel Rx filter address */
++		emac_add_type1addr(dev, channel, mac_addr);
++		/* We also need to program the MAC SRC Addr
++		 * Only then the H/w works reliably. Also enable
++		 * Unicast on the channel*/
++		emac_add_type0addr(dev, channel, mac_addr);
++	} else if (dev->rx_addr_type == RX_ADDR_TYPE2) {
++		/* program the MAC addr to Rx filter RAM. We use the first
++		 * MAX_RX_CHANNELS for adding channel MAC address to the
++		 * RX Filter RAM. Hence index=channel number*/
++		emac_add_type2addr(dev, channel, mac_addr, channel, 1);
++		/* We also need to program the MAC SRC Addr
++		 * Only then the H/w works reliably. Also enable
++		 * Unicast on the channel*/
++		emac_add_type0addr(dev, channel, mac_addr);
++	}
++	/**NOTE:: make sure this path is correct for type2 filtering*/
+ 	else
+ 		LOGERR
+ 		    ("Wrong Rx Addressing Type - (Type2) detected in hardware");
+@@ -5267,9 +5121,15 @@ static void emac_set_mac_address(emac_de
+  * 1. It is assumed that the channel is already "initialized"
+  * 2. To enable a channel after its disabled, it needs to be initialized again
+  */
+-static int emac_enable_channel(emac_dev_t * _dev, u32 channel, u32 direction)
++static int emac_enable_channel(emac_dev_t *dev, u32 channel, u32 direction)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
++	bool device_is_dm6467 = FALSE;
++	ewrap_dm646x_regs *dm646x_wrap = NULL;
++
++	if (cpu_is_davinci_dm6467()) {
++		dm646x_wrap = &dev->e_wrap_regs->wrapper_646x_regs;
++		device_is_dm6467 = TRUE;
++	}
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY,
+ 	       "ChannelNo=%d, Direction=%s",
+@@ -5296,18 +5156,29 @@ static int emac_enable_channel(emac_dev_
+ 			if (mac_cfg->tx_interrupt_disable == TRUE) {
+ 				/* disable channel interrupt */
+ 				dev->regs->tx_int_mask_clear = (1 << channel);
++				if (device_is_dm6467) {
++					/* update wrapper book-keeping fields */
++					dev->tx_en &= (~(1 << channel));
++					dm646x_wrap->C0_TXINTEN = dev->tx_en;
++				}
++
+ 				dev->tx_interrupt_disable = TRUE;
+ 				dev->tx_int_threshold[channel] =
+ 				    dev->tx_cppi[channel]->ch_info.service_max;
+ 			} else {
+ 				/* enable channel interrupt */
+ 				dev->regs->tx_int_mask_set = (1 << channel);
++				if (device_is_dm6467) {
++					/* update wrapper book-keeping fields */
++					dev->tx_en = (1 << channel);
++					dm646x_wrap->C0_TXINTEN =
++					    (1 << channel);
++				}
+ 				dev->tx_interrupt_disable = FALSE;
+ 			}
+ 		}
+ 
+ 		/* mark channel open */
+-		dev->tx_is_open[channel] = TRUE;
+ 		tx_cppi->ch_info.ch_state = NET_CH_OPENED;
+ 	}
+ 
+@@ -5324,10 +5195,15 @@ static int emac_enable_channel(emac_dev_
+ 		}
+ 
+ 		/* set interface MAC address */
+-		emac_set_mac_address(_dev, channel, rx_cppi->mac_addr);
++		emac_set_mac_address(dev, channel, rx_cppi->mac_addr);
+ 
+ 		/* enable channel interrupt */
+ 		dev->regs->rx_int_mask_set = (1 << channel);
++		if (device_is_dm6467) {
++			/* update wrapper book-keeping fields */
++			dev->rx_en = (1 << channel);
++			dm646x_wrap->C0_RXINTEN = (1 << channel);
++		}
+ 
+ 		/* mark queue active */
+ 		rx_cppi->queue_active = TRUE;
+@@ -5336,9 +5212,6 @@ static int emac_enable_channel(emac_dev_
+ 		dev->regs->rx_HDP[channel] =
+ 		    EMAC_VIRT_TO_PHYS(rx_cppi->active_queue_head);
+ 
+-		/* mark channel open */
+-		dev->rx_is_open[channel] = TRUE;
+-
+ 		rx_cppi->ch_info.ch_state = NET_CH_OPENED;
+ 
+ 	}
+@@ -5360,10 +5233,17 @@ static int emac_enable_channel(emac_dev_
+  * 1. It is assumed that the channel number passed is valid
+  * 2. Resources for the channel will be released only when its closed
+  */
+-static int emac_disable_channel(emac_dev_t * _dev, u32 channel,
++static int emac_disable_channel(emac_dev_t *dev, u32 channel,
+ 				net_ch_dir direction)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
++	bool device_is_dm6467 = FALSE;
++
++	ewrap_dm646x_regs *dm646x_wrap = NULL;
++
++	if (cpu_is_davinci_dm6467()) {
++		dm646x_wrap = &dev->e_wrap_regs->wrapper_646x_regs;
++		device_is_dm6467 = TRUE;
++	}
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_ENTRY,
+ 	       "ChannelNo=%d, Direction=%s",
+@@ -5378,7 +5258,7 @@ static int emac_disable_channel(emac_dev
+ 
+ 		/* wait for teardown complete */
+ 		if (emac_wait_for_teardown_complete
+-		    (_dev, channel, direction, TRUE) != EMAC_SUCCESS) {
++		    (dev, channel, direction, TRUE) != EMAC_SUCCESS) {
+ 
+ 			LOGERR("Failed to teardown TX channel %d", channel);
+ 
+@@ -5390,11 +5270,14 @@ static int emac_disable_channel(emac_dev
+ 
+ 		/* disable interrupt */
+ 		dev->regs->tx_int_mask_clear = (1 << channel);
++		if (device_is_dm6467) {
++			/* update wrapper book-keeping fields */
++			dev->tx_en &= (~(1 << channel));
++			dm646x_wrap->C0_TXINTEN = dev->tx_en;
++		}
+ 
+ 		/* disable DMA */
+ 
+-		/* mark channel closed */
+-		dev->tx_is_open[channel] = FALSE;
+ 	}
+ 
+ 	else if (direction == NET_CH_DIR_RX) {
+@@ -5405,16 +5288,19 @@ static int emac_disable_channel(emac_dev
+ 
+ 		/* wait for teardown complete */
+ 		if (emac_wait_for_teardown_complete
+-		    (_dev, channel, direction, TRUE) != EMAC_SUCCESS) {
++		    (dev, channel, direction, TRUE) != EMAC_SUCCESS) {
+ 			LOGERR("Failed to teardown RX channel %d", channel);
+ 		}
+ 		dev->rx_teardown_pending[channel] = FALSE;
+ 
+ 		/* disable interrupt */
+ 		dev->regs->rx_int_mask_clear = (1 << channel);
++		if (device_is_dm6467) {
++			/* update wrapper book-keeping fields */
++			dev->rx_en &= (~(1 << channel));
++			dm646x_wrap->C0_RXINTEN = dev->rx_en;
++		}
+ 
+-		/* mark channel closed */
+-		dev->rx_is_open[channel] = FALSE;
+ 	}
+ 
+ 	LOGMSG(EMAC_DEBUG_FUNCTION_EXIT,
+@@ -5431,11 +5317,10 @@ static int emac_disable_channel(emac_dev
+  *             = FALSE (returns immediately) - NOT SUPPORTED
+  * As of now this function supports blocking mode in polled mode only
+  */
+-static int emac_wait_for_teardown_complete(emac_dev_t * _dev,
++static int emac_wait_for_teardown_complete(emac_dev_t *dev,
+ 					   u32 channel,
+ 					   net_ch_dir direction, bool blocking)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	volatile unsigned int teardown_cnt = 0xFFFFFFF0;
+ 
+ 	if (direction == NET_CH_DIR_TX) {
+@@ -5568,167 +5453,167 @@ static void emac_ddcphycnt(emac_dev_t * 
+ 	return;
+ }
+ 
+-static void emac_ddcifcnt_clear(emac_dev_t * _dev)
++static void emac_ddcifcnt_clear(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	memzero((char *)&dev->mib2if_hccounter, sizeof(dev->mib2if_hccounter));
+ }
+ 
+-static void emac_ddcifcnt_updt(emac_dev_t * _dev)
++static void emac_ddcifcnt_updt(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int result;
+ 	emac_hw_statistics stats;
++	struct mib2_if_hccounters *mib2_hc_counters;
+ 
+ 	result =
+-	    emac_control(_dev, EMAC_IOCTL_GET_STATISTICS,
+-			 (u32 *) & stats, NULL);
++	    emac_control(dev, EMAC_IOCTL_GET_STATISTICS, (u32 *) & stats, NULL);
+ 
+-	if (result != 0) {
++	if (unlikely(result != 0)) {
+ 		LOGERR("Error from ioctl for DDC EMAC_IOCTL_GET_STATISTICS \n");
+ 		return;
+ 	}
+ 
+-	if (stats.if_in_octets >= dev->mib2if_hccounter.in_bytes) {
+-		dev->mib2if_hccounter.in_bytes_hc +=
+-		    (stats.if_in_octets - dev->mib2if_hccounter.in_bytes);
++	mib2_hc_counters = &dev->mib2if_hccounter;
++
++	if (stats.if_in_octets >= mib2_hc_counters->in_bytes) {
++		mib2_hc_counters->in_bytes_hc +=
++		    (stats.if_in_octets - mib2_hc_counters->in_bytes);
+ 	} else {
+-		dev->mib2if_hccounter.in_bytes_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.in_bytes -
++		mib2_hc_counters->in_bytes_hc +=
++		    0xffffffff - (mib2_hc_counters->in_bytes -
+ 				  stats.if_in_octets);
+ 	}
+ 
+-	dev->mib2if_hccounter.in_bytes = stats.if_in_octets;
++	mib2_hc_counters->in_bytes = stats.if_in_octets;
+ 	if (stats.if_in_good_frames >=
+-	    dev->mib2if_hccounter.in_multicast_pkts +
+-	    dev->mib2if_hccounter.in_broadcast_pkts +
+-	    dev->mib2if_hccounter.in_unicast_pkts) {
+-		dev->mib2if_hccounter.in_unicast_pkts_hc +=
++	    mib2_hc_counters->in_multicast_pkts +
++	    mib2_hc_counters->in_broadcast_pkts +
++	    mib2_hc_counters->in_unicast_pkts) {
++		mib2_hc_counters->in_unicast_pkts_hc +=
+ 		    ((stats.if_in_good_frames -
+ 		      (stats.if_in_broadcasts + stats.if_in_multicasts))
+-		     - dev->mib2if_hccounter.in_unicast_pkts);
++		     - mib2_hc_counters->in_unicast_pkts);
+ 	} else {
+-		dev->mib2if_hccounter.in_unicast_pkts_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.in_unicast_pkts -
++		mib2_hc_counters->in_unicast_pkts_hc +=
++		    0xffffffff - (mib2_hc_counters->in_unicast_pkts -
+ 				  (stats.if_in_good_frames -
+ 				   (stats.if_in_broadcasts +
+ 				    stats.if_in_multicasts)));
+ 	}
+-	dev->mib2if_hccounter.in_unicast_pkts = (stats.if_in_good_frames -
+-						 (stats.if_in_broadcasts +
+-						  stats.if_in_multicasts));
+-	if (stats.if_in_multicasts >= dev->mib2if_hccounter.in_multicast_pkts) {
+-		dev->mib2if_hccounter.in_multicast_pkts_hc +=
++	mib2_hc_counters->in_unicast_pkts = (stats.if_in_good_frames -
++					     (stats.if_in_broadcasts +
++					      stats.if_in_multicasts));
++	if (stats.if_in_multicasts >= mib2_hc_counters->in_multicast_pkts) {
++		mib2_hc_counters->in_multicast_pkts_hc +=
+ 		    (stats.if_in_multicasts -
+-		     dev->mib2if_hccounter.in_multicast_pkts);
++		     mib2_hc_counters->in_multicast_pkts);
+ 	} else {
+-		dev->mib2if_hccounter.in_multicast_pkts_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.in_multicast_pkts -
++		mib2_hc_counters->in_multicast_pkts_hc +=
++		    0xffffffff - (mib2_hc_counters->in_multicast_pkts -
+ 				  stats.if_in_multicasts);
+ 	}
+ 
+-	dev->mib2if_hccounter.in_multicast_pkts = stats.if_in_multicasts;
+-	if (stats.if_in_broadcasts >= dev->mib2if_hccounter.in_broadcast_pkts) {
+-		dev->mib2if_hccounter.in_broadcast_pkts_hc +=
++	mib2_hc_counters->in_multicast_pkts = stats.if_in_multicasts;
++	if (stats.if_in_broadcasts >= mib2_hc_counters->in_broadcast_pkts) {
++		mib2_hc_counters->in_broadcast_pkts_hc +=
+ 		    (stats.if_in_broadcasts -
+-		     dev->mib2if_hccounter.in_broadcast_pkts);
++		     mib2_hc_counters->in_broadcast_pkts);
+ 
+ 	} else {
+-		dev->mib2if_hccounter.in_broadcast_pkts_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.in_broadcast_pkts -
++		mib2_hc_counters->in_broadcast_pkts_hc +=
++		    0xffffffff - (mib2_hc_counters->in_broadcast_pkts -
+ 				  stats.if_in_broadcasts);
+ 	}
+ 
+-	dev->mib2if_hccounter.in_broadcast_pkts = stats.if_in_broadcasts;
+-	if (stats.if_out_octets >= dev->mib2if_hccounter.out_bytes) {
+-		dev->mib2if_hccounter.out_bytes_hc +=
+-		    (stats.if_out_octets - dev->mib2if_hccounter.out_bytes);
++	mib2_hc_counters->in_broadcast_pkts = stats.if_in_broadcasts;
++	if (stats.if_out_octets >= mib2_hc_counters->out_bytes) {
++		mib2_hc_counters->out_bytes_hc +=
++		    (stats.if_out_octets - mib2_hc_counters->out_bytes);
+ 	} else {
+-		dev->mib2if_hccounter.out_bytes_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.out_bytes -
++		mib2_hc_counters->out_bytes_hc +=
++		    0xffffffff - (mib2_hc_counters->out_bytes -
+ 				  stats.if_out_octets);
+ 	}
+ 
+-	dev->mib2if_hccounter.out_bytes = stats.if_out_octets;
++	mib2_hc_counters->out_bytes = stats.if_out_octets;
+ 	if (stats.if_out_good_frames >=
+-	    dev->mib2if_hccounter.out_multicast_pkts +
+-	    dev->mib2if_hccounter.out_broadcast_pkts +
+-	    dev->mib2if_hccounter.out_unicast_pkts) {
+-		dev->mib2if_hccounter.out_unicast_pkts_hc +=
++	    mib2_hc_counters->out_multicast_pkts +
++	    mib2_hc_counters->out_broadcast_pkts +
++	    mib2_hc_counters->out_unicast_pkts) {
++		mib2_hc_counters->out_unicast_pkts_hc +=
+ 		    ((stats.if_out_good_frames -
+ 		      (stats.if_out_broadcasts + stats.if_out_multicasts))
+-		     - dev->mib2if_hccounter.out_unicast_pkts);
++		     - mib2_hc_counters->out_unicast_pkts);
+ 	}
+ 
+ 	else {
+-		dev->mib2if_hccounter.out_unicast_pkts_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.out_unicast_pkts -
++		mib2_hc_counters->out_unicast_pkts_hc +=
++		    0xffffffff - (mib2_hc_counters->out_unicast_pkts -
+ 				  (stats.if_out_good_frames -
+ 				   (stats.if_out_broadcasts +
+ 				    stats.if_out_multicasts)));
+ 	}
+ 
+-	dev->mib2if_hccounter.out_unicast_pkts = (stats.if_out_good_frames -
+-						  (stats.if_out_broadcasts +
+-						   stats.if_out_multicasts));
++	mib2_hc_counters->out_unicast_pkts = (stats.if_out_good_frames -
++					      (stats.if_out_broadcasts +
++					       stats.if_out_multicasts));
+ 
+-	if (stats.if_out_multicasts >= dev->mib2if_hccounter.out_multicast_pkts) {
+-		dev->mib2if_hccounter.out_multicast_pkts_hc +=
++	if (stats.if_out_multicasts >= mib2_hc_counters->out_multicast_pkts) {
++		mib2_hc_counters->out_multicast_pkts_hc +=
+ 		    (stats.if_out_multicasts -
+-		     dev->mib2if_hccounter.out_multicast_pkts);
++		     mib2_hc_counters->out_multicast_pkts);
+ 	} else {
+-		dev->mib2if_hccounter.out_multicast_pkts_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.out_multicast_pkts -
++		mib2_hc_counters->out_multicast_pkts_hc +=
++		    0xffffffff - (mib2_hc_counters->out_multicast_pkts -
+ 				  stats.if_out_multicasts);
+ 	}
+ 
+-	dev->mib2if_hccounter.out_multicast_pkts = stats.if_out_multicasts;
+-	if (stats.if_out_broadcasts >= dev->mib2if_hccounter.out_broadcast_pkts) {
+-		dev->mib2if_hccounter.out_broadcast_pkts_hc +=
++	mib2_hc_counters->out_multicast_pkts = stats.if_out_multicasts;
++	if (stats.if_out_broadcasts >= mib2_hc_counters->out_broadcast_pkts) {
++		mib2_hc_counters->out_broadcast_pkts_hc +=
+ 		    (stats.if_out_broadcasts -
+-		     dev->mib2if_hccounter.out_broadcast_pkts);
++		     mib2_hc_counters->out_broadcast_pkts);
+ 	} else {
+-		dev->mib2if_hccounter.out_broadcast_pkts_hc +=
+-		    0xffffffff - (dev->mib2if_hccounter.out_broadcast_pkts -
++		mib2_hc_counters->out_broadcast_pkts_hc +=
++		    0xffffffff - (mib2_hc_counters->out_broadcast_pkts -
+ 				  stats.if_out_broadcasts);
+ 	}
+-	dev->mib2if_hccounter.out_broadcast_pkts = stats.if_out_broadcasts;
++	mib2_hc_counters->out_broadcast_pkts = stats.if_out_broadcasts;
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_bytes_low =
+-	    (unsigned long)dev->mib2if_hccounter.in_bytes_hc;
++	mib2_hc_counters->mib2if_counter.in_bytes_low =
++	    (unsigned long)mib2_hc_counters->in_bytes_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_bytes_high =
+-	    (dev->mib2if_hccounter.in_bytes_hc >> 32);
++	mib2_hc_counters->mib2if_counter.in_bytes_high =
++	    (mib2_hc_counters->in_bytes_hc >> 32);
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_unicast_pkts_low =
+-	    (unsigned long)dev->mib2if_hccounter.in_unicast_pkts_hc;
++	mib2_hc_counters->mib2if_counter.in_unicast_pkts_low =
++	    (unsigned long)mib2_hc_counters->in_unicast_pkts_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_unicast_pkts_high =
+-	    (dev->mib2if_hccounter.in_unicast_pkts_hc >> 32);
++	mib2_hc_counters->mib2if_counter.in_unicast_pkts_high =
++	    (mib2_hc_counters->in_unicast_pkts_hc >> 32);
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_multicast_pkts_low =
+-	    (unsigned long)dev->mib2if_hccounter.in_multicast_pkts_hc;
++	mib2_hc_counters->mib2if_counter.in_multicast_pkts_low =
++	    (unsigned long)mib2_hc_counters->in_multicast_pkts_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_multicast_pkts_high =
+-	    dev->mib2if_hccounter.in_multicast_pkts_hc >> 32;
++	mib2_hc_counters->mib2if_counter.in_multicast_pkts_high =
++	    mib2_hc_counters->in_multicast_pkts_hc >> 32;
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_broadcast_pkts_low =
+-	    (unsigned long)dev->mib2if_hccounter.in_broadcast_pkts_hc;
++	mib2_hc_counters->mib2if_counter.in_broadcast_pkts_low =
++	    (unsigned long)mib2_hc_counters->in_broadcast_pkts_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.in_broadcast_pkts_high =
+-	    dev->mib2if_hccounter.in_broadcast_pkts_hc >> 32;
++	mib2_hc_counters->mib2if_counter.in_broadcast_pkts_high =
++	    mib2_hc_counters->in_broadcast_pkts_hc >> 32;
+ 
+ 	/* packets discarded due to resource limit */
+-	dev->mib2if_hccounter.mib2if_counter.in_discard_pkts =
++	mib2_hc_counters->mib2if_counter.in_discard_pkts =
+ 	    stats.if_rx_dmaoverruns
+ 	    + stats.if_rx_mof_overruns
+ 	    + stats.
+@@ -5745,54 +5630,54 @@ static void emac_ddcifcnt_updt(emac_dev_
+ 	    + stats.if_in_filtered_frames + stats.if_in_qos_filtered_frames;
+ 
+ 	/* packets discarded due to format errors */
+-	dev->mib2if_hccounter.mib2if_counter.in_error_pkts =
++	mib2_hc_counters->mib2if_counter.in_error_pkts =
+ 	    stats.if_in_crcerrors
+ 	    + stats.if_in_align_code_errors
+ 	    + stats.if_in_jabber_frames + stats.if_in_fragments;
+ 
+-	dev->mib2if_hccounter.mib2if_counter.in_unknown_prot_pkts = 0;
++	mib2_hc_counters->mib2if_counter.in_unknown_prot_pkts = 0;
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_bytes_low =
+-	    (unsigned long)dev->mib2if_hccounter.out_bytes_hc;
++	mib2_hc_counters->mib2if_counter.out_bytes_low =
++	    (unsigned long)mib2_hc_counters->out_bytes_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_bytes_high =
+-	    dev->mib2if_hccounter.out_bytes_hc >> 32;
++	mib2_hc_counters->mib2if_counter.out_bytes_high =
++	    mib2_hc_counters->out_bytes_hc >> 32;
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_unicast_pkts_low =
+-	    (unsigned long)dev->mib2if_hccounter.out_unicast_pkts_hc;
++	mib2_hc_counters->mib2if_counter.out_unicast_pkts_low =
++	    (unsigned long)mib2_hc_counters->out_unicast_pkts_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_unicast_pkts_high =
+-	    dev->mib2if_hccounter.out_unicast_pkts_hc >> 32;
++	mib2_hc_counters->mib2if_counter.out_unicast_pkts_high =
++	    mib2_hc_counters->out_unicast_pkts_hc >> 32;
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_multicast_pkts_low =
+-	    (unsigned long)dev->mib2if_hccounter.out_multicast_pkts_hc;
++	mib2_hc_counters->mib2if_counter.out_multicast_pkts_low =
++	    (unsigned long)mib2_hc_counters->out_multicast_pkts_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_multicast_pkts_high =
+-	    dev->mib2if_hccounter.out_multicast_pkts_hc >> 32;
++	mib2_hc_counters->mib2if_counter.out_multicast_pkts_high =
++	    mib2_hc_counters->out_multicast_pkts_hc >> 32;
+ 
+ 	/* low 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_broadcast_pkts_low =
+-	    (unsigned long)dev->mib2if_hccounter.out_broadcast_pkts_hc;
++	mib2_hc_counters->mib2if_counter.out_broadcast_pkts_low =
++	    (unsigned long)mib2_hc_counters->out_broadcast_pkts_hc;
+ 
+ 	/* high 32-bit of total octets received from media */
+-	dev->mib2if_hccounter.mib2if_counter.out_broadcast_pkts_high =
+-	    dev->mib2if_hccounter.out_broadcast_pkts_hc >> 32;
++	mib2_hc_counters->mib2if_counter.out_broadcast_pkts_high =
++	    mib2_hc_counters->out_broadcast_pkts_hc >> 32;
+ 
+ 	/* packets discarded due to format errors */
+-	dev->mib2if_hccounter.mib2if_counter.out_error_pkts =
++	mib2_hc_counters->mib2if_counter.out_error_pkts =
+ 	    (stats.if_excessive_collision_frames
+ 	     + stats.if_late_collisions + stats.if_carrier_sense_errors);
+ 
+ 	/* packets discarded due to resource limit */
+-	dev->mib2if_hccounter.mib2if_counter.out_discard_pkts =
++	mib2_hc_counters->mib2if_counter.out_discard_pkts =
+ 	    stats.if_out_underrun +
+-	    dev->mib2if_hccounter.mib2if_counter.out_error_pkts;
++	    mib2_hc_counters->mib2if_counter.out_error_pkts;
+ 
+ 	return;
+ }
+@@ -5848,12 +5733,11 @@ static char *emac_rx_host_error_codes[16
+  *
+  * "tickArgs" is not used in this implementation
+  */
+-static int emac_tick(emac_dev_t * _dev, void *tick_args)
++static int emac_tick(emac_dev_t *dev, void *tick_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	/* verify proper device state */
+-	if (dev->drv_state != DRV_OPENED) {
++	if (unlikely(dev->drv_state != DRV_OPENED)) {
+ 		return (EMAC_ERR_DEV_NOT_OPEN);
+ 	}
+ 
+@@ -5862,7 +5746,7 @@ static int emac_tick(emac_dev_t * _dev, 
+ 		int tick_change;
+ 
+ 		tick_change = emac_mdio_tick();
+-		if (tick_change == 1) {	/*  MDIO indicated a change  */
++		if (unlikely(tick_change == 1)) {/*  MDIO indicated a change  */
+ 			emac_update_phy_status((emac_dev_t *) dev);
+ 			emac_control_cb(dev,
+ 					EMAC_IOCTL_STATUS_UPDATE,
+@@ -5882,9 +5766,8 @@ static int emac_tick(emac_dev_t * _dev, 
+  *    the DDA layer about the hardware error.
+  *
+  */
+-static void emac_process_host_error(emac_dev_t * _dev)
++static void emac_process_host_error(emac_dev_t *dev)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 channel = 0;
+ 	u32 vector = 0;
+ 	u32 status = 0;
+@@ -5946,25 +5829,48 @@ static void emac_process_host_error(emac
+  * "pkts_pending" will contain number of packets still to be processed
+  * (TX + RX)
+  */
+-static int emac_pkt_process(emac_dev_t * _dev, int *pkts_pending,
+-			    void *pkt_args)
++static int emac_pkt_process(emac_dev_t *dev, int *pkts_pending, void *pkt_args)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	u32 channel = 0;
+ 	u32 vector = 0;
+ 	u32 handle_pkts_and_status = 0;
+ 	u32 vector_channel = 0;
+ 	int pkts_processed = 0;
++	u32 mac_in_vector_tx_int_vec;
++	u32 mac_in_vector_tx_int_shift;
++	u32 mac_in_vector_rx_int_vec;
++	u32 mac_in_vector_rx_int_shift;
++	u32 mac_in_vector_host_int_vec;
++	bool device_is_dm6467;
++
++	if (cpu_is_davinci_dm6467()) {
++		mac_in_vector_tx_int_vec = EMAC_DM646X_MAC_IN_VECTOR_TX_INT_VEC;
++		mac_in_vector_tx_int_shift =
++		    EMAC_DM646X_MAC_IN_VECTOR_TX_INT_SHIFT;
++		mac_in_vector_rx_int_vec = EMAC_DM646X_MAC_IN_VECTOR_RX_INT_VEC;
++		mac_in_vector_host_int_vec = EMAC_DM646X_MAC_IN_VECTOR_HOST_INT;
++		mac_in_vector_rx_int_shift =
++		    EMAC_DM646X_MAC_IN_VECTOR_RX_INT_SHIFT;
++		device_is_dm6467 = TRUE;
++	} else {
++		mac_in_vector_tx_int_vec = EMAC_DM644X_MAC_IN_VECTOR_TX_INT_VEC;
++		mac_in_vector_tx_int_shift =
++		    EMAC_DM644X_MAC_IN_VECTOR_TX_INT_SHIFT;
++		mac_in_vector_rx_int_vec = EMAC_DM644X_MAC_IN_VECTOR_RX_INT_VEC;
++		mac_in_vector_rx_int_shift =
++		    EMAC_DM644X_MAC_IN_VECTOR_RX_INT_SHIFT;
++		mac_in_vector_host_int_vec = EMAC_DM644X_MAC_IN_VECTOR_HOST_INT;
++		device_is_dm6467 = FALSE;
++	}
+ 
+-	/* disable interrupts via module control (wrapper) */
+-	((volatile ewrap_regs *)dev->e_wrap_regs)->EWCTL = 0x0;
+ 	vector = dev->regs->mac_in_vector;
+ 
+ 	/* handle packet transmit completion */
+-	if (vector & EMAC_MAC_IN_VECTOR_TX_INT_VEC) {
++	if (vector & mac_in_vector_tx_int_vec) {
+ 		bool is_eoq;
+ 
+-		vector_channel = (vector & EMAC_MAC_IN_VECTOR_TX_INT_VEC);
++		vector_channel = ((vector & mac_in_vector_tx_int_vec) >>
++				  mac_in_vector_tx_int_shift);
+ 		for (channel = 0; channel < 8; channel++) {
+ 			if (vector_channel & 0x1)
+ 				break;
+@@ -5980,7 +5886,7 @@ static int emac_pkt_process(emac_dev_t *
+ 					 handle_pkts_and_status);
+ 
+ 		pkts_processed =
+-		    emac_tx_bdproc(_dev, channel, &handle_pkts_and_status,
++		    emac_tx_bdproc(dev, channel, &handle_pkts_and_status,
+ 				   &is_eoq);
+ 		if (pkt_args)
+ 			((rx_tx_params *) pkt_args)->ret_tx_pkts =
+@@ -5988,9 +5894,19 @@ static int emac_pkt_process(emac_dev_t *
+ 
+ 		if (dev->tx_interrupt_disable == TRUE) {
+ 			/* status */
+-			if (!handle_pkts_and_status && is_eoq)
++			if (!handle_pkts_and_status && is_eoq) {
+ 				/* disable channel interrupt */
+ 				dev->regs->tx_int_mask_clear = (1 << channel);
++				if (device_is_dm6467) {
++					ewrap_dm646x_regs *dm646x_wrap;
++					dm646x_wrap =
++					    &dev->e_wrap_regs->
++					    wrapper_646x_regs;
++					/* update wrapper book-keeping fields */
++					dev->tx_en &= (~(1 << channel));
++					dm646x_wrap->C0_TXINTEN = dev->tx_en;
++				}
++			}
+ 		}
+ 		*pkts_pending = handle_pkts_and_status;	/* status. */
+ 	}
+@@ -6000,9 +5916,9 @@ static int emac_pkt_process(emac_dev_t *
+ 	 * reducing the latency (- but an equally opposite argument
+ 	 * can also be made)
+ 	 */
+-	if (vector & EMAC_MAC_IN_VECTOR_RX_INT_VEC) {
+-		vector_channel = (vector & EMAC_MAC_IN_VECTOR_RX_INT_VEC);
+-		vector_channel >>= 8;
++	if (vector & mac_in_vector_rx_int_vec) {
++		vector_channel = ((vector & mac_in_vector_rx_int_vec) >>
++				  mac_in_vector_rx_int_shift);
+ 		for (channel = 0; channel < 8; channel++) {
+ 			if (vector_channel & 0x1)
+ 				break;
+@@ -6017,7 +5933,7 @@ static int emac_pkt_process(emac_dev_t *
+ 					 handle_pkts_and_status);
+ 
+ 		pkts_processed =
+-		    emac_rx_bdproc(_dev, channel, &handle_pkts_and_status);
++		    emac_rx_bdproc(dev, channel, &handle_pkts_and_status);
+ 
+ 		if (pkt_args)
+ 			((rx_tx_params *) pkt_args)->ret_rx_pkts =
+@@ -6028,36 +5944,13 @@ static int emac_pkt_process(emac_dev_t *
+ 
+ 	/* handle host errors - being handled last does not mean its
+ 	 * of least priority */
+-	if (vector & EMAC_MAC_IN_VECTOR_HOST_INT) {
+-		emac_process_host_error(_dev);
++	if (unlikely(vector & mac_in_vector_host_int_vec)) {
++		emac_process_host_error(dev);
+ 	}
+ 
+ 	return (EMAC_SUCCESS);
+ }
+ 
+-/**
+- * EMAC DDC Signal Packet processing end to hardware
+- * - programs the EOI vector register so that if there are pending
+- *   packets in hardware queue * an interrupt can be generated by the
+- *   hardware
+- */
+-/* packet processing end */
+-static int emac_pkt_process_end(emac_dev_t * _dev, void *proc_args)
+-{
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+-
+-	/* enable interrupts via module control (wrapper) */
+-	((volatile ewrap_regs *)dev->e_wrap_regs)->EWCTL = 0x1;
+-
+-	return (EMAC_SUCCESS);
+-}
+-
+-#ifdef EMAC_MULTIFRAGMENT
+-
+-#error "EMAC Multi fragment Not supported"
+-
+-#else
+-
+ /*************************************
+  * SINGLE-FRAGMENT SUPPORT HERE
+  *************************************/
+@@ -6072,29 +5965,21 @@ static int emac_pkt_process_end(emac_dev
+  * this function
+  */
+ 
+-static int emac_send(emac_dev_t * _dev, net_pkt_obj * pkt,
++static int emac_send(emac_dev_t *dev, net_pkt_obj * pkt,
+ 		     int channel, void *send_args)
+ {
+ 	unsigned long flags;
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	int ret_val = EMAC_SUCCESS;
+ 	emac_tx_bd *curr_bd;
+ 	emac_tx_cppi_ch *tx_cppi;
+ 	net_buf_obj *buf_list;
+ 
+ 	/* verify proper device state */
+-	if (dev->drv_state != DRV_OPENED)
++	if (unlikely(dev->drv_state != DRV_OPENED))
+ 		return (EMAC_ERR_DEV_NOT_OPEN);
+ 
+-	/* validate channel number and get channel control structure */
+-	if (channel > EMAC_MAX_TX_CHANNELS)
+-		return (EMAC_ERR_TX_CH_INVALID);
+-
+-	if (dev->tx_is_open[channel] != TRUE)
+-		return (EMAC_ERR_TX_CH_NOT_OPEN);
+-
+ 	/* check ethernet link state. if not linked, return error */
+-	if (!dev->status.phy_linked)
++	if (unlikely(!dev->status.phy_linked))
+ 		return (EMAC_ERR_TX_NO_LINK);
+ 
+ 	tx_cppi = dev->tx_cppi[channel];
+@@ -6168,6 +6053,16 @@ static int emac_send(emac_dev_t * _dev, 
+ 			if (dev->tx_interrupt_disable == TRUE) {
+ 				/* enable channel interrupt */
+ 				dev->regs->tx_int_mask_set = (1 << channel);
++				if (cpu_is_davinci_dm6467()) {
++					ewrap_dm646x_regs *dm646x_wrap;
++					dm646x_wrap =
++					    &dev->e_wrap_regs->
++					    wrapper_646x_regs;
++					/* update wrapper book-keeping fields */
++					dev->tx_en = (1 << channel);
++					dm646x_wrap->C0_TXINTEN =
++					    (1 << channel);
++				}
+ 			}
+ 		}
+ 	}
+@@ -6185,7 +6080,7 @@ static int emac_send(emac_dev_t * _dev, 
+ 
+ 			handle_pkts_and_status =
+ 			    dev->tx_cppi[channel]->ch_info.service_max;
+-			emac_tx_bdproc(_dev, channel, &handle_pkts_and_status,
++			emac_tx_bdproc(dev, channel, &handle_pkts_and_status,
+ 				       &is_eoq);
+ 			dev->tx_int_threshold[channel] =
+ 			    dev->tx_cppi[channel]->ch_info.service_max;
+@@ -6203,11 +6098,10 @@ static int emac_send(emac_dev_t * _dev, 
+  * returns number of pkts processed and 1 in morePkts if pkt
+  * completion processing pending
+  */
+-static int emac_tx_bdproc(emac_dev_t * _dev, u32 channel,
++static int emac_tx_bdproc(emac_dev_t *dev, u32 channel,
+ 			  u32 * handle_pkts_and_status, bool * is_eoq)
+ {
+ 	unsigned long flags;
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_tx_bd *curr_bd;
+ 	emac_tx_cppi_ch *tx_cppi;
+ 	volatile u32 frame_status;
+@@ -6221,13 +6115,7 @@ static int emac_tx_bdproc(emac_dev_t * _
+ 	*handle_pkts_and_status = 0;	/* status. */
+ 	*is_eoq = TRUE;
+ 
+-	/* Here no need to validate channel number, since it is taken
+-	   from the interrupt register instead channel structure
+-	   should be validated */
+-	if (dev->tx_is_open[channel] == FALSE)
+-		return (EMAC_ERR_TX_CH_NOT_OPEN);
+-
+-	if (dev->tx_teardown_pending[channel] == TRUE) {
++	if (unlikely(dev->tx_teardown_pending[channel] == TRUE)) {
+ 		return (EMAC_SUCCESS);	/* dont handle any pkt completions */
+ 	}
+ 
+@@ -6300,12 +6188,11 @@ static int emac_tx_bdproc(emac_dev_t * _
+ 	if ((curr_bd) && ((frame_status & EMAC_CPPI_OWNERSHIP_BIT) == 0)) {
+ 		*handle_pkts_and_status = 1;
+ 	}
+-        /* this check is same as check for EOQ i.e framestatus and
+-         * EMAC_CPPI_EOQ_BIT */
++	/* this check is same as check for EOQ i.e framestatus and
++	 * EMAC_CPPI_EOQ_BIT */
+ 	if (curr_bd) {
+ 		*is_eoq = FALSE;
+ 	}
+-
+ #ifdef EMAC_MULTIPACKET_TX_COMPLETE_NOTIFY
+ 	/* multiple packet TX complete notify - this function is NOT
+ 	 * called in the send critical section context */
+@@ -6323,11 +6210,10 @@ static int emac_tx_bdproc(emac_dev_t * _
+  *  - returns the BD to the Receive queue
+  *  - If the queue is stalled due to sync issues, re-trigger the hardware
+  */
+-static void emac_add_bdto_rx_queue(emac_dev_t * _dev, emac_rx_cppi_ch * rx_cppi,
++static void emac_add_bdto_rx_queue(emac_dev_t *dev, emac_rx_cppi_ch * rx_cppi,
+ 				   emac_rx_bd * curr_bd, char *buffer,
+ 				   emac_net_data_token buf_token)
+ {
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 
+ 	/* populate the hardware descriptor */
+ 	curr_bd->h_next = 0;
+@@ -6367,7 +6253,7 @@ static void emac_add_bdto_rx_queue(emac_
+ 			++rx_cppi->end_of_queue_add;
+ #endif
+ 		}
+-		
++
+ 	}
+ 
+ #ifdef EMAC_GETSTATS
+@@ -6381,11 +6267,10 @@ static void emac_add_bdto_rx_queue(emac_
+  *  - requeues the buffer descriptor to the receive pool
+  *  - If the queue is stalled due to sync issues, re-trigger the hardware
+  */
+-static int emac_rx_bdproc(emac_dev_t * _dev, u32 channel,
++static int emac_rx_bdproc(emac_dev_t *dev, u32 channel,
+ 			  int *handle_pkts_and_status)
+ {
+ 	unsigned long flags;
+-	emac_dev_t *dev = (emac_dev_t *) _dev;
+ 	emac_rx_cppi_ch *rx_cppi;
+ 	emac_rx_bd *curr_bd, *last_bd;
+ 	u32 frame_status;
+@@ -6393,21 +6278,13 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 	emac_net_data_token new_buf_token;
+ 	net_buf_obj *rx_buf_obj;
+ 	u32 pkts_processed;
+-	net_pkt_obj *curr_pkt,pkt_obj;
++	net_pkt_obj *curr_pkt, pkt_obj;
+ 	net_buf_obj buf_obj;
+ 	u32 pkts_to_be_processed = *handle_pkts_and_status;
+ 
+-	/* Here no need to validate channel number, since it is taken
+-	   from the interrupt register instead channel structure
+-	   should be validated */
+-	if (dev->rx_is_open[channel] == FALSE) {
+-		*handle_pkts_and_status = 0;
+-		return (EMAC_ERR_RX_CH_NOT_OPEN);
+-	}
+-
+ 	/* check if channel teardown pending */
+ 	rx_cppi = dev->rx_cppi[channel];
+-	if (dev->rx_teardown_pending[channel] == TRUE) {
++	if (unlikely(dev->rx_teardown_pending[channel] == TRUE)) {
+ 		*handle_pkts_and_status = 0;
+ 		return (0);
+ 	}
+@@ -6416,9 +6293,9 @@ static int emac_rx_bdproc(emac_dev_t * _
+ #endif
+ 	*handle_pkts_and_status = 0;
+ 	pkts_processed = 0;
+-	
++
+ 	spin_lock_irqsave(&dev->rx_lock, flags);
+-	
++
+ 	pkt_obj.buf_list = &buf_obj;
+ 	curr_pkt = &pkt_obj;
+ 	curr_bd = rx_cppi->active_queue_head;
+@@ -6434,7 +6311,7 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 		    (void *)(emac_net_alloc_rx_buf(dev,
+ 						   rx_cppi->ch_info.buf_size,
+ 						   &new_buf_token, 0, NULL));
+-		if (new_buffer == NULL) {
++		if (unlikely(new_buffer == NULL)) {
+ 			/* no buffer available. return error with packets pending */
+ #ifdef EMAC_GETSTATS
+ 			++rx_cppi->out_of_rx_buffers;
+@@ -6475,17 +6352,17 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 				rx_cppi->queue_active = FALSE;	/* clear software RX queue */
+ 			}
+ 		}
+-		
++
+ 		/* recycle BD */
+-		emac_add_bdto_rx_queue(_dev, rx_cppi, last_bd, new_buffer,
++		emac_add_bdto_rx_queue(dev, rx_cppi, last_bd, new_buffer,
+ 				       new_buf_token);
+ 
+ 		/* return the packet to the user - BD ptr passed in
+ 		 * last parameter for potential *future* use */
+ 		spin_unlock_irqrestore(&dev->rx_lock, flags);
+-		emac_net_rx_cb(dev,curr_pkt,(void*)channel);
++		emac_net_rx_cb(dev, curr_pkt, (void *)channel);
+ 		spin_lock_irqsave(&dev->rx_lock, flags);
+-		
++
+ 		curr_bd = rx_cppi->active_queue_head;
+ 		if (curr_bd) {
+ 			BD_CACHE_INVALIDATE(curr_bd, EMAC_BD_LENGTH_FOR_CACHE);
+@@ -6503,10 +6380,8 @@ static int emac_rx_bdproc(emac_dev_t * _
+ 	return (pkts_processed);
+ }
+ 
+-#endif				/* !EMAC_MULTIFRAGMENT */
+-
+-/* Linux 2.6 Kernel Ethernet Poll function Call only RX processing in
+- * the poll function - TX is taken care of in interrupt context
++/* Linux 2.6 Kernel Ethernet Poll function
++ * We handle both Tx/Rx completion from the polling context
+  */
+ static int emac_poll(struct net_device *netdev, int *budget)
+ {
+@@ -6530,7 +6405,8 @@ static int emac_poll(struct net_device *
+ 			if (test_bit(__LINK_STATE_RX_SCHED, &netdev->state)) {
+ 				netif_rx_complete(netdev);
+ 			}
+-			emac_pkt_process_end(dev, NULL);
++			/* re-enable interrupts to CPU */
++			emac_enable_interrupt(dev, 1);
+ 			return 0;
+ 		} else if (!test_bit(0, &dev->set_to_close)) {
+ 			*budget -= napi_params->ret_rx_pkts;
+@@ -6539,7 +6415,7 @@ static int emac_poll(struct net_device *
+ 		}
+ 	}
+ 
+-        /* we are closing down, so dont process anything */
++	/* we are closing down, so dont process anything */
+ 	return 0;
+ }
+ 
+@@ -6552,9 +6428,9 @@ void emac_poll_controller(struct net_dev
+ {
+ 	emac_dev_t *dev = NETDEV_PRIV(netdev);
+ 
+-	disable_irq(netdev->irq);
++	emac_disable_interrupt(dev);
+ 	emac_hal_isr(netdev->irq, dev, NULL);
+-	enable_irq(netdev->irq);
++	emac_enable_interrupt(dev, 0);
+ }
+ #endif
+ 
+@@ -6567,7 +6443,7 @@ void *emac_net_alloc_rx_buf(emac_dev_t *
+ 	struct sk_buff *p_skb;
+ 
+ 	p_skb = dev_alloc_skb(dev->rx_buf_size);
+-	if (p_skb == NULL) {
++	if (unlikely(p_skb == NULL)) {
+ #ifdef EMAC_DEBUG
+ 		ERR("emac_net_alloc_rx_buf:Failed to allocate skb for %s.\n",
+ 		    netdev->name);
+@@ -6581,10 +6457,8 @@ void *emac_net_alloc_rx_buf(emac_dev_t *
+ 
+ 	/* set the data token */
+ 	*data_token = (emac_net_data_token) p_skb;
+-#ifdef EMAC_CACHE_INVALIDATE_FIX
+ 	/* invalidate buffer */
+-	EMAC_CACHE_INVALIDATE((unsigned long)p_skb->data, buf_size);
+-#endif
++	EMAC_CACHE_WRITEBACK_INVALIDATE((unsigned long)p_skb->data, buf_size);
+ 
+ 	return p_skb->data;
+ }
+@@ -6594,11 +6468,11 @@ static int emac_net_free_rx_buf(emac_dev
+ 				emac_net_data_token data_token,
+ 				u32 channel, void *free_args)
+ {
+-	dev_kfree_skb_any((struct sk_buff *)data_token);
++	if (data_token)
++		dev_kfree_skb_any((struct sk_buff *)data_token);
+ 	return (EMAC_SUCCESS);
+ }
+ 
+-
+ /*
+  * Packet receive notification
+  *
+@@ -6609,20 +6483,15 @@ static int emac_net_free_rx_buf(emac_dev
+  * implementation
+ */
+ static int emac_net_rx_cb(emac_dev_t * dev,
+-		          net_pkt_obj * net_pkt_list,
+-			  void *rx_args)
++			  net_pkt_obj * net_pkt_list, void *rx_args)
+ {
+ 
+ 	struct sk_buff *p_skb;
+-	
++
+ 	p_skb = (struct sk_buff *)net_pkt_list->pkt_token;
+ 
+ 	/* set length of packet */
+ 	skb_put(p_skb, net_pkt_list->pkt_length);
+-#ifndef EMAC_CACHE_INVALIDATE_FIX
+-	/* invalidate cache */
+-	EMAC_CACHE_INVALIDATE((unsigned long)p_skb->data, p_skb->len);
+-#endif
+ 	p_skb->protocol = eth_type_trans(p_skb, dev->owner);
+ 	p_skb->dev->last_rx = jiffies;
+ 	netif_receive_skb(p_skb);
+@@ -6632,7 +6501,6 @@ static int emac_net_rx_cb(emac_dev_t * d
+ 	return (0);
+ }
+ 
+-
+ /* transmit complete callback */
+ static int emac_net_tx_complete(emac_dev_t * dev,
+ 				emac_net_data_token * net_data_tokens,
+@@ -6640,7 +6508,7 @@ static int emac_net_tx_complete(emac_dev
+ {
+ 	u32 cnt;
+ 
+-	if (num_tokens && netif_queue_stopped(dev->owner)) {
++	if (unlikely(num_tokens && netif_queue_stopped(dev->owner))) {
+ 		printk("EMAC: TX Complete: Starting queue\n");
+ 		netif_start_queue(dev->owner);
+ 	}
+@@ -6662,12 +6530,17 @@ static int emac_net_tx_complete(emac_dev
+  *  Interrupt functions
+  *****************************************************************************/
+ 
++/** we register the same ISR for all interrupt causes
++ * though we have 4 interrupt lines to the CPU, all
++ * of them handled by the same ISR */
+ irqreturn_t emac_hal_isr(int irq, void *dev_id, struct pt_regs * regs)
+ {
+ 	emac_dev_t *dev = (emac_dev_t *) dev_id;
+ 
+ 	++dev->isr_count;
+-	if (!dev->set_to_close) {
++	if (likely(!dev->set_to_close)) {
++		/* explicitly disable interrupts to CPU */
++		emac_disable_interrupt(dev);
+ 		/* NAPI support */
+ 		netif_rx_schedule(dev->owner);
+ 	} else {
+@@ -6684,7 +6557,6 @@ static int emac_dev_tx(struct sk_buff *s
+ 	net_buf_obj tx_buf;	/* buffer object - only single frame support */
+ 	net_pkt_obj tx_packet;	/* packet object */
+ 	emac_dev_t *dev = NETDEV_PRIV(netdev);
+-	/* ANANT HACK: unsigned long flags; */
+ 
+ 	/* Build the buffer and packet objects - Since only single fragment is
+ 	 * supported, need not set length and token in both packet & object.
+@@ -6703,21 +6575,12 @@ static int emac_dev_tx(struct sk_buff *s
+ 	EMAC_CACHE_WRITEBACK((unsigned long)skb->data, skb->len);
+ 	netdev->trans_start = jiffies;
+ 
+-	/* ANANT_HACK: Need to lock TX so that there is no contention
+-	   spin_lock_irqsave(&hDDA->lock, flags);
+-	 */
+-
+ 	/* DDC send : last param FALSE so that hardware calculates CRC */
+ 	ret_code = emac_send(dev, &tx_packet, EMAC_DEFAULT_TX_CHANNEL, FALSE);
+ 
+-	/* ANANT_HACK: Need to un-lock TX so that there is no contention
+-	   between two processes
+-	   spin_unlock_irqrestore(&hDDA->lock, flags);
+-	 */
+-
+-	if (ret_code != EMAC_SUCCESS) {
++	if (unlikely(ret_code != EMAC_SUCCESS)) {
+ 		if (ret_code == EMAC_ERR_TX_OUT_OF_BD) {
+-			ERR("WARN: emac_dev_tx: Out of TX BD's\n");
++			/* ERR("WARN: emac_dev_tx: Out of TX BD's\n"); */
+ 			netif_stop_queue(dev->owner);
+ 		}
+ 		dev->net_dev_stats.tx_dropped++;
+@@ -6731,6 +6594,77 @@ static int emac_dev_tx(struct sk_buff *s
+ 	return (-1);
+ }
+ 
++/* emac_disable_interrupt : Turns of the interrupts from the
++ * peripheral to the CPU. we have four interrupt lines
++ * running to the CPU, we handle them as a set*/
++static void emac_disable_interrupt(emac_dev_t *edev)
++{
++	if (cpu_is_davinci_dm6467()) {
++		unsigned long flags;
++		ewrap_dm646x_regs *dm646x_wrap;
++
++		dm646x_wrap = &edev->e_wrap_regs->wrapper_646x_regs;
++		local_irq_save(flags);
++		/* Program C0_Int_En to zero to turn off
++		 * interrupts to the CPU */
++		dm646x_wrap->C0_RXTHRESHEN = 0x0;
++		dm646x_wrap->C0_RXINTEN = 0x0;
++		dm646x_wrap->C0_TXINTEN = 0x0;
++		dm646x_wrap->C0_MISCEN = 0x0;
++
++		local_irq_restore(flags);
++	} else {
++		ewrap_dm644x_regs *dm644x_wrap;
++
++		dm644x_wrap = &edev->e_wrap_regs->wrapper_644x_regs;
++		dm644x_wrap->EWCTL = 0x0;
++	}
++}
++
++static void emac_enable_interrupt(emac_dev_t *edev, int ack_eoi)
++{
++	if (cpu_is_davinci_dm6467()) {
++		unsigned long flags;
++		ewrap_dm646x_regs *dm646x_wrap;
++
++		dm646x_wrap = &edev->e_wrap_regs->wrapper_646x_regs;
++
++		local_irq_save(flags);
++
++		/* Program C0_Int_En to zero to appropriate values */
++		dm646x_wrap->C0_RXTHRESHEN = edev->rx_thresh_en;
++		dm646x_wrap->C0_RXINTEN = edev->rx_en;
++		dm646x_wrap->C0_TXINTEN = edev->tx_en;
++		dm646x_wrap->C0_MISCEN = edev->misc_en;
++
++		if (ack_eoi) {
++
++			/* In addition to turning on interrupt Enable, we need
++			 * ack by writing appropriate values to the EOI
++			 * register*/
++			/* ack rxthresh- only then a new pulse is generated */
++			edev->regs->mac_EOI_vector =
++			    EMAC_DM646X_MAC_EOI_C0_RXTHRESH;
++			/*ack rxen only then a new pulse will be generated */
++			edev->regs->mac_EOI_vector =
++			    EMAC_DM646X_MAC_EOI_C0_RXEN;
++			/*ack txen- only then a new pulse will be generated */
++			edev->regs->mac_EOI_vector =
++			    EMAC_DM646X_MAC_EOI_C0_TXEN;
++			/*ack macen- only then a new pulse will be generated */
++			edev->regs->mac_EOI_vector =
++			    EMAC_DM646X_MAC_EOI_C0_MISCEN;
++		}
++
++		local_irq_restore(flags);
++	} else {
++		ewrap_dm644x_regs *dm644x_wrap;
++
++		dm644x_wrap = &edev->e_wrap_regs->wrapper_644x_regs;
++		dm644x_wrap->EWCTL = 0x1;
++	}
++}
++
+ /******************************************************************************
+  *  Linux Driver Model
+  *****************************************************************************/
+@@ -6789,7 +6723,6 @@ static int __init emac_dev_probe(void)
+ 	    platform_device_register_simple("ti_davinci_emac", -1, NULL, 0);
+ 
+ 	if (IS_ERR(emac_dev)) {
+-		/* if error, free EMAC clock */
+ 		clk_unuse(emac_clk);
+ 		clk_disable(emac_clk);
+ 		return -1;
+@@ -6798,13 +6731,14 @@ static int __init emac_dev_probe(void)
+ 	if (driver_register(&emac_driver)) {
+ 		platform_device_unregister(emac_dev);
+ 
+-		/* if error, free EMAC clock */
+ 		clk_unuse(emac_clk);
+ 		clk_disable(emac_clk);
+ 		return -1;
+ 	}
+ 
+-	driver_create_file(&emac_driver, &driver_attr_version);
++	ret_val = driver_create_file(&emac_driver, &driver_attr_version);
++	if (ret_val)
++		return ret_val;
+ 	for (unit = 0; unit < instance_count; unit++) {
+ 		struct net_device *netdev;
+ 		emac_dev_t *dev;
+@@ -6824,18 +6758,15 @@ static int __init emac_dev_probe(void)
+ 		dev = NETDEV_PRIV(netdev);
+ 		dev->owner = netdev;
+ 		dev->instance_num = unit;
++		dev->rx_thresh_en = 0;
++		dev->rx_en = 0;
++		dev->tx_en = 0;
++		dev->misc_en = 0;
+ 		netdev->init = emac_dev_init;
+ 		SET_NETDEV_DEV(netdev, &(emac_dev->dev));
+ 		emac_net_dev[dev->instance_num] = netdev;
+-#if defined CONFIG_EMAC_INIT_BUF_MALLOC
+-		g_init_enable_flag = 1;
+-#endif
+ 		emac_p_detect_manual_cfg(cfg_link_speed, cfg_link_mode,
+ 					 debug_mode);
+-		if (emac_cfg_probe()) {
+-			printk("TI DAVINCI EMAC: Error in configuration.\n");
+-			return (-1);
+-		}
+ 
+ 		/* register the network device with linux */
+ 		failed = register_netdev(netdev);
+@@ -6844,7 +6775,6 @@ static int __init emac_dev_probe(void)
+ 			ERR("Could not register device: %d\n", failed);
+ 
+ 			ret_val = -1;
+-
+ 			clk_unuse(emac_clk);
+ 			clk_disable(emac_clk);
+ 
+@@ -6853,9 +6783,6 @@ static int __init emac_dev_probe(void)
+ 		} else {
+ 			dev->next_device = last_emac_device;
+ 			last_emac_device = netdev;
+-			DBG("%s irq=%2d io=%04x\n",
+-			    netdev->name, (int)netdev->irq,
+-			    (int)netdev->base_addr);
+ 			create_proc_read_entry("net/emac_rfc2665_stats", 0,
+ 					       NULL, emac_p_read_rfc2665_stats,
+ 					       netdev);
+@@ -6880,10 +6807,6 @@ static int __init emac_dev_probe(void)
+ 
+ 	printk("%s\n", emac_version_string);
+ 	printk("TI DaVinci EMAC: Installed %d instances.\n", unit);
+-#if defined CONFIG_EMAC_INIT_BUF_MALLOC
+-	printk
+-	    ("TI DAVINCI EMAC driver is allocating buffer memory at init time.\n");
+-#endif
+ 
+ 	return ((unit >= 0) ? 0 : -ENODEV);
+ }
+@@ -6909,10 +6832,6 @@ static void emac_exit(void)
+ 		clk_unuse(emac_clk);
+ 		clk_disable(emac_clk);
+ 
+-		if (g_init_enable_flag) {
+-			emac_p_dev_disable(dev);
+-		}
+-
+ 		/* deinit DDC */
+ 		ret_code = emac_de_init(dev, NULL);
+ 
+Index: linux-2.6.10/drivers/net/davinci_emac_phy.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/davinci_emac_phy.c
++++ linux-2.6.10/drivers/net/davinci_emac_phy.c
+@@ -30,7 +30,8 @@
+  *           					use PHY_DUPLEX_* constants
+  */
+ #include <linux/kernel.h>
+-
++#include <linux/ethtool.h>
++#include <asm/arch/cpu.h>
+ #include "davinci_emac_phy.h"
+ 
+ #define EMAC_PHY_DEBUG
+@@ -52,12 +53,15 @@
+ #define MII_PHY_ISOLATE         (1<<10)
+ #define MII_RENEGOTIATE         (1<<9)
+ #define MII_PHY_FD              (1<<8)
++#define MII_PHY_1000		(1<<6)
+ 
+ #define PHY_STATUS_REG        	1
+ #define MII_NWAY_COMPLETE       (1<<5)
+ #define MII_NWAY_CAPABLE        (1<<3)
+ #define MII_PHY_LINKED          (1<<2)
+ 
++#define PHY_LEDCONFIG_REG	20
++
+ #define NWAY_ADVERTIZE_REG    	4
+ #define NWAY_REMADVERTISE_REG 	5
+ #define MII_NWAY_FD100          (1<<8)
+@@ -66,6 +70,21 @@
+ #define MII_NWAY_HD10           (1<<5)
+ #define MII_NWAY_SEL            (1<<0)
+ 
++#define GBE_CONTROL_REG		9
++#define MII_LOC_FD1000		(1<<9)
++#define MII_LOC_HD1000		(1<<8)
++#define GBE_STATUS_REG		10
++#define MII_LOC_RX_STAT		(1<<13)
++#define MII_REM_RX_STAT		(1<<12)
++#define MII_REM_FD1000		(1<<11)
++#define MII_REM_HD1000		(1<<10)
++
++#define PHY_CONFIG_REG		22
++#define PHY_FIFO_DEPTH_32	(3<<12)
++#define PHY_FIFO_DEPTH_8	(1<<12)
++#define PHY_EN_TX_CLK		(1<<5)
++#define PHY_EN_SYS_CLK		(1<<4)
++#define PHY_GTX_CLK		(1<<1)
+ /* Timeout values - since timer tikc is expected to be 10 mSecs fixed these
+  * values are in (value * 10 mSecs) */
+ #define PHY_FIND_TIMEOUT (2)
+@@ -147,8 +166,10 @@ struct phy_info {
+ 	unsigned int duplex;	/* 0=Auto Negotiate, Full=3; Half=2, Unknown=1 */
+ 	unsigned int phy_addr;	/* phy address */
+ 	unsigned int phy_mask;	/* phy mask */
+-	unsigned int mlink_mask;/* mlink mask */
++	unsigned int mlink_mask;	/* mlink mask */
+ 	int debug_mode;		/* debug mode */
++
++	int fx_mode;		/* FX (optics) mode detected */
+ };
+ 
+ /* Global phy structure instance */
+@@ -215,11 +236,65 @@ void emac_mdio_set_phy_mode(unsigned int
+ 		emac_phy->state_change = 1;
+ 	}
+ 
+-	DPRINTK("PhyMode:%08X Auto:%d, FD10:%d, HD10:%d, FD100:%d, HD100:%d\n",
++	DPRINTK("PhyMode:%08X Auto:%d, FD10:%d, HD10:%d, FD100:%d, HD100:%d "
++		"FD1000:%d HD1000:%d\n",
+ 		phy_mode,
+ 		phy_mode & NWAY_AUTO, phy_mode & MII_NWAY_FD10,
+ 		phy_mode & MII_NWAY_HD10, phy_mode & MII_NWAY_FD100,
+-		phy_mode & MII_NWAY_HD100);
++		phy_mode & MII_NWAY_HD100,
++		phy_mode & NWAY_FD1000, phy_mode & NWAY_HD1000);
++}
++
++/* Set PHY mode - autonegotiation or any other */
++unsigned int emac_mdio_supported_rate(void)
++{
++	unsigned int supported_mode = 0;
++
++	if (emac_phy->phy_mode & NWAY_HD10)
++		supported_mode |= SUPPORTED_10baseT_Half;
++
++	if (emac_phy->phy_mode & NWAY_FD10)
++		supported_mode |= SUPPORTED_10baseT_Full;
++
++	if (emac_phy->phy_mode & NWAY_HD100)
++		supported_mode |= SUPPORTED_100baseT_Half;
++
++	if (emac_phy->phy_mode & NWAY_FD100)
++		supported_mode |= SUPPORTED_100baseT_Full;
++
++	if (emac_phy->phy_mode & NWAY_FD1000)
++		supported_mode |= SUPPORTED_1000baseT_Full;
++
++	if (emac_phy->phy_mode & NWAY_AUTO)
++		supported_mode |= SUPPORTED_Autoneg;
++
++	return supported_mode;
++}
++
++/* get autonegotiate advertised rates */
++unsigned int emac_mdio_autoneg_rate(void)
++{
++	unsigned int auto_mode = 0;
++
++	if (emac_phy->phy_mode & NWAY_HD10)
++		auto_mode |= ADVERTISED_10baseT_Half;
++
++	if (emac_phy->phy_mode & NWAY_FD10)
++		auto_mode |= ADVERTISED_10baseT_Full;
++
++	if (emac_phy->phy_mode & NWAY_HD100)
++		auto_mode |= ADVERTISED_100baseT_Half;
++
++	if (emac_phy->phy_mode & NWAY_FD100)
++		auto_mode |= ADVERTISED_100baseT_Full;
++
++	if (emac_phy->phy_mode & NWAY_FD1000)
++		auto_mode |= ADVERTISED_1000baseT_Full;
++
++	if (emac_phy->phy_mode & NWAY_AUTO)
++		auto_mode |= ADVERTISED_Autoneg;
++
++	return auto_mode;
+ }
+ 
+ /* Get linked status - check if link is on - 1=link on, 0=link off */
+@@ -246,6 +321,12 @@ int emac_mdio_get_phy_num(void)
+ 	return (emac_phy->phy_addr);
+ }
+ 
++/* Get auto negotiation */
++int emac_mdio_get_autoneg(void)
++{
++	return ((emac_phy->phy_mode & NWAY_AUTO) ? 1 : 0);
++}
++
+ /* Check if loopback enabled on phy */
+ int emac_mdio_is_loopback(void)
+ {
+@@ -299,6 +380,7 @@ void emac_mdio_write(unsigned int phy_ad
+ void emac_mdio_phy_reset(unsigned int phy_addr)
+ {
+ 	unsigned int control;
++	unsigned int led_config = 0xd00;
+ 
+ 	emac_mdio_write(phy_addr, PHY_CONTROL_REG, MII_PHY_RESET);
+ 
+@@ -306,11 +388,16 @@ void emac_mdio_phy_reset(unsigned int ph
+ 		control = emac_mdio_read(phy_addr, PHY_CONTROL_REG);
+ 	} while (control & MII_PHY_RESET);
+ 
++	/* LED1 = [orange] display speed status (default)
++	 * LED2 = [green] display link and receive status combined
++	 */
++	emac_mdio_write(phy_addr, PHY_LEDCONFIG_REG, led_config);
++
+ 	/* CRITICAL: Fix for increasing PHY signal drive strength for
+ 	 * TX lockup issue. On DaVinci EVM, the Intel LXT971 PHY
+-  	 * signal strength was low causing  TX to fail randomly. The
++	 * signal strength was low causing  TX to fail randomly. The
+ 	 * fix is to Set bit 11 (Increased MII drive strength) of PHY
+-         * register 26 (Digital Config register) on this phy. */
++	 * register 26 (Digital Config register) on this phy. */
+ 	control = emac_mdio_read(phy_addr, 26);
+ 	emac_mdio_write(phy_addr, 26, (control | 0x800));
+ 	control = emac_mdio_read(phy_addr, 26);
+@@ -379,6 +466,7 @@ void emac_mdio_found_state(void)
+ 	unsigned int phy_num;
+ 	unsigned int cnt;
+ 	unsigned int nway_advertise;
++	unsigned int gbe_advertise;
+ 
+ 	/* Check if there is any phy mode requested by the user */
+ 	if (emac_phy->phy_mode == 0) {
+@@ -436,6 +524,12 @@ void emac_mdio_found_state(void)
+ 	if (emac_phy->phy_mode & NWAY_HD10)
+ 		nway_advertise |= MII_NWAY_HD10;
+ 
++	gbe_advertise = 0;
++	if (cpu_is_davinci_dm6467()) {
++		if (emac_phy->phy_mode & NWAY_FD1000)
++			gbe_advertise |= MII_LOC_FD1000;
++	}
++
+ 	phy_status = emac_mdio_read(emac_phy->phy_addr, PHY_STATUS_REG);
+ 
+ 	if ((phy_status & MII_NWAY_CAPABLE) && (emac_phy->phy_mode & NWAY_AUTO)) {
+@@ -443,8 +537,17 @@ void emac_mdio_found_state(void)
+ 		/* NWAY Phy Detected - following procedure for NWAY compliant Phys */
+ 		emac_mdio_write(emac_phy->phy_addr, NWAY_ADVERTIZE_REG,
+ 				nway_advertise);
++
++		if (cpu_is_davinci_dm6467())
++			emac_mdio_write(emac_phy->phy_addr, GBE_CONTROL_REG,
++					gbe_advertise);
++
+ 		if (emac_phy->debug_mode) {
+ 			DPRINTK("NWAY Advertising: ");
++			if (gbe_advertise & MII_LOC_FD1000)
++				DPRINTK("1000 Mbps FullDuplex");
++			if (gbe_advertise & MII_LOC_HD1000)
++				DPRINTK("1000 Mbps HalfDuplex");
+ 			if (nway_advertise & MII_NWAY_FD100)
+ 				DPRINTK("100 Mbps FullDuplex");
+ 			if (nway_advertise & MII_NWAY_HD100)
+@@ -471,23 +574,45 @@ void emac_mdio_found_state(void)
+ 		nway_advertise &= ~MII_NWAY_SEL;
+ 		phy_status = 0;
+ 
+-		if (nway_advertise & (MII_NWAY_FD100 | MII_NWAY_HD100)) {
++		if (gbe_advertise & (MII_LOC_FD1000 | MII_LOC_HD1000)) {
++			phy_status = MII_PHY_1000;	/* Set 1000 Mbps */
++			gbe_advertise &= (MII_LOC_FD1000 | MII_LOC_HD1000);
++			emac_phy->speed = 1000;
++		} else if (nway_advertise & (MII_NWAY_FD100 | MII_NWAY_HD100)) {
+ 			phy_status = MII_PHY_100;	/* Set 100 Mbps if requested */
+ 			nway_advertise &= (MII_NWAY_FD100 | MII_NWAY_HD100);
++			emac_phy->speed = 100;
+ 		} else {
+ 			nway_advertise &= (MII_NWAY_FD10 | MII_NWAY_HD10);
++			emac_phy->speed = 10;
+ 		}
+ 
+-		if (nway_advertise & (MII_NWAY_FD100 | MII_NWAY_FD10)) {
++		if ((nway_advertise & (MII_NWAY_FD100 | MII_NWAY_FD10)) ||
++		    (gbe_advertise & MII_LOC_FD1000)) {
+ 			phy_status |= MII_PHY_FD;	/* Set Full duplex if requested */
+ 		}
++		/* advertise supported speed */
++		emac_mdio_write(emac_phy->phy_addr, NWAY_ADVERTIZE_REG,
++				nway_advertise);
++
++		if (cpu_is_davinci_dm6467())
++			emac_mdio_write(emac_phy->phy_addr, GBE_CONTROL_REG,
++					gbe_advertise);
+ 
+ 		/* Set requested speed and duplex mode on phy */
+ 		emac_mdio_write(emac_phy->phy_addr, PHY_CONTROL_REG,
+ 				phy_status);
+ 
+-		/* Set the phy speed and duplex mode */
+-		emac_phy->speed = (phy_status & MII_PHY_100) ? 100 : 10;
++		if (emac_phy->speed == 1000) {
++			emac_mdio_write(emac_phy->phy_addr, PHY_CONFIG_REG,
++					(PHY_FIFO_DEPTH_8 | PHY_EN_SYS_CLK |
++					 PHY_GTX_CLK));
++		} else {
++			emac_mdio_write(emac_phy->phy_addr, PHY_CONFIG_REG,
++					PHY_FIFO_DEPTH_8 | PHY_EN_SYS_CLK);
++		}
++
++		/* Set the duplex mode */
+ 		emac_phy->duplex = (phy_status & MII_PHY_FD) ? 3 : 2;
+ 
+ 		emac_phy->state = PHY_LINK_WAIT;
+@@ -527,6 +652,7 @@ void emac_mdio_nwaywait_state(void)
+ {
+ 	unsigned int status;
+ 	unsigned int my_cap, partner_cap, neg_mode;
++	unsigned int gbe_cap, rgbe_cap, gbe_mode;
+ 
+ 	/* Check if nway negotiation complete */
+ 	status = emac_mdio_read(emac_phy->phy_addr, PHY_STATUS_REG);
+@@ -538,22 +664,41 @@ void emac_mdio_nwaywait_state(void)
+ 		partner_cap =
+ 		    emac_mdio_read(emac_phy->phy_addr, NWAY_REMADVERTISE_REG);
+ 
++		if (cpu_is_davinci_dm6467()) {
++			gbe_cap = emac_mdio_read(emac_phy->phy_addr,
++						 GBE_CONTROL_REG);
++			rgbe_cap = emac_mdio_read(emac_phy->phy_addr,
++						  GBE_STATUS_REG);
++			gbe_mode = (gbe_cap & (rgbe_cap >> 2)) &
++			    (MII_LOC_FD1000);
++		} else {
++			gbe_cap = 0;
++			rgbe_cap = 0;
++			gbe_mode = 0;
++		}
++
+ 		/* Negotiated mode is what we and partnet have in common */
+ 		neg_mode = my_cap & partner_cap;
+ 		if (emac_phy->debug_mode) {
+-			DPRINTK
+-			    ("Phy %d, neg_mode %04X, my_cap %04X, partner_cap %04X\n",
+-			     emac_phy->phy_addr, neg_mode, my_cap, partner_cap);
++			DPRINTK("Phy %d, neg_mode %04X, my_cap %04X, "
++				"partner_cap %04X gbe_mode %04X gbe_cap %04X "
++				"remote_gbe_cap %04X\n",
++				emac_phy->phy_addr, neg_mode, my_cap,
++				partner_cap, gbe_mode, gbe_cap, rgbe_cap);
+ 		}
+ 
+ 		/* Limit negotiation to fields below */
+ 		neg_mode &=
+ 		    (MII_NWAY_FD100 | MII_NWAY_HD100 | MII_NWAY_FD10 |
+ 		     MII_NWAY_HD10);
+-		if (neg_mode == 0)
++		if ((neg_mode == 0) && (gbe_mode == 0))
+ 			DPRINTK
+ 			    ("WARNING: Negotiation complete but NO agreement, default is 10HD\n");
+ 
++		if (gbe_mode & MII_LOC_FD1000)
++			DPRINTK("1000 Mbps FullDuplex");
++		if (gbe_mode & MII_LOC_HD1000)
++			DPRINTK("1000 Mbps HalfDuplex");
+ 		if (neg_mode & MII_NWAY_FD100)
+ 			DPRINTK("100 Mbps FullDuplex");
+ 		if (neg_mode & MII_NWAY_HD100)
+@@ -564,7 +709,7 @@ void emac_mdio_nwaywait_state(void)
+ 			DPRINTK("10 Mbps HalfDuplex");
+ 		DPRINTK("\n");
+ 
+-		if (neg_mode != 0) {
++		if ((neg_mode != 0) || (gbe_mode != 0)) {
+ 			if (status & MII_PHY_LINKED) {
+ 				emac_phy->state = PHY_LINKED;
+ 			} else {
+@@ -573,11 +718,25 @@ void emac_mdio_nwaywait_state(void)
+ 		}
+ 
+ 		/* Set the phy speed and duplex mode */
+-		emac_phy->speed =
+-		    (neg_mode & (MII_NWAY_FD100 | MII_NWAY_HD100)) ? 100 : 10;
+-		emac_phy->duplex =
+-		    (neg_mode & (MII_NWAY_FD100 | MII_NWAY_FD10)) ?
+-				PHY_DUPLEX_FULL : PHY_DUPLEX_HALF;
++		if (gbe_mode & (MII_LOC_FD1000 | MII_LOC_HD1000)) {
++			emac_mdio_write(emac_phy->phy_addr, PHY_CONFIG_REG,
++					(PHY_FIFO_DEPTH_8 | PHY_EN_SYS_CLK |
++					 PHY_GTX_CLK));
++			emac_phy->speed = 1000;
++			emac_phy->duplex = (gbe_mode & MII_LOC_FD1000) ?
++			    PHY_DUPLEX_FULL : PHY_DUPLEX_HALF;
++		} else {
++			emac_mdio_write(emac_phy->phy_addr, PHY_CONFIG_REG,
++					PHY_FIFO_DEPTH_8 | PHY_EN_SYS_CLK);
++			if (neg_mode & (MII_NWAY_FD100 | MII_NWAY_HD100))
++				emac_phy->speed = 100;
++			else
++				emac_phy->speed = 10;
++
++			emac_phy->duplex =
++			    (neg_mode & (MII_NWAY_FD100 | MII_NWAY_FD10)) ?
++			    PHY_DUPLEX_FULL : PHY_DUPLEX_HALF;
++		}
+ 
+ 	} else {
+ 
+@@ -687,6 +846,22 @@ void emac_mdio_phy_dump(void)
+ 	     status & MII_NWAY_HD100 ? "Yes" : "No",
+ 	     status & MII_NWAY_FD10 ? "Yes" : "No",
+ 	     status & MII_NWAY_HD10 ? "Yes" : "No");
++
++	if (cpu_is_davinci_dm6467()) {
++		/* 9: GBE control register */
++		status = emac_mdio_read(emac_phy->phy_addr, GBE_CONTROL_REG);
++		DPRINTK
++		    ("PhyMyGBECapability: %04X, 1000FD=%s, 1000HD=%s\n",
++		     status, status & MII_LOC_FD1000 ? "Yes" : "No",
++		     status & MII_LOC_HD1000 ? "Yes" : "No");
++
++		/* 10: GBE status register */
++		status = emac_mdio_read(emac_phy->phy_addr, GBE_STATUS_REG);
++		DPRINTK
++		    ("PhyPartnerGBECapability: %04X, 1000FD=%s, 1000HD=%s\n",
++		     status, status & MII_REM_FD1000 ? "Yes" : "No",
++		     status & MII_REM_HD1000 ? "Yes" : "No");
++	}
+ }
+ 
+ /* emac_mdio_tick is called every 10 mili seconds to process Phy states */
+Index: linux-2.6.10/drivers/net/davinci_emac_phy.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/davinci_emac_phy.h
++++ linux-2.6.10/drivers/net/davinci_emac_phy.h
+@@ -75,6 +75,12 @@ int emac_mdio_init(unsigned int mdio_bas
+ /* Set PHY mode - autonegotiation or any other */
+ void emac_mdio_set_phy_mode(unsigned int phy_mode);
+ 
++/* get transmit rate supported by phy */
++unsigned int emac_mdio_supported_rate(void);
++
++/* get autonegotiate advertised rates */
++unsigned int emac_mdio_autoneg_rate(void);
++
+ /* Get linked status - check if link is on - 1=link on, 0=link off */
+ int emac_mdio_is_linked(void);
+ 
+@@ -87,6 +93,9 @@ int emac_mdio_get_duplex(void);
+ /* Get Phy number/address */
+ int emac_mdio_get_phy_num(void);
+ 
++/* Get autonegotiation status */
++int emac_mdio_get_autoneg(void);
++
+ /* Check if loopback enabled on phy */
+ int emac_mdio_is_loopback(void);
+ 
+Index: linux-2.6.10/mvl_patches/pro-1675.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1675.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1675);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

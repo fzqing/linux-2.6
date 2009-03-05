@@ -1,0 +1,511 @@
+#! /usr/bin/env bash
+# Patch: -usb_cdc_acm_uses_usb_cdc.h
+# Date: Tue Oct 10 17:10:20 2006
+# MR: 19210
+# From: David Brownell <david-b@pacbell.net>
+# Date: Mon, 7 Mar 2005 15:16:45 +0000 (-0800)
+# Subject: [PATCH] USB: cdc-acm uses <linux/usb_cdc.h>
+# X-Git-Tag: v2.6.11.2
+# commit af6d8afdaf913fe5e4f49fb616ea6327ef1fdac1
+# 
+# [PATCH] USB: cdc-acm uses <linux/usb_cdc.h>
+# 
+# This makes cdc-acm use the <linux/usb_cdc.h> file.  It (still) passes
+# "sparse -Wbitwise" on those fields.
+# 
+# Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+# Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+PATCHNUM=910
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 19210
+From: David Brownell <david-b@pacbell.net>
+Date: Mon, 7 Mar 2005 15:16:45 +0000 (-0800)
+Subject: [PATCH] USB: cdc-acm uses <linux/usb_cdc.h>
+X-Git-Tag: v2.6.11.2
+commit af6d8afdaf913fe5e4f49fb616ea6327ef1fdac1
+
+[PATCH] USB: cdc-acm uses <linux/usb_cdc.h>
+
+This makes cdc-acm use the <linux/usb_cdc.h> file.  It (still) passes
+"sparse -Wbitwise" on those fields.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+Index: linux-2.6.10/drivers/usb/class/cdc-acm.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/class/cdc-acm.c
++++ linux-2.6.10/drivers/usb/class/cdc-acm.c
+@@ -60,6 +60,7 @@
+ #include <linux/smp_lock.h>
+ #include <asm/uaccess.h>
+ #include <linux/usb.h>
++#include <linux/usb_cdc.h>
+ #include <asm/byteorder.h>
+ #include <asm/unaligned.h>
+ 
+@@ -97,9 +98,12 @@ static int acm_ctrl_msg(struct acm *acm,
+ /* devices aren't required to support these requests.
+  * the cdc acm descriptor tells whether they do...
+  */
+-#define acm_set_control(acm, control)	acm_ctrl_msg(acm, ACM_REQ_SET_CONTROL, control, NULL, 0)
+-#define acm_set_line(acm, line)		acm_ctrl_msg(acm, ACM_REQ_SET_LINE, 0, line, sizeof(struct acm_line))
+-#define acm_send_break(acm, ms)		acm_ctrl_msg(acm, ACM_REQ_SEND_BREAK, ms, NULL, 0)
++#define acm_set_control(acm, control) \
++	acm_ctrl_msg(acm, USB_CDC_REQ_SET_CONTROL_LINE_STATE, control, NULL, 0)
++#define acm_set_line(acm, line) \
++	acm_ctrl_msg(acm, USB_CDC_REQ_SET_LINE_CODING, 0, line, sizeof *(line))
++#define acm_send_break(acm, ms) \
++	acm_ctrl_msg(acm, USB_CDC_REQ_SEND_BREAK, ms, NULL, 0)
+ 
+ /*
+  * Interrupt handlers for various ACM device responses
+@@ -109,7 +113,7 @@ static int acm_ctrl_msg(struct acm *acm,
+ static void acm_ctrl_irq(struct urb *urb, struct pt_regs *regs)
+ {
+ 	struct acm *acm = urb->context;
+-	struct usb_ctrlrequest *dr = urb->transfer_buffer;
++	struct usb_cdc_notification *dr = urb->transfer_buffer;
+ 	unsigned char *data;
+ 	int newctrl;
+ 	int status;
+@@ -133,14 +137,14 @@ static void acm_ctrl_irq(struct urb *urb
+ 		goto exit;
+ 
+ 	data = (unsigned char *)(dr + 1);
+-	switch (dr->bRequest) {
++	switch (dr->bNotificationType) {
+ 
+-		case ACM_IRQ_NETWORK:
++		case USB_CDC_NOTIFY_NETWORK_CONNECTION:
+ 
+ 			dbg("%s network", dr->wValue ? "connected to" : "disconnected from");
+ 			break;
+ 
+-		case ACM_IRQ_LINE_STATE:
++		case USB_CDC_NOTIFY_SERIAL_STATE:
+ 
+ 			newctrl = le16_to_cpu(get_unaligned((__le16 *) data));
+ 
+@@ -160,8 +164,9 @@ static void acm_ctrl_irq(struct urb *urb
+ 			break;
+ 
+ 		default:
+-			dbg("unknown control event received: request %d index %d len %d data0 %d data1 %d",
+-				dr->bRequest, dr->wIndex, dr->wLength, data[0], data[1]);
++			dbg("unknown notification %d received: index %d len %d data0 %d data1 %d",
++				dr->bNotificationType, dr->wIndex,
++				dr->wLength, data[0], data[1]);
+ 			break;
+ 	}
+ exit:
+@@ -485,32 +490,34 @@ static void acm_tty_set_termios(struct t
+ {
+ 	struct acm *acm = tty->driver_data;
+ 	struct termios *termios = tty->termios;
+-	struct acm_line newline;
++	struct usb_cdc_line_coding newline;
+ 	int newctrl = acm->ctrlout;
+ 
+ 	if (!ACM_READY(acm))
+ 		return;
+ 
+-	newline.speed = cpu_to_le32p(acm_tty_speed +
++	newline.dwDTERate = cpu_to_le32p(acm_tty_speed +
+ 		(termios->c_cflag & CBAUD & ~CBAUDEX) + (termios->c_cflag & CBAUDEX ? 15 : 0));
+-	newline.stopbits = termios->c_cflag & CSTOPB ? 2 : 0;
+-	newline.parity = termios->c_cflag & PARENB ?
++	newline.bCharFormat = termios->c_cflag & CSTOPB ? 2 : 0;
++	newline.bParityType = termios->c_cflag & PARENB ?
+ 		(termios->c_cflag & PARODD ? 1 : 2) + (termios->c_cflag & CMSPAR ? 2 : 0) : 0;
+-	newline.databits = acm_tty_size[(termios->c_cflag & CSIZE) >> 4];
++	newline.bDataBits = acm_tty_size[(termios->c_cflag & CSIZE) >> 4];
+ 
+ 	acm->clocal = ((termios->c_cflag & CLOCAL) != 0);
+ 
+-	if (!newline.speed) {
+-		newline.speed = acm->line.speed;
++	if (!newline.dwDTERate) {
++		newline.dwDTERate = acm->line.dwDTERate;
+ 		newctrl &= ~ACM_CTRL_DTR;
+ 	} else  newctrl |=  ACM_CTRL_DTR;
+ 
+ 	if (newctrl != acm->ctrlout)
+ 		acm_set_control(acm, acm->ctrlout = newctrl);
+ 
+-	if (memcmp(&acm->line, &newline, sizeof(struct acm_line))) {
+-		memcpy(&acm->line, &newline, sizeof(struct acm_line));
+-		dbg("set line: %d %d %d %d", newline.speed, newline.stopbits, newline.parity, newline.databits);
++	if (memcmp(&acm->line, &newline, sizeof newline)) {
++		memcpy(&acm->line, &newline, sizeof newline);
++		dbg("set line: %d %d %d %d", le32_to_cpu(newline.dwDTERate),
++			newline.bCharFormat, newline.bParityType,
++			newline.bDataBits);
+ 		acm_set_line(acm, &acm->line);
+ 	}
+ }
+@@ -522,7 +529,7 @@ static void acm_tty_set_termios(struct t
+ static int acm_probe (struct usb_interface *intf,
+ 		      const struct usb_device_id *id)
+ {
+-	struct union_desc *union_header = NULL;
++	struct usb_cdc_union_desc *union_header = NULL;
+ 	char *buffer = intf->altsetting->extra;
+ 	int buflen = intf->altsetting->extralen;
+ 	struct usb_interface *control_interface;
+@@ -573,21 +580,22 @@ static int acm_probe (struct usb_interfa
+ 		}
+ 
+ 		switch (buffer [2]) {
+-			case CDC_UNION_TYPE: /* we've found it */
++			case USB_CDC_UNION_TYPE: /* we've found it */
+ 				if (union_header) {
+ 					err("More than one union descriptor, skipping ...");
+ 					goto next_desc;
+ 				}
+-				union_header = (struct union_desc *)buffer;
++				union_header = (struct usb_cdc_union_desc *)
++							buffer;
+ 				break;
+-			case CDC_COUNTRY_TYPE: /* maybe somehow export */
++			case USB_CDC_COUNTRY_TYPE: /* maybe somehow export */
+ 				break; /* for now we ignore it */
+-			case CDC_HEADER_TYPE: /* maybe check version */ 
++			case USB_CDC_HEADER_TYPE: /* maybe check version */ 
+ 				break; /* for now we ignore it */ 
+-			case CDC_AC_MANAGEMENT_TYPE:
++			case USB_CDC_ACM_TYPE:
+ 				ac_management_function = buffer[3];
+ 				break;
+-			case CDC_CALL_MANAGEMENT_TYPE:
++			case USB_CDC_CALL_MANAGEMENT_TYPE:
+ 				call_management_function = buffer[3];
+ 				call_interface_num = buffer[4];
+ 				if ((call_management_function & 3) != 3)
+@@ -750,8 +758,8 @@ skip_normal_probe:
+ 
+ 	acm_set_control(acm, acm->ctrlout);
+ 
+-	acm->line.speed = cpu_to_le32(9600);
+-	acm->line.databits = 8;
++	acm->line.dwDTERate = cpu_to_le32(9600);
++	acm->line.bDataBits = 8;
+ 	acm_set_line(acm, &acm->line);
+ 
+ 	usb_driver_claim_interface(&acm_driver, data_interface, acm);
+@@ -831,14 +839,20 @@ static struct usb_device_id acm_ids[] = 
+ 	.driver_info = NO_UNION_NORMAL, /* has no union descriptor */
+ 	},
+ 	/* control interfaces with various AT-command sets */
+-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, 2, 1) },
+-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, 2, 2) },
+-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, 2, 3) },
+-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, 2, 4) },
+-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, 2, 5) },
+-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, 2, 6) },
++	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ACM,
++		USB_CDC_ACM_PROTO_AT_V25TER) },
++	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ACM,
++		USB_CDC_ACM_PROTO_AT_PCCA101) },
++	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ACM,
++		USB_CDC_ACM_PROTO_AT_PCCA101_WAKE) },
++	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ACM,
++		USB_CDC_ACM_PROTO_AT_GSM) },
++	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ACM,
++		USB_CDC_ACM_PROTO_AT_3G	) },
++	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ACM,
++		USB_CDC_ACM_PROTO_AT_CDMA) },
+ 
+-	/* NOTE:  COMM/2/0xff is likely MSFT RNDIS ... NOT a modem!! */
++	/* NOTE:  COMM/ACM/0xff is likely MSFT RNDIS ... NOT a modem!! */
+ 	{ }
+ };
+ 
+Index: linux-2.6.10/drivers/usb/class/cdc-acm.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/class/cdc-acm.h
++++ linux-2.6.10/drivers/usb/class/cdc-acm.h
+@@ -27,24 +27,6 @@
+ 
+ #define USB_RT_ACM		(USB_TYPE_CLASS | USB_RECIP_INTERFACE)
+ 
+-#define ACM_REQ_COMMAND		0x00
+-#define ACM_REQ_RESPONSE	0x01
+-#define ACM_REQ_SET_FEATURE	0x02
+-#define ACM_REQ_GET_FEATURE	0x03
+-#define ACM_REQ_CLEAR_FEATURE	0x04
+-
+-#define ACM_REQ_SET_LINE	0x20
+-#define ACM_REQ_GET_LINE	0x21
+-#define ACM_REQ_SET_CONTROL	0x22
+-#define ACM_REQ_SEND_BREAK	0x23
+-
+-/*
+- * IRQs.
+- */
+-
+-#define ACM_IRQ_NETWORK		0x00
+-#define ACM_IRQ_LINE_STATE	0x20
+-
+ /*
+  * Output control lines.
+  */
+@@ -66,17 +48,6 @@
+ #define ACM_CTRL_OVERRUN	0x40
+ 
+ /*
+- * Line speed and caracter encoding.
+- */
+-
+-struct acm_line {
+-	__le32 speed;
+-	__u8 stopbits;
+-	__u8 parity;
+-	__u8 databits;
+-} __attribute__ ((packed));
+-
+-/*
+  * Internal driver structures.
+  */
+ 
+@@ -88,7 +59,7 @@ struct acm {
+ 	struct urb *ctrlurb, *readurb, *writeurb;	/* urbs */
+ 	u8 *ctrl_buffer, *read_buffer, *write_buffer;	/* buffers of urbs */
+ 	dma_addr_t ctrl_dma, read_dma, write_dma;	/* dma handles of buffers */
+-	struct acm_line line;				/* line coding (bits, stop, parity) */
++	struct usb_cdc_line_coding line;		/* bits, stop, parity */
+ 	struct work_struct work;			/* work queue entry for line discipline waking up */
+ 	struct tasklet_struct bh;			/* rx processing */
+ 	spinlock_t throttle_lock;			/* synchronize throtteling and read callback */
+@@ -105,24 +76,6 @@ struct acm {
+ 	unsigned int ctrl_caps;				/* control capabilities from the class specific header */
+ };
+ 
+-/* "Union Functional Descriptor" from CDC spec 5.2.3.X */
+-struct union_desc {
+-	u8	bLength;
+-	u8	bDescriptorType;
+-	u8	bDescriptorSubType;
+-
+-	u8	bMasterInterface0;
+-	u8	bSlaveInterface0;
+-	/* ... and there could be other slave interfaces */
+-} __attribute__ ((packed));
+-
+-/* class specific descriptor types */
+-#define CDC_HEADER_TYPE			0x00
+-#define CDC_CALL_MANAGEMENT_TYPE	0x01
+-#define CDC_AC_MANAGEMENT_TYPE		0x02
+-#define CDC_UNION_TYPE			0x06
+-#define CDC_COUNTRY_TYPE		0x07
+-
+ #define CDC_DATA_INTERFACE_TYPE	0x0a
+ 
+ /* constants describing various quirks and errors */
+Index: linux-2.6.10/mvl_patches/pro-0910.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0910.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(910);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

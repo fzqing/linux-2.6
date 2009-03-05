@@ -1,0 +1,5 @@
+#define LSP_BUILD_ID   "0800230"
+#define LSP_REVISION   "1"
+#define LSP_NAME       "ti-dm355_evm"
+#define LSP_BOARD_NAME "TI DM355 EVM (little endian)"
+#define LSP_MVL_ARCH   "arm_v5t_le"

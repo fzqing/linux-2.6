@@ -1,0 +1,1404 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_arava
+# Date: Fri Dec  7 11:52:06 2007
+# Source: Marvell International Ltd.
+# MR: 23291
+# Type: Integration
+# Disposition: merged from Marvell
+# Signed-off-by: yadviga grigorieva <yadviga@ru.mvista.com>
+# Description:
+# 	PXA3xx i2c chip arava driver 
+# 
+
+PATCHNUM=1436
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Marvell International Ltd.
+MR: 23291
+Type: Integration
+Disposition: merged from Marvell
+Signed-off-by: yadviga grigorieva <yadviga@ru.mvista.com>
+Description:
+	PXA3xx i2c chip arava driver 
+
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -470,4 +470,12 @@ config SENSORS_BU9929FV
+ 	help
+ 	  If you say yes here you get support for ROHM BU9929FV chips.
+ 
++config PXA3XX_ARAVA
++ 	boolean "Arava for PXA3xx"
++ 	depends on I2C && I2C_PXA && PXA3xx
++ 	select PXA3xx_PMIC
++ 	help
++ 	  If you say yes here, you get support for PXA300/PXA310 Arava Devices
++ 	  This driver can NOT be built as a module.
++
+ endmenu
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -47,6 +47,7 @@ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_
+ obj-$(CONFIG_SENSORS_DS1338)	+= ds1338.o
+ obj-$(CONFIG_SENSORS_RV5C387A)	+= rv5c387a.o
+ obj-$(CONFIG_SENSORS_BU9929FV)  += bu9929fv.o
++obj-$(CONFIG_PXA3XX_ARAVA)	+= arava.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_CHIP),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/drivers/i2c/chips/arava.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/arava.c
+@@ -0,0 +1,975 @@
++/*
++ * Monahans ARAVA PMIC Management Routines
++ *
++ *
++ * Copyright (C) 2004, Intel Corporation(chao.xie@intel.com).
++ *
++ * This software program is licensed subject to the GNU General Public License
++ * (GPL).Version 2,June 1991, available at http://www.fsf.org/copyleft/gpl.html
++
++ * (C) Copyright 2006 Marvell International Ltd.
++ * All Rights Reserved
++ */
++
++#undef DEBUG
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/sched.h>
++#include <linux/errno.h>
++#include <linux/sysctl.h>
++#include <linux/interrupt.h>
++#include <linux/workqueue.h>
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++
++#include <asm/ioctl.h>
++#include <asm/irq.h>
++#include <asm/hardware.h>
++#include <asm/uaccess.h>
++#include <asm/arch/pxa-regs.h>
++#include <asm/arch/arava.h>
++#include <asm/arch/mhn_pm.h>
++#include <asm/arch/mhn_pmic.h>
++
++#define	IRQ_ARAVA_EVENT		(IRQ_WAKEUP1)
++#define	PECR_INT_EN		(PECR_E0IE)
++#define	PECR_DIR		(PECR_DIR0)
++
++static struct mhn_pmic_regs arava_regs[ARAVA_REG_NUM];
++static spinlock_t arava_lock;
++
++/* Make sure that Power I2C has been initialized before invoke this function */
++#ifdef CONFIG_USB_PXA3XX
++extern int pxa3xx_usb_event_change(unsigned int events);
++#endif
++int arava_write(u8 reg, u8 val);
++int arava_read(u8 reg, u8 * pval);
++
++/* Wrap functions for pmic read/write */
++int mhn_pmic_read(u8 reg, u8 * pval)
++{
++	return arava_read(reg, pval);
++}
++
++EXPORT_SYMBOL(mhn_pmic_read);
++
++int mhn_pmic_write(u8 reg, u8 val)
++{
++	return arava_write(reg, val);
++}
++
++EXPORT_SYMBOL(mhn_pmic_write);
++
++static int arava_set_pump(int enable)
++{
++	int ret;
++	u8 val;
++	unsigned long flags;
++
++	local_irq_save_nort(flags);
++	spin_lock_rt(&arava_lock);
++	if (enable) {
++		ret = arava_read(ARAVA_MISCB, &val);
++		if (ret)
++			goto out;
++		val |= ARAVA_MISCB_SESSION_VALID_EN;
++		val &= ~ARAVA_MISCB_USBINT_BOTHEDGE;
++		ret = arava_write(ARAVA_MISCB, val);
++		if (ret)
++			goto out;
++
++		/* FIXME: We use EXTON as cable detect signal on ZYlonite.
++		 * This depends on the cable signal is connected to EXTON
++		 * of ARAVA.
++		 * If the cable signal is not connected to EXTON, we need
++		 * use other signal as cable detect signal.
++		 */
++		ret = arava_read(ARAVA_IRQ_MASK_A, &val);
++		if (ret)
++			goto out;
++		val &= ~ARAVA_IRQMASK_A_EXTON;
++		ret = arava_write(ARAVA_IRQ_MASK_A, val);
++		if (ret)
++			goto out;
++		val = ARAVA_USBPUMP_EN_USBVE | ARAVA_USBPUMP_EN_USBVEP;
++		ret = arava_write(ARAVA_USBPUMP, val);
++	} else {
++		ret = arava_read(ARAVA_MISCB, &val);
++		if (ret)
++			goto out;
++		val &= ~(ARAVA_MISCB_SESSION_VALID_EN |
++			 ARAVA_MISCB_USBINT_BOTHEDGE);
++		ret = arava_write(ARAVA_MISCB, val);
++		if (ret)
++			goto out;
++		ret = arava_read(ARAVA_IRQ_MASK_A, &val);
++		if (ret)
++			goto out;
++		val |= ARAVA_IRQMASK_A_EXTON;
++		ret = arava_write(ARAVA_IRQ_MASK_A, val);
++		if (ret)
++			goto out;
++		ret = arava_write(ARAVA_USBPUMP, 0);
++	}
++      out:
++	local_irq_restore_nort(flags);
++	spin_unlock_rt(&arava_lock);
++	return ret;
++}
++
++static int arava_set_vbus_supply(int enable, int srp)
++{
++	int ret;
++	u8 val;
++
++	ret = arava_read(ARAVA_USBPUMP, &val);
++	if (ret)
++		goto out;
++
++	if (enable) {
++		val |= ARAVA_USBPUMP_USBVE | ARAVA_USBPUMP_EN_USBVE |
++		    ARAVA_USBPUMP_EN_USBVEP;
++		if (srp)
++			val |= ARAVA_USBPUMP_USBVEP;
++		else
++			val &= ~ARAVA_USBPUMP_USBVEP;
++	} else {
++		val |= ARAVA_USBPUMP_EN_USBVE | ARAVA_USBPUMP_EN_USBVEP;
++		val &= ~(ARAVA_USBPUMP_USBVE | ARAVA_USBPUMP_USBVEP);
++	}
++	ret = arava_write(ARAVA_USBPUMP, val);
++	pr_debug("%s enable %d srp %d val %x\n", __func__, enable, srp, val);
++
++      out:
++	if (ret)
++		printk(KERN_ALERT "i2c operation error %d\n", ret);
++	return ret;
++}
++
++/* Set USB A-device events: VBUS/Session valid.
++ * For ARAVA, only SRP_DETECT event occurs when peer side B-device send
++ * VBUS pulse on the bus. Use SRP_DETECT event as A-device session valid
++ * event, which meet the Min value of the threshold.
++ */
++static int arava_set_usbotg_a_mask(void)
++{
++	int ret;
++	u8 val;
++
++	ret = arava_read(ARAVA_IRQ_MASK_B, &val);
++	if (ret)
++		return ret;
++
++	/* set interrupts that a device care about */
++	val |= (ARAVA_EVENT_B_VBUS_4P0 | ARAVA_EVENT_B_VBUS_4P4 |
++		ARAVA_EVENT_B_SESSION_VALID | ARAVA_EVENT_B_SRP_DETECT);
++	val &= ~(ARAVA_EVENT_B_SRP_DETECT | ARAVA_EVENT_B_VBUS_4P4);
++
++	ret = arava_write(ARAVA_IRQ_MASK_B, val);
++	return ret;
++}
++
++/* Set USB B-device events; Session valid/end
++ * Current USB driver doesn't care about any B-device evnets.
++ */
++static int arava_set_usbotg_b_mask(void)
++{
++	int ret;
++	u8 val;
++
++	ret = arava_read(ARAVA_IRQ_MASK_B, &val);
++	if (ret)
++		return ret;
++
++	/* set interrupts that b device care about */
++	val |= (ARAVA_EVENT_B_VBUS_4P0 | ARAVA_EVENT_B_VBUS_4P4 |
++		ARAVA_EVENT_B_SESSION_VALID | ARAVA_EVENT_B_SRP_DETECT);
++
++	ret = arava_write(ARAVA_IRQ_MASK_B, val);
++	return ret;
++}
++
++static int is_arava_vbus_assert(void)
++{
++	u8 val;
++
++	/* FIXME: We use EXTON as cable detect signal on ZYlonite.
++	 * This depends on the cable signal is connected to EXTON
++	 * of ARAVA.
++	 * If the cable signal is not connected to EXTON, we need
++	 * use other signal as cable detect signal.
++	 */
++	arava_read(ARAVA_STATUS, &val);
++	if (val & ARAVA_STATUS_EXTON)
++		return 1;
++	return 0;
++}
++
++static unsigned int arava_event_change(void)
++{
++	int ret = 0;
++	u8 val;
++
++	arava_read(ARAVA_EVENT_A, &val);
++
++	/* FIXME: We use EXTON as cable detect signal on ZYlonite.
++	 * This depends on the cable signal is connected to EXTON
++	 * of ARAVA.
++	 * If the cable signal is not connected to EXTON, we need
++	 * use other signal as cable detect signal.
++	 */
++	if (val & ARAVA_EVENT_A_EXTON)
++		ret |= PMIC_EVENT_VBUS;
++
++	arava_read(ARAVA_EVENT_B, &val);
++	if (val & ARAVA_EVENT_B_SRP_DETECT) {
++		arava_read(ARAVA_IRQ_MASK_B, &val);
++		if (!(val & ARAVA_EVENT_B_SRP_DETECT))
++			ret |= PMIC_EVENT_VBUS;
++	}
++
++	arava_read(ARAVA_EVENT_C, &val);
++
++	return ret;
++}
++
++/* FIXME: Because the ARAVA silicon has some issues. So need check whether
++ * IRQ is masked or not before check the VBUS state.
++ */
++static int is_arava_avbusvld(void)
++{
++	u8 val;
++
++	arava_read(ARAVA_IRQ_MASK_B, &val);
++	if (val & ARAVA_EVENT_B_VBUS_4P4)
++		return 0;
++
++	arava_read(ARAVA_USBPUMP, &val);
++
++	if (val & ARAVA_USBPUMP_VBUS_VALID_4_4)
++		return 1;
++	else
++		return 0;
++}
++
++static int is_arava_asessvld(void)
++{
++	u8 val;
++
++	arava_read(ARAVA_IRQ_MASK_B, &val);
++
++	if (val & ARAVA_EVENT_B_SESSION_VALID)
++		return 0;
++
++	arava_read(ARAVA_USBPUMP, &val);
++
++	if (val & ARAVA_USBPUMP_SESSION_VALID)
++		return 1;
++	else
++		return 0;
++}
++
++static int is_arava_bsessvld(void)
++{
++	u8 val;
++
++	arava_read(ARAVA_IRQ_MASK_B, &val);
++
++	if (val & ARAVA_EVENT_B_VBUS_4P0)
++		return 0;
++
++	arava_read(ARAVA_USBPUMP, &val);
++
++	if (val & ARAVA_USBPUMP_VBUS_VALID_4_0)
++		return 1;
++	else
++		return 0;
++}
++
++static int is_arava_srp_ready(void)
++{
++	u8 val;
++
++	/* ARAVA reports unexpected SRP_DETECT event when
++	 * VBUS is pulled HIGH/LOW, no matter whether the
++	 * event is cared or not. Reture 0 when USB driver
++	 * don't want to detect SRP_DETECT event.
++	 */
++	arava_read(ARAVA_IRQ_MASK_B, &val);
++
++	if (val & ARAVA_EVENT_B_SRP_DETECT)
++		return 0;
++
++	arava_read(ARAVA_USBPUMP, &val);
++
++	if (val & ARAVA_USBPUMP_SRP_DETECT)
++		return 1;
++	else
++		return 0;
++}
++
++static int get_arava_voltage(int cmd, int *pmv)
++{
++	int ret;
++	u8 val;
++
++	*pmv = 0;
++	switch (cmd) {
++	case VCC_CORE:
++		ret = arava_read(ARAVA_BUCK2DVC1, &val);
++		break;
++	case VCC_SRAM:
++		ret = arava_read(ARAVA_LDO1416, &val);
++		break;
++	case VCC_MVT:
++		ret = arava_read(ARAVA_LDO1819, &val);
++		break;
++	case VCC_MEM:
++		ret = arava_read(ARAVA_LDO1011, &val);
++		break;
++	case VCC_3V_APPS:
++	case VCC_USB:
++	case VCC_TSI:
++	case VCC_LCD:
++	case VCC_CAMERA_IO:
++		ret = arava_read(ARAVA_LDO1819, &val);
++		break;
++	case VCC_SDIO:
++		ret = arava_read(ARAVA_LDO1011, &val);
++		break;
++	case VCC_CAMERA_ANA:
++		ret = arava_read(ARAVA_LDO17_SIMCP0, &val);
++		break;
++	default:
++		printk(KERN_WARNING "input wrong command: %d\n", cmd);
++		return -EINVAL;
++	}
++
++	if (ret != 0)
++		return ret;
++
++	switch (cmd) {
++	case VCC_CORE:
++		val &= 0x1f;
++		*pmv = val * ARAVA_VBUCK2STEP + ARAVA_VBUCK2BASE;
++		break;
++	case VCC_SRAM:
++		val = val >> 3;
++		*pmv = val * ARAVA_VLDO16STEP + ARAVA_VLDO16BASE;
++		break;
++	case VCC_MVT:
++		/* LDO19 is similar to LDO10 */
++		val = (val >> 4) & 0x0f;
++		*pmv = val * ARAVA_VLDO10STEP + ARAVA_VLDO10BASE;
++		break;
++	case VCC_MEM:
++		val &= 0x0f;
++		*pmv = val * ARAVA_VLDO10STEP + ARAVA_VLDO10BASE;
++		break;
++	case VCC_3V_APPS:
++	case VCC_USB:
++	case VCC_TSI:
++	case VCC_LCD:
++	case VCC_CAMERA_IO:
++		/* LDO18 is similar to LDO10 */
++		val &= 0x0f;
++		*pmv = val * ARAVA_VLDO10STEP + ARAVA_VLDO10BASE;
++		break;
++	case VCC_SDIO:
++		/* LDO11 is similar to LDO10 */
++		val = (val >> 4) & 0x0f;
++		*pmv = val * ARAVA_VLDO10STEP + ARAVA_VLDO10BASE;
++		break;
++	case VCC_CAMERA_ANA:
++		/* LDO17 is similar to LDO10 */
++		val &= 0x0f;
++		*pmv = val * ARAVA_VLDO10STEP + ARAVA_VLDO10BASE;
++		break;
++	default:
++		break;
++	}
++	return ret;
++}
++
++int set_arava_voltage(int cmd, int mv)
++{
++	int ret;
++	u8 val;
++
++	switch (cmd) {
++	case VCC_CORE:
++		if (mv < ARAVA_VBUCK2BASE && mv > ARAVA_VBUCK2MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_BUCK2DVC1, &val);
++		break;
++	case VCC_SRAM:
++		if (mv < ARAVA_VLDO16BASE && mv > ARAVA_VLDO16MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_LDO1416, &val);
++		break;
++	case VCC_MVT:
++		if (mv < ARAVA_VLDO10BASE && mv > ARAVA_VLDO10MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_LDO1819, &val);
++		break;
++	case VCC_MEM:
++		if (mv < ARAVA_VLDO10BASE && mv > ARAVA_VLDO10MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_LDO1011, &val);
++		break;
++	case VCC_3V_APPS:
++	case VCC_USB:
++	case VCC_TSI:
++	case VCC_LCD:
++	case VCC_CAMERA_IO:
++		if (mv < ARAVA_VLDO10BASE && mv > ARAVA_VLDO10MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_LDO1819, &val);
++		break;
++	case VCC_SDIO:
++		if (mv < ARAVA_VLDO10BASE && mv > ARAVA_VLDO10MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_LDO1011, &val);
++		break;
++	case VCC_CAMERA_ANA:
++		if (mv < ARAVA_VLDO10BASE && mv > ARAVA_VLDO10MAX)
++			return -EINVAL;
++		ret = arava_read(ARAVA_LDO17_SIMCP0, &val);
++		break;
++	default:
++		printk(KERN_INFO "error command\n");
++		return -EINVAL;
++	}
++
++	if (ret != 0)
++		return ret;
++
++	switch (cmd) {
++	case VCC_CORE:
++		val &= 0xe0;
++		val |= ((mv - ARAVA_VBUCK2BASE) / ARAVA_VBUCK2STEP) | 0x80;
++		ret = arava_write(ARAVA_BUCK2DVC1, val);
++		break;
++	case VCC_SRAM:
++		val &= 0x07;
++		val |= ((mv - ARAVA_VLDO16BASE) / ARAVA_VLDO16STEP) << 3;
++		ret = arava_write(ARAVA_LDO1416, val);
++		break;
++	case VCC_MVT:
++		val &= 0x0f;
++		val |= ((mv - ARAVA_VLDO10BASE) / ARAVA_VLDO10STEP) << 4;
++		ret = arava_write(ARAVA_LDO1819, val);
++		break;
++	case VCC_MEM:
++		val &= 0xf0;
++		val |= (mv - ARAVA_VLDO10BASE) / ARAVA_VLDO10STEP;
++		ret = arava_write(ARAVA_LDO1011, val);
++		break;
++	case VCC_3V_APPS:
++	case VCC_USB:
++	case VCC_TSI:
++	case VCC_LCD:
++	case VCC_CAMERA_IO:
++		val &= 0xf0;
++		val |= (mv - ARAVA_VLDO10BASE) / ARAVA_VLDO10STEP;
++		ret = arava_write(ARAVA_LDO1819, val);
++		break;
++	case VCC_SDIO:
++		val &= 0x0f;
++		val |= ((mv - ARAVA_VLDO10BASE) / ARAVA_VLDO10STEP) << 4;
++		ret = arava_write(ARAVA_LDO1011, val);
++		break;
++	case VCC_CAMERA_ANA:
++		val &= 0xf0;
++		val |= (mv - ARAVA_VLDO10BASE) / ARAVA_VLDO10STEP;
++		ret = arava_write(ARAVA_LDO17_SIMCP0, val);
++		break;
++	}
++	return ret;
++}
++
++static int arava_initchip(void)
++{
++	int i;
++
++	memset(&arava_regs, 0, sizeof(struct mhn_pmic_regs) * ARAVA_REG_NUM);
++
++	/* set these registers as uncacheable */
++	for (i = 0; i < 0x10; i++)
++		arava_regs[i].mask = 1;
++	/* arava_regs[0x15].mask = 1;
++	 */
++	arava_regs[0x19].mask = 1;
++	for (i = 0x1C; i < 0x20; i++)
++		arava_regs[i].mask = 1;
++	arava_regs[0x24].mask = 1;
++	arava_regs[0x27].mask = 1;
++	for (i = 0x2C; i < 0x31; i++)
++		arava_regs[i].mask = 1;
++	for (i = 0x37; i < 0x50; i++)
++		arava_regs[i].mask = 1;
++	for (i = 0x51; i < 0x80; i++)
++		arava_regs[i].mask = 1;
++	for (i = 0x82; i < 0x90; i++)
++		arava_regs[i].mask = 1;
++	for (i = 0x9C; i < 0xA0; i++)
++		arava_regs[i].mask = 1;
++	for (i = 0xA7; i < ARAVA_REG_NUM; i++)
++		arava_regs[i].mask = 1;
++
++	return arava_write(ARAVA_SYSCTRL_A, 0xE8);
++}
++
++static DECLARE_WAIT_QUEUE_HEAD(arava_event_wait);
++static int arava_event_handler(void *arg)
++{
++	unsigned int event;
++
++	DECLARE_WAITQUEUE(wait, current);
++	current->flags |= PF_MEMALLOC | PF_NOFREEZE;
++	daemonize("arava_event");
++
++	while (1) {
++#ifdef CONFIG_PREEMPT_RT
++		spin_lock_rt(&arava_lock);
++#else
++		disable_irq(IRQ_ARAVA_EVENT);
++#endif
++
++		event = arava_event_change();
++#ifdef CONFIG_USB_PXA3XX
++		if (event & PMIC_EVENT_USB) {
++			pxa3xx_usb_event_change(event);
++		}
++#endif
++
++		add_wait_queue(&arava_event_wait, &wait);
++		set_current_state(TASK_INTERRUPTIBLE);
++
++#ifdef CONFIG_PREEMPT_RT
++		spin_unlock_rt(&arava_lock);
++#else
++		enable_irq(IRQ_ARAVA_EVENT);
++#endif
++		schedule();
++		set_current_state(TASK_RUNNING);
++		remove_wait_queue(&arava_event_wait, &wait);
++	}
++	return 0;
++}
++
++/*
++ * Arava interrupt service routine.
++ * In the ISR we need to check the Status bits in Arava and according to those
++ * bits to check which kind of IRQ had happened.
++ */
++static irqreturn_t arava_irq_handler(int irq, void *dev_id,
++				     struct pt_regs *regs)
++{
++	/* wakeup event */
++	PECR |= PECR_INT_EN;
++
++	wake_up_interruptible(&arava_event_wait);
++
++	return IRQ_HANDLED;
++}
++
++#ifdef	CONFIG_PM
++/*
++ * Suspend the arava interface.
++ */
++static int arava_suspend(struct device *_dev, u32 state, u32 level)
++{
++	if (level == SUSPEND_DISABLE) {
++		pr_info("arava: arava suspend\n");
++		disable_irq(IRQ_ARAVA_EVENT);
++	}
++#ifdef CONFIG_ZYLONITE_POWER_OPT
++	if (level == SUSPEND_POWER_DOWN) {
++		arava_write(ARAVA_REGCTRL1, 0x41);
++		arava_write(ARAVA_REGCTRL2, 0x03);
++		arava_write(ARAVA_LED1_CTRL, 0x00);
++		arava_write(ARAVA_LED2_CTRL, 0x00);
++		arava_write(ARAVA_LED3_CTRL, 0x80);
++		arava_write(ARAVA_LED4_CTRL, 0x80);
++		arava_write(ARAVA_LEDPC_CTRL, 0x80);
++	}
++#endif
++
++	return 0;
++}
++
++/*
++ * Resume the arava interface.
++ */
++static int arava_resume(struct device *_dev, u32 level)
++{
++	int i;
++
++	if (level == RESUME_ENABLE) {
++		pr_info("arava: arava resume\n");
++		/* all registers need to be read again */
++		for (i = 0; i < ARAVA_REG_NUM; i++) {
++			arava_regs[i].hit = 0;
++		}
++		enable_irq(IRQ_ARAVA_EVENT);
++	}
++#ifdef CONFIG_ZYLONITE_POWER_OPT
++	if (level == RESUME_POWER_ON) {
++		arava_write(ARAVA_REGCTRL1, 0xBF);
++		arava_write(ARAVA_CON1, 0xBF);
++		arava_write(ARAVA_CON2, 0x33);
++		arava_write(ARAVA_LED4_CTRL, 0x00);
++	}
++#endif
++	return 0;
++}
++
++#else
++#define	arava_suspend		NULL
++#define	arava_resume		NULL
++#endif
++
++static struct pmic_ops arava_pmic_ops = {
++	.get_voltage = get_arava_voltage,
++	.set_voltage = set_arava_voltage,
++
++	.is_vbus_assert = is_arava_vbus_assert,
++	.is_avbusvld = is_arava_avbusvld,
++	.is_asessvld = is_arava_asessvld,
++	.is_bsessvld = is_arava_bsessvld,
++	.is_srp_ready = is_arava_srp_ready,
++
++	.set_pump = arava_set_pump,
++	.set_vbus_supply = arava_set_vbus_supply,
++	.set_usbotg_a_mask = arava_set_usbotg_a_mask,
++	.set_usbotg_b_mask = arava_set_usbotg_b_mask,
++
++#ifdef	CONFIG_PM
++	.suspend = arava_suspend,
++	.resume = arava_resume,
++#endif
++};
++
++#ifdef CONFIG_PROC_FS
++#define	ARAVA_PROC_FILE	"driver/arava"
++static struct proc_dir_entry *arava_proc_file;
++
++static int arava_seq_show(struct seq_file *s, void *p)
++{
++	u8 val;
++
++	mhn_pmic_read(ARAVA_STATUS, &val);
++	seq_printf(s, "Arava status regs: 0x%02x\n", val);
++
++	mhn_pmic_read(ARAVA_IRQ_MASK_A, &val);
++	seq_printf(s, "Arava event mask A: 0x%02x\n", val);
++
++	mhn_pmic_read(ARAVA_EVENT_A, &val);
++	seq_printf(s, "Arava event A:0x%02x\n", val);
++
++	mhn_pmic_read(ARAVA_EVENT_B, &val);
++	seq_printf(s, "Arava event B:0x%02x\n", val);
++
++	mhn_pmic_read(ARAVA_EVENT_C, &val);
++	seq_printf(s, "Arava event C:0x%02x\n", val);
++
++	mhn_pmic_read(ARAVA_USBPUMP, &val);
++	seq_printf(s, "USB pump:0x%02x\n", val);
++
++	mhn_pmic_read(ARAVA_MISCB, &val);
++	seq_printf(s, "Misc control reg:0x%02x\n", val);
++	return 0;
++}
++
++static int arava_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, &arava_seq_show, NULL);
++}
++
++static struct file_operations arava_seq_fops = {
++	.owner = THIS_MODULE,
++	.open = arava_seq_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static void create_arava_proc_file(void)
++{
++	arava_proc_file = create_proc_entry(ARAVA_PROC_FILE, 0644, NULL);
++	if (!arava_proc_file) {
++		printk(KERN_INFO "Create proc file for Arava failed\n");
++		return;
++	}
++
++	arava_proc_file->proc_fops = &arava_seq_fops;
++}
++
++static void remove_arava_proc_file(void)
++{
++	remove_proc_entry(ARAVA_PROC_FILE, &proc_root);
++}
++#endif
++
++static int arava_probe(struct device *_dev)
++{
++	int ret;
++	u8 value;
++
++	ret = arava_initchip();
++	if (ret != 0) {
++		printk(KERN_WARNING "Initialize ARAVA failed\n");
++	}
++
++	PECR |= PECR_INT_EN;
++	PECR &= ~PECR_DIR;
++	ret = request_irq(IRQ_ARAVA_EVENT, arava_irq_handler, 0, "Arava", NULL);
++
++	if (ret) {
++		printk(KERN_WARNING
++		       "Request IRQ for ARAVA failed, return :%d\n", ret);
++		return ret;
++	}
++
++	/* Mask interrupts that are not needed */
++	arava_write(ARAVA_IRQ_MASK_A, 0xFF);
++	arava_write(ARAVA_IRQ_MASK_B, 0xFF);
++	arava_write(ARAVA_IRQ_MASK_C, 0xFF);
++
++#ifdef CONFIG_ZYLONITE_POWER_OPT
++	arava_write(ARAVA_REGCTRL1, 0xBF);
++	arava_write(ARAVA_REGCTRL2, 0x43);
++#else
++	arava_write(ARAVA_REGCTRL1, 0xFF);
++	arava_write(ARAVA_REGCTRL2, 0x43);
++	/* On old zylonite board, SRAM LDO doesn't work well.
++	 * We have to set ARAVA_APPSLEEP_CTRL, to invoid shutdown SRAM LDO.
++	 */
++	arava_write(ARAVA_APPSLEEP_CTRL, 0x27);
++#endif
++
++	/* IRQ is masked during the power-up sequence and will not be released
++	 * until they have been read for the first time */
++	arava_read(ARAVA_EVENT_A, &value);
++	arava_read(ARAVA_EVENT_B, &value);
++	arava_read(ARAVA_EVENT_C, &value);
++
++	pmic_set_ops(&arava_pmic_ops);
++
++	spin_lock_init(&arava_lock);
++
++	kernel_thread(arava_event_handler, NULL, CLONE_KERNEL);
++
++#ifdef CONFIG_PROC_FS
++	create_arava_proc_file();
++#endif
++	return 0;
++}
++
++static int arava_remove(struct device *_dev)
++{
++#ifdef	CONFIG_PROC_FS
++	remove_arava_proc_file();
++#endif
++	pmic_set_ops(NULL);
++	free_irq(IRQ_ARAVA_EVENT, NULL);
++	return 0;
++}
++
++static struct device_driver arava_driver = {
++	.name = "mhn_pmic",
++	.bus = &platform_bus_type,
++	.probe = arava_probe,
++	.remove = arava_remove,
++	.suspend = arava_suspend,
++	.resume = arava_resume,
++};
++
++/******************************************************************************
++ *                                                                            *
++ *                              ARAVA I2C Client Driver                       *
++ *                                                                            *
++ ******************************************************************************/
++static int i2c_arava_attach_adapter(struct i2c_adapter *adapter);
++static int i2c_arava_detect_client(struct i2c_adapter *, int, int);
++static int i2c_arava_detach_client(struct i2c_client *client);
++#define I2C_DRIVERID_ARAVA   I2C_DRIVERID_EXP1
++
++static struct i2c_driver i2c_arava_driver = {
++	.owner = THIS_MODULE,
++	.name = "arava i2c client driver",
++	.id = I2C_DRIVERID_ARAVA,
++	.flags = I2C_DF_NOTIFY,
++	.attach_adapter = &i2c_arava_attach_adapter,
++	.detach_client = &i2c_arava_detach_client,
++};
++
++/* Unique ID allocation */
++static struct i2c_client *g_client;
++static unsigned short normal_i2c[] = { ARAVA_ADDRESS, I2C_CLIENT_END };
++static unsigned short normal_i2c_range[] = { I2C_CLIENT_END };
++I2C_CLIENT_INSMOD;
++
++int arava_read(u8 reg, u8 * pval)
++{
++	int ret;
++
++	if (g_client == NULL)	/* No global client pointer? */
++		return -EINVAL;
++
++	pr_debug("hit %d\n", arava_regs[reg].hit);
++	if (arava_regs[reg].hit) {
++		*pval = arava_regs[reg].data;
++		return 0;
++	}
++
++	ret = i2c_smbus_read_byte_data(g_client, reg);
++	pr_debug("i2c read ret:0x%x\n", ret);
++	if (ret >= 0) {
++		*pval = ret;
++		/* If a register is uncacheable, the hit field can't be set */
++		arava_regs[reg].hit = ~arava_regs[reg].mask;
++		arava_regs[reg].data = ret;
++		ret = 0;
++	} else
++		ret = -EIO;
++
++	return ret;
++}
++
++int arava_write(u8 reg, u8 val)
++{
++	int ret;
++
++	if (g_client == NULL)	/* No global client pointer? */
++		return -1;
++
++	ret = i2c_smbus_write_byte_data(g_client, reg, val);
++	if (ret == 0) {
++		/* If a register is uncacheable, the hit field can't be set */
++		arava_regs[reg].hit = ~arava_regs[reg].mask;
++		/* arava_regs[reg].hit = 0; */
++		arava_regs[reg].data = val;
++		ret = 0;
++	} else
++		ret = -EIO;
++
++	return ret;
++}
++
++static int i2c_arava_attach_adapter(struct i2c_adapter *adap)
++{
++	return i2c_probe(adap, &addr_data, &i2c_arava_detect_client);
++}
++
++static int i2c_arava_detect_client(struct i2c_adapter *adapter, int address,
++				   int kind)
++{
++	struct i2c_client *new_client;
++	int err = 0;
++	int chip_id;
++
++	/* Let's see whether this adapter can support what we need.
++	   Please substitute the things you need here!  */
++	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA)) {
++		pr_info("byte op is not permited.\n");
++		goto ERROR0;
++	}
++
++	/* OK. For now, we presume we have a valid client. We now create the
++	   client structure, even though we cannot fill it completely yet.
++	   But it allows us to access several i2c functions safely */
++
++	/* Note that we reserve some space for arava_data too. If you don't
++	   need it, remove it. We do it here to help to lessen memory
++	   fragmentation. */
++
++	new_client = kzalloc(sizeof(struct i2c_client), GFP_KERNEL);
++
++	if (!new_client) {
++		err = -ENOMEM;
++		goto ERROR0;
++	}
++
++	new_client->addr = address;
++	new_client->adapter = adapter;
++	new_client->driver = &i2c_arava_driver;
++	new_client->flags = 0;
++
++	chip_id = i2c_smbus_read_byte_data(new_client, ARAVA_CHIP_ID);
++	if (chip_id < 0) {
++		printk(KERN_ERR "arava unavailable!\n");
++		goto ERROR1;
++	} else {
++		pr_info("arava(chip id:0x%02x) detected.\n", chip_id);
++	}
++
++	g_client = new_client;
++
++	strcpy(new_client->name, "ARAVA");
++
++	/* Tell the i2c layer a new client has arrived */
++	if ((err = i2c_attach_client(new_client)))
++		goto ERROR1;
++
++	return 0;
++
++      ERROR1:
++	g_client = NULL;
++	kfree(new_client);
++      ERROR0:
++	return err;
++}
++
++static int i2c_arava_detach_client(struct i2c_client *client)
++{
++	int err;
++
++	/* Try to detach the client from i2c space */
++	if ((err = i2c_detach_client(client))) {
++		printk(KERN_WARNING
++		       "arava.o: Client deregistration failed, client not detached.\n");
++		return err;
++	}
++
++	/* Frees client data too, if allocated at the same time */
++	kfree(client);
++	g_client = NULL;
++	return 0;
++}
++
++static int __init arava_init(void)
++{
++	int ret;
++
++	if ((ret = i2c_add_driver(&i2c_arava_driver))) {
++		printk(KERN_WARNING
++		       "arava: Driver registration failed,module not inserted.\n");
++		return ret;
++	}
++	ret = driver_register(&arava_driver);
++
++	return ret;
++}
++
++static void __exit arava_exit(void)
++{
++	driver_unregister(&arava_driver);
++
++	if (i2c_del_driver(&i2c_arava_driver)) {
++		printk(KERN_WARNING
++		       "arava: Driver registration failed, module not removed.\n");
++	}
++}
++
++module_init(arava_init);
++module_exit(arava_exit);
++
++MODULE_DESCRIPTION("Arava Driver");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/include/asm-arm/arch-pxa/arava.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-pxa/arava.h
++++ linux-2.6.10/include/asm-arm/arch-pxa/arava.h
+@@ -1,17 +1,21 @@
+ /*
+  * include/asm-arm/arch-pxa/arava.h
+  *
+- * Copyright (C) 2006, Marvell International Ltd.
++ * Copyright (C) 2006, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 as
+  * published by the Free Software Foundation.
++ *
++ *(C) Copyright 2006 Marvell International Ltd.
++ * All Rights Reserved
+  */
+ 
+ #ifndef _ARAVA_H_
+ #define _ARAVA_H_
+-#include <linux/i2c.h>
+-#include <linux/i2c-pxa.h>
++#include <linux/device.h>
++
++#define ARAVA_REG_NUM	       (0xBA)
+ 
+ /* SYSMON */
+ #define ARAVA_CHIP_ID		0x00
+@@ -41,6 +45,22 @@
+ #define ARAVA_APPSLEEP_CTRL	0x1A
+ #define ARAVA_STARTUP_CTRL	0x1B
+ 
++#define ARAVA_LDO0405		0x92
++/* LDO REG */
++#define ARAVA_LDO01		0x90
++#define ARAVA_LDO0203		0x91
++#define ARAVA_LDO0405		0x92
++#define ARAVA_LDO06SIMCP	0x93
++#define ARAVA_LDO0708		0x94
++#define ARAVA_LDO0912		0x95
++
++/* CONTROL REG */
++#define ARAVA_CON1		0x97
++#define ARAVA_CON2		0x98
++#define ARAVA_SLEEP_CON1	0x99
++#define ARAVA_SLEEP_CON2	0x9A
++#define ARAVA_SLEEP_CON3	0x9B
++
+ /* LED - ignored now. Skip */
+ #define ARAVA_LED1_CTRL		0x20
+ #define ARAVA_LED2_CTRL		0x21
+@@ -61,50 +81,70 @@
+ 
+ #define ARAVA_ADDRESS 		0x49
+ 
++#define ARAVA_VBUCK2BASE	850
++#define ARAVA_VBUCK2STEP	25
++#define ARAVA_VBUCK2MAX		1625
++
++#define ARAVA_VLDO10BASE	1800
++#define ARAVA_VLDO10STEP	100
++#define ARAVA_VLDO10MAX		3200
++
++#define ARAVA_VLDO14BASE	2760
++#define ARAVA_VLDO14STEP	30
++#define ARAVA_VLDO14MAX		2940
++
++#define ARAVA_VLDO16BASE	1100
++#define ARAVA_VLDO16STEP	50
++#define ARAVA_VLDO16MAX		2650
++
++#define ARAVA_VLDO18BASE	1800
++#define ARAVA_VLDO18STEP	100
++#define ARAVA_VLDO18MAX		3200
++
++/* The bit definition of ARAVA_EVENT_A (0x01) */
++#define ARAVA_EVENT_A_EXTON		(1 << 2)
++
++/* The bit definition of ARAVA_EVENT_B (0x02) */
++#define ARAVA_EVENT_B_VBUS_4P4		(1 << 3)
++#define ARAVA_EVENT_B_VBUS_4P0		(1 << 4)
++#define ARAVA_EVENT_B_SESSION_VALID	(1 << 5)
++#define ARAVA_EVENT_B_SRP_DETECT	(1 << 6)
++
++/* The bit definition of ARAVA_STATUS (0x04) */
++#define ARAVA_STATUS_EXTON		(1 << 2)
++
++/* The bit definition of ARAVA_IRQMASK_A (0x05) */
++#define ARAVA_IRQMASK_A_EXTON		(1 << 2)
++
++/* The bit definition of ARAVA_USBPUMP (0x19) */
++#define ARAVA_USBPUMP_USBVE		(1 << 0)
++#define ARAVA_USBPUMP_USBVEP		(1 << 1)
++#define ARAVA_USBPUMP_VBUS_VALID_4_4	(1 << 2)
++#define ARAVA_USBPUMP_VBUS_VALID_4_0	(1 << 3)
++#define ARAVA_USBPUMP_SESSION_VALID	(1 << 4)
++#define ARAVA_USBPUMP_SRP_DETECT	(1 << 5)
++#define ARAVA_USBPUMP_EN_USBVE		(1 << 6)
++#define ARAVA_USBPUMP_EN_USBVEP		(1 << 7)
++
++/* The bit definition of ARAVA_MISCB (0x27) */
++#define ARAVA_MISCB_USBINT_BOTHEDGE	(1 << 2)
++#define ARAVA_MISCB_SESSION_VALID_EN	(1 << 3)
++
++/* USB related definitions */
++#define ARAVA_EVENT_VBUS		(1 << 0)
++#define ARAVA_EVENT_VBUS_4P4		(1 << 2)
++#define ARAVA_EVENT_VBUS_4P0		(1 << 4)
++#define ARAVA_EVENT_SESSION		(1 << 6)
++#define ARAVA_EVENT_SRP			(1 << 8)
++
++#define ARAVA_USB_EVENTS	(ARAVA_EVENT_EXTON     |       \
++				ARAVA_EVENT_VBUS_4P4   |       \
++				ARAVA_EVENT_VBUS_4P0   |       \
++				ARAVA_EVENT_SESSION    |       \
++				ARAVA_EVENT_SRP)
+ 
+-#define VBASE			1100
+-#define VSTEP			50
+-#define VMAX			2650
+-
+-#define VBUCK2BASE		850
+-#define VBUCK2STEP		25
+-#define VBUCK2MAX		1625
+-
+-
+-
+-extern int arava_write(u8 reg, u8 val);
+-extern int arava_read(u8 reg, u8 *pval);
+-
+-extern int arava_get_vcc_core(void);
+-extern int arava_get_vcc_sram(void);
+-extern int arava_get_vcc_io(void);
+-extern int arava_set_vcc_io(unsigned int);
+-extern int arava_get_vcc_msl(void);
+-extern int arava_set_vcc_msl(unsigned int);
+-extern int arava_get_vcc_lcd(void);
+-extern int arava_set_vcc_lcd(unsigned int);
+-extern int arava_get_vcc_usb(void);
+-extern int arava_set_vcc_usb(unsigned int);
+-extern int arava_get_vcc_card0(void);
+-extern int arava_set_vcc_card0(unsigned int);
+-extern int arava_get_vcc_card1(void);
+-extern int arava_set_vcc_card1(unsigned int);
+-extern int arava_get_vcc_mem(void);
+-extern int arava_set_vcc_mem(unsigned int);
+-extern int arava_get_vcc_df(void);
+-extern int arava_set_vcc_df(unsigned int);
+-extern int arava_get_vcc_ci(void);
+-extern int arava_set_vcc_ci(unsigned int);
+-extern int arava_get_vcc_tsi(void);
+-extern int arava_set_vcc_tsi(unsigned int);
+-extern int arava_write(u8 reg, u8 val);
+-extern int arava_read(u8 reg, u8 * pval);
+-extern int arava_set_vcc_sram(unsigned int mv);
+-extern int arava_set_vcc_core(unsigned int mv);
+-extern int arava_get_sramvcc(u32 *pmv);
+-extern int arava_get_corevcc(u32 *pmv);
+-
+-extern int arava_lcdbklight_adj(unsigned int);
++extern int arava_platform_init(struct device *_dev);
++extern int arava_platform_deinit(struct device *_dev);
+ 
+ #endif
+ 
+Index: linux-2.6.10/mvl_patches/pro-1436.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1436.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1436);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

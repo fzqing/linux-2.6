@@ -1,0 +1,803 @@
+#! /usr/bin/env bash
+# Patch: -ltt_kernel_tid
+# Date: Wed Apr 26 12:01:21 2006
+# Source: MontaVista Software, Inc.
+# MR: 14723
+# Type: Enhancement
+# Disposition: needs submitting to ltt-dev mailing list.
+# Signed-off-by: Yuri Frolov <yfrolov@ru.mvista.com>
+# Description:
+# 	The LibUserTrace library provided by TraceToolkit-0.9.6 is _not_ thread-safe. 
+# 	Moreover, it supports only a sequential access even for processes.
+# 	Neither the kernel LTT part is re-entrant. It supports the only
+# 	trace_handle_table entry which is usable only for the first process which called
+# 	ltt_alloc_trace_handle (trace_attach in userland).
+# 	This patch should make amends for the kernel side.
+# 
+
+PATCHNUM=503
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14723
+Type: Enhancement
+Disposition: needs submitting to ltt-dev mailing list.
+Signed-off-by: Yuri Frolov <yfrolov@ru.mvista.com>
+Description:
+	The LibUserTrace library provided by TraceToolkit-0.9.6 is _not_ thread-safe. 
+	Moreover, it supports only a sequential access even for processes.
+	Neither the kernel LTT part is re-entrant. It supports the only
+	trace_handle_table entry which is usable only for the first process which called
+	ltt_alloc_trace_handle (trace_attach in userland).
+	This patch should make amends for the kernel side.
+
+ include/linux/ltt-core.h   |   10 -
+ include/linux/ltt-events.h |    2 
+ init/Kconfig               |    7 +
+ kernel/ltt-core.c          |  295 +++++++++++++++++++++++++++++++++++----------
+ mvl_patches/pro-0503.c     |   16 ++
+ 5 files changed, 261 insertions(+), 69 deletions(-)
+
+Index: linux-2.6.10/include/linux/ltt-core.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ltt-core.h
++++ linux-2.6.10/include/linux/ltt-core.h
+@@ -46,7 +46,7 @@
+ #define LTT_CUSTOM_EV_FORMAT_TYPE_XML	3
+ #define LTT_CUSTOM_EV_FORMAT_TYPE_IBM	4
+ 
+-#define LTT_MAX_HANDLES			256
++#define LTT_BASE_HANDLES		2
+ 
+ /* In the ltt root directory lives the trace control file, used for
+    kernel-user communication. */
+@@ -176,11 +176,12 @@ extern int ltt_create_owned_event(
+ 	char		*event_desc,
+ 	int		format_type,
+ 	char		*format_data,
+-	pid_t		owner_pid);
++	pid_t		owner_pid,
++	pid_t		owner_tid);
+ extern void ltt_destroy_event(
+ 	int		event_id);
+ extern void ltt_destroy_owners_events(
+-	pid_t		owner_pid);
++	pid_t		owner_tid);
+ extern void ltt_reregister_custom_events(void);
+ extern int ltt_log_std_formatted_event(
+ 	int		event_id,
+@@ -416,7 +417,8 @@ static inline int ltt_create_owned_event
+ 			   char		*event_desc,
+ 			   int		format_type,
+ 			   char		*format_data,
+-			   pid_t	owner_pid)
++			   pid_t	owner_pid,
++			   pid_t	owner_tid)
+ {
+ 	return 0;
+ }
+Index: linux-2.6.10/include/linux/ltt-events.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ltt-events.h
++++ linux-2.6.10/include/linux/ltt-events.h
+@@ -398,7 +398,7 @@ typedef struct _ltt_buffer_end {
+    provided custom event creation and logging functions. */
+ typedef struct _ltt_new_event {
+ 	/* Basics */
+-	u32 id;						/* Custom event ID */
++	u32 id;					/* Custom event ID */
+ 	char type[LTT_CUSTOM_EV_TYPE_STR_LEN];	/* Event type description */
+ 	char desc[LTT_CUSTOM_EV_DESC_STR_LEN];	/* Detailed event description */
+ 
+Index: linux-2.6.10/init/Kconfig
+===================================================================
+--- linux-2.6.10.orig/init/Kconfig
++++ linux-2.6.10/init/Kconfig
+@@ -412,6 +412,13 @@ config LTT
+ 	  decoder, please check the following address :
+ 	       http://www.opersys.com/ltt
+ 
++menuconfig LTT_MAX_HANDLES
++	int "Maximum number of active handles" if LTT
++	default 128
++	help
++	  A maximum number of simultaneous handles created by 
++	  LTT_TRACER_ALLOC_HANDLE ioctl command.
++
+ menuconfig BOOT_FLIGHT_RECORDER
+        bool "Start flight recorder at the time of boot" if LTT
+        default n
+Index: linux-2.6.10/kernel/ltt-core.c
+===================================================================
+--- linux-2.6.10.orig/kernel/ltt-core.c
++++ linux-2.6.10/kernel/ltt-core.c
+@@ -166,7 +166,7 @@ int mvista_event_struct_size[LTT_MVISTA_
+ struct custom_event_desc {
+ 	ltt_new_event event;
+ 
+-	pid_t owner_pid;
++	pid_t owner_tid;
+ 
+ 	struct custom_event_desc *next;
+ 	struct custom_event_desc *prev;
+@@ -174,7 +174,7 @@ struct custom_event_desc {
+ };
+ 
+ /* Custom event management */
+-static int			next_event_id = LTT_EV_MAX + 1;
++static atomic_t			next_event_id = ATOMIC_INIT(LTT_EV_MAX + 1);
+ static raw_rwlock_t		custom_list_lock = RAW_RW_LOCK_UNLOCKED;
+ static raw_rwlock_t		trace_handle_table_lock = RAW_RW_LOCK_UNLOCKED;
+ static struct custom_event_desc	custom_events_head;
+@@ -184,7 +184,20 @@ static struct custom_event_desc	*custom_
+ struct trace_handle_struct{
+ 	struct task_struct	*owner;
+ };
+-static struct trace_handle_struct trace_handle_table[LTT_MAX_HANDLES];
++static struct trace_handle_struct trace_handle_table[LTT_BASE_HANDLES];
++
++struct handle_thread {
++	long			handle;
++	struct task_struct	*owner;
++	struct hlist_node	chain;
++};
++static int hash_divisor;
++static long thread_handle_count = NR_TRACES;
++static rwlock_t thread_handle_lock = RW_LOCK_UNLOCKED;
++struct hlist_head *thread_handle_hash;
++
++#define LTT_MAX_ORDER	4
++#define LTT_MAX_DIVISOR ((PAGE_SIZE<<LTT_MAX_ORDER) / sizeof(struct hlist_head))
+ 
+ /* 'struct custom_event_desc' memory chunks to be freed */
+ struct {
+@@ -223,6 +236,94 @@ static inline void empty_custom_ev_dustb
+ }
+ 
+ /*
++ * Hash management
++ */
++
++static struct hlist_head *thread_hash_alloc(int divisor)
++{
++	unsigned long size = divisor * sizeof(struct hlist_head);
++
++	if (size <= PAGE_SIZE)
++		return kmalloc(size, GFP_KERNEL);
++	else
++		return (struct hlist_head *)
++			__get_free_pages(GFP_KERNEL, get_order(size));
++}
++
++static void thread_hash_free(struct hlist_head *hash, int divisor)
++{
++	unsigned long size = divisor * sizeof(struct hlist_head);
++
++	if (size <= PAGE_SIZE)
++		kfree(hash);
++	else
++		free_pages((unsigned long)hash, get_order(size));
++}
++
++static int thread_hash_init(void)
++{
++	int handles, divisor, retval = 0;
++	struct hlist_head *ht;
++
++	handles = CONFIG_LTT_MAX_HANDLES - NR_TRACES;
++	if (handles <= LTT_MAX_DIVISOR)
++		divisor = handles;
++	else
++		divisor = LTT_MAX_DIVISOR;
++
++	write_lock(&thread_handle_lock);
++	ht = thread_hash_alloc(divisor);
++	if (ht) {
++		hash_divisor = divisor;
++		thread_handle_hash = ht;
++		memset(ht, 0, divisor * sizeof(struct hlist_head));	
++	} else
++		retval = 1;
++	write_unlock(&thread_handle_lock);
++
++	return retval;
++}
++
++static void thread_hash_cleanup(void)
++{
++	int i;
++	unsigned long flags;
++	struct hlist_node *m, *n;
++	struct handle_thread *pnode;
++
++	write_lock_irqsave(&thread_handle_lock, flags);
++	if (thread_handle_hash) {
++		if (thread_handle_count > NR_TRACES) {
++			for (i = 0; i < hash_divisor; i++)
++				hlist_for_each_entry_safe(pnode, m , n,
++						&thread_handle_hash[i], chain) {
++					hlist_del(&pnode->chain);
++					kfree(pnode);
++					thread_handle_count--;
++				}
++		}
++		thread_hash_free(thread_handle_hash, hash_divisor);
++	}
++	write_unlock_irqrestore(&thread_handle_lock, flags);
++}
++
++/* thread_handle_lock should be already held */
++static struct handle_thread *find_handle_thread(pid_t pid, pid_t tid)
++{
++	int i, j;
++	struct hlist_node *elem;
++	struct handle_thread *pnode;
++
++	j = tid & 0xffffffff;
++	i = (pid + j) % hash_divisor;
++	hlist_for_each_entry(pnode, elem, &thread_handle_hash[i], chain) {
++		if (pnode->owner->tgid == pid && pnode->owner->pid == tid)
++			return pnode;
++	}
++	return NULL;
++}
++
++/*
+  * Helper functions
+  */
+ 
+@@ -948,22 +1049,28 @@ static int ltt_ioctl(int rchan_id,
+ 		break;
+ 
+ 	case LTT_TRACER_CREATE_USER_EVENT:
+-		if (copy_from_user(&new_user_event, (void *) command_arg, sizeof(new_user_event)))
++		if (copy_from_user(&new_user_event, 
++				   (void *) command_arg, 
++				   sizeof(new_user_event)))
+ 			return -EFAULT;
+ 
+-		new_user_event_id = ltt_create_owned_event(new_user_event.type,
+-							     new_user_event.desc,
+-							     new_user_event.format_type,
+-							     new_user_event.form,
+-							     current->pid);
++		new_user_event_id = ltt_create_owned_event(
++						new_user_event.type,
++						new_user_event.desc,
++						new_user_event.format_type,
++						new_user_event.form,
++						current->tgid,
++						current->pid);
++
+ 		if (new_user_event_id >= 0) {
+ 			new_user_event.id = new_user_event_id;
+-			if (copy_to_user((void *) command_arg, &new_user_event, sizeof(new_user_event))) {
++			if (copy_to_user((void *) command_arg, 
++					 &new_user_event, 
++					 sizeof(new_user_event))) {
+ 				ltt_destroy_event(new_user_event_id);
+ 				return -EFAULT;
+ 			}
+-		}
+-		else
++		} else
+ 			return new_user_event_id;
+ 		break;
+ 
+@@ -1119,7 +1226,9 @@ static int ltt_ioctl(int rchan_id,
+ int ltt_valid_trace_handle(unsigned int tracer_handle)
+ {
+ 	int retval = 0;
++	unsigned long flags;
+ 	struct ltt_trace_struct *trace;
++	struct handle_thread *pnode;
+ 
+ 	if (tracer_handle < NR_TRACES) {
+ 		trace = &current_traces[tracer_handle];
+@@ -1130,14 +1239,20 @@ int ltt_valid_trace_handle(unsigned int 
+ 				retval = 1;
+ 		} else
+ 			retval = 1;
+-	} else {
+-		read_lock(&trace_handle_table_lock);
+-		if (trace_handle_table[tracer_handle - NR_TRACES].owner == current)
+-			retval = 1;
+-		else
++		return retval;
++	}
++	/* tracer_handle >= NR_TRACES */
++	read_lock_irqsave(&thread_handle_lock, flags);
++	if (tracer_handle >= thread_handle_count)
++		retval = 0;
++	else {
++		pnode = find_handle_thread(current->tgid, current->pid);
++		if (!pnode)
+ 			retval = 0;
+-		read_unlock(&trace_handle_table_lock);
++		else
++			retval = 1;
+ 	}
++	read_unlock_irqrestore(&thread_handle_lock, flags);
+ 
+ 	return retval;
+ }
+@@ -1153,8 +1268,9 @@ int ltt_valid_trace_handle(unsigned int 
+  */
+ int ltt_alloc_trace_handle(unsigned int tracer_handle)
+ {
+-	int i;
+-	int retval;
++	int i, j, retval;
++	unsigned long flags;
++	struct handle_thread *pnode;
+ 	struct ltt_trace_struct *trace = NULL;
+ 	
+ 	if (tracer_handle < NR_TRACES) {
+@@ -1162,21 +1278,7 @@ int ltt_alloc_trace_handle(unsigned int 
+ 		if (trace->active)
+ 			return -EBUSY;
+ 	}
+-
+-	if (tracer_handle == NR_TRACES) {
+-		write_lock(&trace_handle_table_lock);
+-		for (i = 0; i < LTT_MAX_HANDLES; i++)
+-			if (trace_handle_table[i].owner == NULL) {
+-				trace_handle_table[i].owner = current;
+-				break;
+-			}
+-		write_unlock(&trace_handle_table_lock);
+-		if (i == LTT_MAX_HANDLES)
+-			retval = -ENODEV;
+-		else
+-			retval = (i + NR_TRACES);
+-	}
+-	else {
++	if (tracer_handle != NR_TRACES) {
+ 		trace->active = trace;
+ 		trace->tracer_started = 0;
+ 		trace->tracer_stopping = 0;
+@@ -1190,9 +1292,34 @@ int ltt_alloc_trace_handle(unsigned int 
+  
+ 		trace->proc_dir_entry = create_handle_proc_dir(tracer_handle);
+ 		ltt_set_default_config(trace);
+-		retval = trace->trace_handle = tracer_handle;
++		trace->trace_handle = tracer_handle;
++		return tracer_handle;
+ 	}
+ 
++	/* tracer_handle == NR_TRACES */
++	write_lock_irqsave(&thread_handle_lock, flags);
++	pnode = find_handle_thread(current->tgid, current->pid);
++	if (!pnode) {
++		if (thread_handle_count < CONFIG_LTT_MAX_HANDLES) {
++			pnode = (struct handle_thread *) 
++					kmalloc(sizeof(struct handle_thread), 
++						GFP_KERNEL);
++			if (pnode) {
++				pnode->handle = thread_handle_count++;
++				pnode->owner = current;
++				j = current->pid & 0xffffffff;
++				i = (current->tgid + j) % hash_divisor;
++				hlist_add_head( &pnode->chain, 
++						&thread_handle_hash[i]);
++				retval = pnode->handle;
++			} else
++				retval = -ENOMEM;
++		} else
++			retval = -ENODEV; /* Too many threads */
++	} else
++		retval = pnode->handle;
++	write_unlock_irqrestore(&thread_handle_lock, flags);
++
+ 	return retval;
+ }
+ 
+@@ -1208,20 +1335,23 @@ int ltt_alloc_trace_handle(unsigned int 
+ int ltt_free_trace_handle(unsigned int tracer_handle)
+ {
+ 	int retval;
++	unsigned long flags;
++	struct handle_thread *pnode;
+ 
+-	if ((tracer_handle < NR_TRACES) || (tracer_handle >= LTT_MAX_HANDLES))
++	write_lock_irqsave(&thread_handle_lock, flags);
++	if (tracer_handle < NR_TRACES || tracer_handle >= thread_handle_count) {
++		write_unlock_irqrestore(&thread_handle_lock, flags);
+ 		return -ENODEV;
+-
+-	write_lock(&trace_handle_table_lock);
+-
+-	if (trace_handle_table[tracer_handle - NR_TRACES].owner == current) {
+-		trace_handle_table[tracer_handle - NR_TRACES].owner = NULL;
+-		retval = 0;
+ 	}
+-	else
++	pnode = find_handle_thread(current->tgid, current->pid);
++	if (pnode) {
++		hlist_del(&pnode->chain);
++		kfree(pnode);
++		thread_handle_count--;
++		retval = 0;
++	} else
+ 		retval = -EACCES;
+-
+-	write_unlock(&trace_handle_table_lock);
++	write_unlock_irqrestore(&thread_handle_lock, flags);
+ 
+ 	return retval;
+ }
+@@ -1289,7 +1419,10 @@ int ltt_free_daemon_handle(struct ltt_tr
+  */
+ void ltt_free_all_handles(struct task_struct* task_ptr)
+ {
+-	int i;
++	int i, j;
++	unsigned long flags;
++	struct hlist_node *m, *n;
++	struct handle_thread *pnode;
+ 	struct ltt_trace_struct *trace;
+ 
+ 	if (task_ptr == NULL) {
+@@ -1305,10 +1438,26 @@ void ltt_free_all_handles(struct task_st
+ 	}
+ 
+ 	write_lock(&trace_handle_table_lock);
+-	for (i = 0; i < LTT_MAX_HANDLES; i++)
++	for (i = 0; i < LTT_BASE_HANDLES; i++)
+ 		if (trace_handle_table[i].owner == current)
+ 			trace_handle_table[i].owner = NULL;
+ 	write_unlock(&trace_handle_table_lock);
++
++	write_lock_irqsave(&thread_handle_lock, flags);
++	if (thread_handle_hash) {
++		j = current->pid & 0xffffffff;
++		i = (current->tgid + j) % hash_divisor;
++		hlist_for_each_entry_safe(pnode, m, n, 	
++				&thread_handle_hash[i], chain) {
++			if (pnode->owner->tgid == current->tgid && 
++					pnode->owner->pid == current->pid) {
++				hlist_del(&pnode->chain);
++				kfree(pnode);
++				thread_handle_count--;
++			}
++		}
++	}
++	write_unlock_irqrestore(&thread_handle_lock, flags);
+ }
+ 
+ /*
+@@ -1693,7 +1842,8 @@ static inline void init_custom_events(vo
+  *	@event_desc: string used for standard formatting
+  *	@format_type: type of formatting used to log event data
+  *	@format_data: data specific to format
+- *	@owner_pid: PID of event's owner (0 if none)
++ *	@owner_pid: current->tgid of event's owner (0 if none)
++ *	@owner_tid: current->pid  of event's owner (0 if none)
+  *
+  *	Returns:
+  *	New Event ID if all is OK
+@@ -1703,7 +1853,8 @@ int _ltt_create_event(char *event_type,
+ 		      char *event_desc,
+ 		      int format_type,
+ 		      char *format_data,
+-		      pid_t owner_pid)
++		      pid_t owner_pid,
++		      pid_t owner_tid)
+ {
+ 	ltt_new_event *new_event;
+ 	struct custom_event_desc *new_event_desc;
+@@ -1728,11 +1879,11 @@ int _ltt_create_event(char *event_type,
+ 	new_event->form[LTT_CUSTOM_EV_FORM_STR_LEN - 1] = '\0';
+ 
+ 	new_event->format_type = format_type;
+-	new_event->id = next_event_id;
++	new_event->id = atomic_read(&next_event_id);
+ 
+-	next_event_id++;
++	atomic_inc(&next_event_id);
+ 
+-	new_event_desc->owner_pid = owner_pid;
++	new_event_desc->owner_tid = owner_tid;
+ 
+ 	write_lock(&custom_list_lock);
+ 
+@@ -1755,16 +1906,17 @@ int ltt_create_event(char *event_type,
+ 		     int format_type,
+ 		     char *format_data)
+ {
+-	return _ltt_create_event(event_type, event_desc, format_type, format_data, 0);
++	return _ltt_create_event(event_type, event_desc, format_type, format_data, 0, 0);
+ }
+ 
+ int ltt_create_owned_event(char *event_type,
+ 			   char *event_desc,
+ 			   int format_type,
+ 			   char *format_data,
+-			   pid_t owner_pid)
++			   pid_t owner_pid,
++			   pid_t owner_tid)
+ {
+-	return _ltt_create_event(event_type, event_desc, format_type, format_data, owner_pid);
++	return _ltt_create_event(event_type, event_desc, format_type, format_data, owner_pid, owner_tid);
+ }
+ 
+ /**
+@@ -1797,9 +1949,10 @@ void ltt_destroy_event(int event_id)
+ 
+ /**
+  *	ltt_destroy_owners_events: Destroy an owner's events
+- *	@owner_pid: the PID of the owner who's events are to be deleted.
++ *	@owner_tid: the current->pid of the owner who's 
++ *		    events are to be deleted.
+  */
+-void ltt_destroy_owners_events(pid_t owner_pid)
++void ltt_destroy_owners_events(pid_t owner_tid)
+ {
+ 	struct custom_event_desc *temp_event;
+ 	struct custom_event_desc *event_desc;
+@@ -1813,7 +1966,7 @@ void ltt_destroy_owners_events(pid_t own
+ 
+ 	while (event_desc != custom_events) {
+ 		temp_event = event_desc->next;
+-		if (event_desc->owner_pid == owner_pid) {
++		if (event_desc->owner_tid == owner_tid) {
+ 			event_desc->next->prev = event_desc->prev;
+ 			event_desc->prev->next = event_desc->next;
+ 			put_custom_ev_dustbin(event_desc);
+@@ -2085,17 +2238,27 @@ check_buffer_switch:
+ int ltt_log_event(u8 event_id,
+ 		void *event_struct)
+ {
+-	int i;
++	int i, j, handle;
+ 	static int err[NR_TRACES];
+ 	struct ltt_trace_struct *trace;
+ 	u32 cpu = _smp_processor_id();
+ 
+ 	for (i = 0; i < NR_TRACES; i++) {
+ 		trace = current_traces[i].active;
+-		err[i] = _ltt_log_event(trace,
+-				     event_id,
+-				     event_struct, 
+-				     cpu);
++		if (event_id != LTT_EV_NEW_EVENT)
++			err[i] = _ltt_log_event(trace, 
++						event_id, 
++						event_struct, 
++						cpu);
++		else
++			for (j = 0; j < num_cpus; j++) {
++				handle = trace_channel_handle(trace->trace_handle , j);
++				if (handle != -1)
++					err[i] = _ltt_log_event(trace, 
++								event_id,
++								event_struct, 
++								j);
++			}
+ 	}
+ 
+ 	return err[0] == -ENOMEDIUM ? err[1] : err[0];
+@@ -2898,6 +3061,9 @@ static int __init init_ltt(void)
+ 	int err = 0;
+ 	struct proc_dir_entry *init_entry;
+ 
++	if ( (err = thread_hash_init()) != 0)
++		return err;
++
+ 	ltt_proc_root_entry = proc_mkdir("ltt", NULL);
+ 
+ 	if (ltt_proc_root_entry == NULL)
+@@ -2933,6 +3099,7 @@ static void __exit exit_ltt(void)
+ 	remove_proc_entry("ltt", NULL);
+ 
+ 	remove_control_channel();
++	thread_hash_cleanup();
+ }
+ 
+ /* 
+Index: linux-2.6.10/mvl_patches/pro-0503.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0503.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(503);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

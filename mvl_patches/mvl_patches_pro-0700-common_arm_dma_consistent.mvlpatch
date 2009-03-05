@@ -1,0 +1,390 @@
+#! /usr/bin/env bash
+# Patch: -common_arm_dma_consistent
+# Date: Thu Jun 29 13:44:12 2006
+# Source: MontaVista Software, Inc. 
+# MR: 16935
+# Type: Enhancement
+# Disposition: merged from http://www.arm.linux.org.uk/developer/patches/viewpatch.php?id=3209/1
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+#     Increase available DMA-consistent memory allocated by
+#     dma_coherent_alloc(). The default remains at 2M (defined in
+#     asm/memory.h) and each platform has the ability to override in
+#     asm/arch-foo/memory.h.
+# 
+
+PATCHNUM=700
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 16935
+Type: Enhancement
+Disposition: merged from http://www.arm.linux.org.uk/developer/patches/viewpatch.php?id=3209/1
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+    Increase available DMA-consistent memory allocated by
+    dma_coherent_alloc(). The default remains at 2M (defined in
+    asm/memory.h) and each platform has the ability to override in
+    asm/arch-foo/memory.h.
+
+Index: linux-2.6.10/arch/arm/mm/consistent.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/consistent.c
++++ linux-2.6.10/arch/arm/mm/consistent.c
+@@ -21,15 +21,25 @@
+ #include <asm/cacheflush.h>
+ #include <asm/io.h>
+ #include <asm/tlbflush.h>
++#include <asm/sizes.h>
++
++/* Sanity check size */
++#if (CONSISTENT_DMA_SIZE % SZ_2M)
++#error "CONSISTENT_DMA_SIZE must be multiple of 2MiB"
++#endif
+ 
+-#define CONSISTENT_BASE	(0xffc00000)
+ #define CONSISTENT_END	(0xffe00000)
++#define CONSISTENT_BASE	(CONSISTENT_END - CONSISTENT_DMA_SIZE)
++
+ #define CONSISTENT_OFFSET(x)	(((unsigned long)(x) - CONSISTENT_BASE) >> PAGE_SHIFT)
++#define CONSISTENT_PTE_INDEX(x) (((unsigned long)(x) - CONSISTENT_BASE) >> PGDIR_SHIFT)
++#define NUM_CONSISTENT_PTES (CONSISTENT_DMA_SIZE >> PGDIR_SHIFT)
++
+ 
+ /*
+- * This is the page table (2MB) covering uncached, DMA consistent allocations
++ * These are the page tables (2MB each) covering uncached, DMA consistent allocations
+  */
+-static pte_t *consistent_pte;
++static pte_t *consistent_pte[NUM_CONSISTENT_PTES];
+ static DEFINE_SPINLOCK(consistent_lock);
+ 
+ /*
+@@ -141,7 +151,7 @@ __dma_alloc(struct device *dev, size_t s
+ 	unsigned long order;
+ 	u64 mask = ISA_DMA_THRESHOLD, limit;
+ 
+-	if (!consistent_pte) {
++	if (!consistent_pte[0]) {
+ 		printk(KERN_ERR "%s: not initialised\n", __func__);
+ 		dump_stack();
+ 		return NULL;
+@@ -204,9 +214,12 @@ __dma_alloc(struct device *dev, size_t s
+ 	c = vm_region_alloc(&consistent_head, size,
+ 			    gfp & ~(__GFP_DMA | __GFP_HIGHMEM));
+ 	if (c) {
+-		pte_t *pte = consistent_pte + CONSISTENT_OFFSET(c->vm_start);
++		pte_t *pte;
+ 		struct page *end = page + (1 << order);
++		int idx = CONSISTENT_PTE_INDEX(c->vm_start);
++		u32 off = CONSISTENT_OFFSET(c->vm_start) & (PTRS_PER_PTE-1);
+ 
++		pte = consistent_pte[idx] + off;
+ 		c->vm_pages = page;
+ 
+ 		/*
+@@ -225,6 +238,11 @@ __dma_alloc(struct device *dev, size_t s
+ 			set_pte(pte, mk_pte(page, prot));
+ 			page++;
+ 			pte++;
++			off++;
++			if (off >= PTRS_PER_PTE) {
++				off = 0;
++				pte = consistent_pte[++idx];
++			}
+ 		} while (size -= PAGE_SIZE);
+ 
+ 		/*
+@@ -325,6 +343,8 @@ void dma_free_coherent(struct device *de
+ 	struct vm_region *c;
+ 	unsigned long flags;
+ 	pte_t *ptep;
++	int idx;
++	u32 off;
+ 
+ 	size = PAGE_ALIGN(size);
+ 
+@@ -341,12 +361,19 @@ void dma_free_coherent(struct device *de
+ 		size = c->vm_end - c->vm_start;
+ 	}
+ 
+-	ptep = consistent_pte + CONSISTENT_OFFSET(c->vm_start);
++	idx = CONSISTENT_PTE_INDEX(c->vm_start);
++	off = CONSISTENT_OFFSET(c->vm_start) & (PTRS_PER_PTE-1);
++	ptep = consistent_pte[idx] + off;
+ 	do {
+ 		pte_t pte = ptep_get_and_clear(ptep);
+ 		unsigned long pfn;
+ 
+ 		ptep++;
++		off++;
++		if (off >= PTRS_PER_PTE) {
++			off = 0;
++			ptep = consistent_pte[++idx];
++		}
+ 
+ 		if (!pte_none(pte) && pte_present(pte)) {
+ 			pfn = pte_pfn(pte);
+@@ -393,13 +420,14 @@ static int __init consistent_init(void)
+ 	pgd_t *pgd;
+ 	pmd_t *pmd;
+ 	pte_t *pte;
+-	int ret = 0;
++	int ret = 0, i = 0;
++	u32 base = CONSISTENT_BASE;
+ 
+ 	spin_lock(&init_mm.page_table_lock);
+ 
+ 	do {
+-		pgd = pgd_offset(&init_mm, CONSISTENT_BASE);
+-		pmd = pmd_alloc(&init_mm, pgd, CONSISTENT_BASE);
++		pgd = pgd_offset(&init_mm, base);
++		pmd = pmd_alloc(&init_mm, pgd, base);
+ 		if (!pmd) {
+ 			printk(KERN_ERR "%s: no pmd tables\n", __func__);
+ 			ret = -ENOMEM;
+@@ -407,15 +435,16 @@ static int __init consistent_init(void)
+ 		}
+ 		WARN_ON(!pmd_none(*pmd));
+ 
+-		pte = pte_alloc_kernel(&init_mm, pmd, CONSISTENT_BASE);
++		pte = pte_alloc_kernel(&init_mm, pmd, base);
+ 		if (!pte) {
+ 			printk(KERN_ERR "%s: no pte tables\n", __func__);
+ 			ret = -ENOMEM;
+ 			break;
+ 		}
+ 
+-		consistent_pte = pte;
+-	} while (0);
++		consistent_pte[i++] = pte;
++		base += (1 << PGDIR_SHIFT);
++	} while (base < CONSISTENT_END);
+ 
+ 	spin_unlock(&init_mm.page_table_lock);
+ 
+Index: linux-2.6.10/include/asm-arm/memory.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/memory.h
++++ linux-2.6.10/include/asm-arm/memory.h
+@@ -38,6 +38,14 @@
+ #endif
+ 
+ /*
++ * Size of DMA-consistent memory region.  Must be multiple of 2M,
++ * between 2MB and 14MB inclusive.
++ */
++#ifndef CONSISTENT_DMA_SIZE
++#define CONSISTENT_DMA_SIZE SZ_2M
++#endif
++
++/*
+  * Physical vs virtual RAM address space conversion.  These are
+  * private definitions which should NOT be used outside memory.h
+  * files.  Use virt_to_phys/phys_to_virt/__pa/__va instead.
+Index: linux-2.6.10/mvl_patches/pro-0700.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0700.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(700);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

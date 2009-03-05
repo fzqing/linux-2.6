@@ -1,0 +1,707 @@
+#! /usr/bin/env bash
+# Patch: -arm-remove-udivdi3-from-kernel
+# Date: Mon Mar 20 17:12:50 2006
+
+PATCHNUM=376
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree c7e788766610bdc764d7150e69ace2e0c4196cf0 (from aaaa3f9e51245be3215ff67bb3c7aaf5abb82f00)
+Author: Nicolas Pitre <nico@cam.org>
+Date:   Wed Jun 29 18:10:54 2005 +0100
+
+    [PATCH] ARM: 2723/2: remove __udivdi3 and __umoddi3 from the kernel
+    
+    Patch from Nicolas Pitre
+    
+    Those are big, slow and generally not recommended for kernel code.
+    They are even not present on i386.  So it should be concluded that
+    one could as well get away with do_div() alone.
+    
+    Signed-off-by: Nicolas Pitre <nico@cam.org>
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+ arch/arm/kernel/armksyms.c |    6 -
+ arch/arm/lib/Makefile      |    2 
+ arch/arm/lib/longlong.h    |  183 ----------------------------------
+ arch/arm/lib/udivdi3.c     |  242 ---------------------------------------------
+ mvl_patches/pro-0376.c     |   16 ++
+ 5 files changed, 17 insertions(+), 432 deletions(-)
+
+Index: linux-2.6.10/arch/arm/kernel/armksyms.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/kernel/armksyms.c
++++ linux-2.6.10/arch/arm/kernel/armksyms.c
+@@ -30,9 +30,6 @@ extern void __lshrdi3(void);
+ extern void __modsi3(void);
+ extern void __muldi3(void);
+ extern void __ucmpdi2(void);
+-extern void __udivdi3(void);
+-extern void __umoddi3(void);
+-extern void __udivmoddi4(void);
+ extern void __udivsi3(void);
+ extern void __umodsi3(void);
+ extern void __do_div64(void);
+@@ -137,9 +134,6 @@ EXPORT_SYMBOL(__lshrdi3);
+ EXPORT_SYMBOL(__modsi3);
+ EXPORT_SYMBOL(__muldi3);
+ EXPORT_SYMBOL(__ucmpdi2);
+-EXPORT_SYMBOL(__udivdi3);
+-EXPORT_SYMBOL(__umoddi3);
+-EXPORT_SYMBOL(__udivmoddi4);
+ EXPORT_SYMBOL(__udivsi3);
+ EXPORT_SYMBOL(__umodsi3);
+ EXPORT_SYMBOL(__do_div64);
+Index: linux-2.6.10/arch/arm/lib/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/arm/lib/Makefile
++++ linux-2.6.10/arch/arm/lib/Makefile
+@@ -11,7 +11,7 @@ lib-y		:= backtrace.o changebit.o csumip
+ 		   strnlen_user.o strchr.o strrchr.o testchangebit.o  \
+ 		   testclearbit.o testsetbit.o uaccess.o getuser.o    \
+ 		   putuser.o ashldi3.o ashrdi3.o lshrdi3.o muldi3.o   \
+-		   ucmpdi2.o udivdi3.o lib1funcs.o div64.o	      \
++		   ucmpdi2.o lib1funcs.o div64.o	              \
+ 		   io-readsb.o io-writesb.o io-readsl.o io-writesl.o
+ 
+ ifeq ($(CONFIG_CPU_32v3),y)
+Index: linux-2.6.10/arch/arm/lib/longlong.h
+===================================================================
+--- linux-2.6.10.orig/arch/arm/lib/longlong.h
++++ /dev/null
+@@ -1,183 +0,0 @@
+-/* longlong.h -- based on code from gcc-2.95.3
+-
+-   definitions for mixed size 32/64 bit arithmetic.
+-   Copyright (C) 1991, 92, 94, 95, 96, 1997, 1998 Free Software Foundation, Inc.
+-
+-   This definition file is free software; you can redistribute it
+-   and/or modify it under the terms of the GNU General Public
+-   License as published by the Free Software Foundation; either
+-   version 2, or (at your option) any later version.
+-
+-   This definition file is distributed in the hope that it will be
+-   useful, but WITHOUT ANY WARRANTY; without even the implied
+-   warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+-   See the GNU General Public License for more details.
+-
+-   You should have received a copy of the GNU General Public License
+-   along with this program; if not, write to the Free Software
+-   Foundation, Inc., 59 Temple Place - Suite 330,
+-   Boston, MA 02111-1307, USA.  */
+-
+-/* Borrowed from GCC 2.95.3, I Molton 29/07/01 */
+-
+-#ifndef SI_TYPE_SIZE
+-#define SI_TYPE_SIZE 32
+-#endif
+-
+-#define __BITS4 (SI_TYPE_SIZE / 4)
+-#define __ll_B (1L << (SI_TYPE_SIZE / 2))
+-#define __ll_lowpart(t) ((USItype) (t) % __ll_B)
+-#define __ll_highpart(t) ((USItype) (t) / __ll_B)
+-
+-/* Define auxiliary asm macros.
+-
+-   1) umul_ppmm(high_prod, low_prod, multipler, multiplicand)
+-   multiplies two USItype integers MULTIPLER and MULTIPLICAND,
+-   and generates a two-part USItype product in HIGH_PROD and
+-   LOW_PROD.
+-
+-   2) __umulsidi3(a,b) multiplies two USItype integers A and B,
+-   and returns a UDItype product.  This is just a variant of umul_ppmm.
+-
+-   3) udiv_qrnnd(quotient, remainder, high_numerator, low_numerator,
+-   denominator) divides a two-word unsigned integer, composed by the
+-   integers HIGH_NUMERATOR and LOW_NUMERATOR, by DENOMINATOR and
+-   places the quotient in QUOTIENT and the remainder in REMAINDER.
+-   HIGH_NUMERATOR must be less than DENOMINATOR for correct operation.
+-   If, in addition, the most significant bit of DENOMINATOR must be 1,
+-   then the pre-processor symbol UDIV_NEEDS_NORMALIZATION is defined to 1.
+-
+-   4) sdiv_qrnnd(quotient, remainder, high_numerator, low_numerator,
+-   denominator).  Like udiv_qrnnd but the numbers are signed.  The
+-   quotient is rounded towards 0.
+-
+-   5) count_leading_zeros(count, x) counts the number of zero-bits from
+-   the msb to the first non-zero bit.  This is the number of steps X
+-   needs to be shifted left to set the msb.  Undefined for X == 0.
+-
+-   6) add_ssaaaa(high_sum, low_sum, high_addend_1, low_addend_1,
+-   high_addend_2, low_addend_2) adds two two-word unsigned integers,
+-   composed by HIGH_ADDEND_1 and LOW_ADDEND_1, and HIGH_ADDEND_2 and
+-   LOW_ADDEND_2 respectively.  The result is placed in HIGH_SUM and
+-   LOW_SUM.  Overflow (i.e. carry out) is not stored anywhere, and is
+-   lost.
+-
+-   7) sub_ddmmss(high_difference, low_difference, high_minuend,
+-   low_minuend, high_subtrahend, low_subtrahend) subtracts two
+-   two-word unsigned integers, composed by HIGH_MINUEND_1 and
+-   LOW_MINUEND_1, and HIGH_SUBTRAHEND_2 and LOW_SUBTRAHEND_2
+-   respectively.  The result is placed in HIGH_DIFFERENCE and
+-   LOW_DIFFERENCE.  Overflow (i.e. carry out) is not stored anywhere,
+-   and is lost.
+-
+-   If any of these macros are left undefined for a particular CPU,
+-   C macros are used.  */
+-
+-#if defined (__arm__)
+-#define add_ssaaaa(sh, sl, ah, al, bh, bl) \
+-  __asm__ ("adds	%1, %4, %5					\n\
+-	adc	%0, %2, %3"						\
+-	   : "=r" ((USItype) (sh)),					\
+-	     "=&r" ((USItype) (sl))					\
+-	   : "%r" ((USItype) (ah)),					\
+-	     "rI" ((USItype) (bh)),					\
+-	     "%r" ((USItype) (al)),					\
+-	     "rI" ((USItype) (bl)))
+-#define sub_ddmmss(sh, sl, ah, al, bh, bl) \
+-  __asm__ ("subs	%1, %4, %5					\n\
+-	sbc	%0, %2, %3"						\
+-	   : "=r" ((USItype) (sh)),					\
+-	     "=&r" ((USItype) (sl))					\
+-	   : "r" ((USItype) (ah)),					\
+-	     "rI" ((USItype) (bh)),					\
+-	     "r" ((USItype) (al)),					\
+-	     "rI" ((USItype) (bl)))
+-#define umul_ppmm(xh, xl, a, b) \
+-{register USItype __t0, __t1, __t2;					\
+-  __asm__ ("%@ Inlined umul_ppmm					\n\
+-	mov	%2, %5, lsr #16						\n\
+-	mov	%0, %6, lsr #16						\n\
+-	bic	%3, %5, %2, lsl #16					\n\
+-	bic	%4, %6, %0, lsl #16					\n\
+-	mul	%1, %3, %4						\n\
+-	mul	%4, %2, %4						\n\
+-	mul	%3, %0, %3						\n\
+-	mul	%0, %2, %0						\n\
+-	adds	%3, %4, %3						\n\
+-	addcs	%0, %0, #65536						\n\
+-	adds	%1, %1, %3, lsl #16					\n\
+-	adc	%0, %0, %3, lsr #16"					\
+-	   : "=&r" ((USItype) (xh)),					\
+-	     "=r" ((USItype) (xl)),					\
+-	     "=&r" (__t0), "=&r" (__t1), "=r" (__t2)			\
+-	   : "r" ((USItype) (a)),					\
+-	     "r" ((USItype) (b)));}
+-#define UMUL_TIME 20
+-#define UDIV_TIME 100
+-#endif /* __arm__ */
+-
+-#define __umulsidi3(u, v) \
+-  ({DIunion __w;							\
+-    umul_ppmm (__w.s.high, __w.s.low, u, v);				\
+-    __w.ll; })
+-
+-#define __udiv_qrnnd_c(q, r, n1, n0, d) \
+-  do {									\
+-    USItype __d1, __d0, __q1, __q0;					\
+-    USItype __r1, __r0, __m;						\
+-    __d1 = __ll_highpart (d);						\
+-    __d0 = __ll_lowpart (d);						\
+-									\
+-    __r1 = (n1) % __d1;							\
+-    __q1 = (n1) / __d1;							\
+-    __m = (USItype) __q1 * __d0;					\
+-    __r1 = __r1 * __ll_B | __ll_highpart (n0);				\
+-    if (__r1 < __m)							\
+-      {									\
+-	__q1--, __r1 += (d);						\
+-	if (__r1 >= (d)) /* i.e. we didn't get carry when adding to __r1 */\
+-	  if (__r1 < __m)						\
+-	    __q1--, __r1 += (d);					\
+-      }									\
+-    __r1 -= __m;							\
+-									\
+-    __r0 = __r1 % __d1;							\
+-    __q0 = __r1 / __d1;							\
+-    __m = (USItype) __q0 * __d0;					\
+-    __r0 = __r0 * __ll_B | __ll_lowpart (n0);				\
+-    if (__r0 < __m)							\
+-      {									\
+-	__q0--, __r0 += (d);						\
+-	if (__r0 >= (d))						\
+-	  if (__r0 < __m)						\
+-	    __q0--, __r0 += (d);					\
+-      }									\
+-    __r0 -= __m;							\
+-									\
+-    (q) = (USItype) __q1 * __ll_B | __q0;				\
+-    (r) = __r0;								\
+-  } while (0)
+-
+-#define UDIV_NEEDS_NORMALIZATION 1
+-#define udiv_qrnnd __udiv_qrnnd_c
+-
+-#define count_leading_zeros(count, x) \
+-  do {									\
+-    USItype __xr = (x);							\
+-    USItype __a;							\
+-									\
+-    if (SI_TYPE_SIZE <= 32)						\
+-      {									\
+-	__a = __xr < ((USItype)1<<2*__BITS4)				\
+-	  ? (__xr < ((USItype)1<<__BITS4) ? 0 : __BITS4)		\
+-	  : (__xr < ((USItype)1<<3*__BITS4) ?  2*__BITS4 : 3*__BITS4);	\
+-      }									\
+-    else								\
+-      {									\
+-	for (__a = SI_TYPE_SIZE - 8; __a > 0; __a -= 8)			\
+-	  if (((__xr >> __a) & 0xff) != 0)				\
+-	    break;							\
+-      }									\
+-									\
+-    (count) = SI_TYPE_SIZE - (__clz_tab[__xr >> __a] + __a);		\
+-  } while (0)
+Index: linux-2.6.10/arch/arm/lib/udivdi3.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/lib/udivdi3.c
++++ /dev/null
+@@ -1,242 +0,0 @@
+-/* More subroutines needed by GCC output code on some machines.  */
+-/* Compile this one with gcc.  */
+-/* Copyright (C) 1989, 92-98, 1999 Free Software Foundation, Inc.
+-
+-This file is part of GNU CC.
+-
+-GNU CC is free software; you can redistribute it and/or modify
+-it under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 2, or (at your option)
+-any later version.
+-
+-GNU CC is distributed in the hope that it will be useful,
+-but WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with GNU CC; see the file COPYING.  If not, write to
+-the Free Software Foundation, 59 Temple Place - Suite 330,
+-Boston, MA 02111-1307, USA.  */
+-
+-/* As a special exception, if you link this library with other files,
+-   some of which are compiled with GCC, to produce an executable,
+-   this library does not by itself cause the resulting executable
+-   to be covered by the GNU General Public License.
+-   This exception does not however invalidate any other reasons why
+-   the executable file might be covered by the GNU General Public License.
+- */
+-/* support functions required by the kernel. based on code from gcc-2.95.3 */
+-/* I Molton     29/07/01 */
+-
+-#include "gcclib.h"
+-#include "longlong.h"
+-
+-static const UQItype __clz_tab[] =
+-{
+-  0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+-  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+-  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+-  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+-  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+-  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+-  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+-  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+-};
+-
+-UDItype
+-__udivmoddi4 (UDItype n, UDItype d, UDItype *rp)
+-{
+-  DIunion ww;
+-  DIunion nn, dd;
+-  DIunion rr;
+-  USItype d0, d1, n0, n1, n2;
+-  USItype q0, q1;
+-  USItype b, bm;
+-
+-  nn.ll = n;
+-  dd.ll = d;
+-
+-  d0 = dd.s.low;
+-  d1 = dd.s.high;
+-  n0 = nn.s.low;
+-  n1 = nn.s.high;
+-
+-  if (d1 == 0)
+-    {
+-      if (d0 > n1)
+-        {
+-          /* 0q = nn / 0D */
+-
+-          count_leading_zeros (bm, d0);
+-
+-          if (bm != 0)
+-            {
+-              /* Normalize, i.e. make the most significant bit of the
+-                 denominator set.  */
+-
+-              d0 = d0 << bm;
+-              n1 = (n1 << bm) | (n0 >> (SI_TYPE_SIZE - bm));
+-              n0 = n0 << bm;
+-            }
+-
+-          udiv_qrnnd (q0, n0, n1, n0, d0);
+-          q1 = 0;
+-
+-          /* Remainder in n0 >> bm.  */
+-        }
+-      else
+-        {
+-          /* qq = NN / 0d */
+-
+-          if (d0 == 0)
+-            d0 = 1 / d0;        /* Divide intentionally by zero.  */
+-
+-          count_leading_zeros (bm, d0);
+-
+-          if (bm == 0)
+-            {
+-              /* From (n1 >= d0) /\ (the most significant bit of d0 is set),
+-                 conclude (the most significant bit of n1 is set) /\ (the
+-                 leading quotient digit q1 = 1).
+-
+-                 This special case is necessary, not an optimization.
+-                 (Shifts counts of SI_TYPE_SIZE are undefined.)  */
+-
+-              n1 -= d0;
+-              q1 = 1;
+-            }
+-          else
+-            {
+-              /* Normalize.  */
+-
+-              b = SI_TYPE_SIZE - bm;
+-
+-              d0 = d0 << bm;
+-              n2 = n1 >> b;
+-              n1 = (n1 << bm) | (n0 >> b);
+-              n0 = n0 << bm;
+-
+-              udiv_qrnnd (q1, n1, n2, n1, d0);
+-            }
+-
+-          /* n1 != d0...  */
+-
+-          udiv_qrnnd (q0, n0, n1, n0, d0);
+-
+-          /* Remainder in n0 >> bm.  */
+-        }
+-
+-      if (rp != 0)
+-        {
+-          rr.s.low = n0 >> bm;
+-          rr.s.high = 0;
+-          *rp = rr.ll;
+-        }
+-    }
+-  else
+-    {
+-      if (d1 > n1)
+-        {
+-          /* 00 = nn / DD */
+-
+-          q0 = 0;
+-          q1 = 0;
+-
+-          /* Remainder in n1n0.  */
+-          if (rp != 0)
+-            {
+-              rr.s.low = n0;
+-              rr.s.high = n1;
+-              *rp = rr.ll;
+-            }
+-        }
+-      else
+-        {
+-          /* 0q = NN / dd */
+-
+-          count_leading_zeros (bm, d1);
+-          if (bm == 0)
+-            {
+-              /* From (n1 >= d1) /\ (the most significant bit of d1 is set),
+-                 conclude (the most significant bit of n1 is set) /\ (the
+-                 quotient digit q0 = 0 or 1).
+-
+-                 This special case is necessary, not an optimization.  */
+-
+-              /* The condition on the next line takes advantage of that
+-                 n1 >= d1 (true due to program flow).  */
+-              if (n1 > d1 || n0 >= d0)
+-                {
+-                  q0 = 1;
+-                  sub_ddmmss (n1, n0, n1, n0, d1, d0);
+-                }
+-              else
+-                q0 = 0;
+-
+-              q1 = 0;
+-
+-              if (rp != 0)
+-                {
+-                  rr.s.low = n0;
+-                  rr.s.high = n1;
+-                  *rp = rr.ll;
+-                }
+-            }
+-          else
+-            {
+-              USItype m1, m0;
+-              /* Normalize.  */
+-
+-              b = SI_TYPE_SIZE - bm;
+-
+-              d1 = (d1 << bm) | (d0 >> b);
+-              d0 = d0 << bm;
+-              n2 = n1 >> b;
+-              n1 = (n1 << bm) | (n0 >> b);
+-              n0 = n0 << bm;
+-
+-              udiv_qrnnd (q0, n1, n2, n1, d1);
+-              umul_ppmm (m1, m0, q0, d0);
+-
+-              if (m1 > n1 || (m1 == n1 && m0 > n0))
+-                {
+-                  q0--;
+-                  sub_ddmmss (m1, m0, m1, m0, d1, d0);
+-                }
+-
+-              q1 = 0;
+-
+-              /* Remainder in (n1n0 - m1m0) >> bm.  */
+-              if (rp != 0)
+-                {
+-                  sub_ddmmss (n1, n0, n1, n0, m1, m0);
+-                  rr.s.low = (n1 << b) | (n0 >> bm);
+-                  rr.s.high = n1 >> bm;
+-                  *rp = rr.ll;
+-                }
+-            }
+-        }
+-    }
+-
+-  ww.s.low = q0;
+-  ww.s.high = q1;
+-  return ww.ll;
+-}
+-
+-UDItype
+-__udivdi3 (UDItype n, UDItype d)
+-{
+-  return __udivmoddi4 (n, d, (UDItype *) 0);
+-}
+-
+-UDItype
+-__umoddi3 (UDItype u, UDItype v)
+-{
+-  UDItype w;
+-
+-  (void) __udivmoddi4 (u ,v, &w);
+-
+-  return w;
+-}
+-
+Index: linux-2.6.10/mvl_patches/pro-0376.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0376.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(376);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

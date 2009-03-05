@@ -1,0 +1,1311 @@
+#! /usr/bin/env bash
+# Patch: -common_io_apic_cache
+# Date: Wed Dec 28 14:57:11 2005
+# Source: MontaVista Software, Inc.
+# MR: 12766 
+# Type: Defect Fix
+# Disposition: merged from Real-Time Preempt
+# Signed-off-by: Daniel Walker <dwalker@mvista.com>
+# Description:
+# 
+# 	Adds a feature called the ioapic cache. There seems to be some
+# buggy ioapics that don't act right when you read or write to them faster
+# than "normal" , so this caches reads and writes to take the pressure off
+# the ioapic. 
+# 
+
+PATCHNUM=82
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 12766 
+Type: Defect Fix
+Disposition: merged from Real-Time Preempt
+Signed-off-by: Daniel Walker <dwalker@mvista.com>
+Description:
+
+	Adds a feature called the ioapic cache. There seems to be some
+buggy ioapics that don't act right when you read or write to them faster
+than "normal" , so this caches reads and writes to take the pressure off
+the ioapic. 
+
+Index: linux-2.6.10/arch/i386/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/i386/Kconfig
++++ linux-2.6.10/arch/i386/Kconfig
+@@ -664,6 +664,16 @@ config X86_IO_APIC
+ 	depends on !SMP && X86_UP_IOAPIC
+ 	default y
+ 
++config X86_IOAPIC_FAST
++	bool "enhanced IO-APIC support"
++	depends on X86_IO_APIC
++	default y
++	help
++	  this option will activate further optimizations in the IO-APIC
++	  code. NOTE: this is experimental code, and disabled by default.
++	  Symptoms of non-working systems are boot-time lockups, stray or
++	  screaming interrupts and other interrupt related weirdnesses.
++
+ config X86_TSC
+ 	bool
+ 	depends on (MWINCHIP3D || MWINCHIP2 || MCRUSOE || MEFFICEON || MCYRIXIII || MK7 || MK6 || MPENTIUM4 || MPENTIUMM || MPENTIUMIII || MPENTIUMII || M686 || M586MMX || M586TSC || MK8 || MVIAC3_2) && !X86_NUMAQ
+Index: linux-2.6.10/arch/i386/kernel/io_apic.c
+===================================================================
+--- linux-2.6.10.orig/arch/i386/kernel/io_apic.c
++++ linux-2.6.10/arch/i386/kernel/io_apic.c
+@@ -31,13 +31,13 @@
+ #include <linux/mc146818rtc.h>
+ #include <linux/compiler.h>
+ #include <linux/acpi.h>
++#include <linux/bootmem.h>
+ 
+ #include <linux/sysdev.h>
+ #include <asm/io.h>
+ #include <asm/smp.h>
+ #include <asm/desc.h>
+ #include <asm/timer.h>
+-#include <asm/i8259.h>
+ 
+ #include <mach_apic.h>
+ 
+@@ -55,11 +55,6 @@ static DEFINE_RAW_SPINLOCK(ioapic_lock);
+ int sis_apic_bug = -1;
+ 
+ /*
+- * # of IRQ routing registers
+- */
+-int nr_ioapic_registers[MAX_IO_APICS];
+-
+-/*
+  * Rough estimation of how many shared IRQs there are, can
+  * be changed anytime.
+  */
+@@ -128,69 +123,131 @@ static void __init replace_pin_at_irq(un
+ 	}
+ }
+ 
+-/*
+- * Cache the register used by the irq-redirection hotpath:
+- */
+-static unsigned int io_apic_cache[MAX_IO_APICS][NR_IRQS]
+-		____cacheline_aligned_in_smp;
++#ifdef CONFIG_X86_IOAPIC_FAST
++# define IOAPIC_CACHE
++#endif
++
++
++
++struct ioapic_data_struct {
++	struct sys_device dev;
++	int nr_registers;	//  # of IRQ routing registers
++	volatile unsigned int *base;
++	struct IO_APIC_route_entry *entry;
++#ifdef IOAPIC_CACHE
++	unsigned int reg_set;
++	u32 cached_val[0];
++#endif
++};
+ 
+-static void update_io_apic_cache(unsigned int irq)
++static struct ioapic_data_struct *ioapic_data[MAX_IO_APICS];
++
++
++static inline unsigned int __raw_io_apic_read(struct ioapic_data_struct *ioapic, unsigned int reg)
+ {
+-	struct irq_pin_list *entry = irq_2_pin + irq;
+-	unsigned int pin;
++# ifdef IOAPIC_CACHE
++	ioapic->reg_set = reg;
++# endif
++	ioapic->base[0] = reg;
++	return ioapic->base[4];
++}
+ 
+-	for (;;) {
+-		pin = entry->pin;
+-		if (pin == -1)
+-			break;
+-		io_apic_cache[entry->apic][irq] =
+-			io_apic_read(entry->apic, 0x10 + pin*2);
+-		if (!entry->next)
+-			break;
+-		entry = irq_2_pin + entry->next;
++
++# ifdef IOAPIC_CACHE
++static void __init ioapic_cache_init(struct ioapic_data_struct *ioapic)
++{
++	int reg;
++	for (reg = 0; reg < (0x10 + 2 * ioapic->nr_registers); reg++)
++		ioapic->cached_val[reg] = __raw_io_apic_read(ioapic, reg);
++}
++# endif
++
++
++static unsigned int raw_io_apic_read(struct ioapic_data_struct *ioapic, unsigned int reg)
++{
++	unsigned int val = __raw_io_apic_read(ioapic, reg);
++
++# ifdef IOAPIC_CACHE
++	ioapic->cached_val[reg] = val;
++# endif
++	return val;
++}
++
++static unsigned int io_apic_read(struct ioapic_data_struct *ioapic, unsigned int reg)
++{
++# ifdef IOAPIC_CACHE
++	if (likely(!sis_apic_bug)) {
++		ioapic->reg_set = -1;
++		return ioapic->cached_val[reg];
+ 	}
++# endif
++	return raw_io_apic_read(ioapic, reg);
+ }
+ 
+-//#define IOAPIC_CACHE
++static void io_apic_write(struct ioapic_data_struct *ioapic, unsigned int reg, unsigned int val)
++{
++# ifdef IOAPIC_CACHE
++	ioapic->cached_val[reg] = val;
++	ioapic->reg_set = reg;
++# endif
++	ioapic->base[0] = reg;
++	ioapic->base[4] = val;
++}
++
++
+ /*
+  * Some systems need a POST flush or else level-triggered interrupts
+  * generate lots of spurious interrupts due to the POST-ed write not
+  * reaching the IOAPIC before the IRQ is ACK-ed in the local APIC.
++ *
++ * It seems most systems need this - disable the optimization for now.
+  */
+-#define IOAPIC_POSTFLUSH
++//#ifndef CONFIG_X86_IOAPIC_FAST
++# define IOAPIC_POSTFLUSH
++//#endif
++
++/*
++ * Re-write a value: to be used for read-modify-write
++ * cycles where the read already set up the index register.
++ *
++ * Older SiS APIC requires we rewrite the index regiser
++ */
++static void io_apic_modify(struct ioapic_data_struct *ioapic, unsigned int reg, unsigned int val)
++{
++#ifdef IOAPIC_CACHE
++	ioapic->cached_val[reg] = val;
++	if (ioapic->reg_set != reg || sis_apic_bug) {
++		ioapic->reg_set = reg;
++#else
++	if (unlikely(sis_apic_bug)) {
++#endif
++		ioapic->base[0] = reg;
++	}
++	ioapic->base[4] = val;
++#ifndef IOAPIC_POSTFLUSH
++	if (unlikely(sis_apic_bug))
++#endif
++		/*
++		 * Force POST flush by reading:
++ 		 */
++		val = ioapic->base[4];
++}
+ 
+ static void __modify_IO_APIC_irq (unsigned int irq, unsigned long enable, unsigned long disable)
+ {
+ 	struct irq_pin_list *entry = irq_2_pin + irq;
+-	unsigned int pin, reg;
++	unsigned int pin, val;
++	struct ioapic_data_struct *ioapic;
+ 
+ 	for (;;) {
+ 		pin = entry->pin;
+ 		if (pin == -1)
+ 			break;
+-#ifdef IOAPIC_CACHE
+-		reg = io_apic_cache[entry->apic][irq];
+-		if (unlikely(!reg)) {
+-			reg = io_apic_read(entry->apic, 0x10 + pin*2);
+-			io_apic_cache[entry->apic][irq] = reg;
+-			printk("hm: ioapic cache empty for irq %d (e:%08lx/d:%08lx) %08x\n", irq, enable, disable, reg);
+-		
+-		}
+-		reg &= ~disable;
+-		reg |= enable;
+-		io_apic_write(entry->apic, 0x10 + pin*2, reg);
+-#else
+-		reg = io_apic_read(entry->apic, 0x10 + pin*2);
+-		reg &= ~disable;
+-		reg |= enable;
+-		io_apic_modify(entry->apic, 0x10 + pin*2, reg);
+-#endif
+-#ifdef IOAPIC_POSTFLUSH
+-		/*
+-		 * Force POST flush by reading:
+-	 	 */
+-		reg = *(IO_APIC_BASE(entry->apic)+4);
+-#endif
++		ioapic = ioapic_data[entry->apic];
++		val = io_apic_read(ioapic, 0x10 + pin*2);
++		val &= ~disable;
++		val |= enable;
++		io_apic_modify(ioapic, 0x10 + pin*2, val);
+ 		if (!entry->next)
+ 			break;
+ 		entry = irq_2_pin + entry->next;
+@@ -198,13 +255,13 @@ static void __modify_IO_APIC_irq (unsign
+ }
+ 
+ /* mask = 1 */
+-static void __mask_IO_APIC_irq (unsigned int irq)
++static inline void __mask_IO_APIC_irq (unsigned int irq)
+ {
+ 	__modify_IO_APIC_irq(irq, 0x00010000, 0);
+ }
+ 
+ /* mask = 0 */
+-static void __unmask_IO_APIC_irq (unsigned int irq)
++static inline void __unmask_IO_APIC_irq (unsigned int irq)
+ {
+ 	__modify_IO_APIC_irq(irq, 0, 0x00010000);
+ }
+@@ -227,15 +284,15 @@ static void unmask_IO_APIC_irq (unsigned
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ }
+ 
+-void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
++static void clear_IO_APIC_pin(struct ioapic_data_struct *ioapic, unsigned int pin)
+ {
+ 	struct IO_APIC_route_entry entry;
+ 	unsigned long flags;
+ 	
+ 	/* Check delivery_mode to be sure we're not clearing an SMI pin */
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	*(((int*)&entry) + 0) = io_apic_read(apic, 0x10 + 2 * pin);
+-	*(((int*)&entry) + 1) = io_apic_read(apic, 0x11 + 2 * pin);
++	*(((int*)&entry) + 0) = io_apic_read(ioapic, 0x10 + 2 * pin);
++	*(((int*)&entry) + 1) = io_apic_read(ioapic, 0x11 + 2 * pin);
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 	if (entry.delivery_mode == dest_SMI)
+ 		return;
+@@ -246,8 +303,8 @@ void clear_IO_APIC_pin(unsigned int apic
+ 	memset(&entry, 0, sizeof(entry));
+ 	entry.mask = 1;
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	io_apic_write(apic, 0x10 + 2 * pin, *(((int *)&entry) + 0));
+-	io_apic_write(apic, 0x11 + 2 * pin, *(((int *)&entry) + 1));
++	io_apic_write(ioapic, 0x10 + 2 * pin, *(((int *)&entry) + 0));
++	io_apic_write(ioapic, 0x11 + 2 * pin, *(((int *)&entry) + 1));
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ }
+ 
+@@ -255,9 +312,14 @@ static void clear_IO_APIC (void)
+ {
+ 	int apic, pin;
+ 
+-	for (apic = 0; apic < nr_ioapics; apic++)
+-		for (pin = 0; pin < nr_ioapic_registers[apic]; pin++)
+-			clear_IO_APIC_pin(apic, pin);
++	for (apic = 0; apic < nr_ioapics; apic++) {
++		struct ioapic_data_struct *ioapic = ioapic_data[apic];
++#ifdef IOAPIC_CACHE
++		ioapic->reg_set = -1;
++#endif
++		for (pin = 0; pin < ioapic->nr_registers; pin++)
++			clear_IO_APIC_pin(ioapic, pin);
++	}
+ }
+ 
+ static void set_ioapic_affinity_irq(unsigned int irq, cpumask_t cpumask)
+@@ -275,7 +337,7 @@ static void set_ioapic_affinity_irq(unsi
+ 		pin = entry->pin;
+ 		if (pin == -1)
+ 			break;
+-		io_apic_write(entry->apic, 0x10 + 1 + pin*2, apicid_value);
++		io_apic_write(ioapic_data[entry->apic], 0x10 + 1 + pin*2, apicid_value);
+ 		if (!entry->next)
+ 			break;
+ 		entry = irq_2_pin + entry->next;
+@@ -864,7 +926,7 @@ void __init setup_ioapic_dest(void)
+ 		return;
+ 
+ 	for (ioapic = 0; ioapic < nr_ioapics; ioapic++) {
+-		for (pin = 0; pin < nr_ioapic_registers[ioapic]; pin++) {
++		for (pin = 0; pin < ioapic_data[ioapic]->nr_registers; pin++) {
+ 			irq_entry = find_irq_entry(ioapic, pin, mp_INT);
+ 			if (irq_entry == -1)
+ 				continue;
+@@ -1107,7 +1169,7 @@ static int pin_2_irq(int idx, int apic, 
+ 			 */
+ 			i = irq = 0;
+ 			while (i < apic)
+-				irq += nr_ioapic_registers[i++];
++				irq += ioapic_data[i++]->nr_registers;
+ 			irq += pin;
+ 
+ 			/*
+@@ -1150,7 +1212,7 @@ static inline int IO_APIC_irq_trigger(in
+ 	int apic, idx, pin;
+ 
+ 	for (apic = 0; apic < nr_ioapics; apic++) {
+-		for (pin = 0; pin < nr_ioapic_registers[apic]; pin++) {
++		for (pin = 0; pin < ioapic_data[apic]->nr_registers; pin++) {
+ 			idx = find_irq_entry(apic,pin,mp_INT);
+ 			if ((idx != -1) && (irq == pin_2_irq(idx,apic,pin)))
+ 				return irq_trigger(idx);
+@@ -1222,11 +1284,13 @@ void __init setup_IO_APIC_irqs(void)
+ 	struct IO_APIC_route_entry entry;
+ 	int apic, pin, idx, irq, first_notcon = 1, vector;
+ 	unsigned long flags;
++	struct ioapic_data_struct *ioapic;
+ 
+ 	apic_printk(APIC_VERBOSE, KERN_DEBUG "init IO_APIC IRQs\n");
+ 
+ 	for (apic = 0; apic < nr_ioapics; apic++) {
+-	for (pin = 0; pin < nr_ioapic_registers[apic]; pin++) {
++		ioapic = ioapic_data[apic];
++	for (pin = 0; pin < ioapic->nr_registers; pin++) {
+ 
+ 		/*
+ 		 * add it to the IO-APIC irq-routing table:
+@@ -1283,10 +1347,9 @@ void __init setup_IO_APIC_irqs(void)
+ 				disable_8259A_irq(irq);
+ 		}
+ 		spin_lock_irqsave(&ioapic_lock, flags);
+-		io_apic_write(apic, 0x11+2*pin, *(((int *)&entry)+1));
+-		io_apic_write(apic, 0x10+2*pin, *(((int *)&entry)+0));
++		io_apic_write(ioapic, 0x11+2*pin, *(((int *)&entry)+1));
++		io_apic_write(ioapic, 0x10+2*pin, *(((int *)&entry)+0));
+ 		spin_unlock_irqrestore(&ioapic_lock, flags);
+-		update_io_apic_cache(irq);
+ 	}
+ 	}
+ 
+@@ -1331,8 +1394,8 @@ void __init setup_ExtINT_IRQ0_pin(unsign
+ 	 * Add it to the IO-APIC irq-routing table:
+ 	 */
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	io_apic_write(0, 0x11+2*pin, *(((int *)&entry)+1));
+-	io_apic_write(0, 0x10+2*pin, *(((int *)&entry)+0));
++	io_apic_write(ioapic_data[0], 0x11+2*pin, *(((int *)&entry)+1));
++	io_apic_write(ioapic_data[0], 0x10+2*pin, *(((int *)&entry)+0));
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 	enable_8259A_irq(0);
+@@ -1342,7 +1405,7 @@ static inline void UNEXPECTED_IO_APIC(vo
+ {
+ }
+ 
+-void __init print_IO_APIC(void)
++void /*__init*/ print_IO_APIC(void)
+ {
+ 	int apic, i;
+ 	union IO_APIC_reg_00 reg_00;
+@@ -1350,6 +1413,7 @@ void __init print_IO_APIC(void)
+ 	union IO_APIC_reg_02 reg_02;
+ 	union IO_APIC_reg_03 reg_03;
+ 	unsigned long flags;
++	struct ioapic_data_struct *ioapic;
+ 
+ 	if (apic_verbosity == APIC_QUIET)
+ 		return;
+@@ -1357,7 +1421,7 @@ void __init print_IO_APIC(void)
+  	printk(KERN_DEBUG "number of MP IRQ sources: %d.\n", mp_irq_entries);
+ 	for (i = 0; i < nr_ioapics; i++)
+ 		printk(KERN_DEBUG "number of IO-APIC #%d registers: %d.\n",
+-		       mp_ioapics[i].mpc_apicid, nr_ioapic_registers[i]);
++		       mp_ioapics[i].mpc_apicid, ioapic_data[i]->nr_registers);
+ 
+ 	/*
+ 	 * We are a bit conservative about what we expect.  We have to
+@@ -1366,14 +1430,14 @@ void __init print_IO_APIC(void)
+ 	printk(KERN_INFO "testing the IO APIC.......................\n");
+ 
+ 	for (apic = 0; apic < nr_ioapics; apic++) {
+-
++	ioapic = ioapic_data[apic];
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	reg_00.raw = io_apic_read(apic, 0);
+-	reg_01.raw = io_apic_read(apic, 1);
++	reg_00.raw = io_apic_read(ioapic, 0);
++	reg_01.raw = io_apic_read(ioapic, 1);
+ 	if (reg_01.bits.version >= 0x10)
+-		reg_02.raw = io_apic_read(apic, 2);
++		reg_02.raw = io_apic_read(ioapic, 2);
+ 	if (reg_01.bits.version >= 0x20)
+-		reg_03.raw = io_apic_read(apic, 3);
++		reg_03.raw = io_apic_read(ioapic, 3);
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 	printk(KERN_DEBUG "IO APIC #%d......\n", mp_ioapics[apic].mpc_apicid);
+@@ -1444,8 +1508,8 @@ void __init print_IO_APIC(void)
+ 		struct IO_APIC_route_entry entry;
+ 
+ 		spin_lock_irqsave(&ioapic_lock, flags);
+-		*(((int *)&entry)+0) = io_apic_read(apic, 0x10+i*2);
+-		*(((int *)&entry)+1) = io_apic_read(apic, 0x11+i*2);
++		*(((int *)&entry)+0) = raw_io_apic_read(ioapic, 0x10+i*2);
++		*(((int *)&entry)+1) = raw_io_apic_read(ioapic, 0x11+i*2);
+ 		spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 		printk(KERN_DEBUG " %02x %03X %02X  ",
+@@ -1602,6 +1666,7 @@ void print_all_local_APICs (void)
+ 
+ void /*__init*/ print_PIC(void)
+ {
++	extern spinlock_t i8259A_lock;
+ 	unsigned int v;
+ 	unsigned long flags;
+ 
+@@ -1634,9 +1699,7 @@ void /*__init*/ print_PIC(void)
+ 
+ static void __init enable_IO_APIC(void)
+ {
+-	union IO_APIC_reg_01 reg_01;
+ 	int i;
+-	unsigned long flags;
+ 
+ 	for (i = 0; i < PIN_MAP_SIZE; i++) {
+ 		irq_2_pin[i].pin = -1;
+@@ -1647,16 +1710,6 @@ static void __init enable_IO_APIC(void)
+ 			pirq_entries[i] = -1;
+ 
+ 	/*
+-	 * The number of IO-APIC IRQ registers (== #pins):
+-	 */
+-	for (i = 0; i < nr_ioapics; i++) {
+-		spin_lock_irqsave(&ioapic_lock, flags);
+-		reg_01.raw = io_apic_read(i, 1);
+-		spin_unlock_irqrestore(&ioapic_lock, flags);
+-		nr_ioapic_registers[i] = reg_01.bits.entries+1;
+-	}
+-
+-	/*
+ 	 * Do not trust the IO-APIC being empty at bootup
+ 	 */
+ 	clear_IO_APIC();
+@@ -1691,6 +1744,7 @@ static void __init setup_ioapic_ids_from
+ 	int i;
+ 	unsigned char old_id;
+ 	unsigned long flags;
++	struct ioapic_data_struct *ioapic;
+ 
+ 	/*
+ 	 * This is broken; anything with a real cpu count has to
+@@ -1702,10 +1756,10 @@ static void __init setup_ioapic_ids_from
+ 	 * Set the IOAPIC ID to the value stored in the MPC table.
+ 	 */
+ 	for (apic = 0; apic < nr_ioapics; apic++) {
+-
++		ioapic = ioapic_data[apic];
+ 		/* Read the register 0 value */
+ 		spin_lock_irqsave(&ioapic_lock, flags);
+-		reg_00.raw = io_apic_read(apic, 0);
++		reg_00.raw = io_apic_read(ioapic, 0);
+ 		spin_unlock_irqrestore(&ioapic_lock, flags);
+ 		
+ 		old_id = mp_ioapics[apic].mpc_apicid;
+@@ -1770,14 +1824,14 @@ static void __init setup_ioapic_ids_from
+ 
+ 		reg_00.bits.ID = mp_ioapics[apic].mpc_apicid;
+ 		spin_lock_irqsave(&ioapic_lock, flags);
+-		io_apic_write(apic, 0, reg_00.raw);
++		io_apic_write(ioapic, 0, reg_00.raw);
+ 		spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 		/*
+ 		 * Sanity check
+ 		 */
+ 		spin_lock_irqsave(&ioapic_lock, flags);
+-		reg_00.raw = io_apic_read(apic, 0);
++		reg_00.raw = io_apic_read(ioapic, 0);
+ 		spin_unlock_irqrestore(&ioapic_lock, flags);
+ 		if (reg_00.bits.ID != mp_ioapics[apic].mpc_apicid)
+ 			printk("could not set ID!\n");
+@@ -1865,9 +1919,11 @@ static unsigned int startup_edge_ioapic_
+ static void ack_edge_ioapic_irq(unsigned int irq)
+ {
+ 	move_irq(irq);
++#if 0
+ 	if ((irq_desc[irq].status & (IRQ_PENDING | IRQ_DISABLED))
+ 					== (IRQ_PENDING | IRQ_DISABLED))
+ 		mask_IO_APIC_irq(irq);
++#endif
+ 	ack_APIC_irq();
+ }
+ 
+@@ -1892,15 +1948,15 @@ static unsigned int startup_level_ioapic
+ 	return 0; /* don't check for pending */
+ }
+ 
++#ifdef CONFIG_PREEMPT_HARDIRQS
++
+ /*
+- * Level-triggered interrupt handling is different for RT kernels.
+- *
+- * In the RT case mask the IRQ first, then ack it, redirect it,
+- * and the IRQ thread then will handle it (sometime later) and will
+- * unmask it.
++ * in the PREEMPT_HARDIRQS case we dont want to keep the local
++ * APIC unacked, because the prevents further interrupts from
++ * being handled - and with IRQ threads being delayed arbitrarily,
++ * that's unacceptable. So we first mask the IRQ, then ack it.
++ * The hardirq thread will then unmask it.
+  */
+-#if defined(CONFIG_PREEMPT_HARDIRQS)
+-
+ static void mask_and_ack_level_ioapic_irq(unsigned int irq)
+ {
+ 	move_irq(irq);
+@@ -1908,21 +1964,14 @@ static void mask_and_ack_level_ioapic_ir
+ 	ack_APIC_irq();
+ }
+ 
+-static void end_level_ioapic_irq(unsigned int irq)
+-{
+-#ifndef CONFIG_PCI_MSI
+-	if (!(irq_desc[irq].status & (IRQ_DISABLED | IRQ_INPROGRESS)) &&
+-							irq_desc[irq].action)
+-#endif
+-		unmask_IO_APIC_irq(irq);
+-}
+-
+-#else /* !CONFIG_PREEMPT_HARDIRQS */
++#else
+ 
+ static void mask_and_ack_level_ioapic_irq(unsigned int irq)
+ {
+ }
+ 
++#endif
++
+ static void end_level_ioapic_irq (unsigned int irq)
+ {
+ 	unsigned long v;
+@@ -1965,13 +2014,6 @@ static void end_level_ioapic_irq (unsign
+ 	}
+ }
+ 
+-#endif /* !CONFIG_PREEMPT_HARDIRQS */
+-
+-static void enable_level_ioapic_irq(unsigned int irq)
+-{
+-	unmask_IO_APIC_irq(irq);
+-}
+-
+ #ifdef CONFIG_PCI_MSI
+ static unsigned int startup_edge_ioapic_vector(unsigned int vector)
+ {
+@@ -2005,16 +2047,7 @@ static void end_level_ioapic_vector (uns
+ {
+ 	int irq = vector_to_irq(vector);
+ 
+-#if defined(CONFIG_PREEMPT_HARDIRQS)
+-	if (!(irq_desc[vector].status & (IRQ_DISABLED | IRQ_INPROGRESS)) &&
+-							irq_desc[vector].action)
+-#endif
+-		end_level_ioapic_irq(irq);
+-}
+-
+-static void enable_level_ioapic_vector(unsigned int vector)
+-{
+-	enable_level_ioapic_irq(vector_to_irq(vector));
++	end_level_ioapic_irq(irq);
+ }
+ 
+ static void mask_IO_APIC_vector (unsigned int vector)
+@@ -2049,25 +2082,25 @@ static void set_ioapic_affinity_vector (
+  * races.
+  */
+ static struct hw_interrupt_type ioapic_edge_type = {
+-	.typename 	= "IO-APIC-edge",
++	.typename	= "IO-APIC-edge",
+ 	.startup 	= startup_edge_ioapic,
+ 	.shutdown 	= shutdown_edge_ioapic,
+ 	.enable 	= enable_edge_ioapic,
+ 	.disable 	= disable_edge_ioapic,
+ 	.ack 		= ack_edge_ioapic,
+ 	.end 		= end_edge_ioapic,
+-	.set_affinity 	= set_ioapic_affinity,
++	.set_affinity	= set_ioapic_affinity,
+ };
+ 
+ static struct hw_interrupt_type ioapic_level_type = {
+-	.typename 	= "IO-APIC-level",
++	.typename	= "IO-APIC-level",
+ 	.startup 	= startup_level_ioapic,
+ 	.shutdown 	= shutdown_level_ioapic,
+ 	.enable 	= enable_level_ioapic,
+ 	.disable 	= disable_level_ioapic,
+ 	.ack 		= mask_and_ack_level_ioapic,
+ 	.end 		= end_level_ioapic,
+-	.set_affinity 	= set_ioapic_affinity,
++	.set_affinity	= set_ioapic_affinity,
+ };
+ 
+ static inline void init_IO_APIC_traps(void)
+@@ -2131,13 +2164,13 @@ static void ack_lapic_irq (unsigned int 
+ static void end_lapic_irq (unsigned int i) { /* nothing */ }
+ 
+ static struct hw_interrupt_type lapic_irq_type = {
+-	.typename 	= "local-APIC-edge",
+-	.startup 	= NULL, /* startup_irq() not used for IRQ0 */
+-	.shutdown 	= NULL, /* shutdown_irq() not used for IRQ0 */
+-	.enable 	= enable_lapic_irq,
+-	.disable 	= disable_lapic_irq,
+-	.ack 		= ack_lapic_irq,
+-	.end 		= end_lapic_irq
++	.typename	= "local-APIC-edge",
++	.startup	= NULL, /* startup_irq() not used for IRQ0 */
++	.shutdown	= NULL, /* shutdown_irq() not used for IRQ0 */
++	.enable		= enable_lapic_irq,
++	.disable	= disable_lapic_irq,
++	.ack		= ack_lapic_irq,
++	.end		= end_lapic_irq
+ };
+ 
+ static void setup_nmi (void)
+@@ -2165,22 +2198,23 @@ static void setup_nmi (void)
+  * cycles as some i82489DX-based boards have glue logic that keeps the
+  * 8259A interrupt line asserted until INTA.  --macro
+  */
+-static inline void unlock_ExtINT_logic(void)
++static void __init unlock_ExtINT_logic(void)
+ {
+ 	int pin, i;
+ 	struct IO_APIC_route_entry entry0, entry1;
+ 	unsigned char save_control, save_freq_select;
+ 	unsigned long flags;
++	struct ioapic_data_struct *ioapic0 = ioapic_data[0];
+ 
+ 	pin = find_isa_irq_pin(8, mp_INT);
+ 	if (pin == -1)
+ 		return;
+ 
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	*(((int *)&entry0) + 1) = io_apic_read(0, 0x11 + 2 * pin);
+-	*(((int *)&entry0) + 0) = io_apic_read(0, 0x10 + 2 * pin);
++	*(((int *)&entry0) + 1) = io_apic_read(ioapic0, 0x11 + 2 * pin);
++	*(((int *)&entry0) + 0) = io_apic_read(ioapic0, 0x10 + 2 * pin);
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+-	clear_IO_APIC_pin(0, pin);
++	clear_IO_APIC_pin(ioapic0, pin);
+ 
+ 	memset(&entry1, 0, sizeof(entry1));
+ 
+@@ -2193,8 +2227,8 @@ static inline void unlock_ExtINT_logic(v
+ 	entry1.vector = 0;
+ 
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	io_apic_write(0, 0x11 + 2 * pin, *(((int *)&entry1) + 1));
+-	io_apic_write(0, 0x10 + 2 * pin, *(((int *)&entry1) + 0));
++	io_apic_write(ioapic0, 0x11 + 2 * pin, *(((int *)&entry1) + 1));
++	io_apic_write(ioapic0, 0x10 + 2 * pin, *(((int *)&entry1) + 0));
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 	save_control = CMOS_READ(RTC_CONTROL);
+@@ -2212,11 +2246,11 @@ static inline void unlock_ExtINT_logic(v
+ 
+ 	CMOS_WRITE(save_control, RTC_CONTROL);
+ 	CMOS_WRITE(save_freq_select, RTC_FREQ_SELECT);
+-	clear_IO_APIC_pin(0, pin);
++	clear_IO_APIC_pin(ioapic0, pin);
+ 
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	io_apic_write(0, 0x11 + 2 * pin, *(((int *)&entry0) + 1));
+-	io_apic_write(0, 0x10 + 2 * pin, *(((int *)&entry0) + 0));
++	io_apic_write(ioapic0, 0x11 + 2 * pin, *(((int *)&entry0) + 1));
++	io_apic_write(ioapic0, 0x10 + 2 * pin, *(((int *)&entry0) + 0));
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ }
+ 
+@@ -2226,10 +2260,11 @@ static inline void unlock_ExtINT_logic(v
+  * is so screwy.  Thanks to Brian Perkins for testing/hacking this beast
+  * fanatically on his truly buggy board.
+  */
+-static inline void check_timer(void)
++static void __init check_timer(void)
+ {
+ 	int pin1, pin2;
+ 	int vector;
++	struct ioapic_data_struct *ioapic0 = ioapic_data[0];
+ 
+ 	/*
+ 	 * get/set the timer IRQ vector:
+@@ -2247,7 +2282,10 @@ static inline void check_timer(void)
+ 	 */
+ 	apic_write_around(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_EXTINT);
+ 	init_8259A(1);
+-	timer_ack = 1;
++#ifdef CONFIG_PREEMPT_RT
++	if (nmi_watchdog)
++#endif
++		timer_ack = 1;
+ 	enable_8259A_irq(0);
+ 
+ 	pin1 = find_isa_irq_pin(0, mp_INT);
+@@ -2269,7 +2307,7 @@ static inline void check_timer(void)
+ 			}
+ 			return;
+ 		}
+-		clear_IO_APIC_pin(0, pin1);
++		clear_IO_APIC_pin(ioapic0, pin1);
+ 		printk(KERN_ERR "..MP-BIOS bug: 8254 timer not connected to IO-APIC\n");
+ 	}
+ 
+@@ -2295,7 +2333,7 @@ static inline void check_timer(void)
+ 		/*
+ 		 * Cleanup, just in case ...
+ 		 */
+-		clear_IO_APIC_pin(0, pin2);
++		clear_IO_APIC_pin(ioapic0, pin2);
+ 	}
+ 	printk(" failed.\n");
+ 
+@@ -2336,6 +2374,46 @@ static inline void check_timer(void)
+ 		"report.  Then try booting with the 'noapic' option");
+ }
+ 
++void __init setup_IO_APIC_early(int _ioapic)
++{
++	union IO_APIC_reg_01 reg_01;
++	unsigned long flags;
++	int size, nr_ioapic_registers;
++	volatile int *ioapic;
++	if (ioapic_data[_ioapic]) {
++		printk("been in %s before !!!!!\n", __FUNCTION__);
++		return;
++	}
++
++	set_fixmap_nocache(FIX_IO_APIC_BASE_0 + _ioapic, mp_ioapics[_ioapic].mpc_apicaddr);
++	printk(KERN_DEBUG "mapped IOAPIC to %08lx (%08lx)\n",
++	       __fix_to_virt(FIX_IO_APIC_BASE_0 + _ioapic), mp_ioapics[_ioapic].mpc_apicaddr);
++	/*
++	 * The number of IO-APIC IRQ registers (== #pins):
++	 */
++	ioapic = IO_APIC_BASE(_ioapic);
++	spin_lock_irqsave(&ioapic_lock, flags);
++	ioapic[0] = 1;
++	reg_01.raw = ioapic[4];
++	spin_unlock_irqrestore(&ioapic_lock, flags);
++	nr_ioapic_registers = reg_01.bits.entries+1;
++
++	/*
++	 * Initialsize ioapic_data struct:
++	 */
++	size = sizeof(struct ioapic_data_struct);
++#ifdef IOAPIC_CACHE
++	size += 0x10 * sizeof(u32) + nr_ioapic_registers * sizeof(struct IO_APIC_route_entry);
++#endif
++	ioapic_data[_ioapic] = alloc_bootmem(size);
++	memset(ioapic_data[_ioapic], 0, size);
++	ioapic_data[_ioapic]->nr_registers = nr_ioapic_registers;
++	ioapic_data[_ioapic]->base = ioapic;
++#ifdef IOAPIC_CACHE
++	ioapic_cache_init(ioapic_data[_ioapic]);
++#endif
++}
++
+ /*
+  *
+  * IRQ's that are handled by the PIC in the MPS IOAPIC case.
+@@ -2383,25 +2461,22 @@ static int __init io_apic_bug_finalize(v
+ 
+ late_initcall(io_apic_bug_finalize);
+ 
+-struct sysfs_ioapic_data {
+-	struct sys_device dev;
+-	struct IO_APIC_route_entry entry[0];
+-};
+-static struct sysfs_ioapic_data * mp_ioapic_data[MAX_IO_APICS];
+-
+ static int ioapic_suspend(struct sys_device *dev, u32 state)
+ {
+ 	struct IO_APIC_route_entry *entry;
+-	struct sysfs_ioapic_data *data;
++	struct ioapic_data_struct *data;
+ 	unsigned long flags;
+ 	int i;
+-	
+-	data = container_of(dev, struct sysfs_ioapic_data, dev);
++	struct ioapic_data_struct *ioapic;
++
++	data = container_of(dev, struct ioapic_data_struct, dev);
+ 	entry = data->entry;
++
++	ioapic = ioapic_data[dev->id];
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	for (i = 0; i < nr_ioapic_registers[dev->id]; i ++, entry ++ ) {
+-		*(((int *)entry) + 1) = io_apic_read(dev->id, 0x11 + 2 * i);
+-		*(((int *)entry) + 0) = io_apic_read(dev->id, 0x10 + 2 * i);
++	for (i = 0; i < ioapic_data[dev->id]->nr_registers; i ++, entry ++) {
++		*(((int *)entry) + 1) = io_apic_read(ioapic, 0x11 + 2 * i);
++		*(((int *)entry) + 0) = io_apic_read(ioapic, 0x10 + 2 * i);
+ 	}
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+@@ -2411,23 +2486,25 @@ static int ioapic_suspend(struct sys_dev
+ static int ioapic_resume(struct sys_device *dev)
+ {
+ 	struct IO_APIC_route_entry *entry;
+-	struct sysfs_ioapic_data *data;
++	struct ioapic_data_struct *data;
+ 	unsigned long flags;
+ 	union IO_APIC_reg_00 reg_00;
+ 	int i;
+-	
+-	data = container_of(dev, struct sysfs_ioapic_data, dev);
++	struct ioapic_data_struct *ioapic;
++
++	data = container_of(dev, struct ioapic_data_struct, dev);
+ 	entry = data->entry;
+ 
++	ioapic = ioapic_data[dev->id];
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	reg_00.raw = io_apic_read(dev->id, 0);
++	reg_00.raw = io_apic_read(ioapic, 0);
+ 	if (reg_00.bits.ID != mp_ioapics[dev->id].mpc_apicid) {
+ 		reg_00.bits.ID = mp_ioapics[dev->id].mpc_apicid;
+-		io_apic_write(dev->id, 0, reg_00.raw);
++		io_apic_write(ioapic, 0, reg_00.raw);
+ 	}
+-	for (i = 0; i < nr_ioapic_registers[dev->id]; i ++, entry ++ ) {
+-		io_apic_write(dev->id, 0x11+2*i, *(((int *)entry)+1));
+-		io_apic_write(dev->id, 0x10+2*i, *(((int *)entry)+0));
++	for (i = 0; i < ioapic_data[dev->id]->nr_registers; i ++, entry ++) {
++		io_apic_write(ioapic, 0x11+2*i, *(((int *)entry)+1));
++		io_apic_write(ioapic, 0x10+2*i, *(((int *)entry)+0));
+ 	}
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+@@ -2450,21 +2527,20 @@ static int __init ioapic_init_sysfs(void
+ 		return error;
+ 
+ 	for (i = 0; i < nr_ioapics; i++ ) {
+-		size = sizeof(struct sys_device) + nr_ioapic_registers[i] 
+-			* sizeof(struct IO_APIC_route_entry);
+-		mp_ioapic_data[i] = kmalloc(size, GFP_KERNEL);
+-		if (!mp_ioapic_data[i]) {
++		size = ioapic_data[i]->nr_registers * sizeof(struct IO_APIC_route_entry);
++		ioapic_data[i]->entry = kmalloc(size, GFP_KERNEL);
++		if (!ioapic_data[i]->entry) {
+ 			printk(KERN_ERR "Can't suspend/resume IOAPIC %d\n", i);
+ 			continue;
+ 		}
+-		memset(mp_ioapic_data[i], 0, size);
+-		dev = &mp_ioapic_data[i]->dev;
++		memset(ioapic_data[i]->entry, 0, size);
++		dev = &ioapic_data[i]->dev;
+ 		dev->id = i; 
+ 		dev->cls = &ioapic_sysdev_class;
+ 		error = sysdev_register(dev);
+ 		if (error) {
+-			kfree(mp_ioapic_data[i]);
+-			mp_ioapic_data[i] = NULL;
++			kfree(ioapic_data[i]->entry);
++			ioapic_data[i]->entry = NULL;
+ 			printk(KERN_ERR "Can't suspend/resume IOAPIC %d\n", i);
+ 			continue;
+ 		}
+@@ -2481,13 +2557,14 @@ device_initcall(ioapic_init_sysfs);
+ 
+ #ifdef CONFIG_ACPI_BOOT
+ 
+-int __init io_apic_get_unique_id (int ioapic, int apic_id)
++int __init io_apic_get_unique_id (int apic, int apic_id)
+ {
+ 	union IO_APIC_reg_00 reg_00;
+ 	static physid_mask_t apic_id_map = PHYSID_MASK_NONE;
+ 	physid_mask_t tmp;
+ 	unsigned long flags;
+ 	int i = 0;
++	struct ioapic_data_struct *ioapic = ioapic_data[apic];
+ 
+ 	/*
+ 	 * The P4 platform supports up to 256 APIC IDs on two separate APIC 
+@@ -2507,7 +2584,7 @@ int __init io_apic_get_unique_id (int io
+ 
+ 	if (apic_id >= get_physical_broadcast()) {
+ 		printk(KERN_WARNING "IOAPIC[%d]: Invalid apic_id %d, trying "
+-			"%d\n", ioapic, apic_id, reg_00.bits.ID);
++			"%d\n", apic, apic_id, reg_00.bits.ID);
+ 		apic_id = reg_00.bits.ID;
+ 	}
+ 
+@@ -2526,7 +2603,7 @@ int __init io_apic_get_unique_id (int io
+ 			panic("Max apic_id exceeded!\n");
+ 
+ 		printk(KERN_WARNING "IOAPIC[%d]: apic_id %d already used, "
+-			"trying %d\n", ioapic, apic_id, i);
++			"trying %d\n", apic, apic_id, i);
+ 
+ 		apic_id = i;
+ 	} 
+@@ -2544,50 +2621,50 @@ int __init io_apic_get_unique_id (int io
+ 
+ 		/* Sanity check */
+ 		if (reg_00.bits.ID != apic_id)
+-			panic("IOAPIC[%d]: Unable change apic_id!\n", ioapic);
++			panic("IOAPIC[%d]: Unable change apic_id!\n", apic);
+ 	}
+ 
+ 	apic_printk(APIC_VERBOSE, KERN_INFO
+-			"IOAPIC[%d]: Assigned apic_id %d\n", ioapic, apic_id);
++			"IOAPIC[%d]: Assigned apic_id %d\n", apic, apic_id);
+ 
+ 	return apic_id;
+ }
+ 
+ 
+-int __init io_apic_get_version (int ioapic)
++int __init io_apic_get_version (int apic)
+ {
+ 	union IO_APIC_reg_01	reg_01;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	reg_01.raw = io_apic_read(ioapic, 1);
++	reg_01.raw = io_apic_read(ioapic_data[apic], 1);
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 	return reg_01.bits.version;
+ }
+ 
+ 
+-int __init io_apic_get_redir_entries (int ioapic)
++int __init io_apic_get_redir_entries (int apic)
+ {
+ 	union IO_APIC_reg_01	reg_01;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+-	reg_01.raw = io_apic_read(ioapic, 1);
++	reg_01.raw = io_apic_read(ioapic_data[apic], 1);
+ 	spin_unlock_irqrestore(&ioapic_lock, flags);
+ 
+ 	return reg_01.bits.entries;
+ }
+ 
+ 
+-int io_apic_set_pci_routing (int ioapic, int pin, int irq, int edge_level, int active_high_low)
++int io_apic_set_pci_routing (int apic, int pin, int irq, int edge_level, int active_high_low)
+ {
+ 	struct IO_APIC_route_entry entry;
+ 	unsigned long flags;
+-
++	struct ioapic_data_struct *ioapic = ioapic_data[apic];
+ 	if (!IO_APIC_IRQ(irq)) {
+ 		printk(KERN_ERR "IOAPIC[%d]: Invalid reference to IRQ 0\n",
+-			ioapic);
++			apic);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -2610,18 +2687,18 @@ int io_apic_set_pci_routing (int ioapic,
+ 	 * IRQs < 16 are already in the irq_2_pin[] map
+ 	 */
+ 	if (irq >= 16)
+-		add_pin_to_irq(irq, ioapic, pin);
++		add_pin_to_irq(irq, apic, pin);
+ 
+ 	entry.vector = assign_irq_vector(irq);
+ 
+ 	apic_printk(APIC_DEBUG, KERN_DEBUG "IOAPIC[%d]: Set PCI routing entry "
+-		"(%d-%d -> 0x%x -> IRQ %d Mode:%i Active:%i)\n", ioapic,
+-		mp_ioapics[ioapic].mpc_apicid, pin, entry.vector, irq,
++		"(%d-%d -> 0x%x -> IRQ %d Mode:%i Active:%i)\n", apic,
++		mp_ioapics[apic].mpc_apicid, pin, entry.vector, irq,
+ 		edge_level, active_high_low);
+ 
+ 	ioapic_register_intr(irq, entry.vector, edge_level);
+ 
+-	if (!ioapic && (irq < 16))
++	if (!apic && (irq < 16))
+ 		disable_8259A_irq(irq);
+ 
+ 	spin_lock_irqsave(&ioapic_lock, flags);
+Index: linux-2.6.10/arch/i386/kernel/mpparse.c
+===================================================================
+--- linux-2.6.10.orig/arch/i386/kernel/mpparse.c
++++ linux-2.6.10/arch/i386/kernel/mpparse.c
+@@ -263,6 +263,7 @@ static void __init MP_ioapic_info (struc
+ 		return;
+ 	}
+ 	mp_ioapics[nr_ioapics] = *m;
++	setup_IO_APIC_early(nr_ioapics);
+ 	nr_ioapics++;
+ }
+ 
+@@ -913,7 +914,7 @@ void __init mp_register_ioapic (
+ 	mp_ioapics[idx].mpc_flags = MPC_APIC_USABLE;
+ 	mp_ioapics[idx].mpc_apicaddr = address;
+ 
+-	set_fixmap_nocache(FIX_IO_APIC_BASE_0 + idx, address);
++	setup_IO_APIC_early(idx);
+ 	mp_ioapics[idx].mpc_apicid = io_apic_get_unique_id(idx, id);
+ 	mp_ioapics[idx].mpc_apicver = io_apic_get_version(idx);
+ 	
+Index: linux-2.6.10/include/asm-i386/io_apic.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-i386/io_apic.h
++++ linux-2.6.10/include/asm-i386/io_apic.h
+@@ -19,7 +19,7 @@ static inline void disable_edge_ioapic_v
+ static inline void end_edge_ioapic_vector (unsigned int vector) { }
+ #define startup_level_ioapic	startup_level_ioapic_vector
+ #define shutdown_level_ioapic	mask_IO_APIC_vector
+-#define enable_level_ioapic	enable_level_ioapic_vector
++#define enable_level_ioapic	unmask_IO_APIC_vector
+ #define disable_level_ioapic	mask_IO_APIC_vector
+ #define mask_and_ack_level_ioapic mask_and_ack_level_ioapic_vector
+ #define end_level_ioapic	end_level_ioapic_vector
+@@ -37,7 +37,7 @@ static inline void disable_edge_ioapic_i
+ static inline void end_edge_ioapic_irq (unsigned int irq) { }
+ #define startup_level_ioapic	startup_level_ioapic_irq
+ #define shutdown_level_ioapic	mask_IO_APIC_irq
+-#define enable_level_ioapic	enable_level_ioapic_irq
++#define enable_level_ioapic	unmask_IO_APIC_irq
+ #define disable_level_ioapic	mask_IO_APIC_irq
+ #define mask_and_ack_level_ioapic mask_and_ack_level_ioapic_irq
+ #define end_level_ioapic	end_level_ioapic_irq
+@@ -158,31 +158,8 @@ extern struct mpc_config_intsrc mp_irqs[
+ /* non-0 if default (table-less) MP configuration */
+ extern int mpc_default_type;
+ 
+-static inline unsigned int io_apic_read(unsigned int apic, unsigned int reg)
+-{
+-	*IO_APIC_BASE(apic) = reg;
+-	return *(IO_APIC_BASE(apic)+4);
+-}
+-
+-static inline void io_apic_write(unsigned int apic, unsigned int reg, unsigned int value)
+-{
+-	*IO_APIC_BASE(apic) = reg;
+-	*(IO_APIC_BASE(apic)+4) = value;
+-}
+-
+-/*
+- * Re-write a value: to be used for read-modify-write
+- * cycles where the read already set up the index register.
+- *
+- * Older SiS APIC requires we rewrite the index regiser
+- */
++extern void setup_IO_APIC_early(int ioapic);
+ extern int sis_apic_bug;
+-static inline void io_apic_modify(unsigned int apic, unsigned int reg, unsigned int value)
+-{
+-	if (sis_apic_bug)
+-		*IO_APIC_BASE(apic) = reg;
+-	*(IO_APIC_BASE(apic)+4) = value;
+-}
+ 
+ /* 1 if "noapic" boot option passed */
+ extern int skip_ioapic_setup;
+Index: linux-2.6.10/mvl_patches/pro-0082.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0082.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(82);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

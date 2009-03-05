@@ -1,0 +1,1164 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_spi
+# Date: Mon Mar  6 15:04:49 2006
+# Source: MontaVista Software, Inc.
+# MR: 17072
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+#                Yuri Frolov <yfrolov@ru.mvista.com>
+# Description:
+# 	Linux driver (aka "adapter") for Xilinx SPI IP.
+# 
+
+PATCHNUM=361
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 17072
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+               Yuri Frolov <yfrolov@ru.mvista.com>
+Description:
+	Linux driver (aka "adapter") for Xilinx SPI IP.
+
+ arch/ppc/platforms/4xx/virtex.c        |   33 +
+ drivers/char/Kconfig                   |    7 
+ drivers/char/Makefile                  |    1 
+ drivers/char/xilinx_spi/Makefile       |   14 
+ drivers/char/xilinx_spi/xspi_adapter.c |  746 +++++++++++++++++++++++++++++++++
+ drivers/char/xilinx_spi/xspi_ioctl.h   |   46 ++
+ include/linux/xilinx_devices.h         |   11 
+ mvl_patches/pro-0361.c                 |   16 
+ 8 files changed, 874 insertions(+)
+
+Index: linux-2.6.10/arch/ppc/platforms/4xx/virtex.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/4xx/virtex.c
++++ linux-2.6.10/arch/ppc/platforms/4xx/virtex.c
+@@ -418,6 +418,35 @@ static struct platform_device xilinx_tou
+ 
+ #endif /* XPAR_TOUCHSCREEN_0_BASEADDR */
+ 
++#ifdef XPAR_SPI_0_BASEADDR
++
++static struct xspi_platform_data xspi_0_pdata = {
++	.device_flags = (XPAR_OPB_SPI_0_FIFO_EXIST ? XSPI_HAS_FIFOS : 0) |
++		(XPAR_OPB_SPI_0_SPI_SLAVE_ONLY ? XSPI_SLAVE_ONLY : 0),
++	.num_slave_bits = XPAR_OPB_SPI_0_NUM_SS_BITS
++};
++
++static struct platform_device xilinx_spi_0_device = {
++	.name = "xilinx_spi",
++	.id = XPAR_SPI_0_DEVICE_ID,
++	.dev.platform_data = &xspi_0_pdata,
++	.num_resources = 2,
++	.resource = (struct resource[]) {
++		{
++			.start	= XPAR_SPI_0_BASEADDR,
++			.end	= XPAR_SPI_0_HIGHADDR,
++			.flags	= IORESOURCE_MEM
++		},
++		{
++			.start	= XPAR_INTC_0_SPI_0_VEC_ID,
++			.end	= XPAR_INTC_0_SPI_0_VEC_ID,
++			.flags	= IORESOURCE_IRQ
++		}
++	}
++};
++
++#endif /* XPAR_SPI_0_BASEADDR */
++
+ static int __init xilinx_platform_init(void)
+ {
+ #ifdef XPAR_EMAC_0_BASEADDR
+@@ -477,6 +506,10 @@ static int __init xilinx_platform_init(v
+ 	platform_device_register(&xilinx_touchscreen_device);
+ #endif /* XPAR_TOUCHSCREEN_0_BASEADDR */
+ 
++#ifdef XPAR_SPI_0_BASEADDR
++	platform_device_register(&xilinx_spi_0_device);
++#endif /* XPAR_SPI_0_BASEADDR */
++
+ #ifdef XPAR_OPB_LCD_INTERFACE_0_BASEADDR
+ 	platform_device_register(&xilinx_char_lcd_device);
+ #endif /* XPAR_OPB_LCD_INTERFACE_0_BASEADDR */
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -1024,6 +1024,13 @@ config XILINX_TS
+ 	help
+ 	  Touchscreen support for Xilinx ML300 board
+ 
++config XILINX_SPI
++	tristate "Xilinx SPI"
++	depends on XILINX_ML300
++	select XILINX_EDK
++	help
++	  Simple SPI driver for Xilinx ML300 board
++
+ config RAW_DRIVER
+ 	tristate "RAW driver (/dev/raw/rawN) (OBSOLETE)"
+ 	help
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -93,6 +93,7 @@ obj-$(CONFIG_XILINX_GPIO) += xilinx_gpio
+ obj-$(CONFIG_XILINX_UARTLITE) += xilinx_uartlite/ generic_serial.o
+ obj-$(CONFIG_XILINX_CHAR_LCD) += xilinx_lcd.o
+ obj-$(CONFIG_XILINX_TS) += xilinx_ts/
++obj-$(CONFIG_XILINX_SPI) += xilinx_spi/
+ 
+ obj-$(CONFIG_WATCHDOG)	+= watchdog/
+ obj-$(CONFIG_MWAVE) += mwave/
+Index: linux-2.6.10/drivers/char/xilinx_spi/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/Makefile
+@@ -0,0 +1,14 @@
++#
++# Makefile for the Xilinx SPI driver
++#
++
++EXTRA_CFLAGS	+= -Idrivers/xilinx_edk
++
++# The Linux adapter for the Xilinx driver code.
++xilinx_spi-objs	:= xspi_adapter.o
++
++# The Xilinx OS independent code.
++xilinx_spi-objs	+= xspi.o xspi_options.o xspi_stats.o
++
++obj-$(CONFIG_XILINX_SPI) := xilinx_spi.o
++
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi_adapter.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi_adapter.c
+@@ -0,0 +1,746 @@
++/*
++ * xspi_adapter.c
++ *
++ * Xilinx Adapter component to interface SPI component to Linux
++ *
++ * Only master mode is supported. One or more slaves can be served.
++ *
++ * Author: MontaVista Software, Inc.
++ *         akonovalov@ru.mvista.com, or source@mvista.com
++ *
++ * 2004-2006 (c) MontaVista, Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/sched.h>	/* wait_event_interruptible */
++#include <linux/bitops.h>	/* ffs() */
++#include <linux/slab.h>		/* kmalloc() etc. */
++#include <linux/moduleparam.h>
++#include <linux/xilinx_devices.h>
++
++#include <asm/irq.h>
++#include <asm/uaccess.h>
++#include <asm/page.h>		/* PAGE_SIZE */
++
++#include "xspi.h"
++#include "xspi_i.h"
++#include "xspi_ioctl.h"
++
++#define XSPI_DEFAULT_MAJOR	123
++#define XSPI_DEFAULT_MINOR	0	/* The minors start from this value */
++#define XSPI_MINORS		4	/* Allocate 4 minors for this driver */
++
++static int xspi_major = XSPI_DEFAULT_MAJOR;
++static int xspi_minor = XSPI_DEFAULT_MINOR;
++static int xspi_no_minors = XSPI_MINORS;
++module_param(xspi_major, int, S_IRUGO);
++module_param(xspi_minor, int, S_IRUGO);
++
++#define XSPI_NAME "xilinx_spi"
++
++/*
++ * Debugging macros
++ */
++
++#define DEBUG_FLOW   0x0001
++#define DEBUG_STAT   0x0002
++
++#define DEBUG_MASK   0x0000
++
++#if (DEBUG_MASK != 0)
++#define d_printk(str...)  printk(str)
++#else
++#define d_printk(str...)	/* nothing */
++#endif
++
++#if ((DEBUG_MASK & DEBUG_FLOW) != 0)
++#define func_enter()      printk("xspi: enter %s\n", __FUNCTION__)
++#define func_exit()       printk("xspi: exit  %s\n", __FUNCTION__)
++#else
++#define func_enter()
++#define func_exit()
++#endif
++
++/* These options are always set by the driver. */
++#define XSPI_DEFAULT_OPTIONS	(XSP_MASTER_OPTION | XSP_MANUAL_SSELECT_OPTION)
++/* These options can be changed by the user. */
++#define XSPI_CHANGEABLE_OPTIONS	(XSP_CLK_ACTIVE_LOW_OPTION | XSP_CLK_PHASE_1_OPTION \
++				| XSP_LOOPBACK_OPTION)
++
++/* Our private per interface data. */
++struct xspi_instance {
++	u32 phys_addr;			/* Saved physical base address */
++	ulong remap_size;
++	u32 device_id;
++	unsigned int irq;		/* device IRQ number */
++	wait_queue_head_t waitq;	/* For those waiting until SPI is busy */
++	struct semaphore sem;
++	int use_count;
++
++	struct cdev cdev;		/* Char device structure */
++
++	/* The flag ISR uses to tell the transfer completion status
++	 * (the values are defined in "xstatus.h"; set to 0 before the transfer) */
++	int completion_status;
++	/* The actual number of bytes transferred */
++	int tx_count;
++
++	/* The object used by Xilinx OS independent code */
++	XSpi Spi;
++};
++
++/*******************************************************************************
++ * This configuration stuff should become unnecessary after EDK version 8.x is
++ * released.
++ ******************************************************************************/
++
++static DECLARE_MUTEX(cfg_sem);
++static XSpi_Config * p_xspi_cfg;
++
++/*
++ * Lookup the device configuration based on the unique device ID.
++ * Prototyped in xspi.h.
++ * We rely on that p_xspi_cfg is set properly right before XSpi_Initialize()
++ * calls XSpi_LookupConfig().
++ */
++XSpi_Config * XSpi_LookupConfig(u16 DeviceId)
++{
++	return p_xspi_cfg;
++}
++
++static XStatus XSpi_CfgInitialize(XSpi * InstancePtr,
++				  XSpi_Config * CfgPtr)
++{
++	XStatus retval;
++
++	down(&cfg_sem);
++	p_xspi_cfg = CfgPtr;
++	retval = XSpi_Initialize(InstancePtr, 0);
++	up(&cfg_sem);
++
++	return retval;
++}
++
++static int convert_status(XStatus status)
++{
++	switch (status) {
++	case XST_SUCCESS:
++		return 0;
++	case XST_DEVICE_NOT_FOUND:
++		return -ENODEV;
++	case XST_DEVICE_BUSY:
++		return -EBUSY;
++	default:
++		return -EIO;
++	}
++}
++
++/*
++ * Simple function that hands an interrupt to the Xilinx code.
++ * dev_id contains a pointer to proper XSpi instance.
++ */
++static irqreturn_t xspi_isr(int irq, void *dev_id, struct pt_regs *regs)
++{
++	XSpi_InterruptHandler((XSpi *) dev_id);
++	return IRQ_HANDLED;
++}
++
++/*
++ * This function is called back from the XSpi interrupt handler
++ * when one of the following status events occures:
++ * 	XST_SPI_TRANSFER_DONE - the requested data transfer is done,
++ * 	XST_SPI_RECEIVE_OVERRUN - Rx FIFO overrun, transmission continues,
++ * 	XST_SPI_MODE_FAULT - should not happen: the driver doesn't support multiple masters,
++ * 	XST_SPI_TRANSMIT_UNDERRUN,
++ * 	XST_SPI_SLAVE_MODE_FAULT - should not happen: the driver doesn't support slave mode.
++ */
++static void xspi_status_handler(void *CallBackRef, u32 StatusEvent,
++				unsigned int ByteCount)
++{
++	struct xspi_instance *dev = (struct xspi_instance *) CallBackRef;
++
++	dev->completion_status = StatusEvent;
++
++	if (StatusEvent == XST_SPI_TRANSFER_DONE) {
++		dev->tx_count = (int) ByteCount;
++		wake_up_interruptible(&dev->waitq);
++	} else if (StatusEvent == XST_SPI_RECEIVE_OVERRUN) {
++		/* As both Rx and Tx FIFO have the same sizes
++		   this should not happen in master mode.
++		   That is why we consider Rx overrun as severe error
++		   and abort the transfer */
++		dev->tx_count = (int) ByteCount;
++		XSpi_Abort(&dev->Spi);
++		wake_up_interruptible(&dev->waitq);
++		printk(KERN_ERR XSPI_NAME " %d: Rx overrun!!!.\n",
++		       dev->device_id);
++	} else if (StatusEvent == XST_SPI_MODE_FAULT) {
++		wake_up_interruptible(&dev->waitq);
++	} else {
++		printk(KERN_ERR XSPI_NAME " %d: Invalid status event %u.\n",
++		       dev->device_id, StatusEvent);
++	}
++}
++
++/*
++ * To be called from xspi_ioctl(), xspi_read(), and xspi_write().
++ *
++ * xspi_ioctl() uses both wr_buf and rd_buf.
++ * xspi_read() doesn't care of what is sent, and sets wr_buf to NULL.
++ * xspi_write() doesn't care of what it receives, and sets rd_buf to NULL.
++ *
++ * Set slave_ind to negative value if the currently selected SPI slave
++ * device is to be used.
++ *
++ * Returns the number of bytes transferred (0 or positive value)
++ * or error code (negative value).
++ */
++static int xspi_transfer(struct xspi_instance *dev, const char *wr_buf,
++			 char *rd_buf, int count, int slave_ind)
++{
++	int retval;
++	unsigned char *tmp_buf;
++
++	if (count <= 0)
++		return 0;
++
++	/* Limit the count value to the small enough one.
++	   This prevents a denial-of-service attack by using huge count values
++	   thus making everything to be swapped out to free the space
++	   for this huge buffer */
++	if (count > 8192)
++		count = 8192;
++
++	/* Allocate buffer in the kernel space (it is first filled with
++	   the data to send, then these data are overwritten with the
++	   received data) */
++	tmp_buf = kmalloc(count, GFP_KERNEL);
++	if (tmp_buf == NULL)
++		return -ENOMEM;
++
++	/* Fill the buffer with data to send */
++	if (wr_buf == NULL) {
++		/* zero the buffer not to expose the kernel data */
++		memset(tmp_buf, 0, count);
++	} else {
++		if (copy_from_user(tmp_buf, wr_buf, count) != 0) {
++			kfree(tmp_buf);
++			return -EFAULT;
++		}
++	}
++
++	/* Lock the device */
++	if (down_interruptible(&dev->sem)) {
++		kfree(tmp_buf);
++		return -ERESTARTSYS;
++	}
++
++	/* The while cycle below never loops - this is just a convenient
++	   way to handle the errors */
++	while (TRUE) {
++		/* Select the proper slave if requested to do so */
++		if (slave_ind >= 0) {
++			retval =
++			    convert_status(XSpi_SetSlaveSelect
++					   (&dev->Spi,
++					    0x00000001 << slave_ind));
++			if (retval != 0)
++				break;
++		}
++
++		/* Initiate transfer */
++		dev->completion_status = 0;
++		retval = convert_status(XSpi_Transfer(&dev->Spi, tmp_buf,
++						      (rd_buf ==
++						       NULL) ? NULL : tmp_buf,
++						      count));
++		if (retval != 0)
++			break;
++
++		/* Put the process to sleep */
++		if (wait_event_interruptible(dev->waitq,
++					     dev->completion_status != 0) !=
++		    0) {
++			/* ... woken up by the signal */
++			retval = -ERESTARTSYS;
++			break;
++		}
++		/* ... woken up by the transfer completed interrupt */
++		if (dev->completion_status != XST_SPI_TRANSFER_DONE) {
++			retval = -EIO;
++			break;
++		}
++
++		/* Copy the received data to user if rd_buf != NULL */
++		if (rd_buf != NULL &&
++		    copy_to_user(rd_buf, tmp_buf, dev->tx_count) != 0) {
++			retval = -EFAULT;
++			break;
++		}
++
++		retval = dev->tx_count;
++		break;
++	}			/* while(TRUE) */
++
++	/* Unlock the device, free the buffer and return */
++	up(&dev->sem);
++	kfree(tmp_buf);
++	return retval;
++}
++
++static int
++xspi_ioctl(struct inode *inode, struct file *filp,
++	   unsigned int cmd, unsigned long arg)
++{
++	struct xspi_instance *dev = filp->private_data;
++
++	/* paranoia check */
++	if (!dev)
++		return -ENODEV;
++
++	switch (cmd) {
++	case XSPI_IOC_GETSLAVESELECT:
++		{
++			int i;
++
++			i = ffs(XSpi_GetSlaveSelect(&dev->Spi)) - 1;
++			return put_user(i, (int *) arg);	/* -1 means nothing selected */
++		}
++		break;
++	case XSPI_IOC_SETSLAVESELECT:
++		{
++			int i;
++			int retval;
++
++			if (get_user(i, (int *) arg) != 0)
++				return -EFAULT;
++
++			if (i < -1 || i > 31)
++				return -EINVAL;
++
++			/* Lock the device. */
++			if (down_interruptible(&dev->sem))
++				return -ERESTARTSYS;
++
++			if (i == -1)
++				retval =
++				    convert_status(XSpi_SetSlaveSelect
++						   (&dev->Spi, 0));
++			else
++				retval =
++				    convert_status(XSpi_SetSlaveSelect
++						   (&dev->Spi, (u32) 1 << i));
++
++			/* Unlock the device. */
++			up(&dev->sem);
++
++			return retval;
++		}
++		break;
++	case XSPI_IOC_GETOPTS:
++		{
++			struct xspi_ioc_options xspi_opts;
++			u32 xspi_options;
++
++			xspi_options = XSpi_GetOptions(&dev->Spi);
++
++			memset(&xspi_opts, 0, sizeof (xspi_opts));
++			if (dev->Spi.HasFifos)
++				xspi_opts.has_fifo = 1;
++			if (xspi_options & XSP_CLK_ACTIVE_LOW_OPTION)
++				xspi_opts.clk_level = 1;
++			if (xspi_options & XSP_CLK_PHASE_1_OPTION)
++				xspi_opts.clk_phase = 1;
++			if (xspi_options & XSP_LOOPBACK_OPTION)
++				xspi_opts.loopback = 1;
++			xspi_opts.slave_selects = dev->Spi.NumSlaveBits;
++
++			return put_user(xspi_opts,
++					(struct xspi_ioc_options *) arg);
++		}
++		break;
++	case XSPI_IOC_SETOPTS:
++		{
++			struct xspi_ioc_options xspi_opts;
++			u32 xspi_options;
++			int retval;
++
++			if (copy_from_user(&xspi_opts,
++					   (struct xspi_ioc_options *) arg,
++					   sizeof (struct xspi_ioc_options)) !=
++			    0)
++				return -EFAULT;
++
++			/* Lock the device. */
++			if (down_interruptible(&dev->sem))
++				return -ERESTARTSYS;
++
++			/* Read current settings and set the changeable ones. */
++			xspi_options = XSpi_GetOptions(&dev->Spi)
++			    & ~XSPI_CHANGEABLE_OPTIONS;
++			if (xspi_opts.clk_level != 0)
++				xspi_options |= XSP_CLK_ACTIVE_LOW_OPTION;
++			if (xspi_opts.clk_phase != 0)
++				xspi_options |= XSP_CLK_PHASE_1_OPTION;
++			if (xspi_opts.loopback != 0)
++				xspi_options |= XSP_LOOPBACK_OPTION;
++
++			retval =
++			    convert_status(XSpi_SetOptions
++					   (&dev->Spi, xspi_options));
++
++			/* Unlock the device. */
++			up(&dev->sem);
++
++			return retval;
++		}
++		break;
++	case XSPI_IOC_TRANSFER:
++		{
++			struct xspi_ioc_transfer_data trans_data;
++			int retval;
++
++			if (copy_from_user(&trans_data,
++					   (struct xspi_ioc_transfer_data *)
++					   arg,
++					   sizeof (struct
++						   xspi_ioc_transfer_data)) !=
++			    0)
++				return -EFAULT;
++
++			/* Transfer the data. */
++			retval = xspi_transfer(dev, trans_data.write_buf,
++					       trans_data.read_buf,
++					       trans_data.count,
++					       trans_data.slave_index);
++			if (retval > 0)
++				return 0;
++			else
++				return retval;
++		}
++		break;
++	default:
++		return -ENOTTY;	/* redundant */
++	}			/* switch(cmd) */
++
++	return -ENOTTY;
++}
++
++static ssize_t
++xspi_read(struct file *filp, char *buf, size_t count, loff_t * not_used)
++{
++	struct xspi_instance *dev = filp->private_data;
++
++	/* Set the 2nd arg to NULL to indicate we don't care what to send;
++	   set the last arg to -1 to talk to the currently selected SPI
++	   slave */
++	return xspi_transfer(dev, NULL, buf, count, -1);
++}
++
++static ssize_t
++xspi_write(struct file *filp, const char *buf, size_t count, loff_t * not_used)
++{
++	struct xspi_instance *dev = filp->private_data;
++
++	/* Set the 3d arg to NULL to indicate we are not interested in
++	   the data read; set the last arg to -1 to talk to the currently
++	   selected SPI slave */
++	return xspi_transfer(dev, buf, NULL, count, -1);
++}
++
++static int
++xspi_open(struct inode *inode, struct file *filp)
++{
++	int retval = 0;
++	struct xspi_instance *dev;
++
++	func_enter();
++
++	dev = container_of(inode->i_cdev, struct xspi_instance, cdev);
++	filp->private_data = dev; /* for other methods */
++
++	if (dev == NULL)
++		return -ENODEV;
++
++	if (down_interruptible(&dev->sem))
++		return -EINTR;
++
++	while (dev->use_count++ == 0) {
++		/*
++		 * This was the first opener; we need  to get the IRQ,
++		 * and to setup the device as master.
++		 */
++		retval = request_irq(dev->irq, xspi_isr, 0, XSPI_NAME,
++				     &dev->Spi);
++		if (retval != 0) {
++			printk(KERN_ERR XSPI_NAME
++			       "%d: Could not allocate interrupt %d.\n",
++			       dev->device_id, dev->irq);
++			break;
++		}
++
++		if (XSpi_SetOptions(&dev->Spi, XSPI_DEFAULT_OPTIONS) !=
++		    XST_SUCCESS) {
++			printk(KERN_ERR XSPI_NAME
++			       "%d: Could not set device options.\n",
++			       dev->device_id);
++			free_irq(dev->irq, &dev->Spi);
++			retval = -EIO;
++			break;
++		}
++
++		if (XSpi_Start(&dev->Spi) != XST_SUCCESS) {
++			printk(KERN_ERR XSPI_NAME
++			       "%d: Could not start the device.\n",
++			       dev->device_id);
++			free_irq(dev->irq, &dev->Spi);
++			retval = -EIO;
++			break;
++		}
++
++		break;
++	}
++
++	if (retval != 0)
++		--dev->use_count;
++
++	up(&dev->sem);
++	return retval;
++}
++
++static int
++xspi_release(struct inode *inode, struct file *filp)
++{
++	struct xspi_instance *dev = filp->private_data;
++
++	func_enter();
++
++	if (down_interruptible(&dev->sem))
++		return -EINTR;
++
++	if (--dev->use_count == 0) {
++		/* This was the last closer: stop the device and free the IRQ */
++		if (wait_event_interruptible(dev->waitq,
++					     XSpi_Stop(&dev->Spi) !=
++					     XST_DEVICE_BUSY) != 0) {
++			/* Abort transfer by brute force */
++			XSpi_Abort(&dev->Spi);
++		}
++		disable_irq(dev->irq);
++		free_irq(dev->irq, &dev->Spi);
++	}
++
++	up(&dev->sem);
++	return 0;
++}
++
++struct file_operations xspi_fops = {
++      .open	= xspi_open,
++      .release	= xspi_release,
++      .read	= xspi_read,
++      .write	= xspi_write,
++      .ioctl	= xspi_ioctl,
++};
++
++static int __init check_spi_config(XSpi_Config * cfg)
++{
++	if (cfg->SlaveOnly || cfg->NumSlaveBits == 0)
++		return -1;
++	else
++		return 0;	/* the configuration is supported by this driver */
++}
++
++/******************************
++ * The platform device driver *
++ ******************************/
++
++static int xspi_probe(struct device *dev)
++{
++	dev_t devt;
++	XSpi_Config xspi_cfg;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct xspi_platform_data *pdata;
++	struct xspi_instance *inst;
++	struct resource *irq_res, *regs_res;
++	unsigned long remap_size;
++	int retval;
++
++	if (!dev)
++		return -EINVAL;
++
++	pdata = (struct xspi_platform_data *) pdev->dev.platform_data;
++	if (!pdata) {
++		printk(KERN_ERR XSPI_NAME " %d: Couldn't find platform data.\n",
++		       pdev->id);
++
++		return -ENODEV;
++	}
++
++	devt = MKDEV(xspi_major, xspi_minor + pdev->id);
++
++	inst = kzalloc(sizeof(struct xspi_instance), GFP_KERNEL);
++	if (!inst) {
++		printk(KERN_ERR XSPI_NAME " #%d: Could not allocate device.\n",
++		       pdev->id);
++		return -ENOMEM;
++	}
++	dev_set_drvdata(dev, (void *)inst);
++	init_MUTEX(&inst->sem);
++	init_waitqueue_head(&inst->waitq);
++
++	/* Find irq number, map the control registers in */
++
++	irq_res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	regs_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!regs_res || !irq_res) {
++		printk(KERN_ERR XSPI_NAME" #%d: IO resource(s) not found\n",
++		       pdev->id);
++		retval = -EFAULT;
++		goto failed1;
++	}
++	inst->irq = irq_res->start;
++
++	remap_size = regs_res->end - regs_res->start + 1;
++	if (!request_mem_region(regs_res->start, remap_size, XSPI_NAME)) {
++		printk(KERN_ERR XSPI_NAME
++		       " #%d: Couldn't lock memory region at 0x%08lX\n",
++		       pdev->id, regs_res->start);
++		retval = -EBUSY;
++		goto failed1;
++	}
++	inst->remap_size = remap_size;
++	inst->phys_addr = regs_res->start;
++	inst->device_id = pdev->id;
++	xspi_cfg.DeviceId = pdev->id;
++	xspi_cfg.HasFifos = (pdata->device_flags & XSPI_HAS_FIFOS) ? 1 : 0;
++	xspi_cfg.SlaveOnly = (pdata->device_flags & XSPI_SLAVE_ONLY) ? 1 : 0;
++	xspi_cfg.NumSlaveBits = pdata->num_slave_bits;
++
++	if(check_spi_config(&xspi_cfg)) {
++		printk(KERN_ERR XSPI_NAME
++		       " #%d: Unsupported hardware configuration\n", pdev->id);
++		retval = -ENODEV;
++		goto failed1;
++	}
++
++	xspi_cfg.BaseAddress = (u32) ioremap(regs_res->start, remap_size);
++	if (xspi_cfg.BaseAddress == 0) {
++		printk(KERN_ERR XSPI_NAME
++		       " #%d: Couldn't ioremap memory at 0x%08lX\n",
++		       pdev->id, regs_res->start);
++		retval = -EFAULT;
++		goto failed2;
++	}
++
++	/* Tell the Xilinx code to bring this SPI interface up. */
++	if (XSpi_CfgInitialize(&inst->Spi, &xspi_cfg) != XST_SUCCESS) {
++		printk(KERN_ERR XSPI_NAME " #%d: Could not initialize device.\n",
++		       pdev->id);
++		retval = -ENODEV;
++		goto failed3;
++	}
++
++	/* Set interrupt callback */
++	XSpi_SetStatusHandler(&inst->Spi, inst, xspi_status_handler);
++	/* request_irq() is done in open() */
++
++	cdev_init(&inst->cdev, &xspi_fops);
++	inst->cdev.owner = THIS_MODULE;
++	retval = cdev_add(&inst->cdev, devt, 1);
++	if (retval) {
++		printk(KERN_ERR XSPI_NAME " #%d: cdev_add() failed\n",
++		       pdev->id);
++		goto failed3;
++	}
++
++	printk(KERN_INFO XSPI_NAME
++	       " %d: at 0x%08X mapped to 0x%08X, irq=%d\n",
++	       pdev->id, inst->phys_addr, inst->Spi.BaseAddr, inst->irq);
++
++	return 0;	/* success */
++
++failed3:
++	iounmap((void *) (xspi_cfg.BaseAddress));
++
++failed2:
++	release_mem_region(regs_res->start, remap_size);
++
++failed1:
++	kfree(inst);
++
++	return retval;
++}
++
++static int xspi_remove(struct device *dev)
++{
++	struct xspi_instance *inst;
++
++	if (!dev)
++		return -EINVAL;
++
++	inst = (struct xspi_data *) dev_get_drvdata(dev);
++
++	cdev_del(&inst->cdev);
++	iounmap((void *) (inst->Spi.BaseAddr));
++	release_mem_region(inst->phys_addr, inst->remap_size);
++	kfree(inst);
++	dev_set_drvdata(dev, NULL);
++
++	return 0;	/* success */
++}
++
++static struct device_driver xspi_driver = {
++	.name		= XSPI_NAME,
++	.bus		= &platform_bus_type,
++	.probe		= xspi_probe,
++	.remove		= xspi_remove
++};
++
++static int __init xspi_init(void)
++{
++	dev_t devt;
++	int retval;
++
++	if (xspi_major) {
++		devt = MKDEV(xspi_major, xspi_minor);
++		retval = register_chrdev_region(devt, xspi_no_minors,
++						XSPI_NAME);
++	} else {
++		retval = alloc_chrdev_region(&devt, xspi_minor, xspi_no_minors,
++					     XSPI_NAME);
++		xspi_major = MAJOR(devt);
++	}
++	if (retval < 0) {
++		xspi_major = 0;
++		return retval;
++	}
++
++	retval = driver_register(&xspi_driver);
++	if (retval) {
++		unregister_chrdev_region(devt, xspi_no_minors);
++	}
++
++	return retval;
++}
++
++static void __exit xspi_cleanup(void)
++{
++	dev_t devt = MKDEV(xspi_major, xspi_minor);
++
++	driver_unregister(&xspi_driver);
++	unregister_chrdev_region(devt, xspi_no_minors);
++}
++
++module_init(xspi_init);
++module_exit(xspi_cleanup);
++
++MODULE_AUTHOR("MontaVista Software, Inc. <source@mvista.com>");
++MODULE_DESCRIPTION("Xilinx SPI driver");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/char/xilinx_spi/xspi_ioctl.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_spi/xspi_ioctl.h
+@@ -0,0 +1,46 @@
++/*
++ * xspi_ioctl.h
++ *
++ * ioctl numbers for Xilinx SPI driver
++ *
++ * Author: MontaVista Software, Inc.
++ *         akonovalov@ru.mvista.com, or source@mvista.com
++ *
++ * 2004 (c) MontaVista, Software, Inc.  This file is licensed under the terms
++ * of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#ifndef _XSPI_IOCTL_H
++#define _XSPI_IOCTL_H
++
++#include <linux/ioctl.h>
++
++/* All the SPI options including the readonly ones (labeled RO) */
++struct xspi_ioc_options {
++	unsigned int has_fifo:1;	/* RO: 1 == has FIFO, 0 == no FIFO */
++	unsigned int clk_level:1;	/* RW: 0 == SCK idles low */
++	unsigned int clk_phase:1;	/* RW: 0 == data is valid on the 1st SCK edge */
++	unsigned int loopback:1;	/* RW: 0 == loopback is OFF */
++	unsigned int slave_selects:8;	/* RO: the number of slave selects */
++};
++
++struct xspi_ioc_transfer_data {
++	int slave_index;
++	const char *write_buf;
++	char *read_buf;
++	int count;
++};
++
++#define XSPI_IOC_MAGIC	0xAA
++
++#define XSPI_IOC_MINNR	0xF0
++#define XSPI_IOC_MAXNR	0xF4
++
++#define XSPI_IOC_GETOPTS	_IOR(XSPI_IOC_MAGIC, 0xF0, struct xspi_ioc_options)
++#define XSPI_IOC_SETOPTS	_IOW(XSPI_IOC_MAGIC, 0xF1, struct xspi_ioc_options)
++#define XSPI_IOC_GETSLAVESELECT	_IOR(XSPI_IOC_MAGIC, 0xF2, int)
++#define XSPI_IOC_SETSLAVESELECT _IOW(XSPI_IOC_MAGIC, 0xF3, int)
++#define XSPI_IOC_TRANSFER	_IOWR(XSPI_IOC_MAGIC, 0xF4, struct xspi_ioc_transfer_data)
++
++#endif				/* #ifndef _XSPI_IOCTL_H */
+Index: linux-2.6.10/include/linux/xilinx_devices.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/xilinx_devices.h
++++ linux-2.6.10/include/linux/xilinx_devices.h
+@@ -62,5 +62,16 @@ struct xtemac_platform_data {
+ #define XTEMAC_DMA_SIMPLE	2	/* simple 2 channel DMA */
+ #define XTEMAC_DMA_SGDMA	3	/* scatter gather DMA */
+ 
++/*- SPI -*/
++
++struct xspi_platform_data {
++	u32 device_flags;
++	u8 num_slave_bits;
++};
++
++/* Flags related to XSPI device features */
++#define XSPI_HAS_FIFOS		0x00000001
++#define XSPI_SLAVE_ONLY		0x00000002
++
+ #endif /* _XILINX_DEVICE_H_ */
+ #endif /* __KERNEL__ */
+Index: linux-2.6.10/mvl_patches/pro-0361.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0361.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(361);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

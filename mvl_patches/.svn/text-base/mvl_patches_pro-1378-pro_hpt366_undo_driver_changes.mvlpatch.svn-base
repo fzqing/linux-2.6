@@ -1,0 +1,1342 @@
+#! /usr/bin/env bash
+# Patch: -pro_hpt366_undo_driver_changes
+# Date: Mon Nov 26 16:54:37 2007
+# Source: MontaVista Software, Inc.
+# MR: 14142
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Description:
+# Back up the temporary HighPoint HPT36x/37x driver patch in order to replace it
+# with the series of the community accepted patches...
+# 
+#  drivers/ide/pci/hpt366.c |  560 ++++++++++++++++++++---------------------------
+#  drivers/ide/pci/hpt366.h |  176 +++-----------
+#  2 files changed, 293 insertions(+), 443 deletions(-)
+# 
+
+PATCHNUM=1378
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14142
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Description:
+Back up the temporary HighPoint HPT36x/37x driver patch in order to replace it
+with the series of the community accepted patches...
+
+ drivers/ide/pci/hpt366.c |  560 ++++++++++++++++++++---------------------------
+ drivers/ide/pci/hpt366.h |  176 +++-----------
+ mvl_patches/pro-1378.c   |   16 +
+ 3 files changed, 309 insertions(+), 443 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/hpt366.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.c
++++ linux-2.6.10/drivers/ide/pci/hpt366.c
+@@ -4,7 +4,6 @@
+  * Copyright (C) 1999-2003		Andre Hedrick <andre@linux-ide.org>
+  * Portions Copyright (C) 2001	        Sun Microsystems, Inc.
+  * Portions Copyright (C) 2003		Red Hat Inc
+- * Portions Copyright (C) 2005-2006	MontaVista Software, Inc.
+  *
+  * Thanks to HighPoint Technologies for their assistance, and hardware.
+  * Special Thanks to Jon Burchmore in SanDiego for the deep pockets, his
+@@ -48,12 +47,6 @@
+  * keeping me sane. 
+  *		Alan Cox <alan@redhat.com>
+  *
+- * Rewrote the driver to correctly recognize all known HighPoint chips and their
+- * default DPLL clocks (thanks to Alan Cox for publishing them!), generalizing
+- * the PCI clock detection code; added 66 MHz clock table for HPT3xxN chips and
+- * extended HPT372N clock switching trickery to HPT302N...
+- *	<source@mvista.com>
+- *
+  */
+ 
+ 
+@@ -153,31 +146,23 @@ static u8 hpt3xx_ratemask (ide_drive_t *
+ 	struct pci_dev *dev	= HWIF(drive)->pci_dev;
+ 	u8 mode			= 0;
+ 
+-	switch (hpt_revision(dev)) {
+-		case 8:	/* HPT374 */
+-			mode = 3;
+-			break;
+-		case 7: /* HPT371 */
+-			mode = (HPT371_ALLOW_ATA133_6) ? 4 : 3;
+-			break;
+-		case 6:	/* HPT302 */
+-			mode = (HPT302_ALLOW_ATA133_6) ? 4 : 3;
+-			break;
+-		case 5:	/* HPT372 */
+-			mode = (HPT372_ALLOW_ATA133_6) ? 4 : 3;
+-			break;
+-		case 4: /* HPT370A */
+-			mode = (HPT370_ALLOW_ATA100_5) ? 3 : 2;
+-			break;
+-		case 3: /* HPT370 */
+-			mode = (HPT370_ALLOW_ATA100_5) ? 3 : 2;
+-			mode = (check_in_drive_lists(drive, bad_ata33)) ? 0 : mode;
+-			break;
+-		default: /* HPT366 and HPT368 */
+-			mode = (check_in_drive_lists(drive, bad_ata33)) ? 0 : 2;
+-			break;
++	if (hpt_minimum_revision(dev, 8)) {		/* HPT374 */
++		mode = (HPT374_ALLOW_ATA133_6) ? 4 : 3;
++	} else if (hpt_minimum_revision(dev, 7)) {	/* HPT371 */
++		mode = (HPT371_ALLOW_ATA133_6) ? 4 : 3;
++	} else if (hpt_minimum_revision(dev, 6)) {	/* HPT302 */
++		mode = (HPT302_ALLOW_ATA133_6) ? 4 : 3;
++	} else if (hpt_minimum_revision(dev, 5)) {	/* HPT372 */
++		mode = (HPT372_ALLOW_ATA133_6) ? 4 : 3;
++	} else if (hpt_minimum_revision(dev, 4)) {	/* HPT370A */
++		mode = (HPT370_ALLOW_ATA100_5) ? 3 : 2;
++	} else if (hpt_minimum_revision(dev, 3)) {	/* HPT370 */
++		mode = (HPT370_ALLOW_ATA100_5) ? 3 : 2;
++		mode = (check_in_drive_lists(drive, bad_ata33)) ? 0 : mode;
++	} else {				/* HPT366 and HPT368 */
++		mode = (check_in_drive_lists(drive, bad_ata33)) ? 0 : 2;
+ 	}
+-	if (!eighty_ninty_three(drive) && mode)
++	if (!eighty_ninty_three(drive) && (mode))
+ 		mode = min(mode, (u8)1);
+ 	return mode;
+ }
+@@ -195,7 +180,7 @@ static u8 hpt3xx_ratefilter (ide_drive_t
+ 	if (drive->media != ide_disk)
+ 		return min(speed, (u8)XFER_PIO_4);
+ 
+-	switch (mode) {
++	switch(mode) {
+ 		case 0x04:
+ 			speed = min(speed, (u8)XFER_UDMA_6);
+ 			break;
+@@ -312,7 +297,7 @@ static int hpt370_tune_chipset(ide_drive
+ 	u8 drive_pci	= 0x40 + (drive->dn * 4);
+ 	u8 new_fast	= 0, drive_fast = 0;
+ 	u32 list_conf	= 0, drive_conf = 0;
+-	u32 conf_mask	= (speed >= XFER_MW_DMA_0) ? 0xc0000000 : 0x301c0000;
++	u32 conf_mask	= (speed >= XFER_MW_DMA_0) ? 0xc0000000 : 0x30070000;
+ 
+ 	/*
+ 	 * Disable the "fast interrupt" prediction.
+@@ -357,7 +342,7 @@ static int hpt372_tune_chipset(ide_drive
+ 	u8 regfast	= (HWIF(drive)->channel) ? 0x55 : 0x51;
+ 	u8 drive_fast	= 0, drive_pci = 0x40 + (drive->dn * 4);
+ 	u32 list_conf	= 0, drive_conf = 0;
+-	u32 conf_mask	= (speed >= XFER_MW_DMA_0) ? 0xc0000000 : 0x301c0000;
++	u32 conf_mask	= (speed >= XFER_MW_DMA_0) ? 0xc0000000 : 0x30070000;
+ 
+ 	/*
+ 	 * Disable the "fast interrupt" prediction.
+@@ -366,7 +351,7 @@ static int hpt372_tune_chipset(ide_drive
+ 	pci_read_config_byte(dev, regfast, &drive_fast);
+ 	drive_fast &= ~0x07;
+ 	pci_write_config_byte(dev, regfast, drive_fast);
+-
++					
+ 	list_conf = pci_bus_clock_list(speed,
+ 			(struct chipset_bus_clock_list_entry *)
+ 					pci_get_drvdata(dev));
+@@ -379,16 +364,36 @@ static int hpt372_tune_chipset(ide_drive
+ 	return ide_config_drive_speed(drive, speed);
+ }
+ 
++static int hpt3xx_tune_chipset (ide_drive_t *drive, u8 speed)
++{
++	struct pci_dev *dev	= HWIF(drive)->pci_dev;
++
++	if (hpt_minimum_revision(dev, 8))
++		return hpt372_tune_chipset(drive, speed); /* not a typo */
++#if 0
++	else if (hpt_minimum_revision(dev, 7))
++		hpt371_tune_chipset(drive, speed);
++	else if (hpt_minimum_revision(dev, 6))
++		hpt302_tune_chipset(drive, speed);
++#endif
++	else if (hpt_minimum_revision(dev, 5))
++		return hpt372_tune_chipset(drive, speed);
++	else if (hpt_minimum_revision(dev, 3))
++		return hpt370_tune_chipset(drive, speed);
++	else	/* hpt368: hpt_minimum_revision(dev, 2) */
++		return hpt36x_tune_chipset(drive, speed);
++}
++
+ static void hpt3xx_tune_drive (ide_drive_t *drive, u8 pio)
+ {
+ 	pio = ide_get_best_pio_mode(drive, 255, pio, NULL);
+-	(void) HWIF(drive)->speedproc(drive, XFER_PIO_0 + pio);
++	(void) hpt3xx_tune_chipset(drive, (XFER_PIO_0 + pio));
+ }
+ 
+ /*
+  * This allows the configuration of ide_pci chipset registers
+  * for cards that learn about the drive's UDMA, DMA, PIO capabilities
+- * after the drive is reported by the OS.  Initially designed for
++ * after the drive is reported by the OS.  Initially for designed for
+  * HPT366 UDMA chipset by HighPoint|Triones Technologies, Inc.
+  *
+  * check_in_drive_lists(drive, bad_ata66_4)
+@@ -400,10 +405,10 @@ static int config_chipset_for_dma (ide_d
+ {
+ 	u8 speed = ide_dma_speed(drive, hpt3xx_ratemask(drive));
+ 
+-	if (!speed)
++	if (!(speed))
+ 		return 0;
+ 
+-	(void) HWIF(drive)->speedproc(drive, speed);
++	(void) hpt3xx_tune_chipset(drive, speed);
+ 	return ide_dma_enable(drive);
+ }
+ 
+@@ -604,15 +609,15 @@ static int hpt374_ide_dma_end (ide_drive
+ }
+ 
+ /**
+- *	hpt3x2n_set_clock	-	perform clock switching dance
++ *	hpt372n_set_clock	-	perform clock switching dance
+  *	@drive: Drive to switch
+  *	@mode: Switching mode (0x21 for write, 0x23 otherwise)
+  *
+- *	Switch the DPLL clock on the HPT302N/372N devices. This is a
++ *	Switch the DPLL clock on the HPT372N devices. This is a
+  *	right mess.
+  */
+  
+-static void hpt3x2n_set_clock(ide_drive_t *drive, int mode)
++static void hpt372n_set_clock(ide_drive_t *drive, int mode)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
+ 	
+@@ -638,18 +643,18 @@ static void hpt3x2n_set_clock(ide_drive_
+ }
+ 
+ /**
+- *	hpt3x2n_rw_disk		-	wrapper for I/O
++ *	hpt372n_rw_disk		-	wrapper for I/O
+  *	@drive: drive for command
+  *	@rq: block request structure
+  *	@block: block number
+  *
+- *	This is called when a disk I/O is issued to HPT302N/372N instead
++ *	This is called when a disk I/O is issued to the 372N instead
+  *	of the default functionality. We need it because of the clock
+  *	switching
+  *
+  */
+  
+-static ide_startstop_t hpt3x2n_rw_disk(ide_drive_t *drive, struct request *rq, sector_t block)
++static ide_startstop_t hpt372n_rw_disk(ide_drive_t *drive, struct request *rq, sector_t block)
+ {
+ 	int wantclock;
+ 	
+@@ -660,7 +665,7 @@ static ide_startstop_t hpt3x2n_rw_disk(i
+ 		
+ 	if(HWIF(drive)->config_data != wantclock)
+ 	{
+-		hpt3x2n_set_clock(drive, wantclock);
++		hpt372n_set_clock(drive, wantclock);
+ 		HWIF(drive)->config_data = wantclock;
+ 	}
+ 	return __ide_do_rw_disk(drive, rq, block);
+@@ -775,159 +780,184 @@ static int hpt370_busproc(ide_drive_t * 
+ 	return 0;
+ }
+ 
+-/**
+- *	hpt37x_calibrate_dpll	-	calibrate the DPLL
+- *	@dev: PCI device
+- *
+- *	Perform a calibration cycle on the DPLL.
+- *	Returns 1 if this succeeds
+- */
+-static int __devinit hpt37x_calibrate_dpll(struct pci_dev *dev, u16 f_low, u16 f_high)
++static int __devinit init_hpt37x(struct pci_dev *dev)
+ {
+-	u32 dpll = (f_high << 16) | f_low | 0x100;
+-	u8  sctl2;
+-	int i;
+-
+-	pci_write_config_dword(dev, 0x5c, dpll);
+-
+-	/* Wait for oscillator ready */
+-	for(i = 0; i < 0x5000; ++i) {
+-		udelay(50);
+-		pci_read_config_byte(dev, 0x5b, &sctl2);
+-		if (sctl2 & 0x80)
+-			break;
+-	}
+-	/* See if it stays ready (we'll just bail out if it's not yet) */
+-	for(i = 0; i < 0x1000; ++i) {
+-		pci_read_config_byte(dev, 0x5b, &sctl2);
+-		/* DPLL destabilized? */
+-		if(!(sctl2 & 0x80))
+-			return 0;
++	int adjust, i;
++	u16 freq;
++	u32 pll;
++	u8 reg5bh;
++	u8 reg5ah = 0;
++	unsigned long dmabase = pci_resource_start(dev, 4);
++	u8 did, rid;	
++	int is_372n = 0;
++	
++	pci_read_config_byte(dev, 0x5a, &reg5ah);
++	/* interrupt force enable */
++	pci_write_config_byte(dev, 0x5a, (reg5ah & ~0x10));
++
++	if(dmabase)
++	{
++		did = inb(dmabase + 0x22);
++		rid = inb(dmabase + 0x28);
++	
++		if((did == 4 && rid == 6) || (did == 5 && rid > 1))
++			is_372n = 1;
+ 	}
+-	/* Turn off tuning, we have the DPLL set */
+-	pci_read_config_dword(dev, 0x5c, &dpll);
+-	pci_write_config_dword(dev, 0x5c, dpll & ~0x100);
+-	return 1;
+-}
+-
+-static int __devinit init_hpt37x(struct pci_dev *dev, const char *name)
+-{
+-	u32 temp;
+-	u16 f_cnt;
+-	u8  sctl1 = 0;
+-	struct chipset_bus_clock_list_entry *timings;
+-	struct hpt_clock_info *info = pci_get_drvdata(dev);
+-	u16 pci_clk, dpll_clk = info->default_dpll; /* MHz */
+-
+-	/* Interrupt force enable */
+-	pci_read_config_byte (dev, 0x5a, &sctl1);
+-	pci_write_config_byte(dev, 0x5a, (sctl1 & ~0x10));
+ 
+ 	/*
+-	 * Default to PCI clock. Make sure MA15/16 are set to output
++	 * default to pci clock. make sure MA15/16 are set to output
+ 	 * to prevent drives having problems with 40-pin cables.
+ 	 */
+ 	pci_write_config_byte(dev, 0x5b, 0x23);
+ 
+ 	/*
+-	 * Now we'll have to read f_CNT value in order to determine
+-	 * the PCI clock frequency according to the following ratio:
++	 * set up the PLL. we need to adjust it so that it's stable. 
++	 * freq = Tpll * 192 / Tpci
+ 	 *
+-	 * f_CNT = Fpci * 192 / Fdpll
+-	 *
+-	 * First try reading the register where the HighPoint BIOS saves f_CNT
+-	 * value before reprogramming the DPLL from its default setting (which
+-	 * differs for the various chips).  In case the signature check fails,
+-	 * we resort to reading the f_CNT register itself in hopes that nobody
+-	 * has touched DPLL yet...
++	 * Todo. For non x86 should probably check the dword is
++	 * set to 0xABCDExxx indicating the BIOS saved f_CNT
+ 	 */
+-	pci_read_config_dword(dev, 0x70, &temp);
+-	if ((temp & 0xFFFFF000) == 0xABCDE000)
+-		f_cnt = temp & 0x1FF;
+-	else {
+-		printk(KERN_WARNING "%s: no clock data saved by BIOS...\n", name);
+-		pci_read_config_word(dev, 0x78, &f_cnt);
+-		f_cnt &= 0x1FF;
+-	}
+-
+-	pci_clk = (f_cnt * dpll_clk) / 192;
+-
+-	/* Clamp PCI clock to bands */
+-	if (pci_clk < 40) {
+-		pci_clk = 33;
+-		timings = info->timings[ATA_CLOCK_33MHZ];
+-	} else if (pci_clk < 45) {
+-		pci_clk = 40;
+-		timings = NULL; /* Unsupported */
+-	} else if (pci_clk < 55) {
+-		pci_clk = 50;
+-		timings = info->timings[ATA_CLOCK_50MHZ];
+-	} else {
+-		pci_clk = 66;
+-		timings = info->timings[ATA_CLOCK_66MHZ];
+-	}
+-
+-	printk(KERN_INFO "%s: DPLL base: %d MHz, f_CNT: %d, assuming %d MHz PCI\n",
+-	       name, dpll_clk, f_cnt, pci_clk);
+-
++	pci_read_config_word(dev, 0x78, &freq);
++	freq &= 0x1FF;
++	
+ 	/*
+-	 * Only try the DPLL if we don't have a table for the clock speed that
+-	 * we are running at... with the exception of HPT3xxN chips,  in which
+-	 * case the DPLL should always be used, not the PCI clock...
++	 * The 372N uses different PCI clock information and has
++	 * some other complications
++	 *	On PCI33 timing we must clock switch
++	 *	On PCI66 timing we must NOT use the PCI clock
+ 	 *
+-	 * NOTE: the internal PLL will result in slow reads when using 33 MHz
+-	 * PCI clock. We also don't like to use the PLL because it will cause
+-	 * glitches on PRST/SRST when the HPT state engine gets reset.
++	 * Currently we always set up the PLL for the 372N
+ 	 */
+-	if (dpll_clk == 77 || timings == NULL) {
+-		u16 f_low, delta = pci_clk < 50 ? 2 : 4;
+-		int adjust;
+-
+-		 /*
+-		  * HPT370/374 chips are UltraATA/100 only and
+-		  * have the default DPLL clock of 48 MHz...
+-		  */
+-		dpll_clk = dpll_clk == 48 ? 50 : 66;
+-
+-		timings  = info->timings[dpll_clk > 50 ?
+-					ATA_CLOCK_66MHZ : ATA_CLOCK_50MHZ];
+-
+-		/* Select PLL clock */
+-		pci_write_config_byte(dev, 0x5b, 0x21);
+-
+-		/*
+-		 * Adjust PLL based upon PCI clock, enable it, and wait for
+-		 * stabilization...
+-		 */
+-		f_low = (pci_clk * 48) / dpll_clk;
+-
+-		for (adjust = 0; adjust < 8; adjust++) {
+-			if(hpt37x_calibrate_dpll(dev, f_low, f_low + delta))
+-				break;
+-
+-			/*
+-			 * See if it'll settle at a fractionally different clock
+-			 */
+-			if (adjust & 1)
+-				f_low -= adjust >> 1;
++	 
++	pci_set_drvdata(dev, NULL);
++	
++	if(is_372n)
++	{
++		printk(KERN_INFO "hpt: HPT372N detected, using 372N timing.\n");
++		if(freq < 0x55)
++			pll = F_LOW_PCI_33;
++		else if(freq < 0x70)
++			pll = F_LOW_PCI_40;
++		else if(freq < 0x7F)
++			pll = F_LOW_PCI_50;
++		else
++			pll = F_LOW_PCI_66;
++			
++		printk(KERN_INFO "FREQ: %d PLL: %d\n", freq, pll);
++			
++		/* We always use the pll not the PCI clock on 372N */
++	}
++	else
++	{
++		if(freq < 0x9C)
++			pll = F_LOW_PCI_33;
++		else if(freq < 0xb0)
++			pll = F_LOW_PCI_40;
++		else if(freq <0xc8)
++			pll = F_LOW_PCI_50;
++		else
++			pll = F_LOW_PCI_66;
++	
++		if (pll == F_LOW_PCI_33) {
++			if (hpt_minimum_revision(dev,8))
++				pci_set_drvdata(dev, (void *) thirty_three_base_hpt374);
++			else if (hpt_minimum_revision(dev,5))
++				pci_set_drvdata(dev, (void *) thirty_three_base_hpt372);
++			else if (hpt_minimum_revision(dev,4))
++				pci_set_drvdata(dev, (void *) thirty_three_base_hpt370a);
+ 			else
+-				f_low += adjust >> 1;
+-		}
+-		if (adjust == 8) {
+-			printk(KERN_ERR "%s: DPLL did not stabilize!\n", name);
+-			return -EIO;
++				pci_set_drvdata(dev, (void *) thirty_three_base_hpt370);
++			printk("HPT37X: using 33MHz PCI clock\n");
++		} else if (pll == F_LOW_PCI_40) {
++			/* Unsupported */
++		} else if (pll == F_LOW_PCI_50) {
++			if (hpt_minimum_revision(dev,8))
++				pci_set_drvdata(dev, (void *) fifty_base_hpt370a);
++			else if (hpt_minimum_revision(dev,5))
++				pci_set_drvdata(dev, (void *) fifty_base_hpt372);
++			else if (hpt_minimum_revision(dev,4))
++				pci_set_drvdata(dev, (void *) fifty_base_hpt370a);
++			else
++				pci_set_drvdata(dev, (void *) fifty_base_hpt370a);
++			printk("HPT37X: using 50MHz PCI clock\n");
++		} else {
++			if (hpt_minimum_revision(dev,8))
++			{
++				printk(KERN_ERR "HPT37x: 66MHz timings are not supported.\n");
++			}
++			else if (hpt_minimum_revision(dev,5))
++				pci_set_drvdata(dev, (void *) sixty_six_base_hpt372);
++			else if (hpt_minimum_revision(dev,4))
++				pci_set_drvdata(dev, (void *) sixty_six_base_hpt370a);
++			else
++				pci_set_drvdata(dev, (void *) sixty_six_base_hpt370);
++			printk("HPT37X: using 66MHz PCI clock\n");
+ 		}
+-		printk("%s: using %d MHz internal DPLL\n", name, dpll_clk);
+ 	}
+-	else
+-		printk("%s: using %d MHz PCI clock\n", name, pci_clk);
+-
+-	pci_set_drvdata(dev, timings);
+-
++	
++	/*
++	 * only try the pll if we don't have a table for the clock
++	 * speed that we're running at. NOTE: the internal PLL will
++	 * result in slow reads when using a 33MHz PCI clock. we also
++	 * don't like to use the PLL because it will cause glitches
++	 * on PRST/SRST when the HPT state engine gets reset.
++	 */
++	if (pci_get_drvdata(dev)) 
++		goto init_hpt37X_done;
++	
++	/*
++	 * adjust PLL based upon PCI clock, enable it, and wait for
++	 * stabilization.
++	 */
++	adjust = 0;
++	freq = (pll < F_LOW_PCI_50) ? 2 : 4;
++	while (adjust++ < 6) {
++		pci_write_config_dword(dev, 0x5c, (freq + pll) << 16 |
++				       pll | 0x100);
++
++		/* wait for clock stabilization */
++		for (i = 0; i < 0x50000; i++) {
++			pci_read_config_byte(dev, 0x5b, &reg5bh);
++			if (reg5bh & 0x80) {
++				/* spin looking for the clock to destabilize */
++				for (i = 0; i < 0x1000; ++i) {
++					pci_read_config_byte(dev, 0x5b, 
++							     &reg5bh);
++					if ((reg5bh & 0x80) == 0)
++						goto pll_recal;
++				}
++				pci_read_config_dword(dev, 0x5c, &pll);
++				pci_write_config_dword(dev, 0x5c, 
++						       pll & ~0x100);
++				pci_write_config_byte(dev, 0x5b, 0x21);
++				if (hpt_minimum_revision(dev,8))
++					pci_set_drvdata(dev, (void *) fifty_base_hpt370a);
++				else if (hpt_minimum_revision(dev,5))
++					pci_set_drvdata(dev, (void *) fifty_base_hpt372);
++				else if (hpt_minimum_revision(dev,4))
++					pci_set_drvdata(dev, (void *) fifty_base_hpt370a);
++				else
++					pci_set_drvdata(dev, (void *) fifty_base_hpt370a);
++				printk("HPT37X: using 50MHz internal PLL\n");
++				goto init_hpt37X_done;
++			}
++		}
++pll_recal:
++		if (adjust & 1)
++			pll -= (adjust >> 1);
++		else
++			pll += (adjust >> 1);
++	} 
++
++init_hpt37X_done:
++	/* reset state engine */
++	pci_write_config_byte(dev, 0x50, 0x37); 
++	pci_write_config_byte(dev, 0x54, 0x37); 
++	udelay(100);
+ 	return 0;
+ }
+ 
+-static int __devinit init_hpt366(struct pci_dev *dev, const char *name)
++static int __devinit init_hpt366(struct pci_dev *dev)
+ {
+ 	u32 reg1	= 0;
+ 	u8 drive_fast	= 0;
+@@ -943,20 +973,20 @@ static int __devinit init_hpt366(struct 
+ 	/* detect bus speed by looking at control reg timing: */
+ 	switch((reg1 >> 8) & 7) {
+ 		case 5:
+-			pci_set_drvdata(dev, forty_base_hpt366);
++			pci_set_drvdata(dev, (void *) forty_base_hpt366);
+ 			break;
+ 		case 9:
+-			pci_set_drvdata(dev, twenty_five_base_hpt366);
++			pci_set_drvdata(dev, (void *) twenty_five_base_hpt366);
+ 			break;
+ 		case 7:
+ 		default:
+-			pci_set_drvdata(dev, thirty_three_base_hpt366);
++			pci_set_drvdata(dev, (void *) thirty_three_base_hpt366);
+ 			break;
+ 	}
+ 
+ 	if (!pci_get_drvdata(dev))
+ 	{
+-		printk(KERN_ERR "%s: unknown bus timing.\n", name);
++		printk(KERN_ERR "hpt366: unknown bus timing.\n");
+ 		pci_set_drvdata(dev, NULL);
+ 	}
+ 	return 0;
+@@ -989,9 +1019,9 @@ static unsigned int __devinit init_chips
+ 		pci_write_config_byte(dev, PCI_MAX_LAT, 0x08);
+ 
+ 	if (hpt_minimum_revision(dev, 3)) {
+-		ret = init_hpt37x(dev, name);
++		ret = init_hpt37x(dev);
+ 	} else {
+-		ret = init_hpt366(dev, name);
++		ret =init_hpt366(dev);
+ 	}
+ 	if (ret)
+ 		return ret;
+@@ -1002,35 +1032,35 @@ static unsigned int __devinit init_chips
+ static void __devinit init_hwif_hpt366(ide_hwif_t *hwif)
+ {
+ 	struct pci_dev *dev		= hwif->pci_dev;
+-	u8 revision			= hpt_revision(dev);
+ 	u8 ata66 = 0, regmask		= (hwif->channel) ? 0x01 : 0x02;
++	u8 did, rid;
++	unsigned long dmabase		= hwif->dma_base;
++	int is_372n = 0;
++	
++	if(dmabase)
++	{
++		did = inb(dmabase + 0x22);
++		rid = inb(dmabase + 0x28);
+ 	
++		if((did == 4 && rid == 6) || (did == 5 && rid > 1))
++			is_372n = 1;
++	}
++		
+ 	hwif->tuneproc			= &hpt3xx_tune_drive;
++	hwif->speedproc			= &hpt3xx_tune_chipset;
+ 	hwif->quirkproc			= &hpt3xx_quirkproc;
+ 	hwif->intrproc			= &hpt3xx_intrproc;
+ 	hwif->maskproc			= &hpt3xx_maskproc;
+ 	
+-	if (revision == 8)
+-		hwif->speedproc	= &hpt372_tune_chipset; /* not a typo */
+-#if 0
+-	else if (revision >= 7)
+-		hwif->speedproc	= &hpt371_tune_chipset;
+-	else if (revision >= 6)
+-		hwif->speedproc	= &hpt302_tune_chipset;
+-#endif
+-	else if (revision >= 5)
+-		hwif->speedproc	= &hpt372_tune_chipset;
+-	else if (revision >= 3)
+-		hwif->speedproc	= &hpt370_tune_chipset;
+-	else	/* hpt368: revision >= 2 */
+-		hwif->speedproc	= &hpt36x_tune_chipset;
++	if(is_372n)
++		hwif->rw_disk = &hpt372n_rw_disk;
+ 
+ 	/*
+ 	 * The HPT37x uses the CBLID pins as outputs for MA15/MA16
+ 	 * address lines to access an external eeprom.  To read valid
+ 	 * cable detect state the pins must be enabled as inputs.
+ 	 */
+-	if (revision >= 8 && PCI_FUNC(dev->devfn) & 1) {
++	if (hpt_minimum_revision(dev, 8) && PCI_FUNC(dev->devfn) & 1) {
+ 		/*
+ 		 * HPT374 PCI function 1
+ 		 * - set bit 15 of reg 0x52 to enable TCBLID as input
+@@ -1045,7 +1075,7 @@ static void __devinit init_hwif_hpt366(i
+ 		pci_read_config_byte(dev, 0x5a, &ata66);
+ 		pci_write_config_word(dev, 0x52, mcr3);
+ 		pci_write_config_word(dev, 0x56, mcr6);
+-	} else if (revision >= 3) {
++	} else if (hpt_minimum_revision(dev, 3)) {
+ 		/*
+ 		 * HPT370/372 and 374 pcifn 0
+ 		 * - clear bit 0 of 0x5b to enable P/SCBLID as inputs
+@@ -1072,15 +1102,9 @@ static void __devinit init_hwif_hpt366(i
+ 		hwif->serialized = hwif->mate->serialized = 1;
+ #endif
+ 
+-	if (revision >= 3) {
++	if (hpt_minimum_revision(dev,3)) {
+ 		u8 reg5ah = 0;
+-		u8 mscreg = hwif->channel ? 0x54 : 0x50;
+-
+-		pci_write_config_byte(dev, 0x5a, reg5ah & ~0x10);
+-
+-		/* reset state engine */
+-		pci_write_config_byte(dev, mscreg, 0x37);
+-
++			pci_write_config_byte(dev, 0x5a, reg5ah & ~0x10);
+ 		/*
+ 		 * set up ioctl for power status.
+ 		 * note: power affects both
+@@ -1089,7 +1113,7 @@ static void __devinit init_hwif_hpt366(i
+ 		hwif->resetproc	= &hpt3xx_reset;
+ 		hwif->busproc	= &hpt370_busproc;
+ //		hwif->drives[0].autotune = hwif->drives[1].autotune = 1;
+-	} else if (revision >= 2) {
++	} else if (hpt_minimum_revision(dev,2)) {
+ 		hwif->resetproc	= &hpt3xx_reset;
+ 		hwif->busproc	= &hpt3xx_tristate;
+ 	} else {
+@@ -1110,46 +1134,22 @@ static void __devinit init_hwif_hpt366(i
+ 		hwif->udma_four = ((ata66 & regmask) ? 0 : 1);
+ 	hwif->ide_dma_check = &hpt366_config_drive_xfer_rate;
+ 
+-	if (revision >= 8) {
++	if (hpt_minimum_revision(dev,8)) {
+ 		hwif->ide_dma_test_irq = &hpt374_ide_dma_test_irq;
+ 		hwif->ide_dma_end = &hpt374_ide_dma_end;
+-	} else if (revision >= 5) {
++	} else if (hpt_minimum_revision(dev,5)) {
+ 		hwif->ide_dma_test_irq = &hpt374_ide_dma_test_irq;
+ 		hwif->ide_dma_end = &hpt374_ide_dma_end;
+-	} else if (revision >= 3) {
++	} else if (hpt_minimum_revision(dev,3)) {
+ 		hwif->dma_start = &hpt370_ide_dma_start;
+ 		hwif->ide_dma_end = &hpt370_ide_dma_end;
+ 		hwif->ide_dma_timeout = &hpt370_ide_dma_timeout;
+ 		hwif->ide_dma_lostirq = &hpt370_ide_dma_lostirq;
+-	} else if (revision >= 2)
++	} else if (hpt_minimum_revision(dev,2))
+ 		hwif->ide_dma_lostirq = &hpt366_ide_dma_lostirq;
+ 	else
+ 		hwif->ide_dma_lostirq = &hpt366_ide_dma_lostirq;
+ 
+-	pci_read_config_byte(dev, PCI_REVISION_ID, &revision);
+-
+-	/*
+-	 * HPT372N/302N chips have some complications:
+-	 *	On PCI33 timing we must clock switch
+-	 *	On PCI66 timing we must NOT use the PCI clock
+-	 */
+-	if((dev->device == PCI_DEVICE_ID_TTI_HPT366 && revision > 5) ||
+-	   (dev->device == PCI_DEVICE_ID_TTI_HPT372 && revision > 1) ||
+-	   (dev->device == PCI_DEVICE_ID_TTI_HPT302 && revision > 1) ||
+-	   (dev->device == PCI_DEVICE_ID_TTI_HPT372N)) {
+-
+-		hwif->rw_disk = &hpt3x2n_rw_disk;
+-
+-#ifndef HPT_SERIALIZE_IO
+-		/*
+-		 * Clock is shared between the channels,
+-		 * so we have to serialize them... :-(
+-		 */
+-		if (hwif->mate)
+-			hwif->serialized = hwif->mate->serialized = 1;
+-	}
+-#endif
+-
+ 	if (!noautodma)
+ 		hwif->autodma = 1;
+ 	hwif->drives[0].autodma = hwif->autodma;
+@@ -1169,8 +1169,7 @@ static void __devinit init_dma_hpt366(id
+ 		
+ 	if(pci_get_drvdata(hwif->pci_dev) == NULL)
+ 	{
+-		printk(KERN_WARNING "%s: no known IDE timings, disabling DMA.\n",
+-		       hwif->cds->name);
++		printk(KERN_WARNING "hpt: no known IDE timings, disabling DMA.\n");
+ 		return;
+ 	}
+ 
+@@ -1196,8 +1195,6 @@ static void __devinit init_setup_hpt374(
+ {
+ 	struct pci_dev *findev = NULL;
+ 
+-	pci_set_drvdata(dev, &hpt374);
+-
+ 	if (PCI_FUNC(dev->devfn) & 1)
+ 		return;
+ 
+@@ -1219,66 +1216,8 @@ static void __devinit init_setup_hpt374(
+ 	ide_setup_pci_device(dev, d);
+ }
+ 
+-static void __devinit init_setup_hpt372n(struct pci_dev *dev, ide_pci_device_t *d)
+-{
+-	pci_set_drvdata(dev, &hpt3xxn);
+-
+-	ide_setup_pci_device(dev, d);
+-}
+-
+-static void __devinit init_setup_hpt371(struct pci_dev *dev, ide_pci_device_t *d)
+-{
+-	u8 rev, misc1;
+-
+-	pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
+-
+-	if (rev > 1) {
+-		d->name = "HPT371N";
+-
+-		pci_set_drvdata(dev, &hpt3xxn);
+-	} else
+-		pci_set_drvdata(dev, &hpt371);
+-
+-	/*
+-	 * HPT371 chips physically have only one channel, the secondary one,
+-	 * however the primary channel registers do exist! Go figure...
+-	 * So, we manually disable the non-existing channel here...
+-	 */
+-	pci_read_config_byte (dev, 0x50, &misc1);
+-	pci_write_config_byte(dev, 0x50, misc1 & ~0x04);
+-
+-	ide_setup_pci_device(dev, d);
+-}
+-
+-static void __devinit init_setup_hpt372a(struct pci_dev *dev, ide_pci_device_t *d)
+-{
+-	u8 rev;
+-
+-	pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
+-
+-	if (rev > 1) {
+-		d->name = "HPT372N";
+-
+-		pci_set_drvdata(dev, &hpt3xxn);
+-	} else
+-		pci_set_drvdata(dev, &hpt372a);
+-
+-	ide_setup_pci_device(dev, d);
+-}
+-
+-static void __devinit init_setup_hpt302(struct pci_dev *dev, ide_pci_device_t *d)
++static void __devinit init_setup_hpt37x(struct pci_dev *dev, ide_pci_device_t *d)
+ {
+-	u8 rev;
+-
+-	pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
+-
+-	if (rev > 1) {
+-		d->name = "HPT302N";
+-
+-		pci_set_drvdata(dev, &hpt3xxn);
+-	} else
+-		pci_set_drvdata(dev, &hpt302);
+-
+ 	ide_setup_pci_device(dev, d);
+ }
+ 
+@@ -1297,23 +1236,19 @@ static void __devinit init_setup_hpt366(
+ 	pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_rev);
+ 	class_rev &= 0xff;
+ 
++	if(dev->device == PCI_DEVICE_ID_TTI_HPT372N)
++		class_rev = 6;
++		
+ 	if(class_rev <= 6)
+ 		d->name = chipset_names[class_rev];
+ 
+ 	switch(class_rev) {
+ 		case 6:
+-			return init_setup_hpt372n(dev, d);
+ 		case 5:
+-			pci_set_drvdata(dev, &hpt372);
+-			goto init_single;
+ 		case 4:
+-			pci_set_drvdata(dev, &hpt370a);
+-			goto init_single;
+-		case 3:
+-			pci_set_drvdata(dev, &hpt370);
+-			goto init_single;
+-		default:
+-			break;
++		case 3: ide_setup_pci_device(dev, d);
++			return;
++		default:	break;
+ 	}
+ 
+ 	d->channels = 1;
+@@ -1335,7 +1270,6 @@ static void __devinit init_setup_hpt366(
+ 			return;
+ 		}
+ 	}
+-init_single:
+ 	ide_setup_pci_device(dev, d);
+ }
+ 
+Index: linux-2.6.10/drivers/ide/pci/hpt366.h
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.h
++++ linux-2.6.10/drivers/ide/pci/hpt366.h
+@@ -77,35 +77,26 @@ struct chipset_bus_clock_list_entry {
+ 	unsigned int	chipset_settings;
+ };
+ 
+-/* Supported ATA clock frequencies */
+-#define ATA_CLOCK_33MHZ	0
+-#define ATA_CLOCK_50MHZ	1
+-#define ATA_CLOCK_66MHZ	2
+-#define NUM_ATA_CLOCKS	3
+-
+-struct hpt_clock_info {
+-	struct chipset_bus_clock_list_entry *timings[NUM_ATA_CLOCKS];
+-	byte default_dpll;
+-};
+-
+-
+ /* key for bus clock timings
+  * bit
+- * 0:3    data_high_time. inactive time of DIOW_/DIOR_ for PIO and MW DMA.
+- *        cycles = value + 1
+- * 4:8    data_low_time. active time of DIOW_/DIOR_ for PIO and MW DMA.
+- *        cycles = value + 1
++ * 0:3    data_high_time. inactive time of DIOW_/DIOR_ for PIO and MW
++ *        DMA. cycles = value + 1
++ * 4:8    data_low_time. active time of DIOW_/DIOR_ for PIO and MW
++ *        DMA. cycles = value + 1
+  * 9:12   cmd_high_time. inactive time of DIOW_/DIOR_ during task file
+  *        register access.
+  * 13:17  cmd_low_time. active time of DIOW_/DIOR_ during task file
+  *        register access.
+  * 18:21  udma_cycle_time. clock freq and clock cycles for UDMA xfer.
+- * 22:24  pre_high_time. time to initialize 1st cycle for PIO and MW DMA xfer.
++ *        during task file register access.
++ * 22:24  pre_high_time. time to initialize 1st cycle for PIO and MW DMA
++ *        xfer.
+  * 25:27  cmd_pre_high_time. time to initialize 1st PIO cycle for task
+  *        register access.
+- * 28     UDMA enable.
+- * 29     DMA  enable.
+- * 30     PIO MST enable. If set, the chip is in bus master mode during PIO.
++ * 28     UDMA enable
++ * 29     DMA enable
++ * 30     PIO_MST enable. if set, the chip is in bus master mode during
++ *        PIO.
+  * 31     FIFO enable.
+  */
+ static struct chipset_bus_clock_list_entry forty_base_hpt366[] = {
+@@ -333,6 +324,7 @@ static struct chipset_bus_clock_list_ent
+ };
+ 
+ static struct chipset_bus_clock_list_entry thirty_three_base_hpt374[] = {
++	{	XFER_UDMA_6,	0x12808242	},
+ 	{	XFER_UDMA_5,	0x12848242	},
+ 	{	XFER_UDMA_4,	0x12ac8242	},
+ 	{	XFER_UDMA_3,	0x128c8242	},
+@@ -353,7 +345,28 @@ static struct chipset_bus_clock_list_ent
+ };
+ 
+ #if 0
++static struct chipset_bus_clock_list_entry fifty_base_hpt374[] = {
++	{	XFER_UDMA_6,	},
++	{	XFER_UDMA_5,	},
++	{	XFER_UDMA_4,	},
++	{	XFER_UDMA_3,	},
++	{	XFER_UDMA_2,	},
++	{	XFER_UDMA_1,	},
++	{	XFER_UDMA_0,	},
++	{	XFER_MW_DMA_2,	},
++	{	XFER_MW_DMA_1,	},
++	{	XFER_MW_DMA_0,	},
++	{	XFER_PIO_4,	},
++	{	XFER_PIO_3,	},
++	{	XFER_PIO_2,	},
++	{	XFER_PIO_1,	},
++	{	XFER_PIO_0,	},
++	{	0,	}
++};
++#endif
++#if 0
+ static struct chipset_bus_clock_list_entry sixty_six_base_hpt374[] = {
++	{	XFER_UDMA_6,	0x12406231	},	/* checkme */
+ 	{	XFER_UDMA_5,	0x12446231	},
+ 				0x14846231
+ 	{	XFER_UDMA_4,		0x16814ea7	},
+@@ -386,42 +399,24 @@ static struct chipset_bus_clock_list_ent
+ };
+ #endif
+ 
+-static struct chipset_bus_clock_list_entry sixty_six_base_hpt3xxn[] = {
+-	{	XFER_UDMA_6,	0x1c869c62	},
+-	{	XFER_UDMA_5,	0x1c8a9c62	},
+-	{	XFER_UDMA_4,	0x1c8a9c62	},
+-	{	XFER_UDMA_3,	0x1c8e9c62	},
+-	{	XFER_UDMA_2,	0x1c929c62	},
+-	{	XFER_UDMA_1,	0x1c9a9c62	},
+-	{	XFER_UDMA_0,	0x1c829c62	},
+-
+-	{	XFER_MW_DMA_2,	0x2c829c62	},
+-	{	XFER_MW_DMA_1,	0x2c829c66	},
+-	{	XFER_MW_DMA_0,	0x2c829d2e	},
+-
+-	{	XFER_PIO_4,	0x0c829c62	},
+-	{	XFER_PIO_3,	0x0c829c84	},
+-	{	XFER_PIO_2,	0x0c829ca6	},
+-	{	XFER_PIO_1,	0x0d029d26	},
+-	{	XFER_PIO_0,	0x0d029d5e	},
+-	{	0,		0x0d029d26	}
+-};
+-
+ #define HPT366_DEBUG_DRIVE_INFO		0
+-#define HPT371_ALLOW_ATA133_6		1
+-#define HPT302_ALLOW_ATA133_6		1
++#define HPT374_ALLOW_ATA133_6		0
++#define HPT371_ALLOW_ATA133_6		0
++#define HPT302_ALLOW_ATA133_6		0
+ #define HPT372_ALLOW_ATA133_6		1
+ #define HPT370_ALLOW_ATA100_5		1
+ #define HPT366_ALLOW_ATA66_4		1
+ #define HPT366_ALLOW_ATA66_3		1
+ #define HPT366_MAX_DEVS			8
+ 
++#define F_LOW_PCI_33      0x23
++#define F_LOW_PCI_40      0x29
++#define F_LOW_PCI_50      0x2d
++#define F_LOW_PCI_66      0x42
++
+ static void init_setup_hpt366(struct pci_dev *, ide_pci_device_t *);
+-static void init_setup_hpt372a(struct pci_dev *, ide_pci_device_t *);
+-static void init_setup_hpt302(struct pci_dev *, ide_pci_device_t *);
+-static void init_setup_hpt371(struct pci_dev *, ide_pci_device_t *);
++static void init_setup_hpt37x(struct pci_dev *, ide_pci_device_t *);
+ static void init_setup_hpt374(struct pci_dev *, ide_pci_device_t *);
+-static void init_setup_hpt372n(struct pci_dev *, ide_pci_device_t *);
+ static unsigned int init_chipset_hpt366(struct pci_dev *, const char *);
+ static void init_hwif_hpt366(ide_hwif_t *);
+ static void init_dma_hpt366(ide_hwif_t *, unsigned long);
+@@ -439,35 +434,31 @@ static ide_pci_device_t hpt366_chipsets[
+ 		.extra		= 240
+ 	},{	/* 1 */
+ 		.name		= "HPT372A",
+-		.init_setup	= init_setup_hpt372a,
++		.init_setup	= init_setup_hpt37x,
+ 		.init_chipset	= init_chipset_hpt366,
+ 		.init_hwif	= init_hwif_hpt366,
+ 		.init_dma	= init_dma_hpt366,
+ 		.channels	= 2,
+ 		.autodma	= AUTODMA,
+ 		.bootable	= OFF_BOARD,
+-		.extra		= 240
+ 	},{	/* 2 */
+ 		.name		= "HPT302",
+-		.init_setup	= init_setup_hpt302,
++		.init_setup	= init_setup_hpt37x,
+ 		.init_chipset	= init_chipset_hpt366,
+ 		.init_hwif	= init_hwif_hpt366,
+ 		.init_dma	= init_dma_hpt366,
+ 		.channels	= 2,
+ 		.autodma	= AUTODMA,
+ 		.bootable	= OFF_BOARD,
+-		.extra		= 240
+ 	},{	/* 3 */
+ 		.name		= "HPT371",
+-		.init_setup	= init_setup_hpt371,
++		.init_setup	= init_setup_hpt37x,
+ 		.init_chipset	= init_chipset_hpt366,
+ 		.init_hwif	= init_hwif_hpt366,
+ 		.init_dma	= init_dma_hpt366,
+ 		.channels	= 2,
+ 		.autodma	= AUTODMA,
+-		.enablebits	= {{0x50,0x04,0x04}, {0x54,0x04,0x04}},
+ 		.bootable	= OFF_BOARD,
+-		.extra		= 240
+ 	},{	/* 4 */
+ 		.name		= "HPT374",
+ 		.init_setup	= init_setup_hpt374,
+@@ -476,91 +467,16 @@ static ide_pci_device_t hpt366_chipsets[
+ 		.init_dma	= init_dma_hpt366,
+ 		.channels	= 2,	/* 4 */
+ 		.autodma	= AUTODMA,
+-		.enablebits	= {{0x50,0x04,0x04}, {0x54,0x04,0x04}},
+ 		.bootable	= OFF_BOARD,
+-		.extra		= 240
+ 	},{	/* 5 */
+ 		.name		= "HPT372N",
+-		.init_setup	= init_setup_hpt372n,
++		.init_setup	= init_setup_hpt37x,
+ 		.init_chipset	= init_chipset_hpt366,
+ 		.init_hwif	= init_hwif_hpt366,
+ 		.init_dma	= init_dma_hpt366,
+ 		.channels	= 2,	/* 4 */
+ 		.autodma	= AUTODMA,
+ 		.bootable	= OFF_BOARD,
+-		.extra		= 240
+-	}
+-};
+-
+-static struct hpt_clock_info hpt370 = {
+-	.default_dpll	= 48,
+-	.timings	= {
+-		thirty_three_base_hpt370,
+-		fifty_base_hpt370a,
+-		sixty_six_base_hpt370
+-	},
+-};
+-
+-static struct hpt_clock_info hpt370a = {
+-	.default_dpll	= 48,
+-	.timings	= {
+-		thirty_three_base_hpt370a,
+-		fifty_base_hpt370a,
+-		sixty_six_base_hpt370a
+-	},
+-};
+-
+-static struct hpt_clock_info hpt372 = {
+-	.default_dpll	= 55,
+-	.timings	= {
+-		thirty_three_base_hpt372,
+-		fifty_base_hpt372,
+-		sixty_six_base_hpt372
+-	},
+-};
+-
+-static struct hpt_clock_info hpt302 = {
+-	.default_dpll	= 66,
+-	.timings	= {
+-		thirty_three_base_hpt372,
+-		fifty_base_hpt372,
+-		sixty_six_base_hpt372
+-	}
+-};
+-
+-static struct hpt_clock_info hpt371 = {
+-	.default_dpll	= 66,
+-	.timings	= {
+-		thirty_three_base_hpt372,
+-		fifty_base_hpt372,
+-		sixty_six_base_hpt372
+-	}
+-};
+-
+-static struct hpt_clock_info hpt372a = {
+-	.default_dpll	= 66,
+-	.timings	= {
+-		thirty_three_base_hpt372,
+-		fifty_base_hpt372,
+-		sixty_six_base_hpt372
+-	}
+-};
+-
+-static struct hpt_clock_info hpt374 = {
+-	.default_dpll	= 48,
+-	.timings	= {
+-		thirty_three_base_hpt374,
+-		fifty_base_hpt370a,
+-		NULL
+-	}
+-};
+-
+-static struct hpt_clock_info hpt3xxn = {
+-	.default_dpll	= 77,
+-	.timings	= {
+-		NULL,
+-		NULL,
+-		sixty_six_base_hpt3xxn
+ 	}
+ };
+ 
+Index: linux-2.6.10/mvl_patches/pro-1378.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1378.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1378);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

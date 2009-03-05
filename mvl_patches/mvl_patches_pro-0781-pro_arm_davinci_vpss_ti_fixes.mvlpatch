@@ -1,0 +1,342 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_vpss_ti_fixes
+# Date: Thu Jul  6 19:21:12 2006
+# Source: Texas Instruments, Inc.
+# MR: 18882
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+#     TI-supplied fix for TI bug.  Some eagle-eyed videophiles reported 
+#     video artifacts due to occasional missing lines.
+# 
+
+PATCHNUM=781
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments, Inc.
+MR: 18882
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+    TI-supplied fix for TI bug.  Some eagle-eyed videophiles reported 
+    video artifacts due to occasional missing lines.
+
+Index: linux-2.6.10/drivers/media/video/ccdc_davinci.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/ccdc_davinci.c
++++ linux-2.6.10/drivers/media/video/ccdc_davinci.c
+@@ -66,7 +66,8 @@ void ccdc_setwin(ccdc_params_ycbcr * par
+ 	} else {
+ 		vert_nr_lines = params->win.height - 1;
+ 	}
+-	regw((vert_start << 16) | vert_start, VERT_START);
++	regw((vert_start << 16) | (vert_start), VERT_START);
++	regw((vert_start << 16) | (vert_start), VDINT);
+ 	regw(vert_nr_lines, VERT_LINES);
+ }
+ 
+Index: linux-2.6.10/drivers/video/davincifb.c
+===================================================================
+--- linux-2.6.10.orig/drivers/video/davincifb.c
++++ linux-2.6.10/drivers/video/davincifb.c
+@@ -30,6 +30,7 @@
+ #include <asm/irq.h>
+ #include <asm/uaccess.h>
+ #include <video/davincifb.h>
++#include <asm/system.h>
+ 
+ #define DAVINCIFB_DEVICE "davincifb"
+ #define DAVINCIFB_DRIVER "davincifb"
+@@ -106,7 +107,7 @@ struct dm_win_info {
+ 
+ 	/* flag to identify if framebuffer area is fixed already or not */
+ 	int alloc_fb_mem;
+-
++	unsigned long sdram_address;
+ 	struct dm_info *dm;
+ };
+ 
+@@ -301,14 +302,49 @@ static int davincifb_venc_check_mode(con
+ 	DBGENTER;
+ 	RETURN(0);
+ }
+-
++static void set_sdram_params(char *id, u32 addr, u32 line_length);
+ static irqreturn_t davincifb_isr(int irq, void *arg, struct pt_regs *regs)
+ {
+ 	struct dm_info *dm = (struct dm_info *)arg;
+-	if ((dispc_reg_in(VENC_VSTAT) & 0x00000010)) {
+-	        ++dm->vsync_cnt;
+-        	wake_up_interruptible(&dm->vsync_wait);
+-       		return IRQ_HANDLED;
++	unsigned long addr=0;
++
++	if ((dispc_reg_in(VENC_VSTAT) & 0x00000010) == 0x10) {
++		xchg(&addr, dm->osd0->sdram_address);
++		if (addr) {
++			set_sdram_params(dm->osd0->info.fix.id,
++					 dm->osd0->sdram_address,
++					 dm->osd0->info.fix.line_length);
++			dm->osd0->sdram_address = 0;
++		}
++		addr = 0;
++		xchg(&addr, dm->osd1->sdram_address);
++		if (addr) {
++			set_sdram_params(dm->osd1->info.fix.id,
++					 dm->osd1->sdram_address,
++					 dm->osd1->info.fix.line_length);
++			dm->osd1->sdram_address = 0;
++		}
++		addr = 0;
++		xchg(&addr, dm->vid0->sdram_address);
++		if (addr) {
++			set_sdram_params(dm->vid0->info.fix.id,
++					 dm->vid0->sdram_address,
++					 dm->vid0->info.fix.line_length);
++			dm->vid0->sdram_address = 0;
++		}
++		addr = 0;
++		xchg(&addr, dm->vid1->sdram_address);
++		if (addr) {
++			set_sdram_params(dm->vid1->info.fix.id,
++					 dm->vid1->sdram_address,
++					 dm->vid1->info.fix.line_length);
++			dm->vid1->sdram_address = 0;
++		}
++		return IRQ_HANDLED;
++	} else {
++		++dm->vsync_cnt;
++		wake_up_interruptible(&dm->vsync_wait);
++		return IRQ_HANDLED;
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -920,8 +956,11 @@ static int davincifb_pan_display(struct 
+ 	offset = var->yoffset * info->fix.line_length +
+ 	    var->xoffset * var->bits_per_pixel / 8;
+ 	start = (u32) w->fb_base_phys + offset;
+-	set_sdram_params(info->fix.id, start, info->fix.line_length);
+ 
++	if ((dispc_reg_in(VENC_VSTAT) & 0x00000010)==0x10)
++		set_sdram_params(info->fix.id, start, info->fix.line_length);
++	else
++		w->sdram_address = start;
+ 	RETURN(0);
+ }
+ 
+@@ -1246,6 +1285,7 @@ static struct fb_info *init_fb_info(stru
+ 	info->fix.mmio_start = dm->mmio_base_phys;
+ 	info->fix.mmio_len = dm->mmio_size;
+ 	info->fix.accel = FB_ACCEL_NONE;
++	w->sdram_address = 0;
+ 
+ 	DBGEXIT;
+ 	return info;
+Index: linux-2.6.10/mvl_patches/pro-0781.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0781.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(781);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1795 @@
+#! /usr/bin/env bash
+# Patch: -ppc_mpc7448_tsi108_arch
+# Date: Fri Feb 16 17:31:35 2007
+# Source: Freescale Semiconductor, Inc.
+# MR: 19074
+# Type: Enhancement
+# Disposition: submitted to linuxppc-dev@ozlabs.org
+# Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com
+# Description:
+# 
+# This patch adds support for Tundra Semiconductor Tsi108 Host Bridge
+# for 32-bit PowerPC processors.
+# 
+# Signed-off-by: Alexandre Bounine <alexandreb@tundra.com>
+# Signed-off-by: Roy Zang	< tie-fei.zang@freescale.com>
+# 
+
+PATCHNUM=1111
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Freescale Semiconductor, Inc.
+MR: 19074
+Type: Enhancement
+Disposition: submitted to linuxppc-dev@ozlabs.org
+Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com
+Description:
+
+This patch adds support for Tundra Semiconductor Tsi108 Host Bridge
+for 32-bit PowerPC processors.
+
+Signed-off-by: Alexandre Bounine <alexandreb@tundra.com>
+Signed-off-by: Roy Zang	< tie-fei.zang@freescale.com>
+
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -944,6 +944,11 @@ config FSL_OCP
+ 	depends on MPC10X_BRIDGE || PPC_MPC52xx
+ 	default y
+ 
++config TSI108_BRIDGE
++	bool
++	depends on TAIGA
++	default y
++
+ config MPC10X_OPENPIC
+ 	bool
+ 	depends on POWERPMC250 || LOPEC || SANDPOINT
+Index: linux-2.6.10/arch/ppc/syslib/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/Makefile
++++ linux-2.6.10/arch/ppc/syslib/Makefile
+@@ -103,6 +103,7 @@ endif
+ obj-$(CONFIG_BOOTX_TEXT)	+= btext.o
+ obj-$(CONFIG_MPC10X_BRIDGE)     += mpc10x_common.o indirect_pci.o
+ obj-$(CONFIG_MPC10X_OPENPIC)	+= open_pic.o
++obj-$(CONFIG_TSI108_BRIDGE)	+= tsi108_common.o tsi108_pic.o
+ obj-$(CONFIG_40x)		+= dcr.o
+ obj-$(CONFIG_BOOKE)		+= dcr.o
+ obj-$(CONFIG_85xx)		+= open_pic.o ppc85xx_common.o ppc85xx_setup.o \
+Index: linux-2.6.10/arch/ppc/syslib/tsi108_common.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/syslib/tsi108_common.c
+@@ -0,0 +1,214 @@
++/*
++ * arch/ppc/syslib/tsi108_common.c
++ *
++ * Common routines for Tundra Semiconductor TSI108 host bridge.
++ *
++ * 2004-2005 (c) Tundra Semiconductor Corp.
++ * Author: Alex Bounine (alexandreb@tundra.com)
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the Free
++ * Software Foundation; either version 2 of the License, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59
++ * Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++
++#include <asm/byteorder.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++#include <asm/uaccess.h>
++#include <asm/machdep.h>
++#include <asm/pci-bridge.h>
++#include <asm/open_pic.h>
++#include <asm/tsi108.h>
++
++#undef TSI108_PCI_DEBUG
++
++#define tsi_mk_config_addr(bus, dev, func, offset) \
++		(((bus)<<16) | ((dev)<<11) | (func<<8) | \
++			(offset & 0xfc)| tsi108_pci_cfg_base)
++#define tsi_mk_config_addr1(bus, devfunc, offset) \
++	(((bus)<<16) | ((devfunc)<<8) | (offset & 0xfc)| tsi108_pci_cfg_base)
++
++u32 tsi108_csr_base;
++u32 tsi108_pci_cfg_base;
++
++/*
++ * Prosessor Bus Clock (in MHz) defined by CG_PB_SELECT
++ * (based on recommended Tsi108 reference clock 33MHz)
++ */
++static int pb_clk_sel[8] = { 0, 0, 183, 100, 133, 167, 200, 233 };
++
++/*
++ * SDRAM Clock (in MHz) defined by CG_SD_SELECT
++ * (based on recommended Tsi108 reference clock 33MHz)
++ */
++static int sd_clk_sel[2][8] = {
++	{0, 0, 183, 100, 133, 167, 200, 233},	/* SYNC */
++	{0, 0, 0, 0, 133, 160, 200, 0}	/* ASYNC */
++};
++
++int __init tsi108_bridge_init(struct pci_controller *hose, uint phys_csr_base)
++{
++	/* Nothing to do here at this moment */
++	return 0;
++}
++
++unsigned long __init tsi108_get_mem_size(void)
++{
++	ulong total;
++
++	total = 512 * 1024 * 1024;
++	return total;
++}
++
++int
++tsi108_direct_write_config(struct pci_bus *bus, unsigned int devfunc,
++			   int offset, int len, u32 val)
++{
++	volatile unsigned char *cfg_addr;
++
++	cfg_addr = (unsigned char *)(tsi_mk_config_addr1(bus->number,
++							 devfunc, offset) |
++							 (offset & 0x03));
++
++#ifdef TSI108_PCI_DEBUG
++	printk("PCI CFG write : ");
++	printk("%d:0x%x:0x%x ", bus->number, devfunc, offset);
++	printk("%d ADDR=0x%08x ", len, (uint) cfg_addr);
++	printk("data = 0x%08x\n", val);
++#endif
++
++	switch (len) {
++	case 1:
++		out_8((u8 *) cfg_addr, val);
++		break;
++	case 2:
++		out_le16((u16 *) cfg_addr, val);
++		break;
++	default:
++		out_le32((u32 *) cfg_addr, val);
++		break;
++	}
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++void tsi108_clear_pci_error(u32 pci_cfg_base)
++{
++	u32 err_stat, err_addr, pci_stat;
++
++	/*
++	 * Quietly clear PB and PCI error flags set as result
++	 * of PCI/X configuration read requests.
++	 */
++
++	/* Read PB Error Log Registers */
++	err_stat = tsi108_read_reg(TSI108_PB_OFFSET + TSI108_PB_ERRCS);
++	err_addr = tsi108_read_reg(TSI108_PB_OFFSET + TSI108_PB_AERR);
++
++	if (err_stat & TSI108_PB_ERRCS_ES) {
++		/* Clear error flag */
++		tsi108_write_reg(TSI108_PB_OFFSET + TSI108_PB_ERRCS,
++				 TSI108_PB_ERRCS_ES);
++
++		/* Clear read error reported in PB_ISR */
++		tsi108_write_reg(TSI108_PB_OFFSET + TSI108_PB_ISR,
++				 TSI108_PB_ISR_PBS_RD_ERR);
++
++		/* Clear PCI/X bus cfg errors if applicable */
++		if ((err_addr & 0xFF000000) == pci_cfg_base) {
++			pci_stat =
++			    tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_CSR);
++			tsi108_write_reg(TSI108_PCI_OFFSET + TSI108_PCI_CSR,
++					 pci_stat);
++		}
++	}
++
++	return;
++}
++
++#define __tsi108_read_pci_config(x, addr, op)		\
++	__asm__ __volatile__(				\
++		"	"op" %0,0,%1\n"		\
++		"1:	eieio\n"			\
++		"2:\n"					\
++		".section .fixup,\"ax\"\n"		\
++		"3:	li %0,-1\n"			\
++		"	b 2b\n"				\
++		".section __ex_table,\"a\"\n"		\
++		"	.align 2\n"			\
++		"	.long 1b,3b\n"			\
++		".text"					\
++		: "=r"(x) : "r"(addr))
++
++int
++tsi108_direct_read_config(struct pci_bus *bus, unsigned int devfn, int offset,
++			  int len, u32 * val)
++{
++	volatile unsigned char *cfg_addr;
++	u32 temp;
++
++	cfg_addr = (unsigned char *)(tsi_mk_config_addr1(bus->number,
++							 devfn,
++							 offset) | (offset &
++								    0x03));
++
++	switch (len) {
++	case 1:
++		__tsi108_read_pci_config(temp, cfg_addr, "lbzx");
++		break;
++	case 2:
++		__tsi108_read_pci_config(temp, cfg_addr, "lhbrx");
++		break;
++	default:
++		__tsi108_read_pci_config(temp, cfg_addr, "lwbrx");
++		break;
++	}
++
++	*val = temp;
++
++#ifdef TSI108_PCI_DEBUG
++	if ((0xFFFFFFFF != temp) && (0xFFFF != temp) && (0xFF != temp)) {
++		printk("PCI CFG read : ");
++		printk("%d:0x%x:0x%x ", bus->number, devfn, offset);
++		printk("%d ADDR=0x%08x ", len, (uint) cfg_addr);
++		printk("data = 0x%x\n", *val);
++	}
++#endif
++	return PCIBIOS_SUCCESSFUL;
++}
++
++unsigned long tsi108_get_cpu_clk(void)
++{
++	/* Detect PB clock freq. */
++	u32 i = tsi108_read_reg(TSI108_CLK_OFFSET + TSI108_CG_PWRUP_STATUS);
++
++	i = (i >> 16) & 0x07;	/* Get PB PLL multiplier */
++	return (pb_clk_sel[i] * 1000000);
++}
++
++unsigned long tsi108_get_sdc_clk(void)
++{
++	u32 i, k;
++
++	/* Get SDC/PB clock freq. from CG settings */
++	i = tsi108_read_reg(TSI108_CLK_OFFSET + TSI108_CG_PWRUP_STATUS);
++	k = (i >> 16) & 0x07;	/* Get PB PLL multiplier */
++	i = (i >> 20) & 0x07;	/* Get SDC PLL multiplier */
++	k = (k == i) ? 0 : 1;	/* sync/async configuration */
++	return (sd_clk_sel[k][i] * 1000000);
++}
+Index: linux-2.6.10/arch/ppc/syslib/tsi108_pic.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/syslib/tsi108_pic.c
+@@ -0,0 +1,791 @@
++/*
++ * (C) Copyright 2005 Tundra Semiconductor Corp.
++ * Alex Bounine, <alexandreb@tundra.com).
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++/*
++ *  arch/ppc/syslib/tsi108_pic.c - Tsi108 Interrupt Controller Handling
++ */
++
++#include <linux/config.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/sysdev.h>
++#include <asm/ptrace.h>
++#include <asm/signal.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++#include <asm/prom.h>
++#include <asm/sections.h>
++#include <asm/hardirq.h>
++#include <asm/machdep.h>
++
++#include <asm/tsi108.h>
++#include <asm/tsi108_irq.h>
++#include "tsi108_pic.h"
++
++extern u32 tsi108_csr_base;
++
++static int tsi108_pic_cascade_irq = -1;
++static int (*tsi108_pic_cascade_fn) (struct pt_regs *);
++
++/* Global Operations */
++static void tsi108_pic_set_task_priority(u_int pri);
++static void tsi108_pic_set_spurious(u_int vector);
++void tsi108_pic_mask_all(void);
++
++/* Timer Interrupts */
++static void tsi108_pic_inittimer(u_int timer, u_int pri, u_int vector);
++static void tsi108_pic_maptimer(u_int timer, u_int cpumask);
++
++/* Interrupt Sources */
++static void tsi108_pic_enable_irq(u_int irq);
++static void tsi108_pic_disable_irq(u_int irq);
++static void tsi108_pic_initirq(u_int irq, u_int pri, u_int vector, int polarity,
++			       int is_level);
++static void tsi108_pic_mapirq(u_int irq, u_int cpumask, u_int keepmask);
++static void init_pci_source(void);
++static inline int get_pci_source(int vector);
++int tsi108_pic_set_irq_sense(int irq, int pol, int sense);
++
++/*
++ * tsi108_pic interface routines
++ */
++static void tsi108_pic_end_irq(unsigned int irq_nr);
++static void tsi108_pic_ack_irq(unsigned int irq_nr);
++void tsi108_pic_set_affinity(unsigned int irq_nr, unsigned long cpumask);
++
++static struct hw_interrupt_type tsi108_pic_irq = {
++	"tsi108_pic",
++	NULL,
++	NULL,
++	tsi108_pic_enable_irq,
++	tsi108_pic_disable_irq,
++	tsi108_pic_ack_irq,
++	tsi108_pic_end_irq,
++	NULL
++};
++
++static void tsi108_pci_irq_enable(u_int irq);
++static void tsi108_pci_irq_disable(u_int irq);
++static void tsi108_pci_irq_ack(u_int irq);
++static void tsi108_pci_irq_end(u_int irq);
++
++static struct hw_interrupt_type tsi108_pci_irq = {
++	"tsi108_PCI_int",
++	NULL,
++	NULL,
++	tsi108_pci_irq_enable,
++	tsi108_pci_irq_disable,
++	tsi108_pci_irq_ack,
++	tsi108_pci_irq_end,
++	NULL
++};
++
++#ifdef DBG_TSI108_INTERRUPT
++#define ASSERT(expr)	if (!(expr)) { \
++				printk("tsi108pic :" \
++					"assertion failed! %s[%d]: %s\n", \
++					__FUNCTION__, __LINE__, #expr); \
++				dump_stack(); \
++			}
++#else
++#define ASSERT(expr)	do {} while (0)
++#endif
++
++static inline u_int get_vector_offset(u_int irq)
++{
++	u_int offset;
++
++	if (irq < TSI108_IRQ_BASE || irq >= IRQ_PCI_INTAD_BASE)
++		return 0;
++
++	if (irq < IRQ_TSI108_MBOX0)
++		offset = TSI108_INT_IVPR(irq - TSI108_IRQ_BASE);
++	else if (irq < IRQ_TSI108_DBELL0)
++		offset = TSI108_INT_MBVPR(irq - IRQ_TSI108_MBOX0);
++	else if (irq < IRQ_TSI108_TIMER0)
++		offset = TSI108_INT_DVPR(irq - IRQ_TSI108_DBELL0);
++	else
++		offset = TSI108_INT_GTVPR(irq - IRQ_TSI108_TIMER0);
++
++	return offset;
++}
++
++static inline u_int tsi108_pic_read_reg(u_int reg_offset)
++{
++	return
++	    in_be32((volatile u32 *)(tsi108_csr_base + TSI108_MPIC_OFFSET +
++				     reg_offset));
++}
++
++static inline void tsi108_pic_write_reg(u_int reg_offset, u_int val)
++{
++	out_be32((volatile u32 *)(tsi108_csr_base + TSI108_MPIC_OFFSET +
++				  reg_offset), val);
++}
++
++void tsi108_pic_reset(void)
++{
++	tsi108_pic_write_reg(TSI108_INT_GCR, TSI108PIC_INT_GCR_R);
++	while (tsi108_pic_read_reg(TSI108_INT_GCR) & TSI108PIC_INT_GCR_R)
++		mb();
++}
++
++void tsi108_pic_set_output(int dest_num, u32 sense, u32 polarity)
++{
++	u32 temp = 0;
++	temp |= (IRQ_SENSE_LEVEL == sense) ?
++	    (TSI108PIC_INT_CSR_S_LEVEL) : (TSI108PIC_INT_CSR_S_EDGE);
++	temp |= (IRQ_POLARITY_POSITIVE == polarity) ?
++	    (TSI108PIC_INT_CSR_P_HIGH) : (TSI108PIC_INT_CSR_P_LOW);
++	tsi108_pic_write_reg(TSI108_INT_CSR(dest_num), temp);
++	mb();
++}
++
++int tsi108_pic_source_cfg(int src_num,	/* interrupt source number */
++			  u32 sense,	/* interrupt source Sense */
++			  u32 polarity,	/* interrupt source Polarity */
++			  TSI108_IRQ_MODE mode	/* interrupt delivery Mode */
++    )
++{
++	unsigned temp;
++
++	temp = tsi108_pic_read_reg(TSI108_INT_IVPR(src_num));
++
++	if (temp & TSI108PIC_ACTIVITY)	/* error if source is active */
++		return -1;
++
++	if (0 == (temp & TSI108PIC_MASK)) {
++		temp |= TSI108PIC_MASK;	/* mask IRQ prior making changes */
++		tsi108_pic_write_reg(TSI108_INT_IVPR(src_num), temp);
++	}
++
++	temp &= ~(TSI108PIC_INT_IVPR_MODE |
++		  TSI108PIC_INT_IVPR_S | TSI108PIC_INT_IVPR_P);
++
++	temp |= (IRQ_SENSE_LEVEL == sense) ?
++	    (TSI108PIC_INT_CSR_S_LEVEL) : (TSI108PIC_INT_CSR_S_EDGE);
++	temp |= (IRQ_POLARITY_POSITIVE == polarity) ?
++	    (TSI108PIC_INT_CSR_P_HIGH) : (TSI108PIC_INT_CSR_P_LOW);
++
++	tsi108_pic_write_reg(TSI108_INT_IVPR(src_num),
++			     TSI108PIC_MASK | (mode << 29) | temp);
++	return (0);
++}
++
++int tsi108_pic_set_vector(int src_num,	/* source number */
++			  int vect,	/* vector number */
++			  int prio	/* interrupt source priority */
++    )
++{
++	unsigned tmp;
++
++	tmp = tsi108_pic_read_reg(TSI108_INT_IVPR(src_num));
++
++	if (tmp & TSI108PIC_ACTIVITY)	/* error if source is active */
++		return -1;
++
++	if (0 == (tmp & TSI108PIC_MASK)) {
++		tmp |= TSI108PIC_MASK;	/* mask IRQ prior making changes */
++		tsi108_pic_write_reg(TSI108_INT_IVPR(src_num), tmp);
++	}
++
++	/* clear bits to be changed */
++	tmp &= ~(TSI108PIC_VECTOR_MASK | TSI108PIC_PRIORITY_MASK);
++
++	tmp |= (prio << 16) | vect;
++	tsi108_pic_write_reg(TSI108_INT_IVPR(src_num), tmp);
++	return 0;
++}
++
++void tsi108_pic_mask_all()
++{
++	int i;
++	unsigned int vp;
++
++	/* Mask all external and internal interrupt sources */
++	for (i = 0; i < TSI108PIC_MAX_SOURCES; i++) {
++		vp = tsi108_pic_read_reg(TSI108_INT_IVPR(i));
++		tsi108_pic_write_reg(TSI108_INT_IVPR(i), vp | TSI108PIC_MASK);
++		mb();
++
++		/* Make sure that irq is masked */
++		do {
++			vp = tsi108_pic_read_reg(TSI108_INT_IVPR(i));
++		} while ((vp & TSI108PIC_ACTIVITY) && !(vp & TSI108PIC_MASK));
++	}
++
++	/* Mask all timer interrupts */
++	for (i = 0; i < TSI108PIC_NUM_TIMERS; i++) {
++		vp = tsi108_pic_read_reg(TSI108_INT_GTVPR(i));
++		tsi108_pic_write_reg(TSI108_INT_GTVPR(i), vp | TSI108PIC_MASK);
++		mb();
++
++		do {
++			vp = tsi108_pic_read_reg(TSI108_INT_GTVPR(i));
++		} while ((vp & TSI108PIC_ACTIVITY) && !(vp & TSI108PIC_MASK));
++	}
++
++	/* Mask all doorbell interrupts */
++	for (i = 0; i < TSI108PIC_NUM_DBELLS; i++) {
++		vp = tsi108_pic_read_reg(TSI108_INT_DVPR(i));
++		tsi108_pic_write_reg(TSI108_INT_IVPR(i), vp | TSI108PIC_MASK);
++		mb();
++
++		do {
++			vp = tsi108_pic_read_reg(TSI108_INT_DVPR(i));
++		} while ((vp & TSI108PIC_ACTIVITY) && !(vp & TSI108PIC_MASK));
++	}
++
++	/* Mask all mailbox interrupts */
++	for (i = 0; i < 4; i++) {
++		vp = tsi108_pic_read_reg(TSI108_INT_MBVPR(i));
++		tsi108_pic_write_reg(TSI108_INT_MBVPR(i), vp | TSI108PIC_MASK);
++		mb();
++
++		do {
++			vp = tsi108_pic_read_reg(TSI108_INT_MBVPR(i));
++		} while ((vp & TSI108PIC_ACTIVITY) && !(vp & TSI108PIC_MASK));
++	}
++}
++
++/*
++ * The Tsi108 PC initialization routine.
++ * A caller routine (usually from platform-specific code has to provide
++ * sense/polarity configuration information for four external interrupt
++ * sources INT0 - INT3. This should be done in form of four-byte array
++ * (one byte per source ) that contains combination of sensitivity/polarity
++ * flags defined in asm-ppc/irq.h.
++ *
++ * Example of PIC initialization call is shown below:
++ *
++ *   u_char your_board_pic_initsenses[] __initdata = {
++ *	    (IRQ_SENSE_LEVEL | IRQ_POLARITY_POSITIVE),  // INT[0]
++ *	    (IRQ_SENSE_LEVEL | IRQ_POLARITY_POSITIVE),  // INT[1]
++ *	    (IRQ_SENSE_LEVEL | IRQ_POLARITY_POSITIVE),  // INT[2]
++ *	    (IRQ_SENSE_LEVEL | IRQ_POLARITY_POSITIVE)   // INT[3]
++ *          };
++ *
++ * tsi108_pic_init(your_board_pic_initsenses);
++ */
++
++void __init tsi108_pic_init(u_char * board_init_senses)
++{
++	u_int i;
++	u32 sense;
++
++	if (!tsi108_csr_base) {
++		printk("No tsi108 PIC found !\n");
++		return;
++	}
++
++	tsi108_pic_reset();
++
++	if (ppc_md.progress)
++		ppc_md.progress("tsi108_pic_init: enter", 0x122);
++
++	/* Initialize timer interrupts */
++	for (i = 0; i < TSI108PIC_NUM_TIMERS; i++) {
++		/* Disabled, Priority 0 */
++		tsi108_pic_inittimer(i, 0, IRQ_TSI108_TIMER0 + i);
++		/* No processor */
++		tsi108_pic_maptimer(i, 0);
++	}
++
++	/* Init board-specific external sources */
++	for (i = 0; i < 4; i++) {
++		sense = board_init_senses[i];
++
++		if (sense & IRQ_SENSE_MASK)
++			irq_desc[TSI108_IRQ(i)].status |= IRQ_LEVEL;
++
++		/* Enabled, Priority 8 */
++		tsi108_pic_initirq(i, 8, TSI108_IRQ(i),
++				   (sense & IRQ_POLARITY_MASK),
++				   (sense & IRQ_SENSE_MASK));
++		/* Map to CPU #0 */
++		tsi108_pic_mapirq(TSI108_IRQ(i), 1 << 0, 0);
++	}
++
++	/* Init remaining internal sources. */
++	for (; i < TSI108PIC_MAX_SOURCES; i++) {
++		/* Disabled, Priority 8, by default - Positive Edge */
++		tsi108_pic_initirq(i, 8, TSI108_IRQ(i),
++				   IRQ_POLARITY_POSITIVE, IRQ_SENSE_EDGE);
++		/* Map to CPU #0 */
++		tsi108_pic_mapirq(TSI108_IRQ(i), (1 << 0), 0);
++	}
++
++	/*
++	 * Change sensitivity to level for sources that require it.
++	 */
++
++	irq_desc[IRQ_TSI108_GIGE0].status |= IRQ_LEVEL;
++	irq_desc[IRQ_TSI108_GIGE1].status |= IRQ_LEVEL;
++	irq_desc[IRQ_TSI108_PCI].status |= IRQ_LEVEL;
++
++	/* Init descriptors */
++	for (i = 0; i < TSI108PIC_MAX_SOURCES; i++)
++		irq_desc[i + TSI108_IRQ_BASE].handler = &tsi108_pic_irq;
++
++	for (i = 0; i < NUM_PCI_IRQS; i++) {
++		irq_desc[i + IRQ_PCI_INTAD_BASE].handler = &tsi108_pci_irq;
++		irq_desc[i + IRQ_PCI_INTAD_BASE].status |= IRQ_LEVEL;
++	}
++
++	/* Initialize the spurious interrupt */
++	tsi108_pic_set_spurious(TSI108_IRQ_SPURIOUS);
++	tsi108_pic_set_task_priority(0);
++
++	init_pci_source();
++	tsi108_pic_enable_irq(IRQ_TSI108_PCI);
++
++	i = tsi108_pic_read_reg(TSI108_INT_VECTOR(0));
++	tsi108_pic_write_reg(TSI108_INT_EOI(0), 0);
++
++	if (ppc_md.progress)
++		ppc_md.progress("tsi108_pic_init: exit", 0x222);
++}
++
++/*
++ *  Find out the current interrupt
++ */
++static u_int tsi108_pic_get_vect(void)
++{
++	u_int vec;
++
++	vec = tsi108_pic_read_reg(TSI108_INT_VECTOR(0)) & TSI108PIC_VECTOR_MASK;
++
++#ifdef DBG_TSI108_INTERRUPT
++	if (vec == TSI108_IRQ_SPURIOUS)
++		printk("TSI108: SPURIOUS vec=0x%08x\n", vec);
++	else
++		printk("TSI108: read vec=0x%08x\n", vec);
++#endif
++	return (vec);
++}
++
++static inline void tsi108_pic_eoi(void)
++{
++	tsi108_pic_write_reg(TSI108_INT_EOI(0), 0);
++	mb();
++}
++
++static void __init tsi108_pic_set_task_priority(u_int pri)
++{
++	ASSERT(pri >= 0 && pri < TSI108PIC_NUM_PRI);
++
++	tsi108_pic_write_reg(TSI108_INT_TASKP(0),
++			     pri & TSI108PIC_INT_TASKP_TASKP);
++	mb();
++}
++
++static void tsi108_pic_set_spurious(u_int vec)
++{
++	ASSERT(vec == TSI108_IRQ_SPURIOUS);
++	tsi108_pic_write_reg(TSI108_INT_SVR, vec);
++	mb();
++}
++
++#ifdef CONFIG_SMP
++/*
++ * Convert a cpu mask from logical to physical cpu numbers.
++ */
++static inline u32 physmask(u32 cpumask)
++{
++	int i;
++	u32 mask = 0;
++
++	for (i = 0; i < NR_CPUS; ++i, cpumask >>= 1)
++		if (cpu_online(i))
++			mask |= (cpumask & 1) << smp_hw_index[i];
++	return mask;
++}
++#else
++#define physmask(cpumask)	(cpumask)
++#endif
++
++/*
++ *  Initialize a timer interrupt (and disable it)
++ *
++ *  timer: timer number
++ *  pri:   interrupt source priority
++ *  vec:   the vector it will produce
++ */
++static void __init tsi108_pic_inittimer(u_int timer, u_int pri, u_int vec)
++{
++	unsigned int gtvpr;
++
++	ASSERT(timer >= 0 && timer < TSI108PIC_NUM_TIMERS);
++	ASSERT(pri >= 0 && pri < TSI108PIC_NUM_PRI);
++	ASSERT(vec >= 0 && vec < TSI108PIC_NUM_VECTORS);
++
++	gtvpr = tsi108_pic_read_reg(TSI108_INT_GTVPR(timer));
++	gtvpr &= ~(TSI108PIC_PRIORITY_MASK | TSI108PIC_VECTOR_MASK);
++	gtvpr |= (pri << 16) | vec;
++	tsi108_pic_write_reg(TSI108_INT_GTVPR(timer), gtvpr | TSI108PIC_MASK);
++	mb();
++}
++
++/*
++ *  Map a timer interrupt to one or more CPUs
++ */
++static void __init tsi108_pic_maptimer(u_int timer, u_int cpumask)
++{
++	ASSERT(timer >= 0 && timer < TSI108PIC_NUM_TIMERS);
++
++	tsi108_pic_write_reg(TSI108_INT_GTDR(timer), physmask(cpumask));
++	mb();
++}
++
++/*
++ * Initalize the interrupt source which will generate an NMI.
++ * This raises the interrupt's priority from 8 to 9.
++ *
++ * irq: The logical IRQ which generates an NMI.
++ */
++void __init tsi108_pic_init_nmi_irq(u_int irq)
++{
++	u_int offset = get_vector_offset(irq);
++	u_int vpr = tsi108_pic_read_reg(offset);
++	vpr &= ~TSI108PIC_PRIORITY_MASK;
++	tsi108_pic_write_reg(offset, vpr | (9 << 16));
++	mb();
++}
++
++/*
++ *
++ * All functions below take an offset'ed irq argument
++ *
++ */
++
++/*
++ * Hookup a cascade to the tsi108 PIC.
++ */
++void __init
++tsi108_pic_hookup_cascade(u_int irq, char *name,
++			  int (*cascade_fn) (struct pt_regs *))
++{
++	tsi108_pic_cascade_irq = irq;
++	tsi108_pic_cascade_fn = cascade_fn;
++	if (request_irq(irq, no_action, SA_INTERRUPT, name, NULL))
++		printk("Unable to get Tsi108 PIC IRQ %d for cascade\n",
++		       irq - TSI108_IRQ_BASE);
++}
++
++/*
++ *  Enable/disable an external interrupt source
++ *
++ *  Externally called, irq is an offseted system-wide interrupt number
++ */
++static void tsi108_pic_enable_irq(u_int irq)
++{
++	u32 offset = get_vector_offset(irq);
++	u32 vpr = tsi108_pic_read_reg(offset);
++
++	/*
++	 * Undo sensitivity change (see tsi108_pic_disable_irq())
++	 */
++	if (irq_desc[irq].status & IRQ_LEVEL)
++		vpr |= TSI108PIC_INT_IVPR_S;
++
++	tsi108_pic_write_reg(offset, vpr & ~TSI108PIC_MASK);
++	mb();
++}
++
++static void tsi108_pic_disable_irq(u_int irq)
++{
++	u32 offset = get_vector_offset(irq);
++	u32 vpr = tsi108_pic_read_reg(offset);
++
++	/*
++	 * Switch level interrupt to edge sensitivity to avoid generation
++	 * of spurious interrupt request. See design note in Tsi108 PIC
++	 * section of Tsi108 manual.
++	 */
++	if (irq_desc[irq].status & IRQ_LEVEL)
++		vpr &= ~TSI108PIC_INT_IVPR_S;
++
++	tsi108_pic_write_reg(offset, vpr | TSI108PIC_MASK);
++	mb();
++	vpr = tsi108_pic_read_reg(offset);
++	if (!(vpr & TSI108PIC_MASK))
++		printk("TSI108_PIC: Error - Unable disable IRQ %d\n", irq);
++}
++
++/*
++ *  Initialize an interrupt source (and disable it!)
++ *
++ *  irq: Tsi108 PIC interrupt source number
++ *  pri: interrupt source priority
++ *  vec: the vector it will produce
++ *  pol: polarity (1 for positive, 0 for negative)
++ *  sense: 1 for level, 0 for edge
++ */
++static void __init
++tsi108_pic_initirq(u_int irq, u_int pri, u_int vec, int pol, int sense)
++{
++	unsigned int ivpr;
++
++	ivpr = TSI108PIC_MASK | (pri << 16) | vec;
++	ivpr |= (IRQ_SENSE_LEVEL == sense) ?
++	    TSI108PIC_INT_IVPR_S_LEVEL : TSI108PIC_INT_IVPR_S_EDGE;
++	ivpr |= (IRQ_POLARITY_POSITIVE == pol) ?
++	    TSI108PIC_INT_IVPR_P_HIGH : TSI108PIC_INT_IVPR_P_LOW;
++	tsi108_pic_write_reg(TSI108_INT_IVPR(irq), ivpr);
++	mb();
++}
++
++int tsi108_pic_set_irq_sense(int irq,	/* PIC source number */
++			     int pol,	/* interrupt source polarity */
++			     int sense	/* interrupt source sense */
++    )
++{
++	unsigned int ivpr;
++
++	ivpr = tsi108_pic_read_reg(TSI108_INT_IVPR(irq));
++
++	if (ivpr & TSI108PIC_ACTIVITY)	/* error if source is active */
++		return -1;
++
++	if (0 == (ivpr & TSI108PIC_MASK)) {
++		ivpr |= TSI108PIC_MASK;	/* mask IRQ prior making changes */
++		tsi108_pic_write_reg(TSI108_INT_IVPR(irq), ivpr);
++	}
++
++	/* clear bits to be changed */
++	ivpr &= ~(TSI108PIC_INT_IVPR_P | TSI108PIC_INT_IVPR_S);
++
++	ivpr |= (IRQ_SENSE_LEVEL == sense) ?
++	    TSI108PIC_INT_IVPR_S_LEVEL : TSI108PIC_INT_IVPR_S_EDGE;
++	ivpr |= (IRQ_POLARITY_POSITIVE == pol) ?
++	    TSI108PIC_INT_IVPR_P_HIGH : TSI108PIC_INT_IVPR_P_LOW;
++
++	tsi108_pic_write_reg(TSI108_INT_IVPR(irq), ivpr);
++	return 0;
++}
++
++/*
++ *  Map an interrupt source to one or more CPUs
++ */
++static void tsi108_pic_mapirq(u_int irq, u_int physmask, u_int keepmask)
++{
++	u_int offset = get_vector_offset(irq);
++
++	if (0 == offset)
++		return;
++	if (keepmask != 0)
++		physmask |= tsi108_pic_read_reg(offset + 4);
++	tsi108_pic_write_reg(offset + 4, physmask);
++	mb();
++}
++
++/* No spinlocks, should not be necessary with the Tsi108 PIC
++ * (1 register = 1 interrupt and we have the desc lock).
++ */
++static void tsi108_pic_ack_irq(unsigned int irq_nr)
++{
++	if ((irq_desc[irq_nr].status & IRQ_LEVEL) == 0)
++		tsi108_pic_eoi();
++}
++
++static void tsi108_pic_end_irq(unsigned int irq_nr)
++{
++	if ((irq_desc[irq_nr].status & IRQ_LEVEL) != 0)
++		tsi108_pic_eoi();
++}
++
++void tsi108_pic_set_affinity(unsigned int irq_nr, unsigned long cpumask)
++{
++	tsi108_pic_mapirq(irq_nr, physmask(cpumask), 0);
++}
++
++int tsi108_pic_get_irq(struct pt_regs *regs)
++{
++	int vector = tsi108_pic_get_vect();
++
++	if (vector == TSI108_IRQ_SPURIOUS) {
++		vector = -1;
++	}
++
++	if (vector == IRQ_TSI108_PCI) {
++		vector = get_pci_source(vector);
++	}
++
++	if (vector == -1) {
++		tsi108_pic_write_reg(TSI108_INT_EOI(0), 0);
++	}
++
++	return vector;
++}
++
++static void tsi108_pci_int_mask(u_int irq)
++{
++	u_int irp_cfg;
++	int int_line = (irq - IRQ_PCI_INTAD_BASE);
++
++	irp_cfg = tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL);
++	mb();
++	irp_cfg |= (1 << int_line);	/* INTx_DIR = output */
++	irp_cfg &= ~(3 << (8 + (int_line * 2)));	/* INTx_TYPE = unused */
++	tsi108_write_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL, irp_cfg);
++	mb();
++	irp_cfg = tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL);
++}
++
++static void tsi108_pci_int_unmask(u_int irq)
++{
++	u_int irp_cfg;
++	int int_line = (irq - IRQ_PCI_INTAD_BASE);
++
++	irp_cfg = tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL);
++	mb();
++	irp_cfg &= ~(1 << int_line);
++	irp_cfg |= (3 << (8 + (int_line * 2)));
++	tsi108_write_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL, irp_cfg);
++	mb();
++}
++
++static void tsi108_pci_irq_enable(u_int irq)
++{
++	tsi108_pci_int_unmask(irq);
++}
++
++static void tsi108_pci_irq_disable(u_int irq)
++{
++	tsi108_pci_int_mask(irq);
++}
++
++static void tsi108_pci_irq_ack(u_int irq)
++{
++	tsi108_pci_int_mask(irq);
++}
++
++static void tsi108_pci_irq_end(u_int irq)
++{
++	tsi108_pic_eoi();	/* eoi IRQ_TSI108_PCI */
++	tsi108_pci_int_unmask(irq);
++}
++
++static inline int get_pci_source(int vector)
++{
++	u_int temp = 0;
++	int irq = -1;
++	int i;
++	u_int pci_irp_stat;
++	static int mask = 0;
++
++	/* Read PCI/X block interrupt status register */
++	pci_irp_stat = tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_STAT);
++	mb();
++
++	if (pci_irp_stat & TSI108_PCI_IRP_STAT_P_INT) {
++		/* Process Interrupt from PCI bus INTA# - INTD# lines */
++		temp =
++		    tsi108_read_reg(TSI108_PCI_OFFSET +
++				    TSI108_PCI_IRP_INTAD) & 0xf;
++		mb();
++		for (i = 0; i < 4; i++, mask++) {
++			if (temp & (1 << mask % 4)) {
++				irq = IRQ_PCI_INTA + mask % 4;
++				mask++;
++				break;
++			}
++		}
++	}
++#ifdef DBG_TSI108_INTERRUPT
++	else {
++		printk("TSI108_PIC: error in TSI108_PCI_IRP_STAT\n");
++		pci_irp_stat =
++		    tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_STAT);
++		temp =
++		    tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_INTAD);
++		mb();
++		printk(">> stat=0x%08x intad=0x%08x ", pci_irp_stat, temp);
++		temp =
++		    tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL);
++		mb();
++		printk("cfg_ctl=0x%08x ", temp);
++		temp =
++		    tsi108_read_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_ENABLE);
++		mb();
++		printk("irp_enable=0x%08x\n", temp);
++	}
++#endif				/* DBG_TSI108_INTERRUPT */
++
++	return irq;
++}
++
++static void init_pci_source(void)
++{
++	tsi108_write_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_CFG_CTL,
++			 0x0000ff00);
++	tsi108_write_reg(TSI108_PCI_OFFSET + TSI108_PCI_IRP_ENABLE, 0x00400000);
++	mb();
++}
++
++static struct sysdev_class tsi108_pic_sysclass = {
++	set_kset_name("tsi108_pic"),
++};
++
++static struct sys_device device_tsi108_pic = {
++	.id = 0,
++	.cls = &tsi108_pic_sysclass,
++};
++
++static struct sysdev_driver driver_tsi108_pic = {
++#ifdef CONFIG_PM		/* FIXME: placeholder for future development */
++	.suspend = &tsi108_pic_suspend,
++	.resume = &tsi108_pic_resume,
++#endif				/* CONFIG_PM */
++};
++
++static int __init init_tsi108_pic_sysfs(void)
++{
++	int rc;
++
++	if (!tsi108_csr_base)
++		return -ENODEV;
++	printk(KERN_DEBUG "Registering tsi108_pic with sysfs...\n");
++	rc = sysdev_class_register(&tsi108_pic_sysclass);
++	if (rc) {
++		printk(KERN_ERR "Failed registering tsi108_pic sys class\n");
++		return -ENODEV;
++	}
++	rc = sysdev_register(&device_tsi108_pic);
++	if (rc) {
++		printk(KERN_ERR "Failed registering tsi108_pic sys device\n");
++		return -ENODEV;
++	}
++	rc = sysdev_driver_register(&tsi108_pic_sysclass, &driver_tsi108_pic);
++	if (rc) {
++		printk(KERN_ERR "Failed registering tsi108_pic sys driver\n");
++		return -ENODEV;
++	}
++	return 0;
++}
++
++subsys_initcall(init_tsi108_pic_sysfs);
+Index: linux-2.6.10/arch/ppc/syslib/tsi108_pic.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/syslib/tsi108_pic.h
+@@ -0,0 +1,233 @@
++/*
++ * (C) Copyright 2005 Tundra Semiconductor Corp.
++ * Alex Bounine, <alexandreb@tundra.com).
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++/*
++ *  arch/ppc/syslib/tsi108_pic.h - Tsi108 Interrupt Controller definitions
++ */
++
++#ifndef _LINUX_TSI108_PIC_H
++#define _LINUX_TSI108_PIC_H
++
++#include <asm/tsi108_irq.h>
++
++#ifdef __KERNEL__
++
++/*
++ *  Tsi108 PIC supports up to 24 interrupt sources and up to 4 processors
++ */
++
++#define TSI108PIC_MAX_SOURCES		24
++#define TSI108PIC_MAX_PROCESSORS	4
++
++#define TSI108PIC_NUM_TIMERS	4
++#define TSI108PIC_NUM_DBELLS	4
++#define TSI108PIC_NUM_PROC   	4
++#define TSI108PIC_NUM_PRI	16
++#define TSI108PIC_NUM_VECTORS	256
++
++/*
++ * Tsi108 PIC Register offsets within block.
++ */
++
++/* Registers controlling sources */
++#define TSI108_INT_FRR		(0x000)
++#define TSI108_INT_GCR		(0x004)
++#define TSI108_INT_SVR		(0x010)
++#define TSI108_INT_GTVPR(n)	(0x38 + 0x10*(n))
++#define TSI108_INT_GTDR(n)	(0x3C + 0x10*(n))
++#define TSI108_INT_IVPR(n)	(0x100 + 0x8*(n))
++#define TSI108_INT_IDR(n)	(0x104 + 0x8*(n))
++#define TSI108_INT_DVPR(n)	(0x204 + 0xC*(n))
++#define TSI108_INT_DDR(n)	(0x208 + 0xC*(n))
++#define TSI108_INT_MBVPR(n)	(0x284 + 0x10*(n))
++#define TSI108_INT_MBDR(n)	(0x288 + 0x10*(n))
++
++/* Registers controlling destinations */
++#define TSI108_INT_TASKP(n)	(0x300 + 0x40*(n))
++#define TSI108_INT_VECTOR(n)	(0x304 + 0x40*(n))
++#define TSI108_INT_EOI(n)	(0x308 + 0x40*(n))
++#define TSI108_INT_CSR(n)	(0x30C + 0x40*(n))
++
++/*
++ * Generic definitions common for different types of interrupt
++ * sources.
++ */
++
++#define TSI108PIC_MASK				(0x80000000)
++#define TSI108PIC_ACTIVITY			(0x40000000)
++#define TSI108PIC_PRIORITY_MASK			(0x000f0000)
++#define TSI108PIC_VECTOR_MASK			(0x000000ff)
++
++/**********************************************************
++ * Register Bit Masks definitions for every register
++ */
++
++/* TSI108PIC_INT_FRR : Register Bits Masks Definitions */
++#define TSI108PIC_INT_FRR_VID			(0x000000ff)
++#define TSI108PIC_INT_FRR_NCPU			(0x00001f00)
++#define TSI108PIC_INT_FRR_NITM			(0x0000e000)
++#define TSI108PIC_INT_FRR_NIRQ			(0x07ff0000)
++#define TSI108PIC_INT_FRR_NIDOOR		(0xe0000000)
++#define TSI108PIC_INT_FRR_RESERVED		(0x18000000)
++
++/* TSI108PIC_INT_GCR : Register Bits Masks Definitions */
++#define TSI108PIC_INT_GCR_R			(0x80000000)
++#define TSI108PIC_INT_GCR_RESERVED		(0x7fffffff)
++
++/* TSI108PIC_INT_ICR : Register Bits Masks Definitions */
++#define TSI108PIC_INT_ICR_R			(0x0000000f)
++#define TSI108PIC_INT_ICR_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_MVI : Register Bits Masks Definitions */
++#define TSI108PIC_INT_MVI_VID			(0x000000ff)
++#define TSI108PIC_INT_MVI_DID			(0x0000ff00)
++#define TSI108PIC_INT_MVI_STEP			(0x00ff0000)
++#define TSI108PIC_INT_MVI_RESERVED		(0xff000000)
++
++/* TSI108PIC_INT_SVR : Register Bits Masks Definitions */
++#define TSI108PIC_INT_SVR_VECTOR		(0x000000ff)
++#define TSI108PIC_INT_SVR_RESERVED		(0xffffff00)
++
++/* TSI108PIC_INT_TFRR : Register Bits Masks Definitions */
++#define TSI108PIC_INT_TFRR_TIME_FREQ		(0xffffffff)
++
++/* TSI108PIC_INT_SOFT_SET : Register Bits Masks Definitions */
++#define TSI108PIC_INT_SOFT_SET_S		(0x00ffffff)
++#define TSI108PIC_INT_SOFT_SET_RESERVED		(0xff000000)
++
++/* TSI108PIC_INT_SOFT_ENABLE : Register Bits Masks Definitions */
++#define TSI108PIC_INT_SOFT_ENABLE_EN		(0x00ffffff)
++#define TSI108PIC_INT_SOFT_ENABLE_RESERVED	(0xff000000)
++
++/* TSI108PIC_INT_GTCCR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_GTCCR_COUNT		(0x7fffffff)
++#define TSI108PIC_INT_GTCCR_T			(0x80000000)
++
++/* TSI108PIC_INT_GTBCR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_GTBCR_B_COUNT		(0x7fffffff)
++#define TSI108PIC_INT_GTBCR_CI			(0x80000000)
++
++/* TSI108PIC_INT_GTVPR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_GTVPR_VECTOR		(0x000000ff)
++#define TSI108PIC_INT_GTVPR_PRIORITY		(0x000f0000)
++#define TSI108PIC_INT_GTVPR_PRESCALE		(0x00f00000)
++#define TSI108PIC_INT_GTVPR_A			(0x40000000)
++#define TSI108PIC_INT_GTVPR_M			(0x80000000)
++#define TSI108PIC_INT_GTVPR_RESERVED		(0x3f00ff00)
++
++/* TSI108PIC_INT_GTDR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_GTDR_SEL_OUT		(0x0000000f)
++#define TSI108PIC_INT_GTDR_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_IVPR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_IVPR_VECTOR		(0x000000ff)
++#define TSI108PIC_INT_IVPR_PRIORITY		(0x000f0000)
++
++#define TSI108PIC_INT_IVPR_P			(0x01000000)
++#define TSI108PIC_INT_IVPR_P_LOW		(0 << 24)
++#define TSI108PIC_INT_IVPR_P_HIGH		(1 << 24)
++
++#define TSI108PIC_INT_IVPR_S			(0x02000000)
++#define TSI108PIC_INT_IVPR_S_EDGE		(0 << 25)
++#define TSI108PIC_INT_IVPR_S_LEVEL		(1 << 25)
++
++#define TSI108PIC_INT_IVPR_MODE			(0x20000000)
++#define TSI108PIC_INT_IVPR_A			(0x40000000)
++#define TSI108PIC_INT_IVPR_M			(0x80000000)
++#define TSI108PIC_INT_IVPR_RESERVED		(0x1cf0ff00)
++
++/* TSI108PIC_INT_IDR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_IDR_SEL_OUT		(0x0000000f)
++#define TSI108PIC_INT_IDR_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_DAR : Register Bits Masks Definitions */
++#define TSI108PIC_INT_DAR_A			(0x0000000f)
++#define TSI108PIC_INT_DAR_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_DVPR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_DVPR_VECTOR		(0x000000ff)
++#define TSI108PIC_INT_DVPR_PRIORITY		(0x000f0000)
++#define TSI108PIC_INT_DVPR_A			(0x40000000)
++#define TSI108PIC_INT_DVPR_M			(0x80000000)
++#define TSI108PIC_INT_DVPR_RESERVED		(0x3ff0ff00)
++
++/* TSI108PIC_INT_DDR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_DDR_SEL_OUT		(0x0000000f)
++#define TSI108PIC_INT_DDR_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_DMR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_DMR_M			(0xffffffff)
++
++/* TSI108PIC_INT_MBR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_MBR_M			(0xffffffff)
++
++/* TSI108PIC_INT_MBVPR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_MBVPR_VECTOR		(0x000000ff)
++#define TSI108PIC_INT_MBVPR_PRIORITY		(0x000f0000)
++#define TSI108PIC_INT_MBVPR_A			(0x40000000)
++#define TSI108PIC_INT_MBVPR_M			(0x80000000)
++#define TSI108PIC_INT_MBVPR_RESERVED		(0x3ff0ff00)
++
++/* TSI108PIC_INT_MBDR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_MBDR_SEL_OUT		(0x0000000f)
++#define TSI108PIC_INT_MBDR_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_TASKP(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_TASKP_TASKP		(0x0000000f)
++#define TSI108PIC_INT_TASKP_RESERVED		(0xfffffff0)
++
++/* TSI108PIC_INT_VECTOR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_VECTOR_VECTOR		(0x000000ff)
++#define TSI108PIC_INT_VECTOR_LS_VECTOR		(0xff000000)
++#define TSI108PIC_INT_VECTOR_RESERVED		(0x00ffff00)
++
++/* TSI108PIC_INT_EOI(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_EOI_EOI			(0x000000ff)
++#define TSI108PIC_INT_EOI_RESERVED		(0xffffff00)
++
++/* TSI108PIC_INT_CSR(X) : Register Bits Masks Definitions */
++#define TSI108PIC_INT_CSR_RESERVED		(0xfffffffc)
++
++#define TSI108PIC_INT_CSR_P			(1 << 0)
++#define TSI108PIC_INT_CSR_P_LOW			(0 << 0)
++#define TSI108PIC_INT_CSR_P_HIGH		(1 << 0)
++
++#define TSI108PIC_INT_CSR_S			(1 << 1)
++#define TSI108PIC_INT_CSR_S_EDGE		(0 << 1)
++#define TSI108PIC_INT_CSR_S_LEVEL		(1 << 1)
++
++extern void tsi108_pic_init(u_char * board_init_senses);
++extern void tsi108_pic_reset(void);
++extern void tsi108_pic_set_output(int dest_num, u32 sense, u32 polarity);
++extern int tsi108_pic_source_cfg(int src_num, u32 sense,
++				 u32 polarity, TSI108_IRQ_MODE mode);
++extern int tsi108_pic_set_vector(int src_num, int vect, int prio);
++
++extern void tsi108_pic_init_nmi_irq(u_int irq);
++extern void tsi108_pic_hookup_cascade(u_int irq, char *name,
++				      int (*cascade_fn) (struct pt_regs *));
++extern int tsi108_pic_get_irq(struct pt_regs *regs);
++
++#endif				/* __KERNEL__ */
++
++#endif				/* _LINUX_TSI108_PIC_H */
+Index: linux-2.6.10/include/asm-ppc/tsi108.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-ppc/tsi108.h
+@@ -0,0 +1,95 @@
++/*
++ * include/asm-ppc/tsi108.h
++ *
++ * common routine and memory layout for Tundra TSI108(Grendel) host bridge
++ * memory controller.
++ *
++ * Author: Jacob Pan (jacob.pan@freescale.com)
++ *	   Alex Bounine (alexandreb@tundra.com)
++ * 2004 (c) Freescale Semiconductor Inc.  This file is licensed under
++ * the terms of the GNU General Public License version 2.  This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#ifndef __PPC_KERNEL_TSI108_H
++#define __PPC_KERNEL_TSI108_H
++
++#include <asm/pci-bridge.h>
++
++/* Size of entire register space */
++#define TSI108_REG_SIZE		(0x10000)
++
++/* Sizes of register spaces for individual blocks */
++#define TSI108_HLP_SIZE		0x1000
++#define TSI108_PCI_SIZE		0x1000
++#define TSI108_CLK_SIZE		0x1000
++#define TSI108_PB_SIZE		0x1000
++#define TSI108_SD_SIZE		0x1000
++#define TSI108_DMA_SIZE		0x1000
++#define TSI108_ETH_SIZE		0x1000
++#define TSI108_I2C_SIZE		0x400
++#define TSI108_MPIC_SIZE	0x400
++#define TSI108_UART0_SIZE	0x200
++#define TSI108_GPIO_SIZE	0x200
++#define TSI108_UART1_SIZE	0x200
++
++/* Offsets within Tsi108(A) CSR space for individual blocks */
++#define TSI108_HLP_OFFSET	0x0000
++#define TSI108_PCI_OFFSET	0x1000
++#define TSI108_CLK_OFFSET	0x2000
++#define TSI108_PB_OFFSET	0x3000
++#define TSI108_SD_OFFSET	0x4000
++#define TSI108_DMA_OFFSET	0x5000
++#define TSI108_ETH_OFFSET	0x6000
++#define TSI108_I2C_OFFSET	0x7000
++#define TSI108_MPIC_OFFSET	0x7400
++#define TSI108_UART0_OFFSET	0x7800
++#define TSI108_GPIO_OFFSET	0x7A00
++#define TSI108_UART1_OFFSET	0x7C00
++
++/* Tsi108 registers used by common code components */
++#define TSI108_PCI_CSR		(0x004)
++#define TSI108_PCI_IRP_CFG_CTL	(0x180)
++#define TSI108_PCI_IRP_STAT	(0x184)
++#define TSI108_PCI_IRP_ENABLE	(0x188)
++#define TSI108_PCI_IRP_INTAD	(0x18C)
++
++#define TSI108_PCI_IRP_STAT_P_INT	(0x00400000)
++
++#define TSI108_CG_PWRUP_STATUS	(0x234)
++
++#define TSI108_PB_ISR		(0x00C)
++#define TSI108_PB_ERRCS		(0x404)
++#define TSI108_PB_AERR		(0x408)
++
++#define TSI108_PB_ERRCS_ES		(1 << 1)
++#define TSI108_PB_ISR_PBS_RD_ERR	(1 << 8)
++
++/* Global variables */
++
++extern u32 tsi108_csr_base;
++extern u32 tsi108_pci_cfg_base;
++
++/* Exported functions */
++
++extern int tsi108_bridge_init(struct pci_controller *hose, uint phys_csr_base);
++extern unsigned long tsi108_get_mem_size(void);
++extern unsigned long tsi108_get_cpu_clk(void);
++extern unsigned long tsi108_get_sdc_clk(void);
++extern int tsi108_direct_write_config(struct pci_bus *bus, unsigned int devfn,
++				      int offset, int len, u32 val);
++extern int tsi108_direct_read_config(struct pci_bus *bus, unsigned int devfn,
++				     int offset, int len, u32 * val);
++extern void tsi108_clear_pci_error(u32 pci_cfg_base);
++
++extern inline u32 tsi108_read_reg(u32 reg_offset)
++{
++	return in_be32((volatile u32 *)(tsi108_csr_base + reg_offset));
++}
++
++extern inline void tsi108_write_reg(u32 reg_offset, u32 val)
++{
++	out_be32((volatile u32 *)(tsi108_csr_base + reg_offset), val);
++}
++
++#endif				/* __PPC_KERNEL_TSI108_H */
+Index: linux-2.6.10/include/asm-ppc/tsi108_irq.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-ppc/tsi108_irq.h
+@@ -0,0 +1,131 @@
++/*
++ * (C) Copyright 2005 Tundra Semiconductor Corp.
++ * Alex Bounine, <alexandreb@tundra.com).
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++/*
++ * asm-ppc/tsi108_irq.h - definitions for interrupt controller
++ * initialization and external interrupt demultiplexing on TSI108EMU/SVB boards.
++ */
++
++#ifndef _ASM_PPC_TSI108_IRQ_H
++#define _ASM_PPC_TSI108_IRQ_H
++
++/*
++ * Tsi108 interrupts
++ */
++#ifndef TSI108_IRQ_BASE
++#define TSI108_IRQ_BASE		0
++#endif
++
++#define TSI108_IRQ(x)		(TSI108_IRQ_BASE + (x))
++
++#define TSI108_MAX_VECTORS	(36 + 4)	/* 36 sources + PCI INT demux */
++#define MAX_TASK_PRIO	0xF
++
++#define TSI108_IRQ_SPURIOUS	(TSI108_MAX_VECTORS)
++
++#define DEFAULT_PRIO_LVL	10	/* initial priority level */
++
++/* Interrupt vectors assignment to external and internal
++ * sources of requests. */
++
++/* EXTERNAL INTERRUPT SOURCES */
++
++#define IRQ_TSI108_EXT_INT0	TSI108_IRQ(0)	/* External Source at INT[0] */
++#define IRQ_TSI108_EXT_INT1	TSI108_IRQ(1)	/* External Source at INT[1] */
++#define IRQ_TSI108_EXT_INT2	TSI108_IRQ(2)	/* External Source at INT[2] */
++#define IRQ_TSI108_EXT_INT3	TSI108_IRQ(3)	/* External Source at INT[3] */
++
++/* INTERNAL INTERRUPT SOURCES */
++
++#define IRQ_TSI108_RESERVED0	TSI108_IRQ(4)	/* Reserved IRQ */
++#define IRQ_TSI108_RESERVED1	TSI108_IRQ(5)	/* Reserved IRQ */
++#define IRQ_TSI108_RESERVED2	TSI108_IRQ(6)	/* Reserved IRQ */
++#define IRQ_TSI108_RESERVED3	TSI108_IRQ(7)	/* Reserved IRQ */
++#define IRQ_TSI108_DMA0		TSI108_IRQ(8)	/* DMA0 */
++#define IRQ_TSI108_DMA1		TSI108_IRQ(9)	/* DMA1 */
++#define IRQ_TSI108_DMA2		TSI108_IRQ(10)	/* DMA2 */
++#define IRQ_TSI108_DMA3		TSI108_IRQ(11)	/* DMA3 */
++#define IRQ_TSI108_UART0	TSI108_IRQ(12)	/* UART0 */
++#define IRQ_TSI108_UART1	TSI108_IRQ(13)	/* UART1 */
++#define IRQ_TSI108_I2C		TSI108_IRQ(14)	/* I2C */
++#define IRQ_TSI108_GPIO		TSI108_IRQ(15)	/* GPIO */
++#define IRQ_TSI108_GIGE0	TSI108_IRQ(16)	/* GIGE0 */
++#define IRQ_TSI108_GIGE1	TSI108_IRQ(17)	/* GIGE1 */
++#define IRQ_TSI108_RESERVED4	TSI108_IRQ(18)	/* Reserved IRQ */
++#define IRQ_TSI108_HLP		TSI108_IRQ(19)	/* HLP */
++#define IRQ_TSI108_SDRAM	TSI108_IRQ(20)	/* SDC */
++#define IRQ_TSI108_PROC_IF	TSI108_IRQ(21)	/* Processor IF */
++#define IRQ_TSI108_RESERVED5	TSI108_IRQ(22)	/* Reserved IRQ */
++#define IRQ_TSI108_PCI		TSI108_IRQ(23)	/* PCI/X block */
++
++#define IRQ_TSI108_MBOX0	TSI108_IRQ(24)	/* Mailbox 0 register */
++#define IRQ_TSI108_MBOX1	TSI108_IRQ(25)	/* Mailbox 1 register */
++#define IRQ_TSI108_MBOX2	TSI108_IRQ(26)	/* Mailbox 2 register */
++#define IRQ_TSI108_MBOX3	TSI108_IRQ(27)	/* Mailbox 3 register */
++
++#define IRQ_TSI108_DBELL0	TSI108_IRQ(28)	/* Doorbell 0 */
++#define IRQ_TSI108_DBELL1	TSI108_IRQ(29)	/* Doorbell 1 */
++#define IRQ_TSI108_DBELL2	TSI108_IRQ(30)	/* Doorbell 2 */
++#define IRQ_TSI108_DBELL3	TSI108_IRQ(31)	/* Doorbell 3 */
++
++#define IRQ_TSI108_TIMER0	TSI108_IRQ(32)	/* Global Timer 0 */
++#define IRQ_TSI108_TIMER1	TSI108_IRQ(33)	/* Global Timer 1 */
++#define IRQ_TSI108_TIMER2	TSI108_IRQ(34)	/* Global Timer 2 */
++#define IRQ_TSI108_TIMER3	TSI108_IRQ(35)	/* Global Timer 3 */
++
++/*
++ * PCI bus INTA# - INTD# lines demultiplexor
++ */
++#define IRQ_PCI_INTAD_BASE	TSI108_IRQ(36)
++#define IRQ_PCI_INTA		(IRQ_PCI_INTAD_BASE + 0)
++#define IRQ_PCI_INTB		(IRQ_PCI_INTAD_BASE + 1)
++#define IRQ_PCI_INTC		(IRQ_PCI_INTAD_BASE + 2)
++#define IRQ_PCI_INTD		(IRQ_PCI_INTAD_BASE + 3)
++#define NUM_PCI_IRQS		(4)
++
++/* number of entries in vector dispatch table */
++#define IRQ_TSI108_TAB_SIZE	(TSI108_MAX_VECTORS + 1)
++
++/* Mapping of MPIC outputs to processors' interrupt pins */
++
++#define IDIR_INT_OUT0		0x1
++#define IDIR_INT_OUT1		0x2
++#define IDIR_INT_OUT2		0x4
++#define IDIR_INT_OUT3		0x8
++
++/*---------------------------------------------------------------
++ * IRQ line configuration parameters */
++
++/* Interrupt delivery modes */
++typedef enum {
++	TSI108_IRQ_DIRECTED,
++	TSI108_IRQ_DISTRIBUTED,
++} TSI108_IRQ_MODE;
++
++/*--------------------------------------------------------------- */
++/* Error codes */
++
++#define MPIC_OK		0
++#define MPIC_ERROR	1
++
++#endif				/*  _ASM_PPC_TSI108_IRQ_H */
+Index: linux-2.6.10/include/linux/pci_ids.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/pci_ids.h
++++ linux-2.6.10/include/linux/pci_ids.h
+@@ -1162,6 +1162,8 @@
+ 
+ #define PCI_VENDOR_ID_TUNDRA		0x10e3
+ #define PCI_DEVICE_ID_TUNDRA_CA91C042	0x0000
++#define PCI_DEVICE_ID_TUNDRA_TSI108	0x0108
++#define PCI_DEVICE_ID_TUNDRA_TSI109	0xA108
+ 
+ #define PCI_VENDOR_ID_AMCC		0x10e8
+ #define PCI_DEVICE_ID_AMCC_MYRINET	0x8043
+Index: linux-2.6.10/arch/ppc/kernel/traps.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/traps.c
++++ linux-2.6.10/arch/ppc/kernel/traps.c
+@@ -175,6 +175,21 @@ static inline int check_io_access(struct
+ 		}
+ 	}
+ #endif /* CONFIG_PPC_PMAC */
++
++#ifdef CONFIG_TSI108_BRIDGE
++	{
++		extern void tsi108_clear_pci_cfg_error(void);
++		const struct exception_table_entry *entry;
++
++		/* Are we prepared to handle this fault?  */
++		if ((entry = search_exception_tables(regs->nip)) != NULL) {
++			tsi108_clear_pci_cfg_error();
++			regs->msr |= MSR_RI;
++			regs->nip = entry->fixup;
++			return 1;
++		}
++	}
++#endif /* CONFIG_TSI108_BRIDGE */
+ 	return 0;
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-1111.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1111.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1111);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

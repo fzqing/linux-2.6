@@ -1,0 +1,567 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_rmi_xlr_sensor
+# Date: Thu May  3 22:20:36 2007
+# Source: RMI Electronics
+# MR: 22935
+# Type: Enhancement
+# Disposition: MontaVista
+# Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+# Description: 
+# 
+# Support for Maxim MAX6657 Temperature Sensor
+# 
+#  drivers/i2c/chips/Kconfig   |    8 +
+#  drivers/i2c/chips/Makefile  |    1 
+#  drivers/i2c/chips/max6657.c |  289 ++++++++++++++++++++++++++++++++++++++++++++
+#  3 files changed, 298 insertions(+)
+# 
+
+PATCHNUM=1314
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: RMI Electronics
+MR: 22935
+Type: Enhancement
+Disposition: MontaVista
+Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+Description: 
+
+Support for Maxim MAX6657 Temperature Sensor
+
+ drivers/i2c/chips/Kconfig   |    8 +
+ drivers/i2c/chips/Makefile  |    1 
+ drivers/i2c/chips/max6657.c |  289 ++++++++++++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-1314.c      |   16 ++
+ 4 files changed, 314 insertions(+)
+
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -406,6 +406,14 @@ config	AT24C02_EEPROM
+ 	help
+ 	  Driver for the I2C-based eeprom Chip on the XLR Reference boards
+ 
++config	MAX6657_TEMP
++	tristate "Maxim MAX6657 Temperature Sensor"
++	depends on RMI_PHOENIX && I2C && EXPERIMENTAL
++	select I2C_SENSOR
++	help
++	  Driver for the I2C-based MAX6657 Temperature Sensor Chip on the
++	  XLR Reference boards
++
+ config SENSORS_M41T00
+ 	tristate "ST M41T00 RTC chip"
+ 	depends on I2C && PPC32
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_SENSORS_W83L785TS)	+= w83l7
+ obj-$(CONFIG_TPS65010)		+= tps65010.o
+ obj-$(CONFIG_ISP1301_OMAP)	+= isp1301_omap.o
+ obj-$(CONFIG_AT24C02_EEPROM)	+= at24c02.o
++obj-$(CONFIG_MAX6657_TEMP)	+= max6657.o
+ obj-$(CONFIG_SENSORS_TLV320AIC23) += tlv320aic23.o
+ obj-$(CONFIG_SENSORS_TLV320AIC33) += tlv320aic33.o
+ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_expander_omap.o
+Index: linux-2.6.10/drivers/i2c/chips/max6657.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/max6657.c
+@@ -0,0 +1,289 @@
++/*
++ * Copyright © 200-2007 Raza Microelectronics, Inc. (.RMI.)
++ *
++ * This program is free software.  You may use it, redistribute it
++ * and/or modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version two of the
++ * License or (at your option) any later version.
++ *
++ * This program is distributed in the hope that you will find it useful.
++ * Notwithstanding the foregoing, you understand and agree that this program
++ * is provided by RMI .as is,. and without any warranties, whether express,
++ * implied or statutory, including without limitation any implied warranty of
++ * non-infringement, merchantability or fitness for a particular purpose.
++ * In no event will RMI be liable for any loss of data, lost profits, cost
++ * of procurement of substitute technology or services or for any direct,
++ * indirect, incidental, consequential or special damages arising from the
++ * use of this program, however caused.  Your unconditional agreement to
++ * these terms and conditions is an express condition to, and shall be deemed
++ * to occur upon, your use, redistribution and/or modification of this program.
++ *
++ * See the GNU General Public License for more details.
++ */
++
++/*
++ * linux/drivers/i2c/chips/max6657.c
++ *
++ * based on drivers/char/x1226-rtc.c
++ * Steve Longerbeam <stevel@mvista.com, or source@mvista.com>
++ * 2002-2003 (c) MontaVista Software, Inc.
++ *
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/i2c.h>
++#include <linux/string.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/types.h>
++#include <linux/miscdevice.h>
++#include <linux/fcntl.h>
++#include <linux/fs.h>
++#include <linux/proc_fs.h>
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/time.h>
++
++#include <asm/rmi/sim.h>
++
++/* #define 	DEBUG_MAX6657 */
++
++
++#ifdef DEBUG_MAX6657		
++#define dbg(fmt, args...) 	printk(KERN_DEBUG "%s: " fmt, __func__, ## args)
++#else
++#define dbg(fmt, args...)
++#endif
++
++#define err(format, arg...) 	printk(KERN_ERR ": " format , ## arg)
++#define info(format, arg...) 	printk(KERN_INFO ": " format , ## arg)
++
++#define DEVID_TEMP    	   	0x4c
++#define MAX6657_TEMP_BASE    	0x00
++#define XLR_I2C_DRIVERID_MAX6657   	0x01
++
++static struct 	i2c_driver max6657_driver;
++static struct 	i2c_client *this_client = NULL;
++static int 	max6657_use_count = 0;
++static int 	temp_read_proc(char *page, char **start, off_t off, int count, 
++		int *eof, void *data);
++
++static int
++max6657_read(struct i2c_client *client, u16 offset, u8 * buf, int len)
++{
++	int ret = 0, sz = 0;
++	struct i2c_msg msg;
++
++	for(sz = 0; sz < len ; sz++) {
++		msg.addr = client->addr;		/* 0x4c */
++		msg.flags = I2C_M_RD;			/* I2C Read Command */
++		msg.len =  1;			        /* bytes */
++		buf[sz] = offset + sz;
++		msg.buf =  &buf[sz];			/* Store the result here */
++
++		if ((ret = i2c_transfer(client->adapter, &msg, 1)) < 0) {
++			err("i2c_transfer failed, ret=%d\n", ret);
++			ret = -ENXIO;
++		}
++	}
++	
++	return ret;
++}
++
++static int
++max6657_get_value(struct i2c_client *client, unsigned char *value, int offset)
++{
++	int ret;
++
++	if (!client) return -ENXIO;
++
++	/* read TEMP registers */
++	if ((ret = max6657_read(client, offset, value, sizeof (char))) < 0) {
++		dbg("couldn't read TEMP\n");
++		return ret;
++	}
++
++	dbg("IN: value=%0x\n", *value);
++
++	return 0;
++}
++
++static int max6657_probe(struct i2c_adapter *adap)
++{
++	int ret;
++	unsigned char temp;
++	if (this_client != NULL)
++		return -EBUSY;
++
++	this_client = kmalloc(sizeof (*this_client), GFP_KERNEL);
++	if (this_client == NULL) {
++		return -ENOMEM;
++	}
++
++	memset(this_client, 0, sizeof(*this_client));
++
++	strcpy(this_client->name, "MAX6657");
++/* 	this_client->id 	= max6657_driver.id; */
++	this_client->addr 	= DEVID_TEMP;
++	this_client->adapter 	= adap;
++	this_client->driver 	= &max6657_driver;
++	this_client->flags 	= 0;
++	/*
++	 * use max6657_get_value() to probe for a MAX6657 on this bus.
++	 */
++	if ((ret = max6657_get_value(this_client, &temp, MAX6657_TEMP_BASE+1)) < 0) {
++		kfree(this_client);
++		this_client = NULL;
++		return ret;
++	}
++
++	info("Found MAX6657 on %s\n", adap->name);
++	printk("XLR Chip temperature is %d degrees Celsius\n", temp);
++
++	/* attach it. */
++	return i2c_attach_client(this_client);
++}
++
++static int
++max6657_detach(struct i2c_client *client)
++{
++	i2c_detach_client(client);
++
++	if (this_client != NULL) {
++		kfree(this_client);
++		this_client = NULL;
++	}
++
++	return 0;
++}
++
++int
++temp_open(struct inode *minode, struct file *mfile)
++{
++	/*if(MOD_IN_USE) */
++	if (max6657_use_count > 0) {
++		return -EBUSY;
++	}
++/* 	MOD_INC_USE_COUNT; */
++	++max6657_use_count;
++	return 0;
++}
++
++int
++temp_release(struct inode *minode, struct file *mfile)
++{
++/* 	MOD_DEC_USE_COUNT; */
++	--max6657_use_count;
++	return 0;
++}
++
++static int
++temp_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
++		unsigned long arg)
++{
++	return -EINVAL;
++}
++
++static struct i2c_driver max6657_driver = {
++	.owner		= THIS_MODULE,
++	.name   = "max6657",
++	.id		= XLR_I2C_DRIVERID_MAX6657,
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter = max6657_probe,
++	.detach_client	= max6657_detach,
++};
++
++static struct file_operations temp_fops = {
++	.owner 		= THIS_MODULE,
++	.ioctl 		= temp_ioctl,
++	.open 		= temp_open,
++	.release 	= temp_release,
++};
++
++static struct miscdevice max6657_miscdev = {
++	TEMP_MINOR,
++	"max6657",
++	&temp_fops
++};
++
++static int __init max6657_init(void)
++{
++	int ret;
++
++	printk("Registering XLR I2C based Temperature Sensor driver...\n");
++	ret = i2c_add_driver(&max6657_driver);
++	if (ret) {
++		printk("Unable to register xlr temperaturn sensor driver!\n");
++		return ret;		
++	}	
++
++	ret = misc_register(&max6657_miscdev);
++	if (ret) {
++		err("Register misc driver failed, errno is %d\n", ret);
++		ret = i2c_del_driver(&max6657_driver);
++		if (ret) {
++			err("Unregister I2C driver failed, errno is %d\n", ret);
++		}
++		return ret;
++	}
++
++	create_proc_read_entry("driver/max6657", 0, 0, temp_read_proc, NULL);
++
++	return 0;
++}
++
++static void __exit max6657_exit(void)
++{
++	remove_proc_entry("driver/max6657", NULL);
++	misc_deregister(&max6657_miscdev);
++	i2c_del_driver(&max6657_driver);
++}
++
++
++module_init(max6657_init);
++module_exit(max6657_exit);
++
++/*
++ * Info exported via "/proc/driver/max6657".
++ */
++
++static int
++temp_proc_output(char *buf)
++{
++	char *p;
++	unsigned char temp;
++	int ret;
++
++	if ((ret = max6657_get_value(this_client, &temp, 1)) < 0)
++		return ret;
++
++	p = buf;
++	/*
++	 * There is no way to tell if the luser has the TEMP set for local
++	 * time or for Universal Standard Time (GMT). Probably local though.
++	 */
++	p += sprintf(p, "temperature: %d C\n", temp);
++	return p - buf;
++}
++
++static int
++temp_read_proc(char *page, char **start, off_t off,
++		int count, int *eof, void *data)
++{
++	int len = temp_proc_output(page);
++	if (len <= off + count)
++		*eof = 1;
++	*start = page + off;
++	len -= off;
++	if (len > count)
++		len = count;
++	if (len < 0)
++		len = 0;
++	return len;
++}
++
++MODULE_AUTHOR("RMI");
++MODULE_DESCRIPTION("Maxim max6657 Driver");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/mvl_patches/pro-1314.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1314.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1314);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,571 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_au1000_eth_probe_rewrite
+# Date: Tue Jun 20 13:36:27 2006
+# Source: MontaVista Software, Inc.
+# MR: 15450
+# Type: Defect Fix
+# Disposition: accepted into 2.6.17-rc2-mm1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Description:
+# Straighten up the AMD Au1xx0 Ethernet driver probing code, make it print out
+# (and store in the 'net_device' structure) the controller's physical address,
+# not the KSEG1-based virtual one. Make the driver also claim/release 4-byte MAC
+# enable registers and assign to the Ethernet ports two consecutive MAC addresses
+# to match those that are printed on their stickers.
+# 
+
+PATCHNUM=629
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15450
+Type: Defect Fix
+Disposition: accepted into 2.6.17-rc2-mm1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Description:
+Straighten up the AMD Au1xx0 Ethernet driver probing code, make it print out
+(and store in the 'net_device' structure) the controller's physical address,
+not the KSEG1-based virtual one. Make the driver also claim/release 4-byte MAC
+enable registers and assign to the Ethernet ports two consecutive MAC addresses
+to match those that are printed on their stickers.
+
+Index: linux-2.6.10/drivers/net/au1000_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/au1000_eth.c
++++ linux-2.6.10/drivers/net/au1000_eth.c
+@@ -2,7 +2,7 @@
+  *
+  * Alchemy Au1x00 ethernet driver
+  *
+- * Copyright 2001,2002,2003 MontaVista Software Inc.
++ * Copyright 2001-2003, 2006 MontaVista Software Inc.
+  * Copyright 2002 TimeSys Corp.
+  * Added ethtool/mii-tool support,
+  * Copyright 2004 Matt Porter <mporter@kernel.crashing.org>
+@@ -66,7 +66,7 @@ static int au1000_debug = 5;
+ static int au1000_debug = 3;
+ #endif
+ 
+-#define DRV_NAME	"au1000eth"
++#define DRV_NAME	"au1000_eth"
+ #define DRV_VERSION	"1.5"
+ #define DRV_AUTHOR	"Pete Popov <ppopov@embeddedalley.com>"
+ #define DRV_DESC	"Au1xxx on-chip Ethernet driver"
+@@ -78,7 +78,7 @@ MODULE_LICENSE("GPL");
+ // prototypes
+ static void hard_stop(struct net_device *);
+ static void enable_rx_tx(struct net_device *dev);
+-static struct net_device * au1000_probe(u32 ioaddr, int irq, int port_num);
++static struct net_device * au1000_probe(int port_num);
+ static int au1000_init(struct net_device *);
+ static int au1000_open(struct net_device *);
+ static int au1000_close(struct net_device *);
+@@ -1164,12 +1164,27 @@ setup_hw_rings(struct au1000_private *au
+ }
+ 
+ static struct {
+-	int port;
+ 	u32 base_addr;
+ 	u32 macen_addr;
+ 	int irq;
+ 	struct net_device *dev;
+-} iflist[2];
++} iflist[2] = {
++#ifdef CONFIG_SOC_AU1000
++	{AU1000_ETH0_BASE, AU1000_MAC0_ENABLE, AU1000_MAC0_DMA_INT},
++	{AU1000_ETH1_BASE, AU1000_MAC1_ENABLE, AU1000_MAC1_DMA_INT}
++#endif
++#ifdef CONFIG_SOC_AU1100
++	{AU1100_ETH0_BASE, AU1100_MAC0_ENABLE, AU1100_MAC0_DMA_INT}
++#endif
++#ifdef CONFIG_SOC_AU1500
++	{AU1500_ETH0_BASE, AU1500_MAC0_ENABLE, AU1500_MAC0_DMA_INT},
++	{AU1500_ETH1_BASE, AU1500_MAC1_ENABLE, AU1500_MAC1_DMA_INT}
++#endif
++#ifdef CONFIG_SOC_AU1550
++	{AU1550_ETH0_BASE, AU1550_MAC0_ENABLE, AU1550_MAC0_DMA_INT},
++	{AU1550_ETH1_BASE, AU1550_MAC1_ENABLE, AU1550_MAC1_DMA_INT}
++#endif
++};
+ 
+ static int num_ifs;
+ 
+@@ -1180,58 +1195,14 @@ static int num_ifs;
+  */
+ static int __init au1000_init_module(void)
+ {
+-	struct cpuinfo_mips *c = &current_cpu_data;
+ 	int ni = (int)((au_readl(SYS_PINFUNC) & (u32)(SYS_PF_NI2)) >> 4);
+ 	struct net_device *dev;
+ 	int i, found_one = 0;
+ 
+-	switch (c->cputype) {
+-#ifdef CONFIG_SOC_AU1000
+-	case CPU_AU1000:
+-		num_ifs = 2 - ni;
+-		iflist[0].base_addr = AU1000_ETH0_BASE;
+-		iflist[1].base_addr = AU1000_ETH1_BASE;
+-		iflist[0].macen_addr = AU1000_MAC0_ENABLE;
+-		iflist[1].macen_addr = AU1000_MAC1_ENABLE;
+-		iflist[0].irq = AU1000_MAC0_DMA_INT;
+-		iflist[1].irq = AU1000_MAC1_DMA_INT;
+-		break;
+-#endif
+-#ifdef CONFIG_SOC_AU1100
+-	case CPU_AU1100:
+-		num_ifs = 1 - ni;
+-		iflist[0].base_addr = AU1100_ETH0_BASE;
+-		iflist[0].macen_addr = AU1100_MAC0_ENABLE;
+-		iflist[0].irq = AU1100_MAC0_DMA_INT;
+-		break;
+-#endif
+-#ifdef CONFIG_SOC_AU1500
+-	case CPU_AU1500:
+-		num_ifs = 2 - ni;
+-		iflist[0].base_addr = AU1500_ETH0_BASE;
+-		iflist[1].base_addr = AU1500_ETH1_BASE;
+-		iflist[0].macen_addr = AU1500_MAC0_ENABLE;
+-		iflist[1].macen_addr = AU1500_MAC1_ENABLE;
+-		iflist[0].irq = AU1500_MAC0_DMA_INT;
+-		iflist[1].irq = AU1500_MAC1_DMA_INT;
+-		break;
+-#endif
+-#ifdef CONFIG_SOC_AU1550
+-	case CPU_AU1550:
+-		num_ifs = 2 - ni;
+-		iflist[0].base_addr = AU1550_ETH0_BASE;
+-		iflist[1].base_addr = AU1550_ETH1_BASE;
+-		iflist[0].macen_addr = AU1550_MAC0_ENABLE;
+-		iflist[1].macen_addr = AU1550_MAC1_ENABLE;
+-		iflist[0].irq = AU1550_MAC0_DMA_INT;
+-		iflist[1].irq = AU1550_MAC1_DMA_INT;
+-		break;
+-#endif
+-	default:
+-		num_ifs = 0;
+-	}
++	num_ifs = NUM_ETH_INTERFACES - ni;
++
+ 	for(i = 0; i < num_ifs; i++) {
+-		dev = au1000_probe(iflist[i].base_addr, iflist[i].irq, i);
++		dev = au1000_probe(i);
+ 		iflist[i].dev = dev;
+ 		if (dev)
+ 			found_one++;
+@@ -1440,8 +1411,7 @@ static struct ethtool_ops au1000_ethtool
+ 	.get_link = au1000_get_link
+ };
+ 
+-static struct net_device *
+-au1000_probe(u32 ioaddr, int irq, int port_num)
++static struct net_device * au1000_probe(int port_num)
+ {
+ 	static unsigned version_printed = 0;
+ 	struct au1000_private *aup = NULL;
+@@ -1449,94 +1419,95 @@ au1000_probe(u32 ioaddr, int irq, int po
+ 	db_dest_t *pDB, *pDBfree;
+ 	char *pmac, *argptr;
+ 	char ethaddr[6];
+-	int i, err;
++	int irq, i, err;
++	u32 base, macen;
++
++	if (port_num >= NUM_ETH_INTERFACES)
++ 		return NULL;
+ 
+-	if (!request_mem_region(CPHYSADDR(ioaddr), MAC_IOSIZE, "Au1x00 ENET"))
++	base  = CPHYSADDR(iflist[port_num].base_addr );
++	macen = CPHYSADDR(iflist[port_num].macen_addr);
++	irq = iflist[port_num].irq;
++
++	if (!request_mem_region( base, MAC_IOSIZE, "Au1x00 ENET") ||
++	    !request_mem_region(macen, 4, "Au1x00 ENET"))
+ 		return NULL;
+ 
+-	if (version_printed++ == 0) 
++	if (version_printed++ == 0)
+ 		printk("%s version %s %s\n", DRV_NAME, DRV_VERSION, DRV_AUTHOR);
+ 
+ 	dev = alloc_etherdev(sizeof(struct au1000_private));
+ 	if (!dev) {
+-		printk (KERN_ERR "au1000 eth: alloc_etherdev failed\n");  
++		printk(KERN_ERR "%s: alloc_etherdev failed\n", DRV_NAME);
+ 		return NULL;
+ 	}
+ 
+-	if ((err = register_netdev(dev))) {
+-		printk(KERN_ERR "Au1x_eth Cannot register net device err %d\n",
+-				err);
++	if ((err = register_netdev(dev)) != 0) {
++		printk(KERN_ERR "%s: Cannot register net device, error %d\n",
++				DRV_NAME, err);
+ 		free_netdev(dev);
+ 		return NULL;
+ 	}
+ 
+-	printk("%s: Au1x Ethernet found at 0x%x, irq %d\n", 
+-			dev->name, ioaddr, irq);
++	printk("%s: Au1xx0 Ethernet found at 0x%x, irq %d\n",
++		dev->name, base, irq);
+ 
+ 	aup = dev->priv;
+ 
+ 	/* Allocate the data buffers */
+ 	/* Snooping works fine with eth on all au1xxx */
+-	aup->vaddr = (u32)dma_alloc_noncoherent(NULL,
+-			MAX_BUF_SIZE * (NUM_TX_BUFFS+NUM_RX_BUFFS),
+-			&aup->dma_addr,
+-			0);
++	aup->vaddr = (u32)dma_alloc_noncoherent(NULL, MAX_BUF_SIZE *
++						(NUM_TX_BUFFS + NUM_RX_BUFFS),
++						&aup->dma_addr,	0);
+ 	if (!aup->vaddr) {
+ 		free_netdev(dev);
+-		release_mem_region(CPHYSADDR(ioaddr), MAC_IOSIZE);
++		release_mem_region( base, MAC_IOSIZE);
++		release_mem_region(macen, 4);
+ 		return NULL;
+ 	}
+ 
+ 	/* aup->mac is the base address of the MAC's registers */
+-	aup->mac = (volatile mac_reg_t *)((unsigned long)ioaddr);
++	aup->mac = (volatile mac_reg_t *)iflist[port_num].base_addr;
++
+ 	/* Setup some variables for quick register address access */
+-	if (ioaddr == iflist[0].base_addr)
+-	{
+-		/* check env variables first */
+-		if (!get_ethernet_addr(ethaddr)) { 
++	aup->enable = (volatile u32 *)iflist[port_num].macen_addr;
++	aup->mac_id = port_num;
++	au_macs[port_num] = aup;
++
++	if (port_num == 0) {
++		/* Check the environment variables first */
++		if (get_ethernet_addr(ethaddr) == 0)
+ 			memcpy(au1000_mac_addr, ethaddr, sizeof(au1000_mac_addr));
+-		} else {
++		else {
+ 			/* Check command line */
+ 			argptr = prom_getcmdline();
+-			if ((pmac = strstr(argptr, "ethaddr=")) == NULL) {
+-				printk(KERN_INFO "%s: No mac address found\n", 
+-						dev->name);
+-				/* use the hard coded mac addresses */
+-			} else {
++			if ((pmac = strstr(argptr, "ethaddr=")) == NULL)
++				printk(KERN_INFO "%s: No MAC address found\n",
++						 dev->name);
++				/* Use the hard coded MAC addresses */
++			else {
+ 				str2eaddr(ethaddr, pmac + strlen("ethaddr="));
+ 				memcpy(au1000_mac_addr, ethaddr, 
+-						sizeof(au1000_mac_addr));
++				       sizeof(au1000_mac_addr));
+ 			}
+ 		}
+-			aup->enable = (volatile u32 *) 
+-				((unsigned long)iflist[0].macen_addr);
+-		memcpy(dev->dev_addr, au1000_mac_addr, sizeof(au1000_mac_addr));
++
+ 		setup_hw_rings(aup, MAC0_RX_DMA_ADDR, MAC0_TX_DMA_ADDR);
+-		aup->mac_id = 0;
+-		au_macs[0] = aup;
+-	}
+-		else
+-	if (ioaddr == iflist[1].base_addr)
+-	{
+-			aup->enable = (volatile u32 *) 
+-				((unsigned long)iflist[1].macen_addr);
+-		memcpy(dev->dev_addr, au1000_mac_addr, sizeof(au1000_mac_addr));
+-		dev->dev_addr[4] += 0x10;
++	} else if (port_num == 1)
+ 		setup_hw_rings(aup, MAC1_RX_DMA_ADDR, MAC1_TX_DMA_ADDR);
+-		aup->mac_id = 1;
+-		au_macs[1] = aup;
+-	}
+-	else
+-	{
+-		printk(KERN_ERR "%s: bad ioaddr\n", dev->name);
+-	}
+ 
+-	/* bring the device out of reset, otherwise probing the mii
+-	 * will hang */
++	/*
++	 * Assign to the Ethernet ports two consecutive MAC addresses
++	 * to match those that are printed on their stickers
++	 */
++	memcpy(dev->dev_addr, au1000_mac_addr, sizeof(au1000_mac_addr));
++	dev->dev_addr[5] += port_num;
++
++	/* Bring the device out of reset, otherwise probing the MII will hang */
+ 	*aup->enable = MAC_EN_CLOCK_ENABLE;
+ 	au_sync_delay(2);
+-	*aup->enable = MAC_EN_RESET0 | MAC_EN_RESET1 | 
+-		MAC_EN_RESET2 | MAC_EN_CLOCK_ENABLE;
++	*aup->enable = MAC_EN_RESET0 | MAC_EN_RESET1 | MAC_EN_RESET2 |
++		       MAC_EN_CLOCK_ENABLE;
+ 	au_sync_delay(2);
+ 
+ 	aup->mii = kmalloc(sizeof(struct mii_phy), GFP_KERNEL);
+@@ -1582,7 +1553,7 @@ au1000_probe(u32 ioaddr, int irq, int po
+ 	}
+ 
+ 	spin_lock_init(&aup->lock);
+-	dev->base_addr = ioaddr;
++	dev->base_addr = base;
+ 	dev->irq = irq;
+ 	dev->open = au1000_open;
+ 	dev->hard_start_xmit = au1000_tx;
+@@ -1617,13 +1588,12 @@ err_out:
+ 		if (aup->tx_db_inuse[i])
+ 			ReleaseDB(aup, aup->tx_db_inuse[i]);
+ 	}
+-	dma_free_noncoherent(NULL,
+-			MAX_BUF_SIZE * (NUM_TX_BUFFS+NUM_RX_BUFFS),
+-			(void *)aup->vaddr,
+-			aup->dma_addr);
++	dma_free_noncoherent(NULL, MAX_BUF_SIZE * (NUM_TX_BUFFS + NUM_RX_BUFFS),
++			     (void *)aup->vaddr, aup->dma_addr);
+ 	unregister_netdev(dev);
+ 	free_netdev(dev);
+-	release_mem_region(CPHYSADDR(ioaddr), MAC_IOSIZE);
++	release_mem_region( base, MAC_IOSIZE);
++	release_mem_region(macen, 4);
+ 	return NULL;
+ }
+ 
+@@ -1815,20 +1785,18 @@ static void __exit au1000_cleanup_module
+ 			unregister_netdev(dev);
+ 			if (aup->mii)
+ 				kfree(aup->mii);
+-			for (j = 0; j < NUM_RX_DMA; j++) {
++			for (j = 0; j < NUM_RX_DMA; j++)
+ 				if (aup->rx_db_inuse[j])
+ 					ReleaseDB(aup, aup->rx_db_inuse[j]);
+-			}
+-			for (j = 0; j < NUM_TX_DMA; j++) {
++			for (j = 0; j < NUM_TX_DMA; j++)
+ 				if (aup->tx_db_inuse[j])
+ 					ReleaseDB(aup, aup->tx_db_inuse[j]);
+-			}
+-			dma_free_noncoherent(NULL,
+-					MAX_BUF_SIZE * (NUM_TX_BUFFS+NUM_RX_BUFFS),
+-					(void *)aup->vaddr,
+-					aup->dma_addr);
++			dma_free_noncoherent(NULL, MAX_BUF_SIZE *
++					     (NUM_TX_BUFFS + NUM_RX_BUFFS),
++					     (void *)aup->vaddr, aup->dma_addr);
++			release_mem_region(dev->base_addr, MAC_IOSIZE);
++			release_mem_region(CPHYSADDR(iflist[i].macen_addr), 4);
+ 			free_netdev(dev);
+-			release_mem_region(CPHYSADDR(iflist[i].base_addr), MAC_IOSIZE);
+ 		}
+ 	}
+ }
+Index: linux-2.6.10/mvl_patches/pro-0629.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0629.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(629);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

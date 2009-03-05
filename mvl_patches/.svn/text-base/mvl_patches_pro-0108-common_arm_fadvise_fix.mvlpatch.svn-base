@@ -1,0 +1,374 @@
+#! /usr/bin/env bash
+# Patch: -common_arm_fadvise_fix
+# Date: Wed Dec 28 14:58:07 2005
+# Source: MontaVista Software, Inc. | URL | Some Guy <email@addr>
+# MR: 14646
+# Type: Defect Fix
+# Disposition: http://www.arm.linux.org.uk/developer/patches/viewpatch.php?id=2865/2
+# Signed-off-by: Nicolas Pitre <nico@mvista.com>
+# Description:
+# 
+# The prototype for sys_fadvise64_64() is:
+# 
+#     long sys_fadvise64_64(int fd, loff_t offset, loff_t len, int advice)
+# 
+# The argument list is therefore as follows on legacy ABI:
+# 
+#         fd: type int (r0)
+#         offset: type long long (r1-r2)
+#         len: type long long (r3-sp[0])
+#         advice: type int (sp[4])
+# 
+# With EABI this becomes:
+# 
+#         fd: type int (r0)
+#         offset: type long long (r2-r3)
+#         len: type long long (sp[0]-sp[4])
+#         advice: type int (sp[8])
+# 
+# Not only do we have ABI differences here, but the EABI version requires
+# one additional word on the syscall stack.
+# To avoid the ABI mismatch and the extra stack space required with EABI
+# this syscall is now defined with a different argument ordering
+# on ARM as follows:
+# 
+#     long sys_arm_fadvise64_64(int fd, int advice, loff_t offset, loff_t len)
+# 
+# This gives us the following ABI independent argument distribution:
+# 
+#         fd: type int (r0)
+#         advice: type int (r1)
+#         offset: type long long (r2-r3)
+#         len: type long long (sp[0]-sp[4])
+# 
+# Now, since the syscall entry code takes care of 5 registers only by
+# default including the store of r4 to the stack, we need a wrapper to
+# store r5 to the stack as well.  Because that wrapper was missing and was
+# always required this means that sys_fadvise64_64 never worked on ARM and
+# therefore we can safely reuse its syscall number for our new
+# sys_arm_fadvise64_64 interface.
+# 
+
+PATCHNUM=108
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. | URL | Some Guy <email@addr>
+MR: 14646
+Type: Defect Fix
+Disposition: http://www.arm.linux.org.uk/developer/patches/viewpatch.php?id=2865/2
+Signed-off-by: Nicolas Pitre <nico@mvista.com>
+Description:
+
+The prototype for sys_fadvise64_64() is:
+
+    long sys_fadvise64_64(int fd, loff_t offset, loff_t len, int advice)
+
+The argument list is therefore as follows on legacy ABI:
+
+        fd: type int (r0)
+        offset: type long long (r1-r2)
+        len: type long long (r3-sp[0])
+        advice: type int (sp[4])
+
+With EABI this becomes:
+
+        fd: type int (r0)
+        offset: type long long (r2-r3)
+        len: type long long (sp[0]-sp[4])
+        advice: type int (sp[8])
+
+Not only do we have ABI differences here, but the EABI version requires
+one additional word on the syscall stack.
+To avoid the ABI mismatch and the extra stack space required with EABI
+this syscall is now defined with a different argument ordering
+on ARM as follows:
+
+    long sys_arm_fadvise64_64(int fd, int advice, loff_t offset, loff_t len)
+
+This gives us the following ABI independent argument distribution:
+
+        fd: type int (r0)
+        advice: type int (r1)
+        offset: type long long (r2-r3)
+        len: type long long (sp[0]-sp[4])
+
+Now, since the syscall entry code takes care of 5 registers only by
+default including the store of r4 to the stack, we need a wrapper to
+store r5 to the stack as well.  Because that wrapper was missing and was
+always required this means that sys_fadvise64_64 never worked on ARM and
+therefore we can safely reuse its syscall number for our new
+sys_arm_fadvise64_64 interface.
+
+Index: linux-2.6.10/arch/arm/kernel/entry-common.S
+===================================================================
+--- linux-2.6.10.orig/arch/arm/kernel/entry-common.S
++++ linux-2.6.10/arch/arm/kernel/entry-common.S
+@@ -268,6 +268,10 @@ sys_futex_wrapper:
+ 		str	r5, [sp, #4]		@ push sixth arg
+ 		b	sys_futex
+ 
++sys_arm_fadvise64_64_wrapper:
++		str	r5, [sp, #4]		@ push r5 to stack
++		b	sys_arm_fadvise64_64
++
+ /*
+  * Note: off_4k (r5) is always units of 4K.  If we can't do the requested
+  * offset, we return EINVAL.
+Index: linux-2.6.10/arch/arm/kernel/calls.S
+===================================================================
+--- linux-2.6.10.orig/arch/arm/kernel/calls.S
++++ linux-2.6.10/arch/arm/kernel/calls.S
+@@ -279,7 +279,7 @@ __syscall_start:
+ 		.long	sys_fstatfs64
+ 		.long	sys_tgkill
+ 		.long	sys_utimes
+-/* 270 */	.long	sys_fadvise64_64
++/* 270 */	.long	sys_arm_fadvise64_64_wrapper
+ 		.long	sys_pciconfig_iobase
+ 		.long	sys_pciconfig_read
+ 		.long	sys_pciconfig_write
+Index: linux-2.6.10/arch/arm/kernel/sys_arm.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/kernel/sys_arm.c
++++ linux-2.6.10/arch/arm/kernel/sys_arm.c
+@@ -321,3 +321,13 @@ long execve(const char *filename, char *
+ 	return ret;
+ }
+ EXPORT_SYMBOL(execve);
++
++/*
++ * Since loff_t is a 64 bit type we avoid a lot of ABI hastle
++ * with a different argument ordering.
++ */
++asmlinkage long sys_arm_fadvise64_64(int fd, int advice,
++				     loff_t offset, loff_t len)
++{
++	return sys_fadvise64_64(fd, offset, len, advice);
++}
+Index: linux-2.6.10/include/asm-arm/unistd.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/unistd.h
++++ linux-2.6.10/include/asm-arm/unistd.h
+@@ -295,7 +295,7 @@
+ #define __NR_fstatfs64			(__NR_SYSCALL_BASE+267)
+ #define __NR_tgkill			(__NR_SYSCALL_BASE+268)
+ #define __NR_utimes			(__NR_SYSCALL_BASE+269)
+-#define __NR_fadvise64_64		(__NR_SYSCALL_BASE+270)
++#define __NR_arm_fadvise64_64		(__NR_SYSCALL_BASE+270)
+ #define __NR_pciconfig_iobase		(__NR_SYSCALL_BASE+271)
+ #define __NR_pciconfig_read		(__NR_SYSCALL_BASE+272)
+ #define __NR_pciconfig_write		(__NR_SYSCALL_BASE+273)
+@@ -471,7 +471,6 @@ type name(type1 arg1, type2 arg2, type3 
+ #define __ARCH_WANT_SYS_TIME
+ #define __ARCH_WANT_SYS_UTIME
+ #define __ARCH_WANT_SYS_SOCKETCALL
+-#define __ARCH_WANT_SYS_FADVISE64
+ #define __ARCH_WANT_SYS_GETPGRP
+ #define __ARCH_WANT_SYS_LLSEEK
+ #define __ARCH_WANT_SYS_NICE
+Index: linux-2.6.10/mvl_patches/pro-0108.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0108.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(108);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

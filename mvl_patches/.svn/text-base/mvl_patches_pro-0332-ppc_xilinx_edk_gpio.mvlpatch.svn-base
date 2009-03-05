@@ -1,0 +1,791 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_gpio
+# Date: Mon Mar  6 15:02:23 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 15265
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list.
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for GPIO IP.
+#     Taken from EDK 7.1i SP2.
+# 
+
+PATCHNUM=332
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 15265
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list.
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for GPIO IP.
+    Taken from EDK 7.1i SP2.
+
+ drivers/char/xilinx_gpio/xgpio.c   |  213 +++++++++++++++++++++++++++++++++++++
+ drivers/char/xilinx_gpio/xgpio.h   |  127 ++++++++++++++++++++++
+ drivers/char/xilinx_gpio/xgpio_l.h |  199 ++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0332.c             |   16 ++
+ 4 files changed, 555 insertions(+)
+
+Index: linux-2.6.10/drivers/char/xilinx_gpio/xgpio.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_gpio/xgpio.c
+@@ -0,0 +1,213 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/**
++* @file xgpio.c
++*
++* The implementation of the XGpio component's basic functionality. See xgpio.h
++* for more information about the component.
++*
++* @note
++*
++* None
++*
++*****************************************************************************/
++
++/***************************** Include Files ********************************/
++#include "xparameters.h"
++#include "xgpio.h"
++#include "xgpio_i.h"
++#include "xstatus.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++/************************** Function Prototypes *****************************/
++
++/****************************************************************************/
++/**
++* Initialize the XGpio instance provided by the caller based on the
++* given DeviceID.
++*
++* Nothing is done except to initialize the InstancePtr.
++*
++* @param InstancePtr is a pointer to an XGpio instance. The memory the pointer
++*        references must be pre-allocated by the caller. Further calls to
++*        manipulate the component through the XGpio API must be made with this
++*        pointer.
++*
++* @param DeviceId is the unique id of the device controlled by this XGpio
++*        component.  Passing in a device id associates the generic XGpio
++*        instance to a specific device, as chosen by the caller or application
++*        developer.
++*
++* @return
++*
++* - XST_SUCCESS           Initialization was successfull.
++* - XST_DEVICE_NOT_FOUND  Device configuration data was not found for a device
++*                         with the supplied device ID.
++*
++* NOTES:
++*
++* None
++*
++*****************************************************************************/
++XStatus XGpio_Initialize(XGpio * InstancePtr, u16 DeviceId)
++{
++	XGpio_Config *ConfigPtr;
++
++	/*
++	 * Assert arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/*
++	 * Lookup configuration data in the device configuration table.
++	 * Use this configuration info down below when initializing this component.
++	 */
++	ConfigPtr = XGpio_LookupConfig(DeviceId);
++	if (ConfigPtr == (XGpio_Config *) NULL) {
++		InstancePtr->IsReady = 0;
++		return (XST_DEVICE_NOT_FOUND);
++	}
++
++	/*
++	 * Set some default values.
++	 */
++	InstancePtr->BaseAddress = ConfigPtr->BaseAddress;
++
++	/*
++	 * Indicate the instance is now ready to use, initialized without error
++	 */
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++	return (XST_SUCCESS);
++}
++
++/******************************************************************************/
++/**
++* Lookup the device configuration based on the unique device ID.  The table
++* ConfigTable contains the configuration info for each device in the system.
++*
++* @param DeviceID is the device identifier to lookup.
++*
++* @return
++*
++* - XGpio configuration structure pointer if DeviceID is found.
++* - NULL if DeviceID is not found.
++*
++******************************************************************************/
++XGpio_Config *XGpio_LookupConfig(u16 DeviceId)
++{
++	XGpio_Config *CfgPtr = NULL;
++
++	int i;
++
++	for (i = 0; i < XPAR_XGPIO_NUM_INSTANCES; i++) {
++		if (XGpio_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XGpio_ConfigTable[i];
++			break;
++		}
++	}
++
++	return CfgPtr;
++}
++
++/****************************************************************************/
++/**
++* Set the input/output direction of all discrete signals.
++*
++* @param InstancePtr is a pointer to an XGpio instance to be worked on.
++* @param DirectionMask is a bitmask specifying which discretes are input and
++*        which are output. Bits set to 0 are output and bits set to 1 are input.
++*
++* @note
++*
++* None
++*
++*****************************************************************************/
++void XGpio_SetDataDirection(XGpio * InstancePtr, u32 DirectionMask)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XGpio_mWriteReg(InstancePtr->BaseAddress, XGPIO_TRI_OFFSET,
++			DirectionMask);
++}
++
++/****************************************************************************/
++/**
++* Read state of discretes.
++*
++* @param InstancePtr is a pointer to an XGpio instance to be worked on.
++*
++* @return Current copy of the discretes register.
++*
++* @note
++*
++* None
++*
++*****************************************************************************/
++u32 XGpio_DiscreteRead(XGpio * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	return (XGpio_mReadReg(InstancePtr->BaseAddress, XGPIO_DATA_OFFSET));
++}
++
++/****************************************************************************/
++/**
++* Write to discretes register
++*
++* @param InstancePtr is a pointer to an XGpio instance to be worked on.
++* @param Data is the value to be written to the discretes register.
++*
++* @note
++*
++* See also XGpio_DiscreteSet() and XGpio_DiscreteClear().
++*
++*****************************************************************************/
++void XGpio_DiscreteWrite(XGpio * InstancePtr, u32 Data)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XGpio_mWriteReg(InstancePtr->BaseAddress, XGPIO_DATA_OFFSET, Data);
++}
+Index: linux-2.6.10/drivers/char/xilinx_gpio/xgpio.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_gpio/xgpio.h
+@@ -0,0 +1,127 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002-2005 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++* @file xgpio.h
++*
++* This file contains the software API definition of the Xilinx General Purpose
++* I/O (XGpio) component.
++*
++* The Xilinx GPIO controller is a soft IP core designed for  Xilinx FPGAs and
++* contains the following general features:
++*   - Support for 8, 16, or 32 I/O discretes
++*   - Each of the discretes can be configured for input or output.
++*
++* @note
++*
++* This driver does not support the second channel of the dual channel gpio
++* cores, nor does it support interrupts for those gpio cores that include
++* interrupts.
++*
++* This API utilizes 32 bit I/O to the GPIO registers. With 16 and 8 bit GPIO
++* components, the unused bits from registers are read as zero and written as
++* don't cares.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- --------------------------------------------------------
++* 1.00a rmm  03/13/02 First release
++* 1.00a rpm  02/24/04 Added notes indicating lack of interrupt and dual channel
++*			 		  support.
++* </pre>
++*****************************************************************************/
++
++#ifndef XGPIO_H			/* prevent circular inclusions */
++#define XGPIO_H			/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++#include "xgpio_l.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/*
++ * This typedef contains configuration information for the device.
++ */
++typedef struct {
++	u16 DeviceId;		/* Unique ID  of device */
++	u32 BaseAddress;	/* Device base address */
++} XGpio_Config;
++
++/**
++ * The XGpio driver instance data. The user is required to allocate a
++ * variable of this type for every GPIO device in the system. A pointer
++ * to a variable of this type is then passed to the driver API functions.
++ */
++typedef struct {
++	u32 BaseAddress;	/* Device base address */
++	u32 IsReady;		/* Device is initialized and ready */
++} XGpio;
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Function Prototypes *****************************/
++
++/*
++ * API Basic functions implemented in xgpio.c
++ */
++XStatus XGpio_Initialize(XGpio * InstancePtr, u16 DeviceId);
++void XGpio_SetDataDirection(XGpio * InstancePtr, u32 DirectionMask);
++u32 XGpio_DiscreteRead(XGpio * InstancePtr);
++void XGpio_DiscreteWrite(XGpio * InstancePtr, u32 Mask);
++
++XGpio_Config *XGpio_LookupConfig(u16 DeviceId);
++
++/*
++ * API Functions implemented in xgpio_extra.c
++ */
++void XGpio_DiscreteSet(XGpio * InstancePtr, u32 Mask);
++void XGpio_DiscreteClear(XGpio * InstancePtr, u32 Mask);
++
++/*
++ * API Functions implemented in xgpio_selftest.c
++ */
++XStatus XGpio_SelfTest(XGpio * InstancePtr);
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_gpio/xgpio_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_gpio/xgpio_l.h
+@@ -0,0 +1,199 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002-2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xgpio_l.h
++*
++* This header file contains identifiers and low-level driver functions (or
++* macros) that can be used to access the device.  The user should refer to the
++* hardware device specification for more details of the device operation.
++* High-level driver functions are defined in xgpio.h.
++*
++* @note
++*
++* This driver does not support the second channel of the dual channel gpio
++* cores, nor does it support interrupts for those gpio cores that include
++* interrupts.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a jhl  04/24/02 First release
++* 1.00a rpm  02/24/04 Added notes indicating lack of interrupt and dual channel
++*			 		  support.
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XGPIO_L_H		/* prevent circular inclusions */
++#define XGPIO_L_H		/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++
++/************************** Constant Definitions *****************************/
++
++/** @name Registers
++ *
++ * Register offsets for this device. This device does not utilize IPIF registers.
++ * @{
++ */
++/**
++ * - XGPIO_DATA_OFFSET    Data register
++ * - XGPIO_TRI_OFFSET     Three state register (sets input/output direction)
++ *                        0 configures pin for output and 1 for input.
++ */
++#define XGPIO_DATA_OFFSET  0x00000000
++#define XGPIO_TRI_OFFSET   0x00000004
++/* @} */
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/*****************************************************************************
++*
++* Low-level driver macros.  The list below provides signatures to help the
++* user use the macros.
++*
++* u32 XGpio_mReadReg(u32 BaseAddress, int RegOffset, u32 Data)
++* void XGpio_mWriteReg(u32 BaseAddress, int RegOffset, u32 Data)
++*
++* void XGpio_mSetDataDirection(u32 BaseAddress, u32 DirectionMask)
++*
++* u32 XGpio_mGetDataReg(u32 BaseAddress)
++* void XGpio_mSetDataReg(u32 BaseAddress, u32 Mask)
++*
++*****************************************************************************/
++
++/****************************************************************************/
++/**
++ *
++ * Write a value to a GPIO register. A 32 bit write is performed. If the
++ * GPIO component is implemented in a smaller width, only the least
++ * significant data is written.
++ *
++ * @param   BaseAddress is the base address of the GPIO device.
++ * @param   RegOffset is the register offset from the base to write to.
++ * @param   Data is the data written to the register.
++ *
++ * @return  None.
++ *
++ * @note    None.
++ *
++ ****************************************************************************/
++#define XGpio_mWriteReg(BaseAddress, RegOffset, Data) \
++    (XIo_Out32((BaseAddress) + (RegOffset), (u32)(Data)))
++
++/****************************************************************************/
++/**
++ *
++ * Read a value from a GPIO register. A 32 bit read is performed. If the
++ * GPIO component is implemented in a smaller width, only the least
++ * significant data is read from the register. The most significant data
++ * will be read as 0.
++ *
++ * @param   BaseAddress is the base address of the GPIO device.
++ * @param   Register is the register offset from the base to write to.
++ * @param   Data is the data written to the register.
++ *
++ * @return  None.
++ *
++ * @note    None.
++ *
++ ****************************************************************************/
++#define XGpio_mReadReg(BaseAddress, RegOffset) \
++    (XIo_In32((BaseAddress) + (RegOffset)))
++
++/*****************************************************************************
++*
++* Set the input/output direction of all signals.
++*
++* @param    BaseAddress contains the base address of the GPIO device.
++* @param    DirectionMask is a bitmask specifying which discretes are input and
++*           which are output. Bits set to 0 are output and bits set to 1 are
++*           input.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XGpio_mSetDataDirection(BaseAddress, DirectionMask) \
++    XGpio_mWriteReg((BaseAddress), XGPIO_TRI_OFFSET, (DirectionMask))
++
++/****************************************************************************/
++/**
++* Get the data register.
++*
++* @param    BaseAddress contains the base address of the GPIO device.
++*
++* @return   The contents of the data register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XGpio_mGetDataReg(BaseAddress) \
++    XGpio_mReadReg(BaseAddress, XGPIO_DATA_OFFSET)
++
++/****************************************************************************/
++/**
++* Set the data register.
++*
++* @param    BaseAddress contains the base address of the GPIO device.
++* @param    Data is the value to be written to the data register.
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XGpio_mSetDataReg(BaseAddress, Data) \
++    XGpio_mWriteReg((BaseAddress), XGPIO_DATA_OFFSET, (Data))
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/mvl_patches/pro-0332.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0332.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(332);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

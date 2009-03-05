@@ -1,0 +1,403 @@
+#! /usr/bin/env bash
+# Patch: -common_NETFILTER_Fix_ip6_tables_extension_header_bypass_bug
+# Date: Sun Apr  8 23:14:50 2007
+# Source: kernel.org
+# MR: 22184
+# Type: Defect fix
+# Disposition: merged from 2.6.19-rc4
+# 
+# Commit: 6d381634d213580d40d431e7664dfb45f641b884
+# Author: Patrick McHardy <kaber@trash.net>
+# Date:   Tue Oct 24 16:15:10 2006 -0700
+# 
+#     [NETFILTER]: Fix ip6_tables extension header bypass bug
+#     
+#     As reported by Mark Dowd <Mark_Dowd@McAfee.com>, ip6_tables is susceptible
+#     to a fragmentation attack causing false negatives on extension header matches.
+#     
+#     When extension headers occur in the non-first fragment after the fragment
+#     header (possibly with an incorrect nexthdr value in the fragment header)
+#     a rule looking for this extension header will never match.
+#     
+#     Drop fragments that are at offset 0 and don't contain the final protocol
+#     header regardless of the ruleset, since this should not happen normally.
+#     Since all extension headers are before the protocol header this makes sure
+#     an extension header is either not present or in the first fragment, where
+#     we can properly parse it.
+#     
+#     With help from Yasuyuki KOZAKAI <yasuyuki.kozakai@toshiba.co.jp>.
+#     
+#     Signed-off-by: Patrick McHardy <kaber@trash.net>
+#     Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1283
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: kernel.org
+MR: 22184
+Type: Defect fix
+Disposition: merged from 2.6.19-rc4
+
+Commit: 6d381634d213580d40d431e7664dfb45f641b884
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Tue Oct 24 16:15:10 2006 -0700
+
+    [NETFILTER]: Fix ip6_tables extension header bypass bug
+    
+    As reported by Mark Dowd <Mark_Dowd@McAfee.com>, ip6_tables is susceptible
+    to a fragmentation attack causing false negatives on extension header matches.
+    
+    When extension headers occur in the non-first fragment after the fragment
+    header (possibly with an incorrect nexthdr value in the fragment header)
+    a rule looking for this extension header will never match.
+    
+    Drop fragments that are at offset 0 and don't contain the final protocol
+    header regardless of the ruleset, since this should not happen normally.
+    Since all extension headers are before the protocol header this makes sure
+    an extension header is either not present or in the first fragment, where
+    we can properly parse it.
+    
+    With help from Yasuyuki KOZAKAI <yasuyuki.kozakai@toshiba.co.jp>.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Index: linux-2.6.10/net/ipv6/netfilter/ip6_tables.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6_tables.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6_tables.c
+@@ -1932,6 +1932,9 @@ static void __exit fini(void)
+  * If target header is found, its offset is set in *offset and return protocol
+  * number. Otherwise, return -1.
+  *
++ * If the first fragment doesn't contain the final protocol header or
++ * NEXTHDR_NONE it is considered invalid.
++ *
+  * Note that non-1st fragment is special case that "the protocol number
+  * of last header" is "next header" field in Fragment header. In this case,
+  * *offset is meaningless and fragment offset is stored in *fragoff if fragoff
+@@ -1955,12 +1958,12 @@ int ipv6_find_hdr(const struct sk_buff *
+ 		if ((!ipv6_ext_hdr(nexthdr)) || nexthdr == NEXTHDR_NONE) {
+ 			if (target < 0)
+ 				break;
+-			return -1;
++			return -ENOENT;
+ 		}
+ 
+ 		hp = skb_header_pointer(skb, start, sizeof(_hdr), &_hdr);
+ 		if (hp == NULL)
+-			return -1;
++			return -EBADMSG;
+ 		if (nexthdr == NEXTHDR_FRAGMENT) {
+ 			unsigned short _frag_off, *fp;
+ 			fp = skb_header_pointer(skb,
+@@ -1969,7 +1972,7 @@ int ipv6_find_hdr(const struct sk_buff *
+ 						sizeof(_frag_off),
+ 						&_frag_off);
+ 			if (fp == NULL)
+-				return -1;
++				return -EBADMSG;
+ 
+ 			_frag_off = ntohs(*fp) & ~0x7;
+ 			if (_frag_off) {
+@@ -1980,7 +1983,7 @@ int ipv6_find_hdr(const struct sk_buff *
+ 						*fragoff = _frag_off;
+ 					return hp->nexthdr;
+ 				}
+-				return -1;
++				return -ENOENT;
+ 			}
+ 			hdrlen = 8;
+ 		} else if (nexthdr == NEXTHDR_AUTH)
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_ah.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_ah.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_ah.c
+@@ -52,9 +52,14 @@ match(const struct sk_buff *skb,
+ 	const struct ip6t_ah *ahinfo = matchinfo;
+ 	unsigned int ptr;
+ 	unsigned int hdrlen = 0;
++	int err;
+ 
+-	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_AUTH, NULL) < 0)
++	err = ipv6_find_hdr(skb, &ptr, NEXTHDR_AUTH, NULL);
++	if (err < 0) {
++		if (err != -ENOENT)
++			*hotdrop = 1;
+ 		return 0;
++	}
+ 
+ 	ah = skb_header_pointer(skb, ptr, sizeof(_ah), &_ah);
+ 	if (ah == NULL) {
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_frag.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_frag.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_frag.c
+@@ -51,9 +51,14 @@ match(const struct sk_buff *skb,
+        struct frag_hdr _frag, *fh;
+        const struct ip6t_frag *fraginfo = matchinfo;
+        unsigned int ptr;
++	int err;
+ 
+-	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_FRAGMENT, NULL) < 0)
++	err = ipv6_find_hdr(skb, &ptr, NEXTHDR_FRAGMENT, NULL);
++	if (err < 0) {
++		if (err != -ENOENT)
++			*hotdrop = 1;
+ 		return 0;
++	}
+ 
+ 	fh = skb_header_pointer(skb, ptr, sizeof(_frag), &_frag);
+ 	if (fh == NULL){
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_hbh.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_hbh.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_hbh.c
+@@ -69,13 +69,18 @@ match(const struct sk_buff *skb,
+        u8 _opttype, *tp = NULL;
+        u8 _optlen, *lp = NULL;
+        unsigned int optlen;
++       int err;
+        
+ #if HOPBYHOP
+-	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_HOP, NULL) < 0)
++	err = ipv6_find_hdr(skb, &ptr, NEXTHDR_HOP, NULL);
+ #else
+-	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_DEST, NULL) < 0)
++	err = ipv6_find_hdr(skb, &ptr, NEXTHDR_DEST, NULL);
+ #endif
++	if (err < 0) {
++		if (err != -ENOENT)
++			*hotdrop = 1;
+ 		return 0;
++	}
+ 
+        oh = skb_header_pointer(skb, ptr, sizeof(_optsh), &_optsh);
+        if (oh == NULL){
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_rt.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_rt.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_rt.c
+@@ -57,9 +57,14 @@ match(const struct sk_buff *skb,
+        unsigned int hdrlen = 0;
+        unsigned int ret = 0;
+        struct in6_addr *ap, _addr;
++       int err;
+ 
+-	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_ROUTING, NULL) < 0)
++	err = ipv6_find_hdr(skb, &ptr, NEXTHDR_ROUTING, NULL);
++	if (err < 0) {
++		if (err != -ENOENT)
++			*hotdrop = 1;
+ 		return 0;
++	}
+ 
+        rh = skb_header_pointer(skb, ptr, sizeof(_route), &_route);
+        if (rh == NULL){
+Index: linux-2.6.10/mvl_patches/pro-1283.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1283.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1283);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

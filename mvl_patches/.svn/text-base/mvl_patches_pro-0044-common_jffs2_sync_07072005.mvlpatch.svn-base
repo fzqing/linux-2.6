@@ -1,0 +1,2692 @@
+#! /usr/bin/env bash
+# Patch: -common_jffs2_sync_07072005
+# Date: Wed Dec 28 14:55:54 2005
+# Source: infradead.org
+# MR: 13548
+# Type: Integration
+# Disposition: merged from linux-mtd@infradead.org
+# Signed-off-by: Todd Poynor <tpoynor@mvista.com>
+# Description:
+#     Resync JFFS2 code with infradead.org as of July 7, 2005.
+# 
+
+PATCHNUM=44
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: infradead.org
+MR: 13548
+Type: Integration
+Disposition: merged from linux-mtd@infradead.org
+Signed-off-by: Todd Poynor <tpoynor@mvista.com>
+Description:
+    Resync JFFS2 code with infradead.org as of July 7, 2005.
+
+Index: linux-2.6.10/fs/Kconfig
+===================================================================
+--- linux-2.6.10.orig/fs/Kconfig
++++ linux-2.6.10/fs/Kconfig
+@@ -1190,7 +1190,7 @@ config JFFS_PROC_FS
+ 
+ config JFFS2_FS
+ 	tristate "Journalling Flash File System v2 (JFFS2) support"
+-	select CRC32
++        select CRC32
+ 	depends on MTD
+ 	help
+ 	  JFFS2 is the second generation of the Journalling Flash File System
+@@ -1218,30 +1218,21 @@ config JFFS2_FS_DEBUG
+ 	  If reporting bugs, please try to have available a full dump of the
+ 	  messages at debug level 1 while the misbehaviour was occurring.
+ 
+-config JFFS2_FS_NAND
+-	bool "JFFS2 support for NAND flash"
++config JFFS2_FS_WRITEBUFFER
++	bool "JFFS2 write-buffering support"
+ 	depends on JFFS2_FS
+-	default n
++	default y
+ 	help
+-	  This enables the support for NAND flash in JFFS2. NAND is a newer
+-	  type of flash chip design than the traditional NOR flash, with
+-	  higher density but a handful of characteristics which make it more
+-	  interesting for the file system to use.
+-
+-	  Say 'N' unless you have NAND flash.
+-
+-config JFFS2_FS_NOR_ECC
+-        bool "JFFS2 support for ECC'd NOR flash (EXPERIMENTAL)"
+-        depends on JFFS2_FS && EXPERIMENTAL
+-        default n
+-        help
+-          This enables the experimental support for NOR flash with transparent
+-          ECC for JFFS2. This type of flash chip is not common, however it is
+-          available from ST Microelectronics.
++	  This enables the write-buffering support in JFFS2.
++
++	  This functionality is required to support JFFS2 on the following
++	  types of flash devices:
++	    - NAND flash
++	    - NOR flash with transparent ECC
++	    - DataFlash
+ 
+ config JFFS2_COMPRESSION_OPTIONS
+ 	bool "Advanced compression options for JFFS2"
+-	depends on JFFS2_FS
+ 	default n
+ 	help
+ 	  Enabling this option allows you to explicitly choose which
+Index: linux-2.6.10/fs/jffs2/Makefile
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/Makefile
++++ linux-2.6.10/fs/jffs2/Makefile
+@@ -1,7 +1,7 @@
+ #
+ # Makefile for the Linux Journalling Flash File System v2 (JFFS2)
+ #
+-# $Id: Makefile.common,v 1.7 2004/11/03 12:57:38 jwboyer Exp $
++# $Id: Makefile.common,v 1.8 2005/02/09 09:17:40 pavlov Exp $
+ #
+ 
+ obj-$(CONFIG_JFFS2_FS) += jffs2.o
+@@ -11,8 +11,7 @@ jffs2-y	+= read.o nodemgmt.o readinode.o
+ jffs2-y	+= symlink.o build.o erase.o background.o fs.o writev.o
+ jffs2-y	+= super.o
+ 
+-jffs2-$(CONFIG_JFFS2_FS_NAND)	+= wbuf.o
+-jffs2-$(CONFIG_JFFS2_FS_NOR_ECC) += wbuf.o
++jffs2-$(CONFIG_JFFS2_FS_WRITEBUFFER)	+= wbuf.o
+ jffs2-$(CONFIG_JFFS2_RUBIN)	+= compr_rubin.o
+ jffs2-$(CONFIG_JFFS2_RTIME)	+= compr_rtime.o
+ jffs2-$(CONFIG_JFFS2_ZLIB)	+= compr_zlib.o
+Index: linux-2.6.10/fs/jffs2/background.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/background.c
++++ linux-2.6.10/fs/jffs2/background.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: background.c,v 1.50 2004/11/16 20:36:10 dwmw2 Exp $
++ * $Id: background.c,v 1.56 2005/06/30 12:15:56 bjd Exp $
+  *
+  */
+ 
+@@ -15,7 +15,6 @@
+ #include <linux/jffs2.h>
+ #include <linux/mtd/mtd.h>
+ #include <linux/completion.h>
+-#include <linux/suspend.h>
+ #include "nodelist.h"
+ 
+ 
+@@ -38,7 +37,7 @@ int jffs2_start_garbage_collect_thread(s
+ 	if (c->gc_task)
+ 		BUG();
+ 
+-	init_MUTEX_LOCKED(&c->gc_thread_start);
++	init_completion(&c->gc_thread_start);
+ 	init_completion(&c->gc_thread_exit);
+ 
+ 	pid = kernel_thread(jffs2_garbage_collect_thread, c, CLONE_FS|CLONE_FILES);
+@@ -49,7 +48,7 @@ int jffs2_start_garbage_collect_thread(s
+ 	} else {
+ 		/* Wait for it... */
+ 		D1(printk(KERN_DEBUG "JFFS2: Garbage collect thread is pid %d\n", pid));
+-		down(&c->gc_thread_start);
++		wait_for_completion(&c->gc_thread_start);
+ 	}
+  
+ 	return ret;
+@@ -57,13 +56,16 @@ int jffs2_start_garbage_collect_thread(s
+ 
+ void jffs2_stop_garbage_collect_thread(struct jffs2_sb_info *c)
+ {
++	int wait = 0;
+ 	spin_lock(&c->erase_completion_lock);
+ 	if (c->gc_task) {
+ 		D1(printk(KERN_DEBUG "jffs2: Killing GC task %d\n", c->gc_task->pid));
+ 		send_sig(SIGKILL, c->gc_task, 1);
++		wait = 1;
+ 	}
+ 	spin_unlock(&c->erase_completion_lock);
+-	wait_for_completion(&c->gc_thread_exit);
++	if (wait)
++		wait_for_completion(&c->gc_thread_exit);
+ }
+ 
+ static int jffs2_garbage_collect_thread(void *_c)
+@@ -76,7 +78,7 @@ static int jffs2_garbage_collect_thread(
+ 	allow_signal(SIGCONT);
+ 
+ 	c->gc_task = current;
+-	up(&c->gc_thread_start);
++	complete(&c->gc_thread_start);
+ 
+ 	set_user_nice(current, 10);
+ 
+Index: linux-2.6.10/fs/jffs2/build.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/build.c
++++ linux-2.6.10/fs/jffs2/build.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: build.c,v 1.68 2004/11/27 13:38:10 gleixner Exp $
++ * $Id: build.c,v 1.69 2004/12/16 20:22:18 dmarlin Exp $
+  *
+  */
+ 
+@@ -97,14 +97,16 @@ static int jffs2_build_filesystem(struct
+ 	/* First, scan the medium and build all the inode caches with
+ 	   lists of physical nodes */
+ 
+-	c->flags |= JFFS2_SB_FLAG_MOUNTING;
++	c->flags |= JFFS2_SB_FLAG_SCANNING;
+ 	ret = jffs2_scan_medium(c);
++	c->flags &= ~JFFS2_SB_FLAG_SCANNING;
+ 	if (ret)
+ 		goto exit;
+ 
+ 	D1(printk(KERN_DEBUG "Scanned flash completely\n"));
+ 	D2(jffs2_dump_block_lists(c));
+ 
++	c->flags |= JFFS2_SB_FLAG_BUILDING;
+ 	/* Now scan the directory tree, increasing nlink according to every dirent found. */
+ 	for_each_inode(i, c, ic) {
+ 		D1(printk(KERN_DEBUG "Pass 1: ino #%u\n", ic->ino));
+@@ -116,7 +118,6 @@ static int jffs2_build_filesystem(struct
+ 			cond_resched();
+ 		}
+ 	}
+-	c->flags &= ~JFFS2_SB_FLAG_MOUNTING;
+ 
+ 	D1(printk(KERN_DEBUG "Pass 1 complete\n"));
+ 
+@@ -164,6 +165,8 @@ static int jffs2_build_filesystem(struct
+ 		ic->scan_dents = NULL;
+ 		cond_resched();
+ 	}
++	c->flags &= ~JFFS2_SB_FLAG_BUILDING;
++	
+ 	D1(printk(KERN_DEBUG "Pass 3 complete\n"));
+ 	D2(jffs2_dump_block_lists(c));
+ 
+@@ -357,7 +360,11 @@ int jffs2_do_mount_fs(struct jffs2_sb_in
+ 		D1(printk(KERN_DEBUG "build_fs failed\n"));
+ 		jffs2_free_ino_caches(c);
+ 		jffs2_free_raw_node_refs(c);
+-		kfree(c->blocks);
++		if (c->mtd->flags & MTD_NO_VIRTBLOCKS) {
++			vfree(c->blocks);
++		} else {
++			kfree(c->blocks);
++		}
+ 		return -EIO;
+ 	}
+ 
+Index: linux-2.6.10/fs/jffs2/compr.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/compr.c
++++ linux-2.6.10/fs/jffs2/compr.c
+@@ -9,7 +9,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: compr.c,v 1.42 2004/08/07 21:56:08 dwmw2 Exp $
++ * $Id: compr.c,v 1.43 2005/01/12 22:34:35 gleixner Exp $
+  *
+  */
+ 
+@@ -23,16 +23,6 @@ static LIST_HEAD(jffs2_compressor_list);
+ /* Actual compression mode */
+ static int jffs2_compression_mode = JFFS2_COMPR_MODE_PRIORITY;
+ 
+-void jffs2_set_compression_mode(int mode) 
+-{
+-        jffs2_compression_mode = mode;
+-}
+-
+-int jffs2_get_compression_mode(void)
+-{
+-        return jffs2_compression_mode;
+-}
+-
+ /* Statistics for blocks stored without compression */
+ static uint32_t none_stat_compr_blocks=0,none_stat_decompr_blocks=0,none_stat_compr_size=0;
+ 
+Index: linux-2.6.10/fs/jffs2/compr.h
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/compr.h
++++ linux-2.6.10/fs/jffs2/compr.h
+@@ -41,9 +41,6 @@
+ #define JFFS2_COMPR_MODE_PRIORITY   1
+ #define JFFS2_COMPR_MODE_SIZE       2
+ 
+-void jffs2_set_compression_mode(int mode);
+-int jffs2_get_compression_mode(void);
+-
+ struct jffs2_compressor {
+         struct list_head list;
+         int priority;              /* used by prirority comr. mode */
+Index: linux-2.6.10/fs/jffs2/compr_rtime.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/compr_rtime.c
++++ linux-2.6.10/fs/jffs2/compr_rtime.c
+@@ -29,8 +29,10 @@
+ #include "compr.h"
+ 
+ /* _compress returns the compressed size, -1 if bigger */
+-int jffs2_rtime_compress(unsigned char *data_in, unsigned char *cpage_out, 
+-		   uint32_t *sourcelen, uint32_t *dstlen, void *model)
++static int jffs2_rtime_compress(unsigned char *data_in,
++				unsigned char *cpage_out,
++				uint32_t *sourcelen, uint32_t *dstlen,
++				void *model)
+ {
+ 	short positions[256];
+ 	int outpos = 0;
+@@ -69,8 +71,10 @@ int jffs2_rtime_compress(unsigned char *
+ }		   
+ 
+ 
+-int jffs2_rtime_decompress(unsigned char *data_in, unsigned char *cpage_out,
+-		      uint32_t srclen, uint32_t destlen, void *model)
++static int jffs2_rtime_decompress(unsigned char *data_in,
++				  unsigned char *cpage_out,
++				  uint32_t srclen, uint32_t destlen,
++				  void *model)
+ {
+ 	short positions[256];
+ 	int outpos = 0;
+Index: linux-2.6.10/fs/jffs2/compr_rubin.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/compr_rubin.c
++++ linux-2.6.10/fs/jffs2/compr_rubin.c
+@@ -228,8 +228,10 @@ int jffs2_rubinmips_compress(unsigned ch
+ 	return rubin_do_compress(BIT_DIVIDER_MIPS, bits_mips, data_in, cpage_out, sourcelen, dstlen);
+ }
+ #endif
+-int jffs2_dynrubin_compress(unsigned char *data_in, unsigned char *cpage_out, 
+-		   uint32_t *sourcelen, uint32_t *dstlen, void *model)
++static int jffs2_dynrubin_compress(unsigned char *data_in,
++				   unsigned char *cpage_out,
++				   uint32_t *sourcelen, uint32_t *dstlen,
++				   void *model)
+ {
+ 	int bits[8];
+ 	unsigned char histo[256];
+@@ -306,15 +308,19 @@ static void rubin_do_decompress(int bit_
+ }		   
+ 
+ 
+-int jffs2_rubinmips_decompress(unsigned char *data_in, unsigned char *cpage_out, 
+-		   uint32_t sourcelen, uint32_t dstlen, void *model)
++static int jffs2_rubinmips_decompress(unsigned char *data_in,
++				      unsigned char *cpage_out,
++				      uint32_t sourcelen, uint32_t dstlen,
++				      void *model)
+ {
+ 	rubin_do_decompress(BIT_DIVIDER_MIPS, bits_mips, data_in, cpage_out, sourcelen, dstlen);
+         return 0;
+ }
+ 
+-int jffs2_dynrubin_decompress(unsigned char *data_in, unsigned char *cpage_out, 
+-		   uint32_t sourcelen, uint32_t dstlen, void *model)
++static int jffs2_dynrubin_decompress(unsigned char *data_in,
++				     unsigned char *cpage_out,
++				     uint32_t sourcelen, uint32_t dstlen,
++				     void *model)
+ {
+ 	int bits[8];
+ 	int c;
+Index: linux-2.6.10/fs/jffs2/compr_rubin.h
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/compr_rubin.h
++++ linux-2.6.10/fs/jffs2/compr_rubin.h
+@@ -1,7 +1,7 @@
+ /* Rubin encoder/decoder header       */
+ /* work started at   : aug   3, 1994  */
+ /* last modification : aug  15, 1994  */
+-/* $Id: compr_rubin.h,v 1.6 2002/01/25 01:49:26 dwmw2 Exp $ */
++/* $Id: compr_rubin.h,v 1.5 2001/02/26 13:50:01 dwmw2 Exp $ */
+ 
+ #include "pushpull.h"
+ 
+Index: linux-2.6.10/fs/jffs2/compr_zlib.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/compr_zlib.c
++++ linux-2.6.10/fs/jffs2/compr_zlib.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: compr_zlib.c,v 1.29 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: compr_zlib.c,v 1.30 2005/05/20 15:39:54 gleixner Exp $
+  *
+  */
+ 
+@@ -17,10 +17,10 @@
+ 
+ #include <linux/config.h>
+ #include <linux/kernel.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/zlib.h>
+ #include <linux/zutil.h>
+-#include <asm/semaphore.h>
+ #include "nodelist.h"
+ #include "compr.h"
+ 
+@@ -69,8 +69,10 @@ static void free_workspaces(void)
+ #define free_workspaces() do { } while(0)
+ #endif /* __KERNEL__ */
+ 
+-int jffs2_zlib_compress(unsigned char *data_in, unsigned char *cpage_out, 
+-		   uint32_t *sourcelen, uint32_t *dstlen, void *model)
++static int jffs2_zlib_compress(unsigned char *data_in,
++			       unsigned char *cpage_out,
++			       uint32_t *sourcelen, uint32_t *dstlen,
++			       void *model)
+ {
+ 	int ret;
+ 
+@@ -135,8 +137,10 @@ int jffs2_zlib_compress(unsigned char *d
+ 	return ret;
+ }
+ 
+-int jffs2_zlib_decompress(unsigned char *data_in, unsigned char *cpage_out,
+-		      uint32_t srclen, uint32_t destlen, void *model)
++static int jffs2_zlib_decompress(unsigned char *data_in,
++				 unsigned char *cpage_out,
++				 uint32_t srclen, uint32_t destlen,
++				 void *model)
+ {
+ 	int ret;
+ 	int wbits = MAX_WBITS;
+Index: linux-2.6.10/fs/jffs2/comprtest.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/comprtest.c
++++ linux-2.6.10/fs/jffs2/comprtest.c
+@@ -1,4 +1,4 @@
+-/* $Id: comprtest.c,v 1.5 2002/01/03 15:20:44 dwmw2 Exp $ */
++/* $Id: comprtest.c,v 1.4 2001/02/21 14:03:20 dwmw2 Exp $ */
+ 
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+Index: linux-2.6.10/fs/jffs2/dir.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/dir.c
++++ linux-2.6.10/fs/jffs2/dir.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: dir.c,v 1.84 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: dir.c,v 1.85 2005/03/01 10:34:03 dedekind Exp $
+  *
+  */
+ 
+@@ -22,16 +22,6 @@
+ #include <linux/time.h>
+ #include "nodelist.h"
+ 
+-/* Urgh. Please tell me there's a nicer way of doing these. */
+-#include <linux/version.h>
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,48)
+-typedef int mknod_arg_t;
+-#define NAMEI_COMPAT(x) ((void *)x)
+-#else
+-typedef dev_t mknod_arg_t;
+-#define NAMEI_COMPAT(x) (x)
+-#endif
+-
+ static int jffs2_readdir (struct file *, void *, filldir_t);
+ 
+ static int jffs2_create (struct inode *,struct dentry *,int,
+@@ -43,7 +33,7 @@ static int jffs2_unlink (struct inode *,
+ static int jffs2_symlink (struct inode *,struct dentry *,const char *);
+ static int jffs2_mkdir (struct inode *,struct dentry *,int);
+ static int jffs2_rmdir (struct inode *,struct dentry *);
+-static int jffs2_mknod (struct inode *,struct dentry *,int,mknod_arg_t);
++static int jffs2_mknod (struct inode *,struct dentry *,int,dev_t);
+ static int jffs2_rename (struct inode *, struct dentry *,
+                         struct inode *, struct dentry *);
+ 
+@@ -58,8 +48,8 @@ struct file_operations jffs2_dir_operati
+ 
+ struct inode_operations jffs2_dir_inode_operations =
+ {
+-	.create =	NAMEI_COMPAT(jffs2_create),
+-	.lookup =	NAMEI_COMPAT(jffs2_lookup),
++	.create =	jffs2_create,
++	.lookup =	jffs2_lookup,
+ 	.link =		jffs2_link,
+ 	.unlink =	jffs2_unlink,
+ 	.symlink =	jffs2_symlink,
+@@ -296,11 +286,11 @@ static int jffs2_symlink (struct inode *
+ 	struct jffs2_full_dirent *fd;
+ 	int namelen;
+ 	uint32_t alloclen, phys_ofs;
+-	int ret;
++	int ret, targetlen = strlen(target);
+ 
+ 	/* FIXME: If you care. We'd need to use frags for the target
+ 	   if it grows much more than this */
+-	if (strlen(target) > 254)
++	if (targetlen > 254)
+ 		return -EINVAL;
+ 
+ 	ri = jffs2_alloc_raw_inode();
+@@ -314,7 +304,7 @@ static int jffs2_symlink (struct inode *
+ 	 * Just the node will do for now, though 
+ 	 */
+ 	namelen = dentry->d_name.len;
+-	ret = jffs2_reserve_space(c, sizeof(*ri) + strlen(target), &phys_ofs, &alloclen, ALLOC_NORMAL);
++	ret = jffs2_reserve_space(c, sizeof(*ri) + targetlen, &phys_ofs, &alloclen, ALLOC_NORMAL);
+ 
+ 	if (ret) {
+ 		jffs2_free_raw_inode(ri);
+@@ -333,16 +323,16 @@ static int jffs2_symlink (struct inode *
+ 
+ 	f = JFFS2_INODE_INFO(inode);
+ 
+-	inode->i_size = strlen(target);
++	inode->i_size = targetlen;
+ 	ri->isize = ri->dsize = ri->csize = cpu_to_je32(inode->i_size);
+ 	ri->totlen = cpu_to_je32(sizeof(*ri) + inode->i_size);
+ 	ri->hdr_crc = cpu_to_je32(crc32(0, ri, sizeof(struct jffs2_unknown_node)-4));
+ 
+ 	ri->compr = JFFS2_COMPR_NONE;
+-	ri->data_crc = cpu_to_je32(crc32(0, target, strlen(target)));
++	ri->data_crc = cpu_to_je32(crc32(0, target, targetlen));
+ 	ri->node_crc = cpu_to_je32(crc32(0, ri, sizeof(*ri)-8));
+ 	
+-	fn = jffs2_write_dnode(c, f, ri, target, strlen(target), phys_ofs, ALLOC_NORMAL);
++	fn = jffs2_write_dnode(c, f, ri, target, targetlen, phys_ofs, ALLOC_NORMAL);
+ 
+ 	jffs2_free_raw_inode(ri);
+ 
+@@ -353,6 +343,20 @@ static int jffs2_symlink (struct inode *
+ 		jffs2_clear_inode(inode);
+ 		return PTR_ERR(fn);
+ 	}
++
++	/* We use f->dents field to store the target path. */
++	f->dents = kmalloc(targetlen + 1, GFP_KERNEL);
++	if (!f->dents) {
++		printk(KERN_WARNING "Can't allocate %d bytes of memory\n", targetlen + 1);
++		up(&f->sem);
++		jffs2_complete_reservation(c);
++		jffs2_clear_inode(inode);
++		return -ENOMEM;
++	}
++
++	memcpy(f->dents, target, targetlen + 1);
++	D1(printk(KERN_DEBUG "jffs2_symlink: symlink's target '%s' cached\n", (char *)f->dents));
++
+ 	/* No data here. Only a metadata node, which will be 
+ 	   obsoleted by the first data write
+ 	*/
+@@ -564,7 +568,7 @@ static int jffs2_rmdir (struct inode *di
+ 	return ret;
+ }
+ 
+-static int jffs2_mknod (struct inode *dir_i, struct dentry *dentry, int mode, mknod_arg_t rdev)
++static int jffs2_mknod (struct inode *dir_i, struct dentry *dentry, int mode, dev_t rdev)
+ {
+ 	struct jffs2_inode_info *f, *dir_f;
+ 	struct jffs2_sb_info *c;
+Index: linux-2.6.10/fs/jffs2/erase.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/erase.c
++++ linux-2.6.10/fs/jffs2/erase.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: erase.c,v 1.66 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: erase.c,v 1.75 2005/04/05 12:51:54 dedekind Exp $
+  *
+  */
+ 
+@@ -33,11 +33,11 @@ static void jffs2_erase_succeeded(struct
+ static void jffs2_free_all_node_refs(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb);
+ static void jffs2_mark_erased_block(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb);
+ 
+-void jffs2_erase_block(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb)
++static void jffs2_erase_block(struct jffs2_sb_info *c,
++			      struct jffs2_eraseblock *jeb)
+ {
+ 	int ret;
+ 	uint32_t bad_offset;
+-	D1(printk(KERN_DEBUG "jffs2_erase_block(): erase block %#x (range %#x-%#x)\n", jeb->offset, jeb->offset, jeb->offset + c->sector_size));
+ #ifdef __ECOS
+        ret = jffs2_flash_erase(c, jeb);
+        if (!ret) {
+@@ -48,6 +48,7 @@ void jffs2_erase_block(struct jffs2_sb_i
+ #else /* Linux */
+ 	struct erase_info *instr;
+ 
++	D1(printk(KERN_DEBUG "jffs2_erase_block(): erase block %#x (range %#x-%#x)\n", jeb->offset, jeb->offset, jeb->offset + c->sector_size));
+ 	instr = kmalloc(sizeof(struct erase_info) + sizeof(struct erase_priv_struct), GFP_KERNEL);
+ 	if (!instr) {
+ 		printk(KERN_WARNING "kmalloc for struct erase_info in jffs2_erase_block failed. Refiling block for later\n");
+@@ -233,7 +234,7 @@ static inline void jffs2_remove_node_ref
+ 			continue;
+ 		} 
+ 
+-		if (((*prev)->flash_offset & ~(c->sector_size -1)) == jeb->offset) {
++		if (SECTOR_ADDR((*prev)->flash_offset) == jeb->offset) {
+ 			/* It's in the block we're erasing */
+ 			struct jffs2_raw_node_ref *this;
+ 
+@@ -277,11 +278,8 @@ static inline void jffs2_remove_node_ref
+ 		printk("\n");
+ 	});
+ 
+-	if (ic->nodes == (void *)ic) {
+-		D1(printk(KERN_DEBUG "inocache for ino #%u is all gone now. Freeing\n", ic->ino));
++	if (ic->nodes == (void *)ic && ic->nlink == 0)
+ 		jffs2_del_ino_cache(c, ic);
+-		jffs2_free_inode_cache(ic);
+-	}
+ }
+ 
+ static void jffs2_free_all_node_refs(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb)
+@@ -310,7 +308,7 @@ static void jffs2_mark_erased_block(stru
+ 	int ret;
+ 	uint32_t bad_offset;
+ 
+-	if (!jffs2_cleanmarker_oob(c)) {
++	if ((!jffs2_cleanmarker_oob(c)) && (c->cleanmarker_size > 0)) {
+ 		marker_ref = jffs2_alloc_raw_node_ref();
+ 		if (!marker_ref) {
+ 			printk(KERN_WARNING "Failed to allocate raw node ref for clean marker\n");
+@@ -335,7 +333,8 @@ static void jffs2_mark_erased_block(stru
+ 
+ 			bad_offset = ofs;
+ 
+-			ret = jffs2_flash_read(c, ofs, readlen, &retlen, ebuf);
++			ret = c->mtd->read(c->mtd, ofs, readlen, &retlen, ebuf);
++
+ 			if (ret) {
+ 				printk(KERN_WARNING "Read of newly-erased block at 0x%08x failed: %d. Putting on bad_list\n", ofs, ret);
+ 				goto bad;
+@@ -351,7 +350,7 @@ static void jffs2_mark_erased_block(stru
+ 					bad_offset += i;
+ 					printk(KERN_WARNING "Newly-erased block contained word 0x%lx at offset 0x%08x\n", datum, bad_offset);
+ 				bad: 
+-					if (!jffs2_cleanmarker_oob(c))
++					if ((!jffs2_cleanmarker_oob(c)) && (c->cleanmarker_size > 0))
+ 						jffs2_free_raw_node_ref(marker_ref);
+ 					kfree(ebuf);
+ 				bad2:
+@@ -387,6 +386,13 @@ static void jffs2_mark_erased_block(stru
+ 		jeb->used_size = 0;
+ 		jeb->dirty_size = 0;
+ 		jeb->wasted_size = 0;
++	} else if (c->cleanmarker_size == 0) {
++		jeb->first_node = jeb->last_node = NULL;
++
++		jeb->free_size = c->sector_size;
++		jeb->used_size = 0;
++		jeb->dirty_size = 0;
++		jeb->wasted_size = 0;
+ 	} else {
+ 		struct kvec vecs[1];
+ 		struct jffs2_unknown_node marker = {
+Index: linux-2.6.10/fs/jffs2/file.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/file.c
++++ linux-2.6.10/fs/jffs2/file.c
+@@ -7,11 +7,10 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: file.c,v 1.99 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: file.c,v 1.101 2005/05/20 15:26:45 gleixner Exp $
+  *
+  */
+ 
+-#include <linux/version.h>
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+ #include <linux/fs.h>
+@@ -25,6 +24,11 @@
+ extern int generic_file_open(struct inode *, struct file *) __attribute__((weak));
+ extern loff_t generic_file_llseek(struct file *file, loff_t offset, int origin) __attribute__((weak));
+ 
++static int jffs2_commit_write (struct file *filp, struct page *pg,
++			       unsigned start, unsigned end);
++static int jffs2_prepare_write (struct file *filp, struct page *pg,
++				unsigned start, unsigned end);
++static int jffs2_readpage (struct file *filp, struct page *pg);
+ 
+ int jffs2_fsync(struct file *filp, struct dentry *dentry, int datasync)
+ {
+@@ -46,9 +50,7 @@ struct file_operations jffs2_file_operat
+ 	.ioctl =	jffs2_ioctl,
+ 	.mmap =		generic_file_readonly_mmap,
+ 	.fsync =	jffs2_fsync,
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,5,29)
+ 	.sendfile =	generic_file_sendfile
+-#endif
+ };
+ 
+ /* jffs2_file_inode_operations */
+@@ -65,7 +67,7 @@ struct address_space_operations jffs2_fi
+ 	.commit_write =	jffs2_commit_write
+ };
+ 
+-int jffs2_do_readpage_nolock (struct inode *inode, struct page *pg)
++static int jffs2_do_readpage_nolock (struct inode *inode, struct page *pg)
+ {
+ 	struct jffs2_inode_info *f = JFFS2_INODE_INFO(inode);
+ 	struct jffs2_sb_info *c = JFFS2_SB_INFO(inode->i_sb);
+@@ -74,8 +76,7 @@ int jffs2_do_readpage_nolock (struct ino
+ 
+ 	D2(printk(KERN_DEBUG "jffs2_do_readpage_nolock(): ino #%lu, page at offset 0x%lx\n", inode->i_ino, pg->index << PAGE_CACHE_SHIFT));
+ 
+-	if (!PageLocked(pg))
+-                PAGE_BUG(pg);
++	BUG_ON(!PageLocked(pg));
+ 
+ 	pg_buf = kmap(pg);
+ 	/* FIXME: Can kmap fail? */
+@@ -105,7 +106,7 @@ int jffs2_do_readpage_unlock(struct inod
+ }
+ 
+ 
+-int jffs2_readpage (struct file *filp, struct page *pg)
++static int jffs2_readpage (struct file *filp, struct page *pg)
+ {
+ 	struct jffs2_inode_info *f = JFFS2_INODE_INFO(pg->mapping->host);
+ 	int ret;
+@@ -116,7 +117,8 @@ int jffs2_readpage (struct file *filp, s
+ 	return ret;
+ }
+ 
+-int jffs2_prepare_write (struct file *filp, struct page *pg, unsigned start, unsigned end)
++static int jffs2_prepare_write (struct file *filp, struct page *pg,
++				unsigned start, unsigned end)
+ {
+ 	struct inode *inode = pg->mapping->host;
+ 	struct jffs2_inode_info *f = JFFS2_INODE_INFO(inode);
+@@ -198,7 +200,8 @@ int jffs2_prepare_write (struct file *fi
+ 	return ret;
+ }
+ 
+-int jffs2_commit_write (struct file *filp, struct page *pg, unsigned start, unsigned end)
++static int jffs2_commit_write (struct file *filp, struct page *pg,
++			       unsigned start, unsigned end)
+ {
+ 	/* Actually commit the write from the page cache page we're looking at.
+ 	 * For now, we write the full page out each time. It sucks, but it's simple
+Index: linux-2.6.10/fs/jffs2/fs.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/fs.c
++++ linux-2.6.10/fs/jffs2/fs.c
+@@ -7,11 +7,10 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: fs.c,v 1.51 2004/11/28 12:19:37 dedekind Exp $
++ * $Id: fs.c,v 1.55 2005/03/18 10:17:18 gleixner Exp $
+  *
+  */
+ 
+-#include <linux/version.h>
+ #include <linux/config.h>
+ #include <linux/kernel.h>
+ #include <linux/sched.h>
+@@ -25,6 +24,7 @@
+ #include <linux/crc32.h>
+ #include "nodelist.h"
+ 
++static int jffs2_flash_setup(struct jffs2_sb_info *c);
+ 
+ static int jffs2_do_setattr (struct inode *inode, struct iattr *iattr)
+ {
+@@ -427,7 +427,7 @@ struct inode *jffs2_new_inode (struct in
+ 	inode->i_mode = jemode_to_cpu(ri->mode);
+ 	inode->i_gid = je16_to_cpu(ri->gid);
+ 	inode->i_uid = je16_to_cpu(ri->uid);
+-	inode->i_atime = inode->i_ctime = inode->i_mtime = CURRENT_TIME;
++	inode->i_atime = inode->i_ctime = inode->i_mtime = CURRENT_TIME_SEC;
+ 	ri->atime = ri->mtime = ri->ctime = cpu_to_je32(I_SEC(inode->i_mtime));
+ 
+ 	inode->i_blksize = PAGE_SIZE;
+@@ -449,11 +449,15 @@ int jffs2_do_fill_super(struct super_blo
+ 
+ 	c = JFFS2_SB_INFO(sb);
+ 
+-#ifndef CONFIG_JFFS2_FS_NAND
++#ifndef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	if (c->mtd->type == MTD_NANDFLASH) {
+ 		printk(KERN_ERR "jffs2: Cannot operate on NAND flash unless jffs2 NAND support is compiled in.\n");
+ 		return -EINVAL;
+ 	}
++	if (c->mtd->type == MTD_DATAFLASH) {
++		printk(KERN_ERR "jffs2: Cannot operate on DataFlash unless jffs2 DataFlash support is compiled in.\n");
++		return -EINVAL;
++	}
+ #endif
+ 
+ 	c->flash_size = c->mtd->size;
+@@ -521,9 +525,7 @@ int jffs2_do_fill_super(struct super_blo
+ 	if (!sb->s_root)
+ 		goto out_root_i;
+ 
+-#if LINUX_VERSION_CODE >= 0x20403
+ 	sb->s_maxbytes = 0xFFFFFFFF;
+-#endif
+ 	sb->s_blocksize = PAGE_CACHE_SIZE;
+ 	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ 	sb->s_magic = JFFS2_SUPER_MAGIC;
+@@ -644,7 +646,7 @@ void jffs2_gc_release_page(struct jffs2_
+ 	page_cache_release(pg);
+ }
+ 
+-int jffs2_flash_setup(struct jffs2_sb_info *c) {
++static int jffs2_flash_setup(struct jffs2_sb_info *c) {
+ 	int ret = 0;
+ 	
+ 	if (jffs2_cleanmarker_oob(c)) {
+@@ -660,6 +662,14 @@ int jffs2_flash_setup(struct jffs2_sb_in
+ 		if (ret)
+ 			return ret;
+ 	}
++	
++	/* and Dataflash */
++	if (jffs2_dataflash(c)) {
++		ret = jffs2_dataflash_setup(c);
++		if (ret)
++			return ret;
++	}
++	
+ 	return ret;
+ }
+ 
+@@ -673,4 +683,9 @@ void jffs2_flash_cleanup(struct jffs2_sb
+ 	if (jffs2_nor_ecc(c)) {
+ 		jffs2_nor_ecc_flash_cleanup(c);
+ 	}
++	
++	/* and DataFlash */
++	if (jffs2_dataflash(c)) {
++		jffs2_dataflash_cleanup(c);
++	}
+ }
+Index: linux-2.6.10/fs/jffs2/gc.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/gc.c
++++ linux-2.6.10/fs/jffs2/gc.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: gc.c,v 1.144 2004/12/21 11:18:50 dwmw2 Exp $
++ * $Id: gc.c,v 1.147 2005/03/20 21:43:22 dedekind Exp $
+  *
+  */
+ 
+@@ -50,6 +50,7 @@ static struct jffs2_eraseblock *jffs2_fi
+ 	   put the clever wear-levelling algorithms. Eventually.  */
+ 	/* We possibly want to favour the dirtier blocks more when the
+ 	   number of free blocks is low. */
++again:
+ 	if (!list_empty(&c->bad_used_list) && c->nr_free_blocks > c->resv_blocks_gcbad) {
+ 		D1(printk(KERN_DEBUG "Picking block from bad_used_list to GC next\n"));
+ 		nextlist = &c->bad_used_list;
+@@ -79,6 +80,13 @@ static struct jffs2_eraseblock *jffs2_fi
+ 		D1(printk(KERN_DEBUG "Picking block from erasable_list to GC next (clean_list and {very_,}dirty_list were empty)\n"));
+ 
+ 		nextlist = &c->erasable_list;
++	} else if (!list_empty(&c->erasable_pending_wbuf_list)) {
++		/* There are blocks are wating for the wbuf sync */
++		D1(printk(KERN_DEBUG "Synching wbuf in order to reuse erasable_pending_wbuf_list blocks\n"));
++		spin_unlock(&c->erase_completion_lock);
++		jffs2_flush_wbuf_pad(c);
++		spin_lock(&c->erase_completion_lock);
++		goto again;
+ 	} else {
+ 		/* Eep. All were empty */
+ 		D1(printk(KERN_NOTICE "jffs2: No clean, dirty _or_ erasable blocks to GC from! Where are they all?\n"));
+@@ -661,9 +669,10 @@ static int jffs2_garbage_collect_metadat
+ {
+ 	struct jffs2_full_dnode *new_fn;
+ 	struct jffs2_raw_inode ri;
++	struct jffs2_node_frag *last_frag;
+ 	jint16_t dev;
+ 	char *mdata = NULL, mdatalen = 0;
+-	uint32_t alloclen, phys_ofs;
++	uint32_t alloclen, phys_ofs, ilen;
+ 	int ret;
+ 
+ 	if (S_ISBLK(JFFS2_F_I_MODE(f)) ||
+@@ -699,6 +708,14 @@ static int jffs2_garbage_collect_metadat
+ 		goto out;
+ 	}
+ 	
++	last_frag = frag_last(&f->fragtree);
++	if (last_frag)
++		/* Fetch the inode length from the fragtree rather then
++		 * from i_size since i_size may have not been updated yet */
++		ilen = last_frag->ofs + last_frag->size;
++	else
++		ilen = JFFS2_F_I_SIZE(f);
++	
+ 	memset(&ri, 0, sizeof(ri));
+ 	ri.magic = cpu_to_je16(JFFS2_MAGIC_BITMASK);
+ 	ri.nodetype = cpu_to_je16(JFFS2_NODETYPE_INODE);
+@@ -710,7 +727,7 @@ static int jffs2_garbage_collect_metadat
+ 	ri.mode = cpu_to_jemode(JFFS2_F_I_MODE(f));
+ 	ri.uid = cpu_to_je16(JFFS2_F_I_UID(f));
+ 	ri.gid = cpu_to_je16(JFFS2_F_I_GID(f));
+-	ri.isize = cpu_to_je32(JFFS2_F_I_SIZE(f));
++	ri.isize = cpu_to_je32(ilen);
+ 	ri.atime = cpu_to_je32(JFFS2_F_I_ATIME(f));
+ 	ri.ctime = cpu_to_je32(JFFS2_F_I_CTIME(f));
+ 	ri.mtime = cpu_to_je32(JFFS2_F_I_MTIME(f));
+@@ -816,8 +833,7 @@ static int jffs2_garbage_collect_deletio
+ 
+ 			/* Doesn't matter if there's one in the same erase block. We're going to 
+ 			   delete it too at the same time. */
+-			if ((raw->flash_offset & ~(c->sector_size-1)) ==
+-			    (fd->raw->flash_offset & ~(c->sector_size-1)))
++			if (SECTOR_ADDR(raw->flash_offset) == SECTOR_ADDR(fd->raw->flash_offset))
+ 				continue;
+ 
+ 			D1(printk(KERN_DEBUG "Check potential deletion dirent at %08x\n", ref_offset(raw)));
+@@ -891,7 +907,7 @@ static int jffs2_garbage_collect_hole(st
+ 	struct jffs2_raw_inode ri;
+ 	struct jffs2_node_frag *frag;
+ 	struct jffs2_full_dnode *new_fn;
+-	uint32_t alloclen, phys_ofs;
++	uint32_t alloclen, phys_ofs, ilen;
+ 	int ret;
+ 
+ 	D1(printk(KERN_DEBUG "Writing replacement hole node for ino #%u from offset 0x%x to 0x%x\n",
+@@ -951,10 +967,19 @@ static int jffs2_garbage_collect_hole(st
+ 		ri.csize = cpu_to_je32(0);
+ 		ri.compr = JFFS2_COMPR_ZERO;
+ 	}
++	
++	frag = frag_last(&f->fragtree);
++	if (frag)
++		/* Fetch the inode length from the fragtree rather then
++		 * from i_size since i_size may have not been updated yet */
++		ilen = frag->ofs + frag->size;
++	else
++		ilen = JFFS2_F_I_SIZE(f);
++
+ 	ri.mode = cpu_to_jemode(JFFS2_F_I_MODE(f));
+ 	ri.uid = cpu_to_je16(JFFS2_F_I_UID(f));
+ 	ri.gid = cpu_to_je16(JFFS2_F_I_GID(f));
+-	ri.isize = cpu_to_je32(JFFS2_F_I_SIZE(f));
++	ri.isize = cpu_to_je32(ilen);
+ 	ri.atime = cpu_to_je32(JFFS2_F_I_ATIME(f));
+ 	ri.ctime = cpu_to_je32(JFFS2_F_I_CTIME(f));
+ 	ri.mtime = cpu_to_je32(JFFS2_F_I_MTIME(f));
+@@ -1161,7 +1186,7 @@ static int jffs2_garbage_collect_dnode(s
+ 		D1(printk(KERN_DEBUG "Expanded dnode to write from (0x%x-0x%x) to (0x%x-0x%x)\n", 
+ 			  orig_start, orig_end, start, end));
+ 
+-		BUG_ON(end > JFFS2_F_I_SIZE(f));
++		D1(BUG_ON(end > frag_last(&f->fragtree)->ofs + frag_last(&f->fragtree)->size));
+ 		BUG_ON(end < orig_end);
+ 		BUG_ON(start > orig_start);
+ 	}
+Index: linux-2.6.10/fs/jffs2/ioctl.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/ioctl.c
++++ linux-2.6.10/fs/jffs2/ioctl.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: ioctl.c,v 1.9 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: ioctl.c,v 1.8 2003/10/28 16:16:28 dwmw2 Exp $
+  *
+  */
+ 
+Index: linux-2.6.10/fs/jffs2/malloc.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/malloc.c
++++ linux-2.6.10/fs/jffs2/malloc.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: malloc.c,v 1.28 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: malloc.c,v 1.27 2003/10/28 17:14:58 dwmw2 Exp $
+  *
+  */
+ 
+Index: linux-2.6.10/fs/jffs2/nodelist.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/nodelist.c
++++ linux-2.6.10/fs/jffs2/nodelist.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: nodelist.c,v 1.90 2004/12/08 17:59:20 dwmw2 Exp $
++ * $Id: nodelist.c,v 1.96 2005/07/06 14:43:14 dedekind Exp $
+  *
+  */
+ 
+@@ -58,27 +58,60 @@ void jffs2_add_fd_to_list(struct jffs2_s
+ /* Put a new tmp_dnode_info into the list, keeping the list in 
+    order of increasing version
+ */
+-static void jffs2_add_tn_to_list(struct jffs2_tmp_dnode_info *tn, struct jffs2_tmp_dnode_info **list)
+-{
+-	struct jffs2_tmp_dnode_info **prev = list;
+-	
+-	while ((*prev) && (*prev)->version < tn->version) {
+-		prev = &((*prev)->next);
+-	}
+-	tn->next = (*prev);
+-        *prev = tn;
+-}
+ 
+-static void jffs2_free_tmp_dnode_info_list(struct jffs2_tmp_dnode_info *tn)
++static void jffs2_add_tn_to_list(struct jffs2_tmp_dnode_info *tn, struct rb_root *list)
+ {
+-	struct jffs2_tmp_dnode_info *next;
++	struct rb_node **p = &list->rb_node;
++	struct rb_node * parent = NULL;
++	struct jffs2_tmp_dnode_info *this;
++
++	while (*p) {
++		parent = *p;
++		this = rb_entry(parent, struct jffs2_tmp_dnode_info, rb);
++
++		/* There may actually be a collision here, but it doesn't
++		   actually matter. As long as the two nodes with the same
++		   version are together, it's all fine. */
++		if (tn->version < this->version)
++			p = &(*p)->rb_left;
++		else
++			p = &(*p)->rb_right;
++        }
++
++	rb_link_node(&tn->rb, parent, p);
++	rb_insert_color(&tn->rb, list);
++}
++
++static void jffs2_free_tmp_dnode_info_list(struct rb_root *list)
++{
++	struct rb_node *this;
++	struct jffs2_tmp_dnode_info *tn;
++
++	this = list->rb_node;
++
++	/* Now at bottom of tree */
++	while (this) {
++		if (this->rb_left)
++			this = this->rb_left;
++		else if (this->rb_right)
++			this = this->rb_right;
++		else {
++			tn = rb_entry(this, struct jffs2_tmp_dnode_info, rb);
++			jffs2_free_full_dnode(tn->fn);
++			jffs2_free_tmp_dnode_info(tn);
++
++			this = this->rb_parent;
++			if (!this)
++				break;
+ 
+-	while (tn) {
+-		next = tn;
+-		tn = tn->next;
+-		jffs2_free_full_dnode(next->fn);
+-		jffs2_free_tmp_dnode_info(next);
++			if (this->rb_left == &tn->rb)
++				this->rb_left = NULL;
++			else if (this->rb_right == &tn->rb)
++				this->rb_right = NULL;
++			else BUG();
++		}
+ 	}
++	list->rb_node = NULL;
+ }
+ 
+ static void jffs2_free_full_dirent_list(struct jffs2_full_dirent *fd)
+@@ -108,12 +141,13 @@ static struct jffs2_raw_node_ref *jffs2_
+    with this ino, returning the former in order of version */
+ 
+ int jffs2_get_inode_nodes(struct jffs2_sb_info *c, struct jffs2_inode_info *f,
+-			  struct jffs2_tmp_dnode_info **tnp, struct jffs2_full_dirent **fdp,
++			  struct rb_root *tnp, struct jffs2_full_dirent **fdp,
+ 			  uint32_t *highest_version, uint32_t *latest_mctime,
+ 			  uint32_t *mctime_ver)
+ {
+ 	struct jffs2_raw_node_ref *ref, *valid_ref;
+-	struct jffs2_tmp_dnode_info *tn, *ret_tn = NULL;
++	struct jffs2_tmp_dnode_info *tn;
++	struct rb_root ret_tn = RB_ROOT;
+ 	struct jffs2_full_dirent *fd, *ret_fd = NULL;
+ 	union jffs2_node_union node;
+ 	size_t retlen;
+@@ -450,7 +484,7 @@ int jffs2_get_inode_nodes(struct jffs2_s
+ 	return 0;
+ 
+  free_out:
+-	jffs2_free_tmp_dnode_info_list(ret_tn);
++	jffs2_free_tmp_dnode_info_list(&ret_tn);
+ 	jffs2_free_full_dirent_list(ret_fd);
+ 	return err;
+ }
+@@ -489,9 +523,13 @@ struct jffs2_inode_cache *jffs2_get_ino_
+ void jffs2_add_ino_cache (struct jffs2_sb_info *c, struct jffs2_inode_cache *new)
+ {
+ 	struct jffs2_inode_cache **prev;
+-	D2(printk(KERN_DEBUG "jffs2_add_ino_cache: Add %p (ino #%u)\n", new, new->ino));
++
+ 	spin_lock(&c->inocache_lock);
+-	
++	if (!new->ino)
++		new->ino = ++c->highest_ino;
++
++	D2(printk(KERN_DEBUG "jffs2_add_ino_cache: Add %p (ino #%u)\n", new, new->ino));
++
+ 	prev = &c->inocache_list[new->ino % INOCACHE_HASHSIZE];
+ 
+ 	while ((*prev) && (*prev)->ino < new->ino) {
+@@ -506,7 +544,7 @@ void jffs2_add_ino_cache (struct jffs2_s
+ void jffs2_del_ino_cache(struct jffs2_sb_info *c, struct jffs2_inode_cache *old)
+ {
+ 	struct jffs2_inode_cache **prev;
+-	D2(printk(KERN_DEBUG "jffs2_del_ino_cache: Del %p (ino #%u)\n", old, old->ino));
++	D1(printk(KERN_DEBUG "jffs2_del_ino_cache: Del %p (ino #%u)\n", old, old->ino));
+ 	spin_lock(&c->inocache_lock);
+ 	
+ 	prev = &c->inocache_list[old->ino % INOCACHE_HASHSIZE];
+@@ -518,6 +556,14 @@ void jffs2_del_ino_cache(struct jffs2_sb
+ 		*prev = old->next;
+ 	}
+ 
++	/* Free it now unless it's in READING or CLEARING state, which
++	   are the transitions upon read_inode() and clear_inode(). The
++	   rest of the time we know nobody else is looking at it, and 
++	   if it's held by read_inode() or clear_inode() they'll free it
++	   for themselves. */
++	if (old->state != INO_STATE_READING && old->state != INO_STATE_CLEARING)
++		jffs2_free_inode_cache(old);
++
+ 	spin_unlock(&c->inocache_lock);
+ }
+ 
+@@ -530,7 +576,6 @@ void jffs2_free_ino_caches(struct jffs2_
+ 		this = c->inocache_list[i];
+ 		while (this) {
+ 			next = this->next;
+-			D2(printk(KERN_DEBUG "jffs2_free_ino_caches: Freeing ino #%u at %p\n", this->ino, this));
+ 			jffs2_free_inode_cache(this);
+ 			this = next;
+ 		}
+Index: linux-2.6.10/fs/jffs2/nodelist.h
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/nodelist.h
++++ linux-2.6.10/fs/jffs2/nodelist.h
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: nodelist.h,v 1.126 2004/11/19 15:06:29 dedekind Exp $
++ * $Id: nodelist.h,v 1.130 2005/04/09 10:46:59 dedekind Exp $
+  *
+  */
+ 
+@@ -135,6 +135,7 @@ struct jffs2_inode_cache {
+ #define INO_STATE_CHECKEDABSENT	3	/* Checked, cleared again */
+ #define INO_STATE_GC		4	/* GCing a 'pristine' node */
+ #define INO_STATE_READING	5	/* In read_inode() */
++#define INO_STATE_CLEARING	6	/* In clear_inode() */
+ 
+ #define INOCACHE_HASHSIZE 128
+ 
+@@ -160,7 +161,7 @@ struct jffs2_full_dnode
+ */
+ struct jffs2_tmp_dnode_info
+ {
+-	struct jffs2_tmp_dnode_info *next;
++	struct rb_node rb;
+ 	struct jffs2_full_dnode *fn;
+ 	uint32_t version;
+ };       
+@@ -362,6 +363,18 @@ static inline struct jffs2_node_frag *fr
+ 		node = node->rb_left;
+ 	return rb_entry(node, struct jffs2_node_frag, rb);
+ }
++
++static inline struct jffs2_node_frag *frag_last(struct rb_root *root)
++{
++	struct rb_node *node = root->rb_node;
++
++	if (!node)
++		return NULL;
++	while(node->rb_right)
++		node = node->rb_right;
++	return rb_entry(node, struct jffs2_node_frag, rb);
++}
++
+ #define rb_parent(rb) ((rb)->rb_parent)
+ #define frag_next(frag) rb_entry(rb_next(&(frag)->rb), struct jffs2_node_frag, rb)
+ #define frag_prev(frag) rb_entry(rb_prev(&(frag)->rb), struct jffs2_node_frag, rb)
+@@ -374,7 +387,7 @@ static inline struct jffs2_node_frag *fr
+ D2(void jffs2_print_frag_list(struct jffs2_inode_info *f));
+ void jffs2_add_fd_to_list(struct jffs2_sb_info *c, struct jffs2_full_dirent *new, struct jffs2_full_dirent **list);
+ int jffs2_get_inode_nodes(struct jffs2_sb_info *c, struct jffs2_inode_info *f,
+-			  struct jffs2_tmp_dnode_info **tnp, struct jffs2_full_dirent **fdp,
++			  struct rb_root *tnp, struct jffs2_full_dirent **fdp,
+ 			  uint32_t *highest_version, uint32_t *latest_mctime,
+ 			  uint32_t *mctime_ver);
+ void jffs2_set_inocache_state(struct jffs2_sb_info *c, struct jffs2_inode_cache *ic, int state);
+@@ -460,10 +473,9 @@ void jffs2_rotate_lists(struct jffs2_sb_
+ int jffs2_do_mount_fs(struct jffs2_sb_info *c);
+ 
+ /* erase.c */
+-void jffs2_erase_block(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb);
+ void jffs2_erase_pending_blocks(struct jffs2_sb_info *c, int count);
+ 
+-#ifdef CONFIG_JFFS2_FS_NAND
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ /* wbuf.c */
+ int jffs2_flush_wbuf_gc(struct jffs2_sb_info *c, uint32_t ino);
+ int jffs2_flush_wbuf_pad(struct jffs2_sb_info *c);
+Index: linux-2.6.10/fs/jffs2/nodemgmt.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/nodemgmt.c
++++ linux-2.6.10/fs/jffs2/nodemgmt.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: nodemgmt.c,v 1.115 2004/11/22 11:07:21 dwmw2 Exp $
++ * $Id: nodemgmt.c,v 1.121 2005/04/06 16:02:52 dedekind Exp $
+  *
+  */
+ 
+@@ -75,7 +75,7 @@ int jffs2_reserve_space(struct jffs2_sb_
+ 			dirty = c->dirty_size + c->erasing_size - c->nr_erasing_blocks * c->sector_size + c->unchecked_size;
+ 			if (dirty < c->nospc_dirty_size) {
+ 				if (prio == ALLOC_DELETION && c->nr_free_blocks + c->nr_erasing_blocks >= c->resv_blocks_deletion) {
+-					printk(KERN_NOTICE "jffs2_reserve_space(): Low on dirty space to GC, but it's a deletion. Allowing...\n");
++					D1(printk(KERN_NOTICE "jffs2_reserve_space(): Low on dirty space to GC, but it's a deletion. Allowing...\n"));
+ 					break;
+ 				}
+ 				D1(printk(KERN_DEBUG "dirty size 0x%08x + unchecked_size 0x%08x < nospc_dirty_size 0x%08x, returning -ENOSPC\n",
+@@ -98,7 +98,7 @@ int jffs2_reserve_space(struct jffs2_sb_
+ 			avail = c->free_size + c->dirty_size + c->erasing_size + c->unchecked_size;
+ 			if ( (avail / c->sector_size) <= blocksneeded) {
+ 				if (prio == ALLOC_DELETION && c->nr_free_blocks + c->nr_erasing_blocks >= c->resv_blocks_deletion) {
+-					printk(KERN_NOTICE "jffs2_reserve_space(): Low on possibly available space, but it's a deletion. Allowing...\n");
++					D1(printk(KERN_NOTICE "jffs2_reserve_space(): Low on possibly available space, but it's a deletion. Allowing...\n"));
+ 					break;
+ 				}
+ 
+@@ -308,7 +308,10 @@ int jffs2_add_physical_node_ref(struct j
+ 
+ 	D1(printk(KERN_DEBUG "jffs2_add_physical_node_ref(): Node at 0x%x(%d), size 0x%x\n", ref_offset(new), ref_flags(new), len));
+ #if 1
+-	if (jeb != c->nextblock || (ref_offset(new)) != jeb->offset + (c->sector_size - jeb->free_size)) {
++	/* we could get some obsolete nodes after nextblock was refiled
++	   in wbuf.c */
++	if ((c->nextblock || !ref_obsolete(new))
++	    &&(jeb != c->nextblock || ref_offset(new) != jeb->offset + (c->sector_size - jeb->free_size))) {
+ 		printk(KERN_WARNING "argh. node added in wrong place\n");
+ 		jffs2_free_raw_node_ref(new);
+ 		return -EINVAL;
+@@ -332,7 +335,7 @@ int jffs2_add_physical_node_ref(struct j
+ 		c->used_size += len;
+ 	}
+ 
+-	if (!jeb->free_size && !jeb->dirty_size) {
++	if (!jeb->free_size && !jeb->dirty_size && !ISDIRTY(jeb->wasted_size)) {
+ 		/* If it lives on the dirty_list, jffs2_reserve_space will put it there */
+ 		D1(printk(KERN_DEBUG "Adding full erase block at 0x%08x to clean_list (free 0x%08x, dirty 0x%08x, used 0x%08x\n",
+ 			  jeb->offset, jeb->free_size, jeb->dirty_size, jeb->used_size));
+@@ -400,7 +403,7 @@ void jffs2_mark_node_obsolete(struct jff
+ 	jeb = &c->blocks[blocknr];
+ 
+ 	if (jffs2_can_mark_obsolete(c) && !jffs2_is_readonly(c) &&
+-	    !(c->flags & JFFS2_SB_FLAG_MOUNTING)) {
++	    !(c->flags & (JFFS2_SB_FLAG_SCANNING | JFFS2_SB_FLAG_BUILDING))) {
+ 		/* Hm. This may confuse static lock analysis. If any of the above 
+ 		   three conditions is false, we're going to return from this 
+ 		   function without actually obliterating any nodes or freeing
+@@ -434,7 +437,7 @@ void jffs2_mark_node_obsolete(struct jff
+ 
+ 	// Take care, that wasted size is taken into concern
+ 	if ((jeb->dirty_size || ISDIRTY(jeb->wasted_size + ref_totlen(c, jeb, ref))) && jeb != c->nextblock) {
+-		D1(printk("Dirtying\n"));
++		D1(printk(KERN_DEBUG "Dirtying\n"));
+ 		addedsize = ref_totlen(c, jeb, ref);
+ 		jeb->dirty_size += ref_totlen(c, jeb, ref);
+ 		c->dirty_size += ref_totlen(c, jeb, ref);
+@@ -456,7 +459,7 @@ void jffs2_mark_node_obsolete(struct jff
+ 			}
+ 		}
+ 	} else {
+-		D1(printk("Wasting\n"));
++		D1(printk(KERN_DEBUG "Wasting\n"));
+ 		addedsize = 0;
+ 		jeb->wasted_size += ref_totlen(c, jeb, ref);
+ 		c->wasted_size += ref_totlen(c, jeb, ref);	
+@@ -467,8 +470,8 @@ void jffs2_mark_node_obsolete(struct jff
+ 
+ 	D1(ACCT_PARANOIA_CHECK(jeb));
+ 
+-	if (c->flags & JFFS2_SB_FLAG_MOUNTING) {
+-		/* Mount in progress. Don't muck about with the block
++	if (c->flags & JFFS2_SB_FLAG_SCANNING) {
++		/* Flash scanning is in progress. Don't muck about with the block
+ 		   lists because they're not ready yet, and don't actually
+ 		   obliterate nodes that look obsolete. If they weren't 
+ 		   marked obsolete on the flash at the time they _became_
+@@ -527,7 +530,8 @@ void jffs2_mark_node_obsolete(struct jff
+ 
+ 	spin_unlock(&c->erase_completion_lock);
+ 
+-	if (!jffs2_can_mark_obsolete(c) || jffs2_is_readonly(c)) {
++	if (!jffs2_can_mark_obsolete(c) || jffs2_is_readonly(c) ||
++		(c->flags & JFFS2_SB_FLAG_BUILDING)) {
+ 		/* We didn't lock the erase_free_sem */
+ 		return;
+ 	}
+@@ -590,11 +594,8 @@ void jffs2_mark_node_obsolete(struct jff
+ 		*p = ref->next_in_ino;
+ 		ref->next_in_ino = NULL;
+ 
+-		if (ic->nodes == (void *)ic) {
+-			D1(printk(KERN_DEBUG "inocache for ino #%u is all gone now. Freeing\n", ic->ino));
++		if (ic->nodes == (void *)ic && ic->nlink == 0)
+ 			jffs2_del_ino_cache(c, ic);
+-			jffs2_free_inode_cache(ic);
+-		}
+ 
+ 		spin_unlock(&c->erase_completion_lock);
+ 	}
+Index: linux-2.6.10/fs/jffs2/os-linux.h
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/os-linux.h
++++ linux-2.6.10/fs/jffs2/os-linux.h
+@@ -7,41 +7,24 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: os-linux.h,v 1.51 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: os-linux.h,v 1.56 2005/05/03 15:19:00 dedekind Exp $
+  *
+  */
+ 
+ #ifndef __JFFS2_OS_LINUX_H__
+ #define __JFFS2_OS_LINUX_H__
+-#include <linux/version.h>
+ 
+ /* JFFS2 uses Linux mode bits natively -- no need for conversion */
+ #define os_to_jffs2_mode(x) (x)
+ #define jffs2_to_os_mode(x) (x)
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,73)
+-#define kstatfs statfs
+-#endif
+-
+ struct kstatfs;
+ struct kvec;
+ 
+-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,5,2)
+ #define JFFS2_INODE_INFO(i) (list_entry(i, struct jffs2_inode_info, vfs_inode))
+ #define OFNI_EDONI_2SFFJ(f)  (&(f)->vfs_inode)
+ #define JFFS2_SB_INFO(sb) (sb->s_fs_info)
+ #define OFNI_BS_2SFFJ(c)  ((struct super_block *)c->os_priv)
+-#elif defined(JFFS2_OUT_OF_KERNEL)
+-#define JFFS2_INODE_INFO(i) ((struct jffs2_inode_info *) &(i)->u)
+-#define OFNI_EDONI_2SFFJ(f)  ((struct inode *) ( ((char *)f) - ((char *)(&((struct inode *)NULL)->u)) ) )
+-#define JFFS2_SB_INFO(sb) ((struct jffs2_sb_info *) &(sb)->u)
+-#define OFNI_BS_2SFFJ(c)  ((struct super_block *) ( ((char *)c) - ((char *)(&((struct super_block *)NULL)->u)) ) )
+-#else
+-#define JFFS2_INODE_INFO(i) (&i->u.jffs2_i)
+-#define OFNI_EDONI_2SFFJ(f)  ((struct inode *) ( ((char *)f) - ((char *)(&((struct inode *)NULL)->u)) ) )
+-#define JFFS2_SB_INFO(sb) (&sb->u.jffs2_sb)
+-#define OFNI_BS_2SFFJ(c)  ((struct super_block *) ( ((char *)c) - ((char *)(&((struct super_block *)NULL)->u)) ) )
+-#endif
+ 
+ 
+ #define JFFS2_F_I_SIZE(f) (OFNI_EDONI_2SFFJ(f)->i_size)
+@@ -49,28 +32,14 @@ struct kvec;
+ #define JFFS2_F_I_UID(f) (OFNI_EDONI_2SFFJ(f)->i_uid)
+ #define JFFS2_F_I_GID(f) (OFNI_EDONI_2SFFJ(f)->i_gid)
+ 
+-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,5,1)
+ #define JFFS2_F_I_RDEV_MIN(f) (iminor(OFNI_EDONI_2SFFJ(f)))
+ #define JFFS2_F_I_RDEV_MAJ(f) (imajor(OFNI_EDONI_2SFFJ(f)))
+-#else
+-#define JFFS2_F_I_RDEV_MIN(f) (MINOR(to_kdev_t(OFNI_EDONI_2SFFJ(f)->i_rdev)))
+-#define JFFS2_F_I_RDEV_MAJ(f) (MAJOR(to_kdev_t(OFNI_EDONI_2SFFJ(f)->i_rdev)))
+-#endif
+ 
+-/* Urgh. The things we do to keep the 2.4 build working */
+-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,5,47)
+ #define ITIME(sec) ((struct timespec){sec, 0})
+ #define I_SEC(tv) ((tv).tv_sec)
+ #define JFFS2_F_I_CTIME(f) (OFNI_EDONI_2SFFJ(f)->i_ctime.tv_sec)
+ #define JFFS2_F_I_MTIME(f) (OFNI_EDONI_2SFFJ(f)->i_mtime.tv_sec)
+ #define JFFS2_F_I_ATIME(f) (OFNI_EDONI_2SFFJ(f)->i_atime.tv_sec)
+-#else
+-#define ITIME(x) (x)
+-#define I_SEC(x) (x)
+-#define JFFS2_F_I_CTIME(f) (OFNI_EDONI_2SFFJ(f)->i_ctime)
+-#define JFFS2_F_I_MTIME(f) (OFNI_EDONI_2SFFJ(f)->i_mtime)
+-#define JFFS2_F_I_ATIME(f) (OFNI_EDONI_2SFFJ(f)->i_atime)
+-#endif
+ 
+ #define sleep_on_spinunlock(wq, s)				\
+ 	do {							\
+@@ -84,23 +53,21 @@ struct kvec;
+ 
+ static inline void jffs2_init_inode_info(struct jffs2_inode_info *f)
+ {
+-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,5,2)
+ 	f->highest_version = 0;
+ 	f->fragtree = RB_ROOT;
+ 	f->metadata = NULL;
+ 	f->dents = NULL;
+ 	f->flags = 0;
+ 	f->usercompr = 0;
+-#else
+-	memset(f, 0, sizeof(*f));
+-	init_MUTEX_LOCKED(&f->sem);
+-#endif
+ }
+ 
++
+ #define jffs2_is_readonly(c) (OFNI_BS_2SFFJ(c)->s_flags & MS_RDONLY)
+ 
+-#if (!defined CONFIG_JFFS2_FS_NAND && !defined CONFIG_JFFS2_FS_NOR_ECC)
++#ifndef CONFIG_JFFS2_FS_WRITEBUFFER
++#define SECTOR_ADDR(x) ( ((unsigned long)(x) & ~(c->sector_size-1)) )
+ #define jffs2_can_mark_obsolete(c) (1)
++#define jffs2_is_writebuffered(c) (0)
+ #define jffs2_cleanmarker_oob(c) (0)
+ #define jffs2_write_nand_cleanmarker(c,jeb) (-EIO)
+ 
+@@ -116,11 +83,14 @@ static inline void jffs2_init_inode_info
+ #define jffs2_wbuf_timeout NULL
+ #define jffs2_wbuf_process NULL
+ #define jffs2_nor_ecc(c) (0)
++#define jffs2_dataflash(c) (0)
+ #define jffs2_nor_ecc_flash_setup(c) (0)
+ #define jffs2_nor_ecc_flash_cleanup(c) do {} while (0)
+ 
+ #else /* NAND and/or ECC'd NOR support present */
+ 
++#define jffs2_is_writebuffered(c) (c->wbuf != NULL)
++#define SECTOR_ADDR(x) ( ((unsigned long)(x) / (unsigned long)(c->sector_size)) * c->sector_size )
+ #define jffs2_can_mark_obsolete(c) ((c->mtd->type == MTD_NORFLASH && !(c->mtd->flags & MTD_ECC)) || c->mtd->type == MTD_RAM)
+ #define jffs2_cleanmarker_oob(c) (c->mtd->type == MTD_NANDFLASH)
+ 
+@@ -142,16 +112,16 @@ int jffs2_flush_wbuf_gc(struct jffs2_sb_
+ int jffs2_flush_wbuf_pad(struct jffs2_sb_info *c);
+ int jffs2_nand_flash_setup(struct jffs2_sb_info *c);
+ void jffs2_nand_flash_cleanup(struct jffs2_sb_info *c);
+-#ifdef CONFIG_JFFS2_FS_NOR_ECC
++
+ #define jffs2_nor_ecc(c) (c->mtd->type == MTD_NORFLASH && (c->mtd->flags & MTD_ECC))
+ int jffs2_nor_ecc_flash_setup(struct jffs2_sb_info *c);
+ void jffs2_nor_ecc_flash_cleanup(struct jffs2_sb_info *c);
+-#else
+-#define jffs2_nor_ecc(c) (0)
+-#define jffs2_nor_ecc_flash_setup(c) (0)
+-#define jffs2_nor_ecc_flash_cleanup(c) do {} while (0)
+-#endif /* NOR ECC */
+-#endif /* NAND */
++
++#define jffs2_dataflash(c) (c->mtd->type == MTD_DATAFLASH)
++int jffs2_dataflash_setup(struct jffs2_sb_info *c);
++void jffs2_dataflash_cleanup(struct jffs2_sb_info *c);
++
++#endif /* WRITEBUFFER */
+ 
+ /* erase.c */
+ static inline void jffs2_erase_pending_trigger(struct jffs2_sb_info *c)
+@@ -173,11 +143,7 @@ extern struct file_operations jffs2_file
+ extern struct inode_operations jffs2_file_inode_operations;
+ extern struct address_space_operations jffs2_file_address_operations;
+ int jffs2_fsync(struct file *, struct dentry *, int);
+-int jffs2_do_readpage_nolock (struct inode *inode, struct page *pg);
+ int jffs2_do_readpage_unlock (struct inode *inode, struct page *pg);
+-int jffs2_readpage (struct file *, struct page *);
+-int jffs2_prepare_write (struct file *, struct page *, unsigned, unsigned);
+-int jffs2_commit_write (struct file *, struct page *, unsigned, unsigned);
+ 
+ /* ioctl.c */
+ int jffs2_ioctl(struct inode *, struct file *, unsigned int, unsigned long);
+@@ -208,7 +174,6 @@ unsigned char *jffs2_gc_fetch_page(struc
+ void jffs2_gc_release_page(struct jffs2_sb_info *c,
+ 			   unsigned char *pg,
+ 			   unsigned long *priv);
+-int jffs2_flash_setup(struct jffs2_sb_info *c);
+ void jffs2_flash_cleanup(struct jffs2_sb_info *c);
+      
+ 
+Index: linux-2.6.10/fs/jffs2/pushpull.h
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/pushpull.h
++++ linux-2.6.10/fs/jffs2/pushpull.h
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: pushpull.h,v 1.10 2004/11/16 20:36:11 dwmw2 Exp $
++ * $Id: pushpull.h,v 1.9 2003/10/04 08:33:06 dwmw2 Exp $
+  *
+  */
+ 
+Index: linux-2.6.10/fs/jffs2/read.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/read.c
++++ linux-2.6.10/fs/jffs2/read.c
+@@ -214,33 +214,3 @@ int jffs2_read_inode_range(struct jffs2_
+ 	return 0;
+ }
+ 
+-/* Core function to read symlink target. */
+-char *jffs2_getlink(struct jffs2_sb_info *c, struct jffs2_inode_info *f)
+-{
+-	char *buf;
+-	int ret;
+-
+-	down(&f->sem);
+-
+-	if (!f->metadata) {
+-		printk(KERN_NOTICE "No metadata for symlink inode #%u\n", f->inocache->ino);
+-		up(&f->sem);
+-		return ERR_PTR(-EINVAL);
+-	}
+-	buf = kmalloc(f->metadata->size+1, GFP_USER);
+-	if (!buf) {
+-		up(&f->sem);
+-		return ERR_PTR(-ENOMEM);
+-	}
+-	buf[f->metadata->size]=0;
+-
+-	ret = jffs2_read_dnode(c, f, f->metadata, buf, 0, f->metadata->size);
+-
+-	up(&f->sem);
+-
+-	if (ret) {
+-		kfree(buf);
+-		return ERR_PTR(ret);
+-	}
+-	return buf;
+-}
+Index: linux-2.6.10/fs/jffs2/readinode.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/readinode.c
++++ linux-2.6.10/fs/jffs2/readinode.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: readinode.c,v 1.117 2004/11/20 18:06:54 dwmw2 Exp $
++ * $Id: readinode.c,v 1.123 2005/07/07 13:46:04 dedekind Exp $
+  *
+  */
+ 
+@@ -151,6 +151,9 @@ int jffs2_add_full_dnode_to_inode(struct
+ 
+ 	D1(printk(KERN_DEBUG "jffs2_add_full_dnode_to_inode(ino #%u, f %p, fn %p)\n", f->inocache->ino, f, fn));
+ 
++	if (unlikely(!fn->size))
++		return 0;
++
+ 	newfrag = jffs2_alloc_node_frag();
+ 	if (unlikely(!newfrag))
+ 		return -ENOMEM;
+@@ -158,18 +161,13 @@ int jffs2_add_full_dnode_to_inode(struct
+ 	D2(printk(KERN_DEBUG "adding node %04x-%04x @0x%08x on flash, newfrag *%p\n",
+ 		  fn->ofs, fn->ofs+fn->size, ref_offset(fn->raw), newfrag));
+ 	
+-	if (unlikely(!fn->size)) {
+-		jffs2_free_node_frag(newfrag);
+-		return 0;
+-	}
+-
+ 	newfrag->ofs = fn->ofs;
+ 	newfrag->size = fn->size;
+ 	newfrag->node = fn;
+ 	newfrag->node->frags = 1;
+ 
+ 	ret = jffs2_add_frag_to_fragtree(c, &f->fragtree, newfrag);
+-	if (ret)
++	if (unlikely(ret))
+ 		return ret;
+ 
+ 	/* If we now share a page with other nodes, mark either previous
+@@ -259,7 +257,7 @@ static int jffs2_add_frag_to_fragtree(st
+ 		if (this) {
+ 			/* By definition, the 'this' node has no right-hand child, 
+ 			   because there are no frags with offset greater than it.
+-			   So that's where we want to put the hole */
++			   So that's where we want to put new fragment */
+ 			D2(printk(KERN_DEBUG "Adding new frag (%p) on right of node at (%p)\n", newfrag, this));
+ 			rb_link_node(&newfrag->rb, &this->rb, &this->rb.rb_right);			
+ 		} else {
+@@ -500,7 +498,9 @@ static int jffs2_do_read_inode_internal(
+ 					struct jffs2_inode_info *f,
+ 					struct jffs2_raw_inode *latest_node)
+ {
+-	struct jffs2_tmp_dnode_info *tn_list, *tn;
++	struct jffs2_tmp_dnode_info *tn = NULL;
++	struct rb_root tn_list;
++	struct rb_node *rb, *repl_rb;
+ 	struct jffs2_full_dirent *fd_list;
+ 	struct jffs2_full_dnode *fn = NULL;
+ 	uint32_t crc;
+@@ -522,9 +522,10 @@ static int jffs2_do_read_inode_internal(
+ 	}
+ 	f->dents = fd_list;
+ 
+-	while (tn_list) {
+-		tn = tn_list;
++	rb = rb_first(&tn_list);
+ 
++	while (rb) {
++		tn = rb_entry(rb, struct jffs2_tmp_dnode_info, rb);
+ 		fn = tn->fn;
+ 
+ 		if (f->metadata) {
+@@ -556,7 +557,30 @@ static int jffs2_do_read_inode_internal(
+ 			mdata_ver = tn->version;
+ 		}
+ 	next_tn:
+-		tn_list = tn->next;
++		BUG_ON(rb->rb_left);
++		repl_rb = NULL;
++		if (rb->rb_parent && rb->rb_parent->rb_left == rb) {
++			/* We were then left-hand child of our parent. We need
++			   to move our own right-hand child into our place. */
++			repl_rb = rb->rb_right;
++			if (repl_rb)
++				repl_rb->rb_parent = rb->rb_parent;
++		} else
++			repl_rb = NULL;
++
++		rb = rb_next(rb);
++
++		/* Remove the spent tn from the tree; don't bother rebalancing
++		   but put our right-hand child in our own place. */
++		if (tn->rb.rb_parent) {
++			if (tn->rb.rb_parent->rb_left == &tn->rb)
++				tn->rb.rb_parent->rb_left = repl_rb;
++			else if (tn->rb.rb_parent->rb_right == &tn->rb)
++				tn->rb.rb_parent->rb_right = repl_rb;
++			else BUG();
++		} else if (tn->rb.rb_right)
++			tn->rb.rb_right->rb_parent = NULL;
++
+ 		jffs2_free_tmp_dnode_info(tn);
+ 	}
+ 	D1(jffs2_sanitycheck_fragtree(f));
+@@ -623,6 +647,40 @@ static int jffs2_do_read_inode_internal(
+ 		   case. */
+ 		if (!je32_to_cpu(latest_node->isize))
+ 			latest_node->isize = latest_node->dsize;
++
++		if (f->inocache->state != INO_STATE_CHECKING) {
++			/* Symlink's inode data is the target path. Read it and
++			 * keep in RAM to facilitate quick follow symlink operation.
++			 * We use f->dents field to store the target path, which
++			 * is somewhat ugly. */
++			f->dents = kmalloc(je32_to_cpu(latest_node->csize) + 1, GFP_KERNEL);
++			if (!f->dents) {
++				printk(KERN_WARNING "Can't allocate %d bytes of memory "
++						"for the symlink target path cache\n",
++						je32_to_cpu(latest_node->csize));
++				up(&f->sem);
++				jffs2_do_clear_inode(c, f);
++				return -ENOMEM;
++			}
++			
++			ret = jffs2_flash_read(c, ref_offset(fn->raw) + sizeof(*latest_node),
++						je32_to_cpu(latest_node->csize), &retlen, (char *)f->dents);
++			
++			if (ret  || retlen != je32_to_cpu(latest_node->csize)) {
++				if (retlen != je32_to_cpu(latest_node->csize))
++					ret = -EIO;
++				kfree(f->dents);
++				f->dents = NULL;
++				up(&f->sem);
++				jffs2_do_clear_inode(c, f);
++				return -ret;
++			}
++
++			((char *)f->dents)[je32_to_cpu(latest_node->csize)] = '\0';
++			D1(printk(KERN_DEBUG "jffs2_do_read_inode(): symlink's target '%s' cached\n",
++						(char *)f->dents));
++		}
++		
+ 		/* fall through... */
+ 
+ 	case S_IFBLK:
+@@ -672,6 +730,9 @@ void jffs2_do_clear_inode(struct jffs2_s
+ 	down(&f->sem);
+ 	deleted = f->inocache && !f->inocache->nlink;
+ 
++	if (f->inocache && f->inocache->state != INO_STATE_CHECKING)
++		jffs2_set_inocache_state(c, f->inocache, INO_STATE_CLEARING);
++
+ 	if (f->metadata) {
+ 		if (deleted)
+ 			jffs2_mark_node_obsolete(c, f->metadata->raw);
+@@ -680,16 +741,27 @@ void jffs2_do_clear_inode(struct jffs2_s
+ 
+ 	jffs2_kill_fragtree(&f->fragtree, deleted?c:NULL);
+ 
+-	fds = f->dents;
++	/* For symlink inodes we us f->dents to store the target path name */
++	if (S_ISLNK(OFNI_EDONI_2SFFJ(f)->i_mode)) {
++		if (f->dents) {
++			kfree(f->dents);
++			f->dents = NULL;
++		}
++	} else {
++		fds = f->dents;
+ 
+-	while(fds) {
+-		fd = fds;
+-		fds = fd->next;
+-		jffs2_free_full_dirent(fd);
++		while(fds) {
++			fd = fds;
++			fds = fd->next;
++			jffs2_free_full_dirent(fd);
++		}
+ 	}
+ 
+-	if (f->inocache && f->inocache->state != INO_STATE_CHECKING)
++	if (f->inocache && f->inocache->state != INO_STATE_CHECKING) {
+ 		jffs2_set_inocache_state(c, f->inocache, INO_STATE_CHECKEDABSENT);
++		if (f->inocache->nodes == (void *)f->inocache)
++			jffs2_del_ino_cache(c, f->inocache);
++	}
+ 
+ 	up(&f->sem);
+ }
+Index: linux-2.6.10/fs/jffs2/scan.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/scan.c
++++ linux-2.6.10/fs/jffs2/scan.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: scan.c,v 1.115 2004/11/17 12:59:08 dedekind Exp $
++ * $Id: scan.c,v 1.118 2005/02/09 09:23:53 pavlov Exp $
+  *
+  */
+ #include <linux/kernel.h>
+@@ -19,7 +19,7 @@
+ #include <linux/compiler.h>
+ #include "nodelist.h"
+ 
+-#define EMPTY_SCAN_SIZE 1024
++#define DEFAULT_EMPTY_SCAN_SIZE 1024
+ 
+ #define DIRTY_SPACE(x) do { typeof(x) _x = (x); \
+ 		c->free_size -= _x; c->dirty_size += _x; \
+@@ -68,13 +68,21 @@ static int jffs2_scan_dirent_node(struct
+ static inline int min_free(struct jffs2_sb_info *c)
+ {
+ 	uint32_t min = 2 * sizeof(struct jffs2_raw_inode);
+-#if defined CONFIG_JFFS2_FS_NAND || defined CONFIG_JFFS2_FS_NOR_ECC
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	if (!jffs2_can_mark_obsolete(c) && min < c->wbuf_pagesize)
+ 		return c->wbuf_pagesize;
+ #endif
+ 	return min;
+ 
+ }
++
++static inline uint32_t EMPTY_SCAN_SIZE(uint32_t sector_size) {
++	if (sector_size < DEFAULT_EMPTY_SCAN_SIZE)
++		return sector_size;
++	else
++		return DEFAULT_EMPTY_SCAN_SIZE;
++}
++
+ int jffs2_scan_medium(struct jffs2_sb_info *c)
+ {
+ 	int i, ret;
+@@ -220,7 +228,7 @@ int jffs2_scan_medium(struct jffs2_sb_in
+ 		c->dirty_size -= c->nextblock->dirty_size;
+ 		c->nextblock->dirty_size = 0;
+ 	}
+-#if defined CONFIG_JFFS2_FS_NAND || defined CONFIG_JFFS2_FS_NOR_ECC
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	if (!jffs2_can_mark_obsolete(c) && c->nextblock && (c->nextblock->free_size & (c->wbuf_pagesize-1))) {
+ 		/* If we're going to start writing into a block which already 
+ 		   contains data, and the end of the data isn't page-aligned,
+@@ -286,7 +294,7 @@ static int jffs2_scan_eraseblock (struct
+ 	uint32_t hdr_crc, buf_ofs, buf_len;
+ 	int err;
+ 	int noise = 0;
+-#ifdef CONFIG_JFFS2_FS_NAND
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	int cleanmarkerfound = 0;
+ #endif
+ 
+@@ -295,7 +303,7 @@ static int jffs2_scan_eraseblock (struct
+ 
+ 	D1(printk(KERN_DEBUG "jffs2_scan_eraseblock(): Scanning block at 0x%x\n", ofs));
+ 
+-#ifdef CONFIG_JFFS2_FS_NAND
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	if (jffs2_cleanmarker_oob(c)) {
+ 		int ret = jffs2_check_nand_cleanmarker(c, jeb);
+ 		D2(printk(KERN_NOTICE "jffs_check_nand_cleanmarker returned %d\n",ret));
+@@ -316,7 +324,7 @@ static int jffs2_scan_eraseblock (struct
+ 	if (!buf_size) {
+ 		buf_len = c->sector_size;
+ 	} else {
+-		buf_len = EMPTY_SCAN_SIZE;
++		buf_len = EMPTY_SCAN_SIZE(c->sector_size);
+ 		err = jffs2_fill_scan_buf(c, buf, buf_ofs, buf_len);
+ 		if (err)
+ 			return err;
+@@ -326,11 +334,11 @@ static int jffs2_scan_eraseblock (struct
+ 	ofs = 0;
+ 
+ 	/* Scan only 4KiB of 0xFF before declaring it's empty */
+-	while(ofs < EMPTY_SCAN_SIZE && *(uint32_t *)(&buf[ofs]) == 0xFFFFFFFF)
++	while(ofs < EMPTY_SCAN_SIZE(c->sector_size) && *(uint32_t *)(&buf[ofs]) == 0xFFFFFFFF)
+ 		ofs += 4;
+ 
+-	if (ofs == EMPTY_SCAN_SIZE) {
+-#ifdef CONFIG_JFFS2_FS_NAND
++	if (ofs == EMPTY_SCAN_SIZE(c->sector_size)) {
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 		if (jffs2_cleanmarker_oob(c)) {
+ 			/* scan oob, take care of cleanmarker */
+ 			int ret = jffs2_check_oob_empty(c, jeb, cleanmarkerfound);
+@@ -343,7 +351,10 @@ static int jffs2_scan_eraseblock (struct
+ 		}
+ #endif
+ 		D1(printk(KERN_DEBUG "Block at 0x%08x is empty (erased)\n", jeb->offset));
+-		return BLK_STATE_ALLFF;	/* OK to erase if all blocks are like this */
++		if (c->cleanmarker_size == 0)
++			return BLK_STATE_CLEANMARKER;	/* don't bother with re-erase */
++		else
++			return BLK_STATE_ALLFF;	/* OK to erase if all blocks are like this */
+ 	}
+ 	if (ofs) {
+ 		D1(printk(KERN_DEBUG "Free space at %08x ends at %08x\n", jeb->offset,
+@@ -422,8 +433,8 @@ scan_more:	
+ 			/* If we're only checking the beginning of a block with a cleanmarker,
+ 			   bail now */
+ 			if (buf_ofs == jeb->offset && jeb->used_size == PAD(c->cleanmarker_size) && 
+-			    c->cleanmarker_size && !jeb->dirty_size && !jeb->first_node->next_in_ino) {
+-				D1(printk(KERN_DEBUG "%d bytes at start of block seems clean... assuming all clean\n", EMPTY_SCAN_SIZE));
++			    c->cleanmarker_size && !jeb->dirty_size && !jeb->first_node->next_phys) {
++				D1(printk(KERN_DEBUG "%d bytes at start of block seems clean... assuming all clean\n", EMPTY_SCAN_SIZE(c->sector_size)));
+ 				return BLK_STATE_CLEANMARKER;
+ 			}
+ 
+@@ -618,7 +629,7 @@ scan_more:	
+ 	}
+ 
+ 	if ((jeb->used_size + jeb->unchecked_size) == PAD(c->cleanmarker_size) && !jeb->dirty_size 
+-		&& (!jeb->first_node || !jeb->first_node->next_in_ino) )
++		&& (!jeb->first_node || !jeb->first_node->next_phys) )
+ 		return BLK_STATE_CLEANMARKER;
+ 		
+ 	/* move blocks with max 4 byte dirty space to cleanlist */	
+Index: linux-2.6.10/fs/jffs2/super.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/super.c
++++ linux-2.6.10/fs/jffs2/super.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: super.c,v 1.104 2004/11/23 15:37:31 gleixner Exp $
++ * $Id: super.c,v 1.105 2005/02/09 09:23:54 pavlov Exp $
+  *
+  */
+ 
+@@ -270,8 +270,6 @@ static void jffs2_put_super (struct supe
+ 
+ 	D2(printk(KERN_DEBUG "jffs2: jffs2_put_super()\n"));
+ 
+-	if (!(sb->s_flags & MS_RDONLY))
+-		jffs2_stop_garbage_collect_thread(c);
+ 	down(&c->alloc_sem);
+ 	jffs2_flush_wbuf_pad(c);
+ 	up(&c->alloc_sem);
+@@ -292,6 +290,8 @@ static void jffs2_put_super (struct supe
+ static void jffs2_kill_sb(struct super_block *sb)
+ {
+ 	struct jffs2_sb_info *c = JFFS2_SB_INFO(sb);
++	if (!(sb->s_flags & MS_RDONLY))
++		jffs2_stop_garbage_collect_thread(c);
+ 	generic_shutdown_super(sb);
+ 	put_mtd_device(c->mtd);
+ 	kfree(c);
+@@ -309,7 +309,7 @@ static int __init init_jffs2_fs(void)
+ 	int ret;
+ 
+ 	printk(KERN_INFO "JFFS2 version 2.2."
+-#ifdef CONFIG_JFFS2_FS_NAND
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	       " (NAND)"
+ #endif
+ 	       " (C) 2001-2003 Red Hat, Inc.\n");
+Index: linux-2.6.10/fs/jffs2/symlink.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/symlink.c
++++ linux-2.6.10/fs/jffs2/symlink.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: symlink.c,v 1.14 2004/11/16 20:36:12 dwmw2 Exp $
++ * $Id: symlink.c,v 1.15 2005/03/01 10:34:03 dedekind Exp $
+  *
+  */
+ 
+@@ -19,27 +19,45 @@
+ #include "nodelist.h"
+ 
+ static int jffs2_follow_link(struct dentry *dentry, struct nameidata *nd);
+-static void jffs2_put_link(struct dentry *dentry, struct nameidata *nd);
+ 
+ struct inode_operations jffs2_symlink_inode_operations =
+ {	
+ 	.readlink =	generic_readlink,
+ 	.follow_link =	jffs2_follow_link,
+-	.put_link =	jffs2_put_link,
+ 	.setattr =	jffs2_setattr
+ };
+ 
+ static int jffs2_follow_link(struct dentry *dentry, struct nameidata *nd)
+ {
+-	unsigned char *buf;
+-	buf = jffs2_getlink(JFFS2_SB_INFO(dentry->d_inode->i_sb), JFFS2_INODE_INFO(dentry->d_inode));
+-	nd_set_link(nd, buf);
++	struct jffs2_inode_info *f = JFFS2_INODE_INFO(dentry->d_inode);
++	
++	/*
++	 * We don't acquire the f->sem mutex here since the only data we
++	 * use is f->dents which in case of the symlink inode points to the
++	 * symlink's target path.
++	 *
++	 * 1. If we are here the inode has already built and f->dents has
++	 * to point to the target path.
++	 * 2. Nobody uses f->dents (if the inode is symlink's inode). The
++	 * exception is inode freeing function which frees f->dents. But
++	 * it can't be called while we are here and before VFS has
++	 * stopped using our f->dents string which we provide by means of
++	 * nd_set_link() call.
++	 */
++	
++	if (!f->dents) {
++		printk(KERN_ERR "jffs2_follow_link(): can't find symlink taerget\n");
++		return -EIO;
++	}
++	D1(printk(KERN_DEBUG "jffs2_follow_link(): target path is '%s'\n", (char *) f->dents));
++
++	nd_set_link(nd, (char *)f->dents);
++	
++	/*
++	 * We unlock the f->sem mutex but VFS will use the f->dents string. This is safe
++	 * since the only way that may cause f->dents to be changed is iput() operation.
++	 * But VFS will not use f->dents after iput() has been called.
++	 */
+ 	return 0;
+ }
+ 
+-static void jffs2_put_link(struct dentry *dentry, struct nameidata *nd)
+-{
+-	char *s = nd_get_link(nd);
+-	if (!IS_ERR(s))
+-		kfree(s);
+-}
+Index: linux-2.6.10/fs/jffs2/wbuf.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/wbuf.c
++++ linux-2.6.10/fs/jffs2/wbuf.c
+@@ -9,7 +9,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: wbuf.c,v 1.82 2004/11/20 22:08:31 dwmw2 Exp $
++ * $Id: wbuf.c,v 1.91 2005/03/18 09:58:06 dedekind Exp $
+  *
+  */
+ 
+@@ -83,7 +83,7 @@ static void jffs2_wbuf_dirties_inode(str
+ 	struct jffs2_inodirty *new;
+ 
+ 	/* Mark the superblock dirty so that kupdated will flush... */
+-	OFNI_BS_2SFFJ(c)->s_dirt = 1;
++	jffs2_erase_pending_trigger(c);
+ 
+ 	if (jffs2_wbuf_pending_for_ino(c, ino))
+ 		return;
+@@ -130,7 +130,10 @@ static inline void jffs2_refile_wbuf_blo
+ 	}
+ }
+ 
+-static void jffs2_block_refile(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb)
++#define REFILE_NOTEMPTY 0
++#define REFILE_ANYWAY   1
++
++static void jffs2_block_refile(struct jffs2_sb_info *c, struct jffs2_eraseblock *jeb, int allow_empty)
+ {
+ 	D1(printk("About to refile bad block at %08x\n", jeb->offset));
+ 
+@@ -144,7 +147,7 @@ static void jffs2_block_refile(struct jf
+ 		D1(printk("Refiling block at %08x to bad_used_list\n", jeb->offset));
+ 		list_add(&jeb->list, &c->bad_used_list);
+ 	} else {
+-		BUG();
++		BUG_ON(allow_empty == REFILE_NOTEMPTY);
+ 		/* It has to have had some nodes or we couldn't be here */
+ 		D1(printk("Refiling block at %08x to erase_pending_list\n", jeb->offset));
+ 		list_add(&jeb->list, &c->erase_pending_list);
+@@ -179,7 +182,7 @@ static void jffs2_wbuf_recover(struct jf
+ 
+ 	jeb = &c->blocks[c->wbuf_ofs / c->sector_size];
+ 
+-	jffs2_block_refile(c, jeb);
++	jffs2_block_refile(c, jeb, REFILE_NOTEMPTY);
+ 
+ 	/* Find the first node to be recovered, by skipping over every
+ 	   node which ends before the wbuf starts, or which is obsolete. */
+@@ -264,17 +267,16 @@ static void jffs2_wbuf_recover(struct jf
+ 	ret = jffs2_reserve_space_gc(c, end-start, &ofs, &len);
+ 	if (ret) {
+ 		printk(KERN_WARNING "Failed to allocate space for wbuf recovery. Data loss ensues.\n");
+-		if (buf)
+-			kfree(buf);
++		kfree(buf);
+ 		return;
+ 	}
+ 	if (end-start >= c->wbuf_pagesize) {
+-		/* Need to do another write immediately. This, btw,
+-		 means that we'll be writing from 'buf' and not from
+-		 the wbuf. Since if we're writing from the wbuf there
+-		 won't be more than a wbuf full of data, now will
+-		 there? :) */
+-
++		/* Need to do another write immediately, but it's possible
++		   that this is just because the wbuf itself is completely
++		   full, and there's nothing earlier read back from the 
++		   flash. Hence 'buf' isn't necessarily what we're writing 
++		   from. */
++		unsigned char *rewrite_buf = buf?:c->wbuf;
+ 		uint32_t towrite = (end-start) - ((end-start)%c->wbuf_pagesize);
+ 
+ 		D1(printk(KERN_DEBUG "Write 0x%x bytes at 0x%08x in wbuf recover\n",
+@@ -292,9 +294,9 @@ static void jffs2_wbuf_recover(struct jf
+ #endif
+ 		if (jffs2_cleanmarker_oob(c))
+ 			ret = c->mtd->write_ecc(c->mtd, ofs, towrite, &retlen,
+-						buf, NULL, c->oobinfo);
++						rewrite_buf, NULL, c->oobinfo);
+ 		else
+-			ret = c->mtd->write(c->mtd, ofs, towrite, &retlen, buf);
++			ret = c->mtd->write(c->mtd, ofs, towrite, &retlen, rewrite_buf);
+ 
+ 		if (ret || retlen != towrite) {
+ 			/* Argh. We tried. Really we did. */
+@@ -321,10 +323,10 @@ static void jffs2_wbuf_recover(struct jf
+ 
+ 		c->wbuf_len = (end - start) - towrite;
+ 		c->wbuf_ofs = ofs + towrite;
+-		memcpy(c->wbuf, buf + towrite, c->wbuf_len);
++		memmove(c->wbuf, rewrite_buf + towrite, c->wbuf_len);
+ 		/* Don't muck about with c->wbuf_inodes. False positives are harmless. */
+-
+-		kfree(buf);
++		if (buf)
++			kfree(buf);
+ 	} else {
+ 		/* OK, now we're left with the dregs in whichever buffer we're using */
+ 		if (buf) {
+@@ -413,9 +415,9 @@ static int __jffs2_flush_wbuf(struct jff
+ 	int ret;
+ 	size_t retlen;
+ 
+-	/* Nothing to do if not NAND flash. In particular, we shouldn't
++	/* Nothing to do if not write-buffering the flash. In particular, we shouldn't
+ 	   del_timer() the timer we never initialised. */
+-	if (jffs2_can_mark_obsolete(c))
++	if (!jffs2_is_writebuffered(c))
+ 		return 0;
+ 
+ 	if (!down_trylock(&c->alloc_sem)) {
+@@ -424,7 +426,7 @@ static int __jffs2_flush_wbuf(struct jff
+ 		BUG();
+ 	}
+ 
+-	if(!c->wbuf || !c->wbuf_len)
++	if (!c->wbuf_len)	/* already checked c->wbuf above */
+ 		return 0;
+ 
+ 	/* claim remaining space on the page
+@@ -433,7 +435,7 @@ static int __jffs2_flush_wbuf(struct jff
+ 	   if we have a switch to next page, we will not have
+ 	   enough remaining space for this. 
+ 	*/
+-	if (pad) {
++	if (pad && !jffs2_dataflash(c)) {
+ 		c->wbuf_len = PAD(c->wbuf_len);
+ 
+ 		/* Pad with JFFS2_DIRTY_BITMASK initially.  this helps out ECC'd NOR
+@@ -484,7 +486,7 @@ static int __jffs2_flush_wbuf(struct jff
+ 	spin_lock(&c->erase_completion_lock);
+ 
+ 	/* Adjust free size of the block if we padded. */
+-	if (pad) {
++	if (pad && !jffs2_dataflash(c)) {
+ 		struct jffs2_eraseblock *jeb;
+ 
+ 		jeb = &c->blocks[c->wbuf_ofs / c->sector_size];
+@@ -550,6 +552,10 @@ int jffs2_flush_wbuf_gc(struct jffs2_sb_
+ 		D1(printk(KERN_DEBUG "jffs2_flush_wbuf_gc() padding. Not finished checking\n"));
+ 		down_write(&c->wbuf_sem);
+ 		ret = __jffs2_flush_wbuf(c, PAD_ACCOUNTING);
++		/* retry flushing wbuf in case jffs2_wbuf_recover
++		   left some data in the wbuf */
++		if (ret)
++			ret = __jffs2_flush_wbuf(c, PAD_ACCOUNTING);
+ 		up_write(&c->wbuf_sem);
+ 	} else while (old_wbuf_len &&
+ 		      old_wbuf_ofs == c->wbuf_ofs) {
+@@ -564,6 +570,10 @@ int jffs2_flush_wbuf_gc(struct jffs2_sb_
+ 			down(&c->alloc_sem);
+ 			down_write(&c->wbuf_sem);
+ 			ret = __jffs2_flush_wbuf(c, PAD_ACCOUNTING);
++			/* retry flushing wbuf in case jffs2_wbuf_recover
++			   left some data in the wbuf */
++			if (ret)
++				ret = __jffs2_flush_wbuf(c, PAD_ACCOUNTING);
+ 			up_write(&c->wbuf_sem);
+ 			break;
+ 		}
+@@ -586,13 +596,22 @@ int jffs2_flush_wbuf_pad(struct jffs2_sb
+ 
+ 	down_write(&c->wbuf_sem);
+ 	ret = __jffs2_flush_wbuf(c, PAD_NOACCOUNT);
++	/* retry - maybe wbuf recover left some data in wbuf. */
++	if (ret)
++		ret = __jffs2_flush_wbuf(c, PAD_NOACCOUNT);
+ 	up_write(&c->wbuf_sem);
+ 
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
++#define PAGE_DIV(x) ( ((unsigned long)(x) / (unsigned long)(c->wbuf_pagesize)) * (unsigned long)(c->wbuf_pagesize) )
++#define PAGE_MOD(x) ( (unsigned long)(x) % (unsigned long)(c->wbuf_pagesize) )
++#else
+ #define PAGE_DIV(x) ( (x) & (~(c->wbuf_pagesize - 1)) )
+ #define PAGE_MOD(x) ( (x) & (c->wbuf_pagesize - 1) )
++#endif
++
+ int jffs2_flash_writev(struct jffs2_sb_info *c, const struct kvec *invecs, unsigned long count, loff_t to, size_t *retlen, uint32_t ino)
+ {
+ 	struct kvec outvecs[3];
+@@ -607,7 +626,7 @@ int jffs2_flash_writev(struct jffs2_sb_i
+ 	uint32_t outvec_to = to;
+ 
+ 	/* If not NAND flash, don't bother */
+-	if (!c->wbuf)
++	if (!jffs2_is_writebuffered(c))
+ 		return jffs2_flash_direct_writev(c, invecs, count, to, retlen);
+ 	
+ 	down_write(&c->wbuf_sem);
+@@ -636,7 +655,7 @@ int jffs2_flash_writev(struct jffs2_sb_i
+ 	   erase block. Anything else, and you die.
+ 	   New block starts at xxx000c (0-b = block header)
+ 	*/
+-	if ( (to & ~(c->sector_size-1)) != (c->wbuf_ofs & ~(c->sector_size-1)) ) {
++	if (SECTOR_ADDR(to) != SECTOR_ADDR(c->wbuf_ofs)) {
+ 		/* It's a write to a new block */
+ 		if (c->wbuf_len) {
+ 			D1(printk(KERN_DEBUG "jffs2_flash_writev() to 0x%lx causes flush of wbuf at 0x%08x\n", (unsigned long)to, c->wbuf_ofs));
+@@ -768,9 +787,18 @@ int jffs2_flash_writev(struct jffs2_sb_i
+ 		
+ 		if (ret < 0 || wbuf_retlen != PAGE_DIV(totlen)) {
+ 			/* At this point we have no problem,
+-			   c->wbuf is empty. 
++			   c->wbuf is empty. However refile nextblock to avoid
++			   writing again to same address.
+ 			*/
+-			*retlen = donelen;
++			struct jffs2_eraseblock *jeb;
++
++			spin_lock(&c->erase_completion_lock);
++
++			jeb = &c->blocks[outvec_to / c->sector_size];
++			jffs2_block_refile(c, jeb, REFILE_ANYWAY);
++
++			*retlen = 0;
++			spin_unlock(&c->erase_completion_lock);
+ 			goto exit;
+ 		}
+ 		
+@@ -825,7 +853,7 @@ int jffs2_flash_write(struct jffs2_sb_in
+ {
+ 	struct kvec vecs[1];
+ 
+-	if (jffs2_can_mark_obsolete(c))
++	if (!jffs2_is_writebuffered(c))
+ 		return c->mtd->write(c->mtd, ofs, len, retlen, buf);
+ 
+ 	vecs[0].iov_base = (unsigned char *) buf;
+@@ -841,39 +869,38 @@ int jffs2_flash_read(struct jffs2_sb_inf
+ 	loff_t	orbf = 0, owbf = 0, lwbf = 0;
+ 	int	ret;
+ 
+-	/* Read flash */
+-	if (!jffs2_can_mark_obsolete(c)) {
+-		down_read(&c->wbuf_sem);
++	if (!jffs2_is_writebuffered(c))
++		return c->mtd->read(c->mtd, ofs, len, retlen, buf);
+ 
+-		if (jffs2_cleanmarker_oob(c))
+-			ret = c->mtd->read_ecc(c->mtd, ofs, len, retlen, buf, NULL, c->oobinfo);
+-		else
+-			ret = c->mtd->read(c->mtd, ofs, len, retlen, buf);
++	/* Read flash */
++	down_read(&c->wbuf_sem);
++	if (jffs2_cleanmarker_oob(c))
++		ret = c->mtd->read_ecc(c->mtd, ofs, len, retlen, buf, NULL, c->oobinfo);
++	else
++		ret = c->mtd->read(c->mtd, ofs, len, retlen, buf);
+ 
+-		if ( (ret == -EBADMSG) && (*retlen == len) ) {
+-			printk(KERN_WARNING "mtd->read(0x%zx bytes from 0x%llx) returned ECC error\n",
+-			       len, ofs);
+-			/* 
+-			 * We have the raw data without ECC correction in the buffer, maybe 
+-			 * we are lucky and all data or parts are correct. We check the node.
+-			 * If data are corrupted node check will sort it out.
+-			 * We keep this block, it will fail on write or erase and the we
+-			 * mark it bad. Or should we do that now? But we should give him a chance.
+-			 * Maybe we had a system crash or power loss before the ecc write or  
+-			 * a erase was completed.
+-			 * So we return success. :)
+-			 */
+-		 	ret = 0;
+-		 }	
+-	} else
+-		return c->mtd->read(c->mtd, ofs, len, retlen, buf);
++	if ( (ret == -EBADMSG) && (*retlen == len) ) {
++		printk(KERN_WARNING "mtd->read(0x%zx bytes from 0x%llx) returned ECC error\n",
++		       len, ofs);
++		/* 
++		 * We have the raw data without ECC correction in the buffer, maybe 
++		 * we are lucky and all data or parts are correct. We check the node.
++		 * If data are corrupted node check will sort it out.
++		 * We keep this block, it will fail on write or erase and the we
++		 * mark it bad. Or should we do that now? But we should give him a chance.
++		 * Maybe we had a system crash or power loss before the ecc write or  
++		 * a erase was completed.
++		 * So we return success. :)
++		 */
++	 	ret = 0;
++	}	
+ 
+ 	/* if no writebuffer available or write buffer empty, return */
+ 	if (!c->wbuf_pagesize || !c->wbuf_len)
+ 		goto exit;
+ 
+ 	/* if we read in a different block, return */
+-	if ( (ofs & ~(c->sector_size-1)) != (c->wbuf_ofs & ~(c->sector_size-1)) ) 
++	if (SECTOR_ADDR(ofs) != SECTOR_ADDR(c->wbuf_ofs))
+ 		goto exit;
+ 
+ 	if (ofs >= c->wbuf_ofs) {
+@@ -1093,7 +1120,7 @@ static struct nand_oobinfo jffs2_oobinfo
+ };
+ 
+ 
+-int jffs2_nand_set_oobinfo(struct jffs2_sb_info *c)
++static int jffs2_nand_set_oobinfo(struct jffs2_sb_info *c)
+ {
+ 	struct nand_oobinfo *oinfo = &c->mtd->oobinfo;
+ 
+@@ -1167,7 +1194,27 @@ void jffs2_nand_flash_cleanup(struct jff
+ 	kfree(c->wbuf);
+ }
+ 
+-#ifdef CONFIG_JFFS2_FS_NOR_ECC
++int jffs2_dataflash_setup(struct jffs2_sb_info *c) {
++	c->cleanmarker_size = 0;		/* No cleanmarkers needed */
++	
++	/* Initialize write buffer */
++	init_rwsem(&c->wbuf_sem);
++	c->wbuf_pagesize = c->sector_size;
++	c->wbuf_ofs = 0xFFFFFFFF;
++
++	c->wbuf = kmalloc(c->wbuf_pagesize, GFP_KERNEL);
++	if (!c->wbuf)
++		return -ENOMEM;
++
++	printk(KERN_INFO "JFFS2 write-buffering enabled (%i)\n", c->wbuf_pagesize);
++
++	return 0;
++}
++
++void jffs2_dataflash_cleanup(struct jffs2_sb_info *c) {
++	kfree(c->wbuf);
++}
++
+ int jffs2_nor_ecc_flash_setup(struct jffs2_sb_info *c) {
+ 	/* Cleanmarker is actually larger on the flashes */
+ 	c->cleanmarker_size = 16;
+@@ -1187,4 +1234,3 @@ int jffs2_nor_ecc_flash_setup(struct jff
+ void jffs2_nor_ecc_flash_cleanup(struct jffs2_sb_info *c) {
+ 	kfree(c->wbuf);
+ }
+-#endif
+Index: linux-2.6.10/fs/jffs2/write.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/write.c
++++ linux-2.6.10/fs/jffs2/write.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: write.c,v 1.87 2004/11/16 20:36:12 dwmw2 Exp $
++ * $Id: write.c,v 1.91 2005/03/01 10:34:03 dedekind Exp $
+  *
+  */
+ 
+@@ -35,13 +35,12 @@ int jffs2_do_new_inode(struct jffs2_sb_i
+ 	f->inocache = ic;
+ 	f->inocache->nlink = 1;
+ 	f->inocache->nodes = (struct jffs2_raw_node_ref *)f->inocache;
+-	f->inocache->ino = ++c->highest_ino;
+ 	f->inocache->state = INO_STATE_PRESENT;
+ 
+-	ri->ino = cpu_to_je32(f->inocache->ino);
+ 
+-	D1(printk(KERN_DEBUG "jffs2_do_new_inode(): Assigned ino# %d\n", f->inocache->ino));
+ 	jffs2_add_ino_cache(c, f->inocache);
++	D1(printk(KERN_DEBUG "jffs2_do_new_inode(): Assigned ino# %d\n", f->inocache->ino));
++	ri->ino = cpu_to_je32(f->inocache->ino);
+ 
+ 	ri->magic = cpu_to_je16(JFFS2_MAGIC_BITMASK);
+ 	ri->nodetype = cpu_to_je16(JFFS2_NODETYPE_INODE);
+@@ -136,6 +135,15 @@ struct jffs2_full_dnode *jffs2_write_dno
+ 	raw->__totlen = PAD(sizeof(*ri)+datalen);
+ 	raw->next_phys = NULL;
+ 
++	if ((alloc_mode!=ALLOC_GC) && (je32_to_cpu(ri->version) < f->highest_version)) {
++		BUG_ON(!retried);
++		D1(printk(KERN_DEBUG "jffs2_write_dnode : dnode_version %d, "
++				"highest version %d -> updating dnode\n", 
++				je32_to_cpu(ri->version), f->highest_version));
++		ri->version = cpu_to_je32(++f->highest_version);
++		ri->node_crc = cpu_to_je32(crc32(0, ri, sizeof(*ri)-8));
++	}
++
+ 	ret = jffs2_flash_writev(c, vecs, cnt, flash_ofs, &retlen,
+ 				 (alloc_mode==ALLOC_GC)?0:f->inocache->ino);
+ 
+@@ -280,6 +288,16 @@ struct jffs2_full_dirent *jffs2_write_di
+ 	raw->__totlen = PAD(sizeof(*rd)+namelen);
+ 	raw->next_phys = NULL;
+ 
++	if ((alloc_mode!=ALLOC_GC) && (je32_to_cpu(rd->version) < f->highest_version)) {
++		BUG_ON(!retried);
++		D1(printk(KERN_DEBUG "jffs2_write_dirent : dirent_version %d, "
++				     "highest version %d -> updating dirent\n",
++				     je32_to_cpu(rd->version), f->highest_version));
++		rd->version = cpu_to_je32(++f->highest_version);
++		fd->version = je32_to_cpu(rd->version);
++		rd->node_crc = cpu_to_je32(crc32(0, rd, sizeof(*rd)-8));
++	}
++
+ 	ret = jffs2_flash_writev(c, vecs, 2, flash_ofs, &retlen,
+ 				 (alloc_mode==ALLOC_GC)?0:je32_to_cpu(rd->pino));
+ 	if (ret || (retlen != sizeof(*rd) + namelen)) {
+@@ -625,20 +643,23 @@ int jffs2_do_unlink(struct jffs2_sb_info
+ 
+ 		down(&dead_f->sem);
+ 
+-		while (dead_f->dents) {
+-			/* There can be only deleted ones */
+-			fd = dead_f->dents;
+-			
+-			dead_f->dents = fd->next;
+-			
+-			if (fd->ino) {
+-				printk(KERN_WARNING "Deleting inode #%u with active dentry \"%s\"->ino #%u\n",
+-				       dead_f->inocache->ino, fd->name, fd->ino);
+-			} else {
+-				D1(printk(KERN_DEBUG "Removing deletion dirent for \"%s\" from dir ino #%u\n", fd->name, dead_f->inocache->ino));
++		if (S_ISDIR(OFNI_EDONI_2SFFJ(dead_f)->i_mode)) {
++			while (dead_f->dents) {
++				/* There can be only deleted ones */
++				fd = dead_f->dents;
++				
++				dead_f->dents = fd->next;
++				
++				if (fd->ino) {
++					printk(KERN_WARNING "Deleting inode #%u with active dentry \"%s\"->ino #%u\n",
++					       dead_f->inocache->ino, fd->name, fd->ino);
++				} else {
++					D1(printk(KERN_DEBUG "Removing deletion dirent for \"%s\" from dir ino #%u\n",
++						fd->name, dead_f->inocache->ino));
++				}
++				jffs2_mark_node_obsolete(c, fd->raw);
++				jffs2_free_full_dirent(fd);
+ 			}
+-			jffs2_mark_node_obsolete(c, fd->raw);
+-			jffs2_free_full_dirent(fd);
+ 		}
+ 
+ 		dead_f->inocache->nlink--;
+Index: linux-2.6.10/fs/jffs2/writev.c
+===================================================================
+--- linux-2.6.10.orig/fs/jffs2/writev.c
++++ linux-2.6.10/fs/jffs2/writev.c
+@@ -7,7 +7,7 @@
+  *
+  * For licensing information, see the file 'LICENCE' in this directory.
+  *
+- * $Id: writev.c,v 1.6 2004/11/16 20:36:12 dwmw2 Exp $
++ * $Id: writev.c,v 1.5 2004/07/13 08:58:25 dwmw2 Exp $
+  *
+  */
+ 
+Index: linux-2.6.10/include/linux/jffs2.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/jffs2.h
++++ linux-2.6.10/include/linux/jffs2.h
+@@ -8,7 +8,7 @@
+  * For licensing information, see the file 'LICENCE' in the 
+  * jffs2 directory.
+  *
+- * $Id: jffs2.h,v 1.34 2004/11/16 20:36:14 dwmw2 Exp $
++ * $Id: jffs2.h,v 1.33 2004/05/25 11:31:55 havasi Exp $
+  *
+  */
+ 
+Index: linux-2.6.10/include/linux/jffs2_fs_i.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/jffs2_fs_i.h
++++ linux-2.6.10/include/linux/jffs2_fs_i.h
+@@ -1,4 +1,4 @@
+-/* $Id: jffs2_fs_i.h,v 1.17 2004/11/11 23:51:27 dwmw2 Exp $ */
++/* $Id: jffs2_fs_i.h,v 1.16 2003/01/09 14:03:21 dwmw2 Exp $ */
+ 
+ #ifndef _JFFS2_FS_I
+ #define _JFFS2_FS_I
+Index: linux-2.6.10/include/linux/jffs2_fs_sb.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/jffs2_fs_sb.h
++++ linux-2.6.10/include/linux/jffs2_fs_sb.h
+@@ -1,4 +1,4 @@
+-/* $Id: jffs2_fs_sb.h,v 1.48 2004/11/20 10:41:12 dwmw2 Exp $ */
++/* $Id: jffs2_fs_sb.h,v 1.51 2005/02/28 08:21:06 dedekind Exp $ */
+ 
+ #ifndef _JFFS2_FS_SB
+ #define _JFFS2_FS_SB
+@@ -14,7 +14,8 @@
+ #include <linux/rwsem.h>
+ 
+ #define JFFS2_SB_FLAG_RO 1
+-#define JFFS2_SB_FLAG_MOUNTING 2
++#define JFFS2_SB_FLAG_SCANNING 2 /* Flash scanning is in progress */
++#define JFFS2_SB_FLAG_BUILDING 4 /* File system building is in progress */
+ 
+ struct jffs2_inodirty;
+ 
+@@ -31,7 +32,7 @@ struct jffs2_sb_info {
+ 	unsigned int flags;
+ 
+ 	struct task_struct *gc_task;	/* GC task struct */
+-	struct semaphore gc_thread_start; /* GC thread start mutex */
++	struct completion gc_thread_start; /* GC thread start completion */
+ 	struct completion gc_thread_exit; /* GC thread exit completion port */
+ 
+ 	struct semaphore alloc_sem;	/* Used to protect all the following 
+@@ -94,7 +95,7 @@ struct jffs2_sb_info {
+ 	   to an obsoleted node. I don't like this. Alternatives welcomed. */
+ 	struct semaphore erase_free_sem;
+ 
+-#if defined CONFIG_JFFS2_FS_NAND || defined CONFIG_JFFS2_FS_NOR_ECC
++#ifdef CONFIG_JFFS2_FS_WRITEBUFFER
+ 	/* Write-behind buffer for NAND flash */
+ 	unsigned char *wbuf;
+ 	uint32_t wbuf_ofs;
+Index: linux-2.6.10/include/linux/rslib.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/rslib.h
++++ linux-2.6.10/include/linux/rslib.h
+@@ -9,7 +9,7 @@
+  * RS code lifted from reed solomon library written by Phil Karn
+  * Copyright 2002 Phil Karn, KA9Q
+  *
+- * $Id: rslib.h,v 1.3 2004/10/05 22:08:22 gleixner Exp $
++ * $Id: rslib.h,v 1.2 2004/10/01 21:43:50 gleixner Exp $
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 as
+Index: linux-2.6.10/mvl_patches/pro-0044.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0044.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(44);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

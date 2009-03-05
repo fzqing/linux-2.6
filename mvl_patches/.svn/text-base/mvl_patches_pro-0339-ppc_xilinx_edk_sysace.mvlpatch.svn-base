@@ -1,0 +1,3768 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_sysace
+# Date: Mon Mar  6 15:02:51 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 15265
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for SystemACE IP.
+#     Taken from EDK 7.1i SP2.
+# 
+
+PATCHNUM=339
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 15265
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for SystemACE IP.
+    Taken from EDK 7.1i SP2.
+
+ drivers/block/xilinx_sysace/xsysace.c              |  383 +++++++++
+ drivers/block/xilinx_sysace/xsysace.h              |  337 ++++++++
+ drivers/block/xilinx_sysace/xsysace_compactflash.c |  814 +++++++++++++++++++++
+ drivers/block/xilinx_sysace/xsysace_intr.c         |  424 ++++++++++
+ drivers/block/xilinx_sysace/xsysace_jtagcfg.c      |  456 +++++++++++
+ drivers/block/xilinx_sysace/xsysace_l.c            |  586 +++++++++++++++
+ drivers/block/xilinx_sysace/xsysace_l.h            |  492 ++++++++++++
+ mvl_patches/pro-0339.c                             |   16 
+ 8 files changed, 3508 insertions(+)
+
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace.c
+@@ -0,0 +1,383 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace.c
++*
++* The Xilinx System ACE driver component. This driver supports the Xilinx
++* System Advanced Configuration Environment (ACE) controller. It currently
++* supports only the CompactFlash solution. See xsysace.h for a detailed
++* description of the driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/17/02 work in progress
++* 1.00a rmm  05/14/03 Fixed diab compiler warnings relating to asserts
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xparameters.h"
++#include "xsysace.h"
++#include "xsysace_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++static void StubEventHandler(void *CallBackRef, int Event);
++
++/************************** Variable Definitions *****************************/
++
++/*****************************************************************************/
++/**
++*
++* Initialize a specific XSysAce instance. The configuration information for
++* the given device ID is found and the driver instance data is initialized
++* appropriately.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param DeviceId is the unique id of the device controlled by this XSysAce
++*        instance.
++*
++* @return
++*
++* XST_SUCCESS if successful, or XST_DEVICE_NOT_FOUND if the device was not
++* found in the configuration table in xsysace_g.c.
++*
++* @note
++*
++* We do not want to reset the configuration controller here since this could
++* cause a reconfiguration of the JTAG target chain, depending on how the
++* CFGMODEPIN of the device is wired.
++*
++******************************************************************************/
++XStatus XSysAce_Initialize(XSysAce * InstancePtr, u16 DeviceId)
++{
++	XSysAce_Config *ConfigPtr;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	InstancePtr->IsReady = 0;
++
++	/*
++	 * Lookup configuration data in the device configuration table.
++	 * Use this configuration info down below when initializing this component.
++	 */
++	ConfigPtr = XSysAce_LookupConfig(DeviceId);
++
++	if (ConfigPtr == (XSysAce_Config *) NULL) {
++		return XST_DEVICE_NOT_FOUND;
++	}
++
++	/*
++	 * Set some default values for the instance data
++	 */
++	InstancePtr->BaseAddress = ConfigPtr->BaseAddress;
++	InstancePtr->EventHandler = StubEventHandler;
++	InstancePtr->NumRequested = 0;
++	InstancePtr->NumRemaining = 0;
++	InstancePtr->BufferPtr = NULL;
++
++	/*
++	 * Put the device into 16-bit mode or 8-bit mode depending on compile-time
++	 * parameter
++	 */
++#if (XPAR_XSYSACE_MEM_WIDTH == 16)
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_BMR_OFFSET,
++			   XSA_BMR_16BIT_MASK);
++#else
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_BMR_OFFSET, 0);
++#endif
++
++	/*
++	 * Disable interrupts. Interrupts must be enabled by the user using
++	 * XSysAce_EnableInterrupt(). Put the interrupt request line in reset and
++	 * clear the interrupt enable bits.
++	 */
++	XSysAce_mOrControlReg(InstancePtr->BaseAddress, XSA_CR_RESETIRQ_MASK);
++	XSysAce_mAndControlReg(InstancePtr->BaseAddress,
++			       ~(XSA_CR_DATARDYIRQ_MASK | XSA_CR_ERRORIRQ_MASK |
++				 XSA_CR_CFGDONEIRQ_MASK));
++
++	/*
++	 * Indicate the instance is now ready to use, initialized without error
++	 */
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Attempt to lock access to the CompactFlash. The CompactFlash may be accessed
++* by the MPU port as well as the JTAG configuration port within the System ACE
++* device. This function requests exclusive access to the CompactFlash for the
++* MPU port. This is a non-blocking request. If access cannot be locked
++* (because the configuration controller has the lock), an appropriate status is
++* returned. In this case, the user should call this function again until
++* successful.
++*
++* If the user requests a forced lock, the JTAG configuration controller will
++* be put into a reset state in case it currently has a lock on the CompactFlash.
++* This effectively aborts any operation the configuration controller had in
++* progress and makes the configuration controller restart its process the
++* next time it is able to get a lock.
++*
++* A lock must be granted to the user before attempting to read or write the
++* CompactFlash device.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param Force is a boolean value that, when set to TRUE, will force the MPU
++*        lock to occur in the System ACE.  When set to FALSE, the lock is
++*        requested and the device arbitrates between the MPU request and
++*        JTAG requests. Forcing the MPU lock resets the configuration
++*        controller, thus aborting any configuration operations in progress.
++*
++* @return
++*
++* XST_SUCCESS if the lock was granted, or XST_DEVICE_BUSY if the lock was
++* not granted because the configuration controller currently has access to
++* the CompactFlash.
++*
++* @note
++*
++* If the lock is not granted to the MPU immediately, this function removes its
++* request for a lock so that a lock is not later granted at a time when the
++* application is (a) not ready for the lock, or (b) cannot be informed
++* asynchronously about the granted lock since there is no such interrupt event.
++*
++******************************************************************************/
++XStatus XSysAce_Lock(XSysAce * InstancePtr, u32 Force)
++{
++	u32 IsLocked;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Check to see if the configuration controller currently has the lock
++	 */
++	IsLocked = (XSysAce_mGetStatusReg(InstancePtr->BaseAddress) &
++		    XSA_SR_CFGLOCK_MASK);
++
++	if (Force) {
++		/*
++		 * Reset the configuration controller if it has the lock. Per ASIC
++		 * designer, this eliminates a potential deadlock if the FORCELOCK and
++		 * LOCKREQ bits are both set and the RDYFORCFCMD is not set.
++		 */
++		if (IsLocked) {
++			/* Reset the configuration controller */
++			XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++					      XSA_CR_CFGRESET_MASK);
++		}
++
++		/* Force the MPU lock. The lock will occur immediately. */
++		XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++				      XSA_CR_LOCKREQ_MASK |
++				      XSA_CR_FORCELOCK_MASK);
++	} else {
++		/*
++		 * Check to see if the configuration controller has the lock. If so,
++		 * return a busy status.
++		 */
++		if (IsLocked) {
++			return XST_DEVICE_BUSY;
++		}
++
++		/* Request the lock, but do not force it */
++		XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++				      XSA_CR_LOCKREQ_MASK);
++	}
++
++	/*
++	 * See if the lock was granted. Note that it is guaranteed to occur if
++	 * the user forced it.
++	 */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		/* Lock was not granted, so remove request and return a busy */
++		XSysAce_mAndControlReg(InstancePtr->BaseAddress,
++				       ~(XSA_CR_LOCKREQ_MASK |
++					 XSA_CR_FORCELOCK_MASK));
++
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * Lock has been granted.
++	 *
++	 * If the configuration controller had the lock and has been reset,
++	 * go ahead and release it from reset as it will not be able to get
++	 * the lock again until the MPU lock is released.
++	 */
++	if (IsLocked && Force) {
++		/* Release the reset of the configuration controller */
++		XSysAce_mAndControlReg(InstancePtr->BaseAddress,
++				       ~XSA_CR_CFGRESET_MASK);
++	}
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Release the MPU lock to the CompactFlash. If a lock is not currently granted
++* to the MPU port, this function has no effect.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_Unlock(XSysAce * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Blindly clear the lock and force-lock request bits of the control
++	 * register
++	 */
++	XSysAce_mAndControlReg(InstancePtr->BaseAddress,
++			       ~(XSA_CR_LOCKREQ_MASK | XSA_CR_FORCELOCK_MASK));
++}
++
++/*****************************************************************************/
++/**
++*
++* Get all outstanding errors. Errors include the inability to read or write
++* CompactFlash and the inability to successfully configure FPGA devices along
++* the target FPGA chain.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* A 32-bit mask of error values. See xsysace_l.h for a description of possible
++* values. The error identifiers are prefixed with XSA_ER_*.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u32 XSysAce_GetErrors(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	return XSysAce_mGetErrorReg(InstancePtr->BaseAddress);
++}
++
++/*****************************************************************************/
++/**
++*
++* Stub for the asynchronous event callback. The stub is here in case the upper
++* layers forget to set the handler.
++*
++* @param    CallBackRef is a pointer to the upper layer callback reference
++* @param    Event is the event that occurs
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void StubEventHandler(void *CallBackRef, int Event)
++{
++	XASSERT_VOID_ALWAYS();
++}
++
++/*****************************************************************************/
++/**
++*
++* Looks up the device configuration based on the unique device ID. The table
++* XSysAce_ConfigTable contains the configuration info for each device in the
++* system.
++*
++* @param DeviceId is the unique device ID to look for.
++*
++* @return
++*
++* A pointer to the configuration data for the device, or NULL if no match is
++* found.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XSysAce_Config *XSysAce_LookupConfig(u16 DeviceId)
++{
++	extern XSysAce_Config XSysAce_ConfigTable[];
++	XSysAce_Config *CfgPtr = NULL;
++	int i;
++
++	for (i = 0; i < XPAR_XSYSACE_NUM_INSTANCES; i++) {
++		if (XSysAce_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XSysAce_ConfigTable[i];
++			break;
++		}
++	}
++
++	return CfgPtr;
++}
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace.h
+@@ -0,0 +1,337 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace.h
++*
++* The Xilinx System ACE driver. This driver supports the Xilinx System Advanced
++* Configuration Environment (ACE) controller. It currently supports only the
++* CompactFlash solution. The driver makes use of the Microprocessor (MPU)
++* interface to communicate with the device.
++*
++* The driver provides a user the ability to access the CompactFlash through
++* the System ACE device.  The user can read and write CompactFlash sectors,
++* identify the flash device, and reset the flash device.  Also, the driver
++* provides a user the ability to configure FPGA devices by selecting a
++* configuration file (.ace file) resident on the CompactFlash, or directly
++* configuring the FPGA devices via the MPU port and the configuration JTAG
++* port of the controller.
++*
++* <b>Bus Mode</b>
++*
++* The System ACE device supports both 8-bit and 16-bit access to its registers.
++* The driver defaults to 8-bit access, but can be changed to use 16-bit access
++* at compile-time.  The compile-time constant XPAR_XSYSACE_MEM_WIDTH must be
++* defined equal to 16 to make the driver use 16-bit access. This constant is
++* typically defined in xparameters.h.
++*
++* <b>Endianness</b>
++*
++* The System ACE device is little-endian. If being accessed by a big-endian
++* processor, the endian conversion will be done by the device driver. The
++* endian conversion is encapsulated inside the XSysAce_RegRead/Write functions
++* so that it can be removed if the endian conversion is moved to hardware.
++*
++* <b>Hardware Access</b>
++*
++* The device driver expects the System ACE controller to be a memory-mapped
++* device. Access to the System ACE controller is typically achieved through
++* the External Memory Controller (EMC) IP core. The EMC is simply a pass-through
++* device that allows access to the off-chip System ACE device. There is no
++* software-based setup or configuration necessary for the EMC.
++*
++* The System ACE registers are expected to be byte-addressable. If for some
++* reason this is not possible, the register offsets defined in xsysace_l.h must
++* be changed accordingly.
++*
++* <b>Reading or Writing CompactFlash</b>
++*
++* The smallest unit that can be read from or written to CompactFlash is one
++* sector. A sector is 512 bytes.  The functions provided by this driver allow
++* the user to specify a starting sector ID and the number of sectors to be read
++* or written. At most 256 sectors can be read or written in one operation. The
++* user must ensure that the buffer passed to the functions is big enough to
++* hold (512 * NumSectors), where NumSectors is the number of sectors specified.
++*
++* <b>Interrupt Mode</b>
++*
++* By default, the device and driver are in polled mode. The user is required to
++* enable interrupts using XSysAce_EnableInterrupt(). In order to use interrupts,
++* it is necessary for the user to connect the driver's interrupt handler,
++* XSysAce_InterruptHandler(), to the interrupt system of the application. This
++* function does not save and restore the processor context. An event handler
++* must also be set by the user, using XSysAce_SetEventHandler(), for the driver
++* such that the handler is called when interrupt events occur. The handler is
++* called from interrupt context and allows application-specific processing to
++* be performed.
++*
++* In interrupt mode, the only available interrupt is data buffer ready, so
++* the size of a data transfer between interrupts is 32 bytes (the size of the
++* data buffer).
++*
++* <b>Polled Mode</b>
++*
++* The sector read and write functions are blocking when in polled mode. This
++* choice was made over non-blocking since sector transfer rates are high
++* (>20Mbps) and the user can limit the number of sectors transferred in a single
++* operation to 1 when in polled mode, plus the API for non-blocking polled
++* functions was a bit awkward. Below is some more information on the sector
++* transfer rates given the current state of technology (year 2002). Although
++* the seek times for CompactFlash cards is high, this average hit needs to be
++* taken every time a new read/write operation is invoked by the user. So the
++* additional few microseconds to transfer an entire sector along with seeking
++* is miniscule.
++*
++* - Microdrives are slower than CompactFlash cards by a significant factor,
++*   especially if the MD is asleep.
++*     - Microdrive:
++*           - Power-up/wake-up time is approx. 150 to 1000 ms.
++*           - Average seek time is approx. 15 to 20 ms.
++*     - CompactFlash:
++*           - Power-up/reset time is approx. 50 to 400 ms and wake-up time is
++*             approx. 3 ms.
++*           - "Seek time" here means how long it takes the internal controller
++*             to process the command until the sector data is ready for transfer
++*             by the ACE controller.  This time is approx. 2 ms per sector.
++*
++*  - Once the sector data is ready in the CF device buffer (i.e., "seek time" is
++*    over) the ACE controller can read 2 bytes from the MD/CF device every 11
++*    clock cycles, assuming no wait cycles happen.  For instance, if the clock
++*    is 33 MHz, then then the max. rate that the ACE controller can transfer is
++*    6 MB/sec.  However, due to other overhead (e.g., time for data buffer
++*    transfers over MPU port, etc.), a better estimate is 3-5 MB/sec.
++*
++* <b>Mutual Exclusion</b>
++*
++* This driver is not thread-safe. The System ACE device has a single data
++* buffer and therefore only one operation can be active at a time. The device
++* driver does not prevent the user from starting an operation while a previous
++* operation is still in progress. It is up to the user to provide this mutual
++* exclusion.
++*
++* <b>Errors</b>
++*
++* Error causes are defined in xsysace_l.h using the prefix XSA_ER_*. The
++* user can use XSysAce_GetErrors() to retrieve all outstanding errors.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/17/02 work in progress
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XSYSACE_H		/* prevent circular inclusions */
++#define XSYSACE_H		/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++#include "xsysace_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/** @name Asynchronous Events
++ *
++ * Asynchronous events passed to the event handler when in interrupt mode.
++ *
++ * Note that when an error event occurs, the only way to clear this condition
++ * is to reset the CompactFlash or the System ACE configuration controller,
++ * depending on where the error occurred. The driver does not reset either
++ * and leaves this task to the user.
++ * @{
++ */
++#define XSA_EVENT_CFG_DONE  1  /**< Configuration of JTAG chain is done */
++#define XSA_EVENT_DATA_DONE 2  /**< Data transfer to/from CompactFlash is done */
++#define XSA_EVENT_ERROR     3  /**< An error occurred. Use XSysAce_GetErrors()
++                                *   to determine the cause of the error(s).
++                                */
++/*@}*/
++
++/**************************** Type Definitions *******************************/
++
++/**
++ * Typedef for CompactFlash identify drive parameters. Use XSysAce_IdentifyCF()
++ * to retrieve this information from the CompactFlash storage device.
++ */
++typedef struct {
++	u16 Signature;	    /**< CompactFlash signature is 0x848a */
++	u16 NumCylinders;   /**< Default number of cylinders */
++	u16 Reserved;
++	u16 NumHeads;	    /**< Default number of heads */
++	u16 NumBytesPerTrack;
++			    /**< Number of unformatted bytes per track */
++	u16 NumBytesPerSector;
++			    /**< Number of unformatted bytes per sector */
++	u16 NumSectorsPerTrack;
++			    /**< Default number of sectors per track */
++	u32 NumSectorsPerCard;
++			    /**< Default number of sectors per card */
++	u16 VendorUnique;   /**< Vendor unique */
++	u8 SerialNo[20];    /**< ASCII serial number */
++	u16 BufferType;	    /**< Buffer type */
++	u16 BufferSize;	    /**< Buffer size in 512-byte increments */
++	u16 NumEccBytes;    /**< Number of ECC bytes on R/W Long cmds */
++	u8 FwVersion[8];    /**< ASCII firmware version */
++	u8 ModelNo[40];	    /**< ASCII model number */
++	u16 MaxSectors;	    /**< Max sectors on R/W Multiple cmds */
++	u16 DblWord;	    /**< Double Word not supported */
++	u16 Capabilities;   /**< Device capabilities */
++	u16 Reserved2;
++	u16 PioMode;	    /**< PIO data transfer cycle timing mode */
++	u16 DmaMode;	    /**< DMA data transfer cycle timing mode */
++	u16 TranslationValid;
++			    /**< Translation parameters are valid */
++	u16 CurNumCylinders;/**< Current number of cylinders */
++	u16 CurNumHeads;    /**< Current number of heads */
++	u16 CurSectorsPerTrack;
++			    /**< Current number of sectors per track */
++	u32 CurSectorsPerCard;
++			    /**< Current capacity in sectors */
++	u16 MultipleSectors;/**< Multiple sector setting */
++	u32 LbaSectors;	    /**< Number of addressable sectors in LBA mode */
++	u8 Reserved3[132];
++	u16 SecurityStatus; /**< Security status */
++	u8 VendorUniqueBytes[62];
++			      /**< Vendor unique bytes */
++	u16 PowerDesc;	    /**< Power requirement description */
++	u8 Reserved4[190];
++
++} XSysAce_CFParameters;
++
++/**
++ * Callback when an asynchronous event occurs during interrupt mode.
++ *
++ * @param CallBackRef is a callback reference passed in by the upper layer
++ *        when setting the callback functions, and passed back to the upper
++ *        layer when the callback is invoked.
++ * @param Event is the event that occurred.  See xsysace.h and the event
++ *        identifiers prefixed with XSA_EVENT_* for a description of possible
++ *        events.
++ */
++typedef void (*XSysAce_EventHandler) (void *CallBackRef, int Event);
++
++/**
++ * This typedef contains configuration information for the device.
++ */
++typedef struct {
++	u16 DeviceId;	/**< Unique ID  of device */
++	u32 BaseAddress;/**< Register base address */
++
++} XSysAce_Config;
++
++/**
++ * The XSysAce driver instance data. The user is required to allocate a
++ * variable of this type for every System ACE device in the system. A
++ * pointer to a variable of this type is then passed to the driver API
++ * functions.
++ */
++typedef struct {
++	u32 BaseAddress;	/* Base address of ACE device */
++	u32 IsReady;		/* Device is initialized and ready */
++
++	/* interrupt-related data */
++	int NumRequested;	/* Number of bytes to read/write */
++	int NumRemaining;	/* Number of bytes left to read/write */
++	u8 *BufferPtr;		/* Buffer being read/written */
++	XSysAce_EventHandler EventHandler;	/* Callback for asynchronous events */
++	void *EventRef;		/* Callback reference */
++
++} XSysAce;
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/*
++ * Required functions in xsysace.c
++ */
++XStatus XSysAce_Initialize(XSysAce * InstancePtr, u16 DeviceId);
++XStatus XSysAce_Lock(XSysAce * InstancePtr, u32 Force);
++void XSysAce_Unlock(XSysAce * InstancePtr);
++u32 XSysAce_GetErrors(XSysAce * InstancePtr);
++XSysAce_Config *XSysAce_LookupConfig(u16 DeviceId);
++
++/*
++ * CompactFlash access functions in xsysace_compactflash.c
++ */
++XStatus XSysAce_ResetCF(XSysAce * InstancePtr);
++XStatus XSysAce_AbortCF(XSysAce * InstancePtr);
++XStatus XSysAce_IdentifyCF(XSysAce * InstancePtr,
++			   XSysAce_CFParameters * ParamPtr);
++u32 XSysAce_IsCFReady(XSysAce * InstancePtr);
++XStatus XSysAce_SectorRead(XSysAce * InstancePtr, u32 StartSector,
++			   int NumSectors, u8 * BufferPtr);
++XStatus XSysAce_SectorWrite(XSysAce * InstancePtr, u32 StartSector,
++			    int NumSectors, u8 * BufferPtr);
++u16 XSysAce_GetFatStatus(XSysAce * InstancePtr);
++
++/*
++ * JTAG configuration interface functions in xsysace_jtagcfg.c
++ */
++void XSysAce_ResetCfg(XSysAce * InstancePtr);
++void XSysAce_SetCfgAddr(XSysAce * InstancePtr, unsigned int Address);
++void XSysAce_SetStartMode(XSysAce * InstancePtr, u32 ImmedOnReset,
++			  u32 SetStart);
++u32 XSysAce_IsCfgDone(XSysAce * InstancePtr);
++u32 XSysAce_GetCfgSector(XSysAce * InstancePtr);
++XStatus XSysAce_ProgramChain(XSysAce * InstancePtr, u8 * BufferPtr,
++			     int NumBytes);
++
++/*
++ * General interrupt-related functions in xsysace_intr.c
++ */
++void XSysAce_EnableInterrupt(XSysAce * InstancePtr);
++void XSysAce_DisableInterrupt(XSysAce * InstancePtr);
++void XSysAce_SetEventHandler(XSysAce * InstancePtr,
++			     XSysAce_EventHandler FuncPtr, void *CallBackRef);
++void XSysAce_InterruptHandler(void *InstancePtr);	/* interrupt handler */
++
++/*
++ * Diagnostic functions in xsysace_selftest.c
++ */
++XStatus XSysAce_SelfTest(XSysAce * InstancePtr);
++u16 XSysAce_GetVersion(XSysAce * InstancePtr);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_compactflash.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_compactflash.c
+@@ -0,0 +1,814 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002-2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace_compactflash.c
++*
++* Contains functions to reset, read, and write the CompactFlash device via
++* the System ACE controller.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/17/02 work in progress
++* 1.00a ecm  09/17/04 Fixed the endianism issue with the string copies.
++*                     Replaced the ByteCopy with WordCopySwap which
++*                     copies the bytes and swaps to correct the endianism.
++*                     CR 194182
++*
++* 1.00a ecm  09/27/04 Fixed the lack of reset during read and write in
++*                     L1 functions.
++*                     CR 194423
++*
++* 1.00a ecm  12/09/04 Removed the above fix, breaks MVL.
++*                     CR 200015
++*
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xsysace.h"
++#include "xsysace_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/*
++ * Indices into the parameter information from the CompactFlash.  When the
++ * user calls XSysAce_IdentifyCF(), the parameter information is read into a
++ * byte buffer.  The byte buffer is then mapped to a XSysAce_CFParameters
++ * structure using these indices into the byte buffer.
++ */
++#define XSA_CFPARM_SIGNATURE    0
++#define XSA_CFPARM_NUMCYLS      2
++#define XSA_CFPARM_RESERVED1    4
++#define XSA_CFPARM_NUMHEADS     6
++#define XSA_CFPARM_BYTES_TRACK  8
++#define XSA_CFPARM_BYTES_SECT   10
++#define XSA_CFPARM_SECTS_TRK    12
++#define XSA_CFPARM_SECTS_HI     14
++#define XSA_CFPARM_SECTS_LO     16
++#define XSA_CFPARM_VENDOR1      18
++#define XSA_CFPARM_SERIAL_NO    20
++#define XSA_CFPARM_BUFFER_TYPE  40
++#define XSA_CFPARM_BUFFER_SIZE  42
++#define XSA_CFPARM_ECC_BYTES    44
++#define XSA_CFPARM_FW_VERSION   46
++#define XSA_CFPARM_MODEL_NO     54
++#define XSA_CFPARM_MAX_SECTORS  94
++#define XSA_CFPARM_DBL_WORD     96
++#define XSA_CFPARM_CAPS         98
++#define XSA_CFPARM_RESERVED2    100
++#define XSA_CFPARM_PIO_MODE     102
++#define XSA_CFPARM_DMA_MODE     104
++#define XSA_CFPARM_TRANSLATE    106
++#define XSA_CFPARM_CURCYLS      108
++#define XSA_CFPARM_CURHEADS     110
++#define XSA_CFPARM_CURSECTS_TRK 112
++#define XSA_CFPARM_CURSECTS     114
++#define XSA_CFPARM_MULTIPLE     118
++#define XSA_CFPARM_LBA_SECTS    120
++#define XSA_CFPARM_RESERVED3    124
++#define XSA_CFPARM_SECURITY     256
++#define XSA_CFPARM_VENDOR2      258
++#define XSA_CFPARM_POWER        320
++#define XSA_CFPARM_RESERVED4    322
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++static void WordCopySwap(u8 * SourcePtr, u8 * DestPtr, int NumBytes);
++static void FillParam(XSysAce_CFParameters * ParamPtr, u8 * BufPtr);
++
++/************************** Variable Definitions *****************************/
++
++/*****************************************************************************/
++/**
++*
++* Reset the CompactFlash device. This function does not reset the System ACE
++* controller.  An ATA soft-reset of the CompactFlash is performed.
++*
++* An MPU lock, obtained using XSysAce_Lock(), must be granted before calling
++* this function. If a lock has not been granted, no action is taken and an
++* error is returned.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* - XST_SUCCESS if the reset was done successfully
++* - XST_SYSACE_NO_LOCK if no MPU lock has yet been granted
++* - XST_DEVICE_BUSY if the CompactFlash is not ready for a command
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XStatus XSysAce_ResetCF(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* If a lock has not been granted, return an error */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		return XST_SYSACE_NO_LOCK;
++	}
++
++	/* See if the CF is ready for a command */
++	if (!XSysAce_mIsReadyForCmd(InstancePtr->BaseAddress)) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * If interrupts are enabled, enable the error interrupt. A reset clears
++	 * the error status, so we're going to re-enable the interrupt here so any
++	 * new errors will be caught.
++	 */
++	if (XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++				      XSA_CR_ERRORIRQ_MASK);
++	}
++
++	/*
++	 * Send the reset command
++	 */
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_SCCR_OFFSET,
++			   XSA_SCCR_RESET_MASK);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Abort the CompactFlash operation currently in progress.
++*
++* An MPU lock, obtained using XSysAce_Lock(), must be granted before calling
++* this function. If a lock has not been granted, no action is taken and an
++* error is returned.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* - XST_SUCCESS if the abort was done successfully
++* - XST_SYSACE_NO_LOCK if no MPU lock has yet been granted
++* - XST_DEVICE_BUSY if the CompactFlash is not ready for a command
++*
++* @note
++*
++* According to the ASIC designer, the abort command has not been well tested.
++*
++******************************************************************************/
++XStatus XSysAce_AbortCF(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* If a lock has not been granted, return an error */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		return XST_SYSACE_NO_LOCK;
++	}
++
++	/*
++	 * See if the CF is ready for a command
++	 *
++	 * TODO: make sure this check works, or possibly the abort can be done
++	 * if it is not ready for a command (e.g., that's what we're aborting)?
++	 */
++	if (!XSysAce_mIsReadyForCmd(InstancePtr->BaseAddress)) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * Send the abort command
++	 */
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_SCCR_OFFSET,
++			   XSA_SCCR_ABORT_MASK);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Identify the CompactFlash device. Retrieves the parameters for the
++* CompactFlash storage device. Note that this is a polled read of one sector
++* of data. The data is read from the CompactFlash into a byte buffer, which
++* is then copied into the XSysAce_CFParameters structure passed in by the
++* user.  The copy is necessary since we don't know how the compiler packs
++* the XSysAce_CFParameters structure.
++*
++* An MPU lock, obtained using XSysAce_Lock(), must be granted before calling
++* this function. If a lock has not been granted, no action is taken and an
++* error is returned.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param ParamPtr is a pointer to a XSysAce_CFParameters structure where the
++*        information for the CompactFlash device will be stored. See xsysace.h
++*        for details on the XSysAce_CFParameters structure.
++*
++* @return
++*
++* - XST_SUCCESS if the identify was done successfully
++* - XST_FAILURE if an error occurs. Use XSysAce_GetErrors() to determine cause.
++* - XST_SYSACE_NO_LOCK if no MPU lock has yet been granted
++* - XST_DEVICE_BUSY if the CompactFlash is not ready for a command
++*
++* @note
++*
++* None.
++*
++* @internal
++*
++* The identify command has the same protocol as the read sector command
++* according to the CompactFlash specification.  However, there is a discepency
++* in that same specification on the size of the parameter structure. The word
++* addresses defined in the spec indicate the parameter information is a full
++* 512 bytes, the same size as a sector. The total bytes defined in the spec,
++* however, indicate that the parameter information is only 500 bytes. We
++* defined the parameter structure in xsysace.h assuming the parameters are the
++* full 512 bytes since that makes sense, and therefore ignored the "Total
++* Bytes" column in the spec.
++*
++* The SectorData variable was made static to avoid putting 512 bytes on the
++* stack every time this function is called.
++*
++******************************************************************************/
++XStatus XSysAce_IdentifyCF(XSysAce * InstancePtr,
++			   XSysAce_CFParameters * ParamPtr)
++{
++	int NumRead;
++	u32 InterruptsOn;
++	static u8 SectorData[XSA_CF_SECTOR_SIZE];
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(ParamPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* If a lock has not been granted, return an error */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		return XST_SYSACE_NO_LOCK;
++	}
++
++	/* See if the CF is ready for a command */
++	if (!XSysAce_mIsReadyForCmd(InstancePtr->BaseAddress)) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/*
++	 * If interrupts are enabled, we disable them because we want to do this
++	 * identify in polled mode - due to the buffer endian conversion and copy
++	 * that takes place.
++	 */
++	InterruptsOn = XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress);
++	if (InterruptsOn) {
++		XSysAce_DisableInterrupt(InstancePtr);
++	}
++
++	/*
++	 * Send the identify command
++	 */
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_SCCR_OFFSET,
++			   XSA_SCCR_IDENTIFY_MASK);
++
++	/* Reset configuration controller (be sure to keep the lock) */
++	/* This breaks mvl, beware! */
++	/* XSysAce_mOrControlReg(InstancePtr->BaseAddress, XSA_CR_CFGRESET_MASK); */
++
++	/*
++	 * Read a sector of data from the data buffer. The parameter info is
++	 * the same size as a sector.
++	 */
++	NumRead = XSysAce_ReadDataBuffer(InstancePtr->BaseAddress, SectorData,
++					 XSA_CF_SECTOR_SIZE);
++
++	/* Clear reset of configuration controller */
++	/* This breaks mvl, beware! */
++	/*XSysAce_mAndControlReg(InstancePtr->BaseAddress, ~(XSA_CR_CFGRESET_MASK)); */
++
++	/* If interrupts were on, re-enable interrupts (regardless of error) */
++	if (InterruptsOn) {
++		XSysAce_EnableInterrupt(InstancePtr);
++	}
++
++	if (NumRead == 0) {
++		/* an error occurred */
++		return XST_FAILURE;
++	}
++
++	/*
++	 * Copy the byte buffer to the parameter structure
++	 */
++	FillParam(ParamPtr, SectorData);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Check to see if the CompactFlash is ready for a command. The CompactFlash
++* may delay after one operation before it is ready for the next. This function
++* helps the user determine when it is ready before invoking a CompactFlash
++* operation such as XSysAce_SectorRead() or XSysAce_SectorWrite();
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* TRUE if the CompactFlash is ready for a command, and FALSE otherwise.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u32 XSysAce_IsCFReady(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	return XSysAce_mIsReadyForCmd(InstancePtr->BaseAddress);
++}
++
++/*****************************************************************************/
++/**
++*
++* Read at least one sector of data from the CompactFlash. The user specifies
++* the starting sector ID and the number of sectors to be read. The minimum unit
++* that can be read from the CompactFlash is a sector, which is 512 bytes.
++*
++* In polled mode, this read is blocking. If there are other tasks in the system
++* that must run, it is best to keep the number of sectors to be read to a
++* minimum (e.g., 1). In interrupt mode, this read is non-blocking and an event,
++* XSA_EVENT_DATA_DONE, is returned to the user in the asynchronous event
++* handler when the read is complete. The user must call
++* XSysAce_EnableInterrupt() to put the driver/device into interrupt mode.
++*
++* An MPU lock, obtained using XSysAce_Lock(), must be granted before calling
++* this function. If a lock has not been granted, no action is taken and an
++* error is returned.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param StartSector is the starting sector ID from where data will be read.
++*        Sector IDs range from 0 (first sector) to 0x10000000.
++* @param NumSectors is the number of sectors to read. The range can be from
++*        1 to 256.
++* @param BufferPtr is a pointer to a buffer where the data will be stored.
++*        The user must ensure it is big enough to hold (512 * NumSectors) bytes.
++*
++* @return
++*
++* - XST_SUCCESS if the read was successful. In interrupt mode, this does not
++*   mean the read is complete, only that it has begun. An event is returned
++*   to the user when the read is complete.
++* - XST_SYSACE_NO_LOCK if no MPU lock has yet been granted
++* - XST_DEVICE_BUSY if the ACE controller is not ready for a command
++* - XST_FAILURE if an error occurred during the read. The user should call
++*   XSysAce_GetErrors() to determine the cause of the error.
++*
++* @note
++*
++* None.
++*
++* @internal
++*
++* Polled mode is blocking under the assumption that a single sector can be
++* transferred at a very fast rate (>20 Mbps).  So, the user can choose to
++* transfer only single sectors when in polled mode, thus allowing time for
++* other work to be done. The biggest issue is that although data transfer
++* rates are high, seek time for CompactFlash cards is slow (5-20 ms on
++* average, depending on the type of device). We could move to a non-blocking
++* solution that transfers 32 bytes at a time (the entire data buffer) and
++* then returns. The user would then need to increment its buffer pointer
++* appropriately and call the read/write again. The driver would need some way
++* to know not to issue a new command to the CompactFlash, but instead continue
++* with the previous command.  This can be done either with a NumSectors argument
++* of zero to indicate that there is already an operation in progress, or by
++* having the driver keep state to know there is an operation in progress. The
++* interface for either seems a bit awkward. Also, the hit for seek time needs
++* to be taken regardless of the blocking or non-blocking nature of the call, so
++* the additional few microseconds to transfer a sector of data seems acceptable.
++*
++******************************************************************************/
++XStatus XSysAce_SectorRead(XSysAce * InstancePtr, u32 StartSector,
++			   int NumSectors, u8 * BufferPtr)
++{
++	u16 SectorCmd;
++	int BytesToRecv;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(NumSectors > 0
++			&& NumSectors <= (XSA_SCCR_COUNT_MASK + 1));
++	XASSERT_NONVOID(BufferPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* If a lock has not been granted, return an error */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		return XST_SYSACE_NO_LOCK;
++	}
++
++	/* See if the CF is ready for a command */
++	if (!XSysAce_mIsReadyForCmd(InstancePtr->BaseAddress)) {
++		return XST_DEVICE_BUSY;
++	}
++
++	BytesToRecv = XSA_CF_SECTOR_SIZE * NumSectors;
++
++	/*
++	 * If in interrupt mode, set up the state variables and enable the
++	 * data-buffer-ready interrupt. This needs to be done before the command
++	 * is sent to the ACE, which will cause the interrupt to occur.
++	 */
++	if (XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		InstancePtr->NumRequested = BytesToRecv;
++		InstancePtr->NumRemaining = BytesToRecv;
++		InstancePtr->BufferPtr = BufferPtr;
++
++		XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++				      XSA_CR_DATARDYIRQ_MASK);
++	}
++
++	/* Write the sector ID (LBA) */
++	XSysAce_RegWrite32(InstancePtr->BaseAddress + XSA_MLR_OFFSET,
++			   StartSector);
++
++	/*
++	 * Send the read command for the number of sectors specified
++	 */
++	SectorCmd = (NumSectors & XSA_SCCR_COUNT_MASK) | XSA_SCCR_READDATA_MASK;
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_SCCR_OFFSET,
++			   SectorCmd);
++
++	/*
++	 * If in polled mode, receive the entire amount requested
++	 */
++	if (!XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		int NumRead;
++
++		/* Reset configuration controller (be sure to keep the lock) */
++		/* This breaks mvl, beware! */
++		/*XSysAce_mOrControlReg(InstancePtr->BaseAddress, XSA_CR_CFGRESET_MASK); */
++
++		NumRead =
++		    XSysAce_ReadDataBuffer(InstancePtr->BaseAddress, BufferPtr,
++					   BytesToRecv);
++		/* Clear reset of configuration controller */
++		/* This breaks mvl, beware! */
++		/*XSysAce_mAndControlReg(InstancePtr->BaseAddress, ~(XSA_CR_CFGRESET_MASK)); */
++
++		if (NumRead != BytesToRecv) {
++			/* an error occurred, report this to the user */
++			return XST_FAILURE;
++		}
++	}
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Write data to the CompactFlash. The user specifies the starting sector ID
++* and the number of sectors to be written. The minimum unit that can be written
++* to the CompactFlash is a sector, which is 512 bytes.
++*
++* In polled mode, this write is blocking. If there are other tasks in the
++* system that must run, it is best to keep the number of sectors to be written
++* to a minimum (e.g., 1). In interrupt mode, this write is non-blocking and an
++* event, XSA_EVENT_DATA_DONE, is returned to the user in the asynchronous
++* event handler when the write is complete. The user must call
++* XSysAce_EnableInterrupt() to put the driver/device into interrupt mode.
++*
++* An MPU lock, obtained using XSysAce_Lock(), must be granted before calling
++* this function. If a lock has not been granted, no action is taken and an
++* error is returned.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param StartSector is the starting sector ID from where data will be written.
++*        Sector IDs range from 0 (first sector) to 0x10000000.
++* @param NumSectors is the number of sectors to write. The range can be from
++*        1 to 256.
++* @param BufferPtr is a pointer to the data buffer to be written. This buffer
++*        must have at least (512 * NumSectors) bytes.
++*
++* @return
++*
++* - XST_SUCCESS if the write was successful. In interrupt mode, this does not
++*   mean the write is complete, only that it has begun. An event is returned
++*   to the user when the write is complete.
++* - XST_SYSACE_NO_LOCK if no MPU lock has yet been granted
++* - XST_DEVICE_BUSY if the ACE controller is not ready for a command
++* - XST_FAILURE if an error occurred during the write. The user should call
++*   XSysAce_GetErrors() to determine the cause of the error.
++*
++* @note
++*
++* None.
++*
++* @internal
++*
++* Polled mode is blocking under the assumption that a single sector can be
++* transferred at a very fast rate (>20 Mbps).  So, the user can choose to
++* transfer only single sectors when in polled mode, thus allowing time for
++* other work to be done. The biggest issue is that although data transfer
++* rates are high, seek time for CompactFlash cards is slow (5-20 ms on
++* average, depending on the type of device). We could move to a non-blocking
++* solution that transfers 32 bytes at a time (the entire data buffer) and
++* then returns. The user would then need to increment its buffer pointer
++* appropriately and call the read/write again. The driver would need some way
++* to know not to issue a new command to the CompactFlash, but instead continue
++* with the previous command.  This can be done either with a NumSectors argument
++* of zero to indicate that there is already an operation in progress, or by
++* having the driver keep state to know there is an operation in progress. The
++* interface for either seems a bit awkward. Also, the hit for seek time needs
++* to be taken regardless of the blocking or non-blocking nature of the call, so
++* the additional few microseconds to transfer a sector of data seems acceptable.
++*
++******************************************************************************/
++XStatus XSysAce_SectorWrite(XSysAce * InstancePtr, u32 StartSector,
++			    int NumSectors, u8 * BufferPtr)
++{
++	u16 SectorCmd;
++	int NumSent;
++	int BytesToSend;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(NumSectors > 0
++			&& NumSectors <= (XSA_SCCR_COUNT_MASK + 1));
++	XASSERT_NONVOID(BufferPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* If a lock has not been granted, return an error */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		return XST_SYSACE_NO_LOCK;
++	}
++
++	/* See if the CF is ready for a command */
++	if (!XSysAce_mIsReadyForCmd(InstancePtr->BaseAddress)) {
++		return XST_DEVICE_BUSY;
++	}
++
++	/* Write the sector ID (LBA) */
++	XSysAce_RegWrite32(InstancePtr->BaseAddress + XSA_MLR_OFFSET,
++			   StartSector);
++
++	/*
++	 * Send the write command for the number of sectors specified
++	 */
++	SectorCmd =
++	    (NumSectors & XSA_SCCR_COUNT_MASK) | XSA_SCCR_WRITEDATA_MASK;
++	XSysAce_RegWrite16(InstancePtr->BaseAddress + XSA_SCCR_OFFSET,
++			   SectorCmd);
++
++	BytesToSend = XSA_CF_SECTOR_SIZE * NumSectors;
++
++	/*
++	 * If in interrupt mode, set up the state variables and enable the
++	 * data-buffer-ready interrupt. We do this after the write command above
++	 * is done in order to guarantee that the interrupt occurs only after the
++	 * first data buffer write is done below (an interrupt may or may not occur
++	 * after the write command is issued)
++	 */
++	if (XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		/*
++		 * Set the state variables. We're going to send one data buffer here in
++		 * this routine, so adjust the buffer pointer and number remaining to
++		 * reflect this.
++		 */
++		InstancePtr->NumRequested = BytesToSend;
++		InstancePtr->NumRemaining = BytesToSend - XSA_DATA_BUFFER_SIZE;
++		InstancePtr->BufferPtr = BufferPtr + XSA_DATA_BUFFER_SIZE;
++
++		/* Send only one data buffer in interrupt mode */
++		BytesToSend = XSA_DATA_BUFFER_SIZE;
++
++		XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++				      XSA_CR_DATARDYIRQ_MASK);
++	}
++
++	NumSent = XSysAce_WriteDataBuffer(InstancePtr->BaseAddress, BufferPtr,
++					  BytesToSend);
++	if (NumSent != BytesToSend) {
++		/* an error occurred, report this to the user */
++		return XST_FAILURE;
++	}
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Get the status of the FAT filesystem on the first valid partition of the
++* CompactFlash device such as the boot record and FAT types found.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* A 16-bit mask of status values. These values are defined in xsysace_l.h
++* with the prefix XSA_FAT_*.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u16 XSysAce_GetFatStatus(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	return XSysAce_RegRead16(InstancePtr->BaseAddress + XSA_FSR_OFFSET);
++}
++
++/*****************************************************************************/
++/**
++*
++* This bit of ugliness allows us to present a structure to the user. The
++* byte buffer which was read from the CompactFlash is converted into the
++* XSysAce_CFParameters structure. The byte buffer is accessed by the indices
++* of the fields as defined at the top of this file. We do not read from
++* CompactFlash directly into the CF Parameter structure because of structure
++* packing problems.
++*
++* Note that we also need to perform endian conversion here since the System
++* ACE device gives us little endian data and we're (possibly) on a big endian
++* processor.
++*
++* @param ParamPtr is the structure to fill
++* @param BufPtr is the byte buffer containing the CF parameter data
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void FillParam(XSysAce_CFParameters * ParamPtr, u8 * BufPtr)
++{
++	u16 HiWord;
++	u16 LoWord;
++
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_SIGNATURE]),
++			       &ParamPtr->Signature);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_NUMCYLS]),
++			       &ParamPtr->NumCylinders);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_RESERVED1]),
++			       &ParamPtr->Reserved);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_NUMHEADS]),
++			       &ParamPtr->NumHeads);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_BYTES_TRACK]),
++			       &ParamPtr->NumBytesPerTrack);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_BYTES_SECT]),
++			       &ParamPtr->NumBytesPerSector);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_SECTS_TRK]),
++			       &ParamPtr->NumSectorsPerTrack);
++
++	/* NumSectorsPerCard is stored as two half-words, MSW first */
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_SECTS_HI]),
++			       &HiWord);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_SECTS_LO]),
++			       &LoWord);
++	ParamPtr->NumSectorsPerCard = ((u32) HiWord << 16) | (u32) LoWord;
++
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_VENDOR1]),
++			       &ParamPtr->VendorUnique);
++
++	WordCopySwap(&BufPtr[XSA_CFPARM_SERIAL_NO], ParamPtr->SerialNo, 20);
++
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_BUFFER_TYPE]),
++			       &ParamPtr->BufferType);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_BUFFER_SIZE]),
++			       &ParamPtr->BufferSize);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_ECC_BYTES]),
++			       &ParamPtr->NumEccBytes);
++
++	WordCopySwap(&BufPtr[XSA_CFPARM_FW_VERSION], ParamPtr->FwVersion, 8);
++	WordCopySwap(&BufPtr[XSA_CFPARM_MODEL_NO], ParamPtr->ModelNo, 40);
++
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_MAX_SECTORS]),
++			       &ParamPtr->MaxSectors);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_DBL_WORD]),
++			       &ParamPtr->DblWord);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_CAPS]),
++			       &ParamPtr->Capabilities);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_RESERVED2]),
++			       &ParamPtr->Reserved2);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_PIO_MODE]),
++			       &ParamPtr->PioMode);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_DMA_MODE]),
++			       &ParamPtr->DmaMode);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_TRANSLATE]),
++			       &ParamPtr->TranslationValid);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_CURCYLS]),
++			       &ParamPtr->CurNumCylinders);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_CURHEADS]),
++			       &ParamPtr->CurNumHeads);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_CURSECTS_TRK]),
++			       &ParamPtr->CurSectorsPerTrack);
++	XIo_FromLittleEndian32(*((u32 *) & BufPtr[XSA_CFPARM_CURSECTS]),
++			       &ParamPtr->CurSectorsPerCard);
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_MULTIPLE]),
++			       &ParamPtr->MultipleSectors);
++	XIo_FromLittleEndian32(*((u32 *) & BufPtr[XSA_CFPARM_LBA_SECTS]),
++			       &ParamPtr->LbaSectors);
++
++	WordCopySwap(&BufPtr[XSA_CFPARM_RESERVED3], ParamPtr->Reserved3, 132);
++
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_SECURITY]),
++			       &ParamPtr->SecurityStatus);
++
++	WordCopySwap(&BufPtr[XSA_CFPARM_VENDOR2], ParamPtr->VendorUniqueBytes,
++		     62);
++
++	XIo_FromLittleEndian16(*((u16 *) & BufPtr[XSA_CFPARM_POWER]),
++			       &ParamPtr->PowerDesc);
++
++	WordCopySwap(&BufPtr[XSA_CFPARM_RESERVED4], ParamPtr->Reserved4, 190);
++
++}
++
++/*****************************************************************************/
++/**
++*
++* Utility to copy words and swap the endianism on the fly.
++*
++* @param SourcePtr is a pointer to the source byte buffer
++* @param DestPtr is a pointer to the destination byte buffer
++* @param NumBytes is the number of bytes to copy
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* NumBytes should be even but if it isn't, the function increases by 1
++* to correct.
++*
++******************************************************************************/
++static void WordCopySwap(u8 * SourcePtr, u8 * DestPtr, int NumBytes)
++{
++	int i;
++
++	/* make sure the requested length is even, if not, increase by 1 */
++
++	if ((NumBytes & 0x00000001) != 0) {
++		NumBytes += 1;
++	}
++
++	for (i = 0; i < NumBytes; i += 2) {
++		DestPtr[i + 1] = SourcePtr[i];
++		DestPtr[i] = SourcePtr[i + 1];
++	}
++}
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_intr.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_intr.c
+@@ -0,0 +1,424 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace_intr.c
++*
++* Contains functions related to System ACE interrupt mode. The driver's
++* interrupt handler, XSysAce_InterruptHandler(), must be connected by the
++* user to the interrupt controller.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/17/02 work in progress
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xsysace.h"
++#include "xsysace_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Variable Definitions *****************************/
++
++/************************** Function Prototypes ******************************/
++
++static void HandleDataBuffer(XSysAce * InstancePtr, u32 StatusReg);
++static void DataComplete(XSysAce * InstancePtr);
++
++/*****************************************************************************/
++/**
++*
++* Enable System ACE interrupts. There are three interrupts that can be enabled.
++* The error interrupt enable serves as the driver's means to determine whether
++* interrupts have been enabled or not. The configuration-done interrupt is not
++* enabled here, instead it is enabled during a reset - which can cause a
++* configuration process to start. The data-buffer-ready interrupt is not enabled
++* here either. It is enabled when a read or write operation is started. The
++* reason for not enabling the latter two interrupts are because the status bits
++* may be set as a leftover of an earlier occurrence of the interrupt.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to work on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_EnableInterrupt(XSysAce * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* By default, enable only the error interrupt */
++	XSysAce_mOrControlReg(InstancePtr->BaseAddress, XSA_CR_ERRORIRQ_MASK);
++
++	/* Clear the reset on the interrupt line if it was in reset */
++	XSysAce_mAndControlReg(InstancePtr->BaseAddress, ~XSA_CR_RESETIRQ_MASK);
++}
++
++/*****************************************************************************/
++/**
++*
++* Disable all System ACE interrupts and hold the interrupt request line of
++* the device in reset.
++*
++* @param InstancePtr is a pointer to the XSysAce instance that just interrupted.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_DisableInterrupt(XSysAce * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Put the interrupt request line in reset */
++	XSysAce_mOrControlReg(InstancePtr->BaseAddress, XSA_CR_RESETIRQ_MASK);
++
++	/* Clear the interrupt enable bits */
++	XSysAce_mAndControlReg(InstancePtr->BaseAddress,
++			       ~(XSA_CR_DATARDYIRQ_MASK | XSA_CR_ERRORIRQ_MASK |
++				 XSA_CR_CFGDONEIRQ_MASK));
++}
++
++/*****************************************************************************/
++/**
++*
++* The interrupt handler for the System ACE driver. This handler must be
++* connected by the user to an interrupt controller or source. This function
++* does not save or restore context.
++*
++* This function continues reading or writing to the compact flash if such an
++* operation is in progress, and notifies the upper layer software through
++* the event handler once the operation is complete or an error occurs. On an
++* error, any command currently in progress is aborted.
++*
++* @param InstancePtr is a pointer to the XSysAce instance that just interrupted.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_InterruptHandler(void *InstancePtr)
++{
++	u32 StatusReg;
++	XSysAce *AcePtr = (XSysAce *) InstancePtr;
++
++	XASSERT_VOID(InstancePtr != NULL);
++
++	/*
++	 * Get the status in order to process each interrupt that has occurred
++	 */
++	StatusReg = XSysAce_mGetStatusReg(AcePtr->BaseAddress);
++
++	/*
++	 * Reset the interrupt line to effectively clear the interrupt conditions.
++	 * We need to set the bit to clear the interrupts, then clear the bit so
++	 * that new interrupts can be generated.
++	 */
++	XSysAce_mOrControlReg(AcePtr->BaseAddress, XSA_CR_RESETIRQ_MASK);
++	XSysAce_mAndControlReg(AcePtr->BaseAddress, ~XSA_CR_RESETIRQ_MASK);
++
++	/*
++	 * Check for data buffer ready, which means an operation (either read or
++	 * write) is in progress.
++	 */
++	if (StatusReg & XSA_SR_DATABUFRDY_MASK) {
++		/*
++		 * Handles the data buffer, and invokes the callback to the user for
++		 * data transfer completion.
++		 */
++		HandleDataBuffer(AcePtr, StatusReg);
++	}
++
++	/*
++	 * Check for completion of JTAG configuration and report the event up.
++	 * We only do this if the CFGDONE interrupt is enabled since the CFGDONE
++	 * status only gets cleared when the confguration controller is reset,
++	 * which we do not do unless requested by the user because it may cause
++	 * a configuration process to start. We could have gotten into this
++	 * interrupt handler by another interrupt, yet have a leftover CFGDONE
++	 * status from an earlier configuration process.
++	 */
++	if ((StatusReg & XSA_SR_CFGDONE_MASK) &&
++	    (XSysAce_mGetControlReg(AcePtr->BaseAddress) &
++	     XSA_CR_CFGDONEIRQ_MASK)) {
++		/*
++		 * Clear the bit indicating MPU is the source of configuration data
++		 * since we're done configuring from the MPU for now. Also clear the
++		 * force CFGMODE bit and the CFGSTART bit, basically undoing what was
++		 * done in XSysAce_ProgramChain(). Disable the interrupts since the
++		 * CFGDONE status does not get cleared unless a reset occurs - and in
++		 * the meantime we may get into this interrupt handler again.
++		 */
++		XSysAce_mAndControlReg(AcePtr->BaseAddress,
++				       ~(XSA_CR_CFGSEL_MASK |
++					 XSA_CR_CFGSTART_MASK |
++					 XSA_CR_CFGDONEIRQ_MASK |
++					 XSA_CR_DATARDYIRQ_MASK |
++					 XSA_CR_FORCECFGMODE_MASK));
++
++		AcePtr->EventHandler(AcePtr->EventRef, XSA_EVENT_CFG_DONE);
++	}
++
++	/*
++	 * Check for errors and report the event (the user is responsible for
++	 * retrieving and interpreting the errors). We only do this if the error
++	 * interrupt is enabled since the error status only gets cleared when the
++	 * CompactFlash or confguration controller is reset, which we do not do
++	 * because it may cause a configuration process to start. We could have
++	 * entered this interrupt handler by another interrupt and have a leftover
++	 * error status from a previous error.
++	 */
++	if ((StatusReg & (XSA_SR_CFGERROR_MASK | XSA_SR_CFCERROR_MASK)) &&
++	    (XSysAce_mGetControlReg(AcePtr->BaseAddress) &
++	     XSA_CR_ERRORIRQ_MASK)) {
++		/* Clear the transfer state to effectively abort the operation */
++		AcePtr->NumRequested = 0;
++		AcePtr->NumRemaining = 0;
++		AcePtr->BufferPtr = NULL;
++
++		/*
++		 * Disable the error interrupt since the only way to clear the
++		 * error status is to reset the CF or the configuration controller,
++		 * neither of which we want to do here since the consequences may
++		 * be undesirable (i.e., may cause a reconfiguration). The user
++		 * will need to perform the reset based on the error event.
++		 */
++		XSysAce_mAndControlReg(AcePtr->BaseAddress,
++				       ~XSA_CR_ERRORIRQ_MASK);
++
++		AcePtr->EventHandler(AcePtr->EventRef, XSA_EVENT_ERROR);
++	}
++}
++
++/*****************************************************************************/
++/**
++*
++* Set the callback function for handling events. The upper layer software
++* should call this function during initialization. The events are passed
++* asynchronously to the upper layer software. The events are described in
++* xsysace.h and are named XSA_EVENT_*.
++*
++* Note that the callback is invoked by the driver within interrupt context, so
++* it needs to do its job quickly. If there are potentially slow operations
++* within the callback, these should be done at task-level.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param FuncPtr is the pointer to the callback function.
++* @param CallBackRef is a reference pointer to be passed back to the upper
++*        layer.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_SetEventHandler(XSysAce * InstancePtr,
++			     XSysAce_EventHandler FuncPtr, void *CallBackRef)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	InstancePtr->EventHandler = FuncPtr;
++	InstancePtr->EventRef = CallBackRef;
++}
++
++/*****************************************************************************/
++/**
++*
++* Handle a data-buffer-ready interrupt. If we get the interrupt when reading,
++* it means there is still data to read since the interrupt does not occur after
++* reading the last data buffer. If we get the interrupt when writing, there
++* may or may not be data left to write since the interrupt does occur after the
++* last data buffer is written.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param StatusReg is the contents of the status register, read at the start
++*        of the interrupt service routine.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void HandleDataBuffer(XSysAce * InstancePtr, u32 StatusReg)
++{
++	/* By default, transfer a whole data buffer */
++	int BytesToTransfer = XSA_DATA_BUFFER_SIZE;
++
++	/*
++	 * Check to see if number of bytes remaining is less than the data buffer
++	 * size. If it is, we need to adjust the remaining bytes to transfer.
++	 */
++	if (InstancePtr->NumRemaining < XSA_DATA_BUFFER_SIZE) {
++		BytesToTransfer = InstancePtr->NumRemaining;
++	}
++
++	/*
++	 * Transfer only one data buffer at a time, which is 32 bytes. Note that
++	 * errors will be handled by an error interrupt occurring, so no need to
++	 * check for them here.
++	 */
++	if (StatusReg & XSA_SR_DATABUFMODE_MASK) {
++		/*
++		 * A write operation in progress, so if there is data remaining then
++		 * write the buffer. If no data is remaining, clean up.
++		 */
++		if (InstancePtr->NumRemaining > 0) {
++			(void)XSysAce_WriteDataBuffer(InstancePtr->BaseAddress,
++						      InstancePtr->BufferPtr,
++						      BytesToTransfer);
++
++			/*
++			 * Decrement the number of bytes remaining to be transferred and
++			 * adjust the buffer pointer appropriately.
++			 */
++			InstancePtr->NumRemaining -= BytesToTransfer;
++			InstancePtr->BufferPtr += BytesToTransfer;
++		} else {
++			/* Done writing data, so clean up */
++			DataComplete(InstancePtr);
++		}
++	} else {
++		/* A read operation in progress, so read the buffer */
++		(void)XSysAce_ReadDataBuffer(InstancePtr->BaseAddress,
++					     InstancePtr->BufferPtr,
++					     BytesToTransfer);
++
++		/*
++		 * Decrement the number of bytes remaining to be transferred and
++		 * adjust the buffer pointer appropriately. If it was the last buffer,
++		 * we're done and we can cleanup.
++		 */
++		InstancePtr->NumRemaining -= BytesToTransfer;
++		InstancePtr->BufferPtr += BytesToTransfer;
++
++		if (InstancePtr->NumRemaining == 0) {
++			/* Done reading data, so clean up */
++			DataComplete(InstancePtr);
++		}
++	}
++}
++
++/*****************************************************************************/
++/**
++*
++* Handle cleanup when a data transfer is complete. This means intializing the
++* state variables, disabling the data-buffer-ready interrupt, and sending the
++* event to the user.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void DataComplete(XSysAce * InstancePtr)
++{
++	InstancePtr->NumRequested = 0;
++	InstancePtr->NumRemaining = 0;
++	InstancePtr->BufferPtr = NULL;
++
++	/*
++	 * Disable the data-buffer-ready interrupt. This isn't necessary when
++	 * reading since the DATABUFRDY status bit is cleared by the ACE after
++	 * the last data buffer is read.  However, the ACE isn't currently
++	 * smart enough to clear the DATABUFRDY status bit after the last data
++	 * buffer is written during a write operation.  So, we need to use the
++	 * enable/disable interrupt bit to control its usefulness.
++	 */
++	XSysAce_mAndControlReg(InstancePtr->BaseAddress,
++			       ~XSA_CR_DATARDYIRQ_MASK);
++
++	/*
++	 * The same code is executed for JTAG configuration as well as CompactFlash
++	 * transfers, so we need to distinguish between JTAG config done and CF
++	 * data transfer done. We look at the CFGSEL value in the control register
++	 * to determine if an MPU JTAG config process has just completed. The
++	 * CFG_DONE event is passed up later by the main interrupt handler.
++	 */
++	if ((XSysAce_mGetControlReg(InstancePtr->BaseAddress)
++	     & XSA_CR_CFGSEL_MASK) == 0) {
++		/* no JTAG configuration in progress */
++		InstancePtr->EventHandler(InstancePtr->EventRef,
++					  XSA_EVENT_DATA_DONE);
++	}
++}
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_jtagcfg.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_jtagcfg.c
+@@ -0,0 +1,456 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace_jtagcfg.c
++*
++* Contains functions to control the configuration of the target FPGA chain on
++* the System ACE via the JTAG configuration port.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/17/02 work in progress
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xsysace.h"
++#include "xsysace_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++/*****************************************************************************/
++/**
++*
++* Reset the JTAG configuration controller. This comprises a reset of the JTAG
++* configuration controller and the CompactFlash controller (if it is currently
++* being accessed by the configuration controller). Note that the MPU controller
++* is not reset, meaning the MPU registers remain unchanged. The configuration
++* controller is reset then released from reset in this function.
++*
++* The CFGDONE status (and therefore interrupt) is cleared when the configuration
++* controller is reset. If interrupts have been enabled, we go ahead and enable
++* the CFGDONE interrupt here. This means that if and when a configuration
++* process starts as a result of this reset, an interrupt will be received when
++* it is complete.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* This function is not thread-safe.
++*
++******************************************************************************/
++void XSysAce_ResetCfg(XSysAce * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Reset the configuration controller */
++	XSysAce_mOrControlReg(InstancePtr->BaseAddress, XSA_CR_CFGRESET_MASK);
++
++	/*
++	 * If in interrupt mode, enable the CFGDONE and error interrupts.
++	 * A reset clears the CFGDONE and error statuses, so we're going to
++	 * re-enable the interrupts here so any new errors or CFGDONEs will be
++	 * caught.
++	 */
++	if (XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		XSysAce_mOrControlReg(InstancePtr->BaseAddress,
++				      XSA_CR_CFGDONEIRQ_MASK |
++				      XSA_CR_ERRORIRQ_MASK);
++	}
++
++	/* Release the reset of the configuration controller */
++	XSysAce_mAndControlReg(InstancePtr->BaseAddress, ~XSA_CR_CFGRESET_MASK);
++}
++
++/*****************************************************************************/
++/**
++*
++* Select the configuration address (or file) from the CompactFlash to be used
++* for configuration of the target FPGA chain.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param Address is the address or file number to be used as the bitstream to
++*        configure the target FPGA devices. There are 8 possible files, so
++*        the value of this parameter can range from 0 to 7.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_SetCfgAddr(XSysAce * InstancePtr, unsigned int Address)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(Address < 8);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Set the control register with the address and the bit that forces
++	 * the use of the control register address bits instead of the address
++	 * pins on the device.
++	 */
++	XSysAce_mSetCfgAddr(InstancePtr->BaseAddress, Address);
++}
++
++/*****************************************************************************/
++/**
++*
++* Set the start mode for configuration of the target FPGA chain from
++* CompactFlash. The configuration process only starts after a reset. The
++* user can indicate that the configuration should start immediately after a
++* reset, or the configuration process can be delayed until the user commands
++* it to start (using this function). The configuration controller can be
++* reset using XSysAce_ResetCfg().
++*
++* The user can select which configuration file on the CompactFlash to use using
++* the XSysAce_SetCfgAddr() function. If the user intends to configure the target
++* FPGA chain directly from the MPU port, this function is not needed. Instead,
++* the user would simply call XSysAce_ProgramChain().
++*
++* The user can use XSysAce_IsCfgDone() when in polled mode to determine if
++* the configuration is complete. If in interrupt mode, the event
++* XSA_EVENT_CFG_DONE will be returned asynchronously to the user when the
++* configuration is complete. The user must call XSysAce_EnableInterrupt() to put
++* the device/driver into interrupt mode.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param ImmedOnReset can be set to TRUE to indicate the configuration process
++*        will start immediately after a reset of the ACE configuration
++*        controller, or it can be set to FALSE to indicate the configuration
++*        process is delayed after a reset until the user starts it (using this
++*        function).
++* @param StartCfg is a boolean indicating whether to start the configuration
++*        process or not. When ImmedOnReset is set to TRUE, this value is
++*        ignored. When ImmedOnReset is set to FALSE, then this value controls
++*        when the configuration process is started. When set to TRUE the
++*        configuration process starts (assuming a reset of the device has
++*        occurred), and when set to FALSE the configuration process does not
++*        start.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XSysAce_SetStartMode(XSysAce * InstancePtr, u32 ImmedOnReset, u32 StartCfg)
++{
++	u32 Control;
++
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Get the current contents of the control register */
++	Control = XSysAce_mGetControlReg(InstancePtr->BaseAddress);
++
++	/*
++	 * Since the user has called this function, we want to tell the ACE
++	 * controller to look at the CFGMODE bit of the control register rather
++	 * than the CFGMODE pin of the device to determine when to start a
++	 * configuration process.
++	 */
++	Control |= XSA_CR_FORCECFGMODE_MASK;
++
++	/* Set or clear the CFGMODE bit of the control register */
++	if (ImmedOnReset) {
++		Control |= XSA_CR_CFGMODE_MASK;	/* immediate on reset */
++	} else {
++		Control &= ~XSA_CR_CFGMODE_MASK;	/* wait for start bit */
++	}
++
++	/* Set or clear the CFGSTART bit of the control register */
++	if (StartCfg) {
++		Control |= XSA_CR_CFGSTART_MASK;
++	} else {
++		Control &= ~XSA_CR_CFGSTART_MASK;
++	}
++
++	XSysAce_mSetControlReg(InstancePtr->BaseAddress, Control);
++}
++
++/*****************************************************************************/
++/**
++*
++* Program the target FPGA chain through the configuration JTAG port. This
++* allows the user to program the devices on the target FPGA chain from the MPU
++* port instead of from CompactFlash. The user specifies a buffer and the number
++* of bytes to write. The buffer should be equivalent to an ACE (.ace) file.
++*
++* Note that when loading the ACE file via the MPU port, the first sector of the
++* ACE file is discarded. The CF filesystem controller in the System ACE device
++* knows to skip the first sector when the ACE file comes from the CF, but the
++* CF filesystem controller is bypassed when the ACE file comes from the MPU
++* port. For this reason, this function skips the first sector of the buffer
++* passed in.
++*
++* In polled mode, the write is blocking. In interrupt mode, the write is
++* non-blocking and an event, XSA_EVENT_CFG_DONE, is returned to the user in
++* the asynchronous event handler when the configuration is complete.
++*
++* An MPU lock, obtained using XSysAce_Lock(), must be granted before calling
++* this function. If a lock has not been granted, no action is taken and an
++* error is returned.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++* @param BufferPtr is a pointer to a buffer that will be used to program
++*        the configuration JTAG devices.
++* @param NumBytes is the number of bytes in the buffer. We assume that there
++*        is at least one sector of data in the .ace file, which is the
++*        information sector.
++*
++* @return
++*
++* - XST_SUCCESS if the write was successful. In interrupt mode, this does not
++*   mean the write is complete, only that it has begun. An event is returned
++*   to the user when the write is complete.
++* - XST_SYSACE_NO_LOCK if no MPU lock has yet been granted
++* - XST_FAILURE if an error occurred during the write. The user should call
++*   XSysAce_GetErrors() to determine the cause of the error.
++*
++* @note
++*
++* None.
++*
++* @internal
++*
++* The System ACE controller has a 32-byte buffer which holds data. The entire
++* buffer must be written to ensure that it gets sent to the configuration
++* JTAG port. If the number of bytes specified by the user is not a multiple
++* of 32, the driver will pad the remaining bytes of the System ACE buffer with
++* zeroes in order to write the entire buffer.
++*
++******************************************************************************/
++XStatus XSysAce_ProgramChain(XSysAce * InstancePtr, u8 * BufferPtr,
++			     int NumBytes)
++{
++	u32 ControlMask;
++	int BytesToSend;
++	int NumSent;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(BufferPtr != NULL);
++	XASSERT_NONVOID(NumBytes > XSA_CF_SECTOR_SIZE);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* If a lock has not been granted, return an error */
++	if (!XSysAce_mIsMpuLocked(InstancePtr->BaseAddress)) {
++		return XST_SYSACE_NO_LOCK;
++	}
++
++	/*
++	 * Set up the configuration controller to use the MPU port as the
++	 * source of configuration data (instead of the CF). The following
++	 * control flow comes directly from the System ACE specification, except
++	 * the reset was moved to after the other control register bits are set.
++	 * Putting it into reset before the bits are set seemed to produce
++	 * configuration errors occasionally.
++	 */
++	ControlMask = XSysAce_mGetControlReg(InstancePtr->BaseAddress);
++
++	/* Select MPU as the source */
++	ControlMask |= XSA_CR_CFGSEL_MASK;
++	XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++
++	/* Tell controller to wait for start bit from MPU */
++	ControlMask |= XSA_CR_FORCECFGMODE_MASK;
++	ControlMask &= ~XSA_CR_CFGMODE_MASK;
++	XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++
++	/* Set the start bit */
++	ControlMask |= XSA_CR_CFGSTART_MASK;
++	XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++
++	/* Put the configuration controller into a reset condition */
++	ControlMask |= XSA_CR_CFGRESET_MASK;
++	XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++
++	/* Clear the reset condition, which starts the process */
++	ControlMask &= ~XSA_CR_CFGRESET_MASK;
++	XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++
++	/*
++	 * Set up number of bytes to send. Default to the entire buffer, which
++	 * will be true in polled mode. In interrupt mode, modify this value to
++	 * send only one data buffer of data.  Always skip the first sector per
++	 * the comment above.
++	 */
++	BytesToSend = NumBytes - XSA_CF_SECTOR_SIZE;
++
++	/*
++	 * The number of bytes to write depends on interrupt or polled mode
++	 */
++	if (XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		/*
++		 * In interrupt mode, so enable the data-buffer-ready and
++		 * configuration-done interrupts. Also, set up the state variables for
++		 * the interrupt handler to transfer the remaining data after the
++		 * initial write below. We need to write one data buffer here in this
++		 * function in order to cause the data-buffer-ready interrupt to occur
++		 * for subsequent writes.
++		 */
++		ControlMask |= XSA_CR_DATARDYIRQ_MASK | XSA_CR_CFGDONEIRQ_MASK;
++		XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++
++		/* Send only one data buffer to begin with (if there is that much) */
++		if (BytesToSend > XSA_DATA_BUFFER_SIZE) {
++			BytesToSend = XSA_DATA_BUFFER_SIZE;
++		}
++
++		/*
++		 * Setup state variables for the interrupt handler. Skip the first
++		 * sector per the comment above, and also skip the first data buffer
++		 * since it is written below.
++		 */
++		InstancePtr->NumRequested = NumBytes - XSA_CF_SECTOR_SIZE;
++		InstancePtr->BufferPtr =
++		    BufferPtr + XSA_CF_SECTOR_SIZE + BytesToSend;
++		InstancePtr->NumRemaining =
++		    NumBytes - XSA_CF_SECTOR_SIZE - BytesToSend;
++	}
++
++	NumSent = XSysAce_WriteDataBuffer(InstancePtr->BaseAddress,
++					  BufferPtr + XSA_CF_SECTOR_SIZE,
++					  BytesToSend);
++	if (NumSent != BytesToSend) {
++		/* an error occurred, report this to the user */
++		return XST_FAILURE;
++	}
++
++	/*
++	 * If in polled mode, restore the control register to the way it was
++	 */
++	if (!XSysAce_mIsIntrEnabled(InstancePtr->BaseAddress)) {
++		/*
++		 * Unselect MPU as the source, tell controller to use CFGMODE pin,
++		 * and clear the start bit.
++		 */
++		ControlMask &= ~(XSA_CR_CFGSEL_MASK | XSA_CR_FORCECFGMODE_MASK |
++				 XSA_CR_CFGSTART_MASK);
++		XSysAce_mSetControlReg(InstancePtr->BaseAddress, ControlMask);
++	}
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Check to see if the configuration of the target FPGA chain is complete. This
++* function is typically only used in polled mode. In interrupt mode, an event
++* (XSA_EVENT_CFG_DONE) is returned to the user in the asynchronous event
++* handler.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* TRUE if the configuration is complete. FALSE otherwise.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u32 XSysAce_IsCfgDone(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Use the layer 0 macro by the same name */
++
++	return XSysAce_mIsCfgDone(InstancePtr->BaseAddress);
++}
++
++/*****************************************************************************/
++/**
++*
++* Get the sector ID of the CompactFlash sector being used for configuration of
++* the target FPGA chain. This sector ID (or logical block address) only affects
++* transfers between the ACE configuration logic and the CompactFlash card.
++* This function is typically used for debug purposes to determine which sector
++* was being accessed when an error occurred.
++*
++* @param InstancePtr is a pointer to the XSysAce instance to be worked on.
++*
++* @return
++*
++* The sector ID (logical block address) being used for data transfers between
++* the ACE configuration logic and the CompactFlash. Sector IDs range from 0
++* to 0x10000000.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u32 XSysAce_GetCfgSector(XSysAce * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	return XSysAce_RegRead32(InstancePtr->BaseAddress + XSA_CLR_OFFSET);
++}
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.c
+@@ -0,0 +1,586 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002-2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace_l.c
++*
++* This file contains low-level functions to read and write CompactFlash
++* sectors and ACE controller registers. These functions can be used when only
++* the low-level functionality of the driver is desired. The user would
++* typically use the high-level driver functions defined in xsysace.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/14/02 work in progress
++* 1.00a rpm  09/16/03 Added include of xparameters.h in order to get
++*                     the XPAR_XSYSACE_MEM_WIDTH definition.
++* 1.00a rpm  02/17/04 Fixed WriteSector function command
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xparameters.h"
++#include "xsysace_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/*
++ * Set up the access width of the MPU registers based on compile-time constants.
++ * If hardware requires 32-bit aligned addresses (XSA_ADDR_ALIGN=4) to access
++ * the MPU registers, then access all of them as 32 bits. If hardware allows
++ * 8-bit aligned addresses (XSA_ADDR_ALIGN=1, or not 4) to access the MPU
++ * registers, access them as 8 or 16 bits depending on the bus mode of the ACE
++ * controller.
++ */
++#if (XSA_ADDR_ALIGN == 4)
++
++#define XIo_In   XIo_In32
++#define XIo_Out  XIo_Out32
++
++#else
++
++#if (XPAR_XSYSACE_MEM_WIDTH == 16)
++#define XIo_In   XIo_In16
++#define XIo_Out  XIo_Out16
++#else				/* XPAR_XSYSACE_MEM_WIDTH */
++#define XIo_In   XIo_In8
++#define XIo_Out  XIo_Out8
++#endif				/* XPAR_XSYSACE_MEM_WIDTH */
++
++#endif				/* (XSA_ADDR_ALIGN == 4) */
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++/*****************************************************************************/
++/**
++*
++* Read a 32-bit value from the given address. Based on a compile-time
++* constant, do the read in two 16-bit reads or four 8-bit reads.
++*
++* @param    Address is the address to read from.
++*
++* @return   The 32-bit value of the address.
++*
++* @note     No need for endian conversion in 8-bit mode since this function
++*           gets the bytes into their proper lanes in the 32-bit word.
++*
++******************************************************************************/
++#if (XPAR_XSYSACE_MEM_WIDTH == 16)
++u32 XSysAce_RegRead32(u32 Address)
++{
++	u16 Data;
++	u16 ConvertedData;
++	u32 Value = 0;
++
++	/*
++	 * Need to endian convert each 32-bit value. The ACE registers are little-
++	 * endian, so we read the two LSBs first, endian convert, then put them
++	 * in the LSB lanes of the 32-bit word. etc...
++	 */
++	Data = (u16) XIo_In(Address);
++	XIo_FromLittleEndian16(Data, &ConvertedData);
++	Value = (u32) ConvertedData;
++
++	Data = (u16) XIo_In(Address + (2 * XSA_ADDR_ALIGN));
++	XIo_FromLittleEndian16(Data, &ConvertedData);
++	Value |= ((u32) ConvertedData << 16);
++
++	return Value;
++}
++#else
++u32 XSysAce_RegRead32(u32 Address)
++{
++	u32 Value = 0;
++
++	/*
++	 * The ACE registers are little-endian always. This code reads each 8-bit
++	 * register value, in order from LSB to MSB, and shifts it to the correct
++	 * byte lane of the 32-bit word. This code should work on both
++	 * little-endian and big-endian processors.
++	 */
++	Value = (u32) XIo_In(Address);
++	Value |= ((u32) XIo_In(Address + (1 * XSA_ADDR_ALIGN)) << 8);
++	Value |= ((u32) XIo_In(Address + (2 * XSA_ADDR_ALIGN)) << 16);
++	Value |= ((u32) XIo_In(Address + (3 * XSA_ADDR_ALIGN)) << 24);
++
++	return Value;
++}
++#endif
++
++/*****************************************************************************/
++/**
++*
++* Read a 16-bit value from the given address. Based on a compile-time
++* constant, do the read in one 16-bit read or two 8-bit reads.
++*
++* @param    Address is the address to read from.
++*
++* @return   The 16-bit value of the address.
++*
++* @note     No need for endian conversion in 8-bit mode since this function
++*           gets the bytes into their proper lanes in the 16-bit word.
++*
++******************************************************************************/
++#if (XPAR_XSYSACE_MEM_WIDTH == 16)
++u16 XSysAce_RegRead16(u32 Address)
++{
++	u16 Data;
++	u16 ConvertedData;
++
++	/*
++	 * Need to endian convert the 16-bit value. The ACE registers are little-
++	 * endian.
++	 */
++	Data = (u16) XIo_In(Address);
++	XIo_FromLittleEndian16(Data, &ConvertedData);
++	return ConvertedData;
++}
++#else
++u16 XSysAce_RegRead16(u32 Address)
++{
++	u16 Value = 0;
++
++	/*
++	 * The ACE registers are little-endian always. This code reads each 8-bit
++	 * register value, in order from LSB to MSB, and shifts it to the correct
++	 * byte lane of the 32-bit word. This code should work on both
++	 * little-endian and big-endian processors.
++	 */
++	Value = (u16) XIo_In(Address);
++	Value |= ((u16) XIo_In(Address + (1 * XSA_ADDR_ALIGN)) << 8);
++
++	return Value;
++}
++#endif
++
++/*****************************************************************************/
++/**
++*
++* Write a 32-bit value to the given address. Based on a compile-time
++* constant, do the write in two 16-bit writes or four 8-bit writes.
++*
++* @param    Address is the address to write to.
++* @param    Data is the value to write
++*
++* @return   None.
++*
++* @note     No need for endian conversion in 8-bit mode since this function
++*           writes the bytes into their proper lanes based on address.
++*
++******************************************************************************/
++#if (XPAR_XSYSACE_MEM_WIDTH == 16)
++void XSysAce_RegWrite32(u32 Address, u32 Data)
++{
++	u16 Hword;
++	u16 ConvertedData;
++
++	/*
++	 * The ACE registers are little-endian always. This code takes each 16-bit
++	 * value of the incoming 32-bit word and endian converts it, then writes it
++	 * to the ACE register.
++	 */
++	Hword = (u16) Data;
++	XIo_ToLittleEndian16(Hword, &ConvertedData);
++	XIo_Out(Address, ConvertedData);
++
++	Hword = (u16) (Data >> 16);
++	XIo_ToLittleEndian16(Hword, &ConvertedData);
++	XIo_Out(Address + (2 * XSA_ADDR_ALIGN), ConvertedData);
++}
++#else
++void XSysAce_RegWrite32(u32 Address, u32 Data)
++{
++	/*
++	 * The ACE registers are little-endian always. This code reads each 8-bit
++	 * register value, in order from LSB to MSB, and shifts it to the correct
++	 * byte lane of the 32-bit word. This code should work on both
++	 * little-endian and big-endian processors.
++	 */
++	XIo_Out(Address, (u8) Data);
++	XIo_Out(Address + (1 * XSA_ADDR_ALIGN), (u8) (Data >> 8));
++	XIo_Out(Address + (2 * XSA_ADDR_ALIGN), (u8) (Data >> 16));
++	XIo_Out(Address + (3 * XSA_ADDR_ALIGN), (u8) (Data >> 24));
++}
++#endif
++
++/*****************************************************************************/
++/**
++*
++* Write a 16-bit value to the given address. Based on a compile-time
++* constant, do the write in one 16-bit write or two 8-bit writes.
++*
++* @param    Address is the address to write to.
++* @param    Data is the value to write
++*
++* @return   None.
++*
++* @note     No need for endian conversion in 8-bit mode since this function
++*           writes the bytes into their proper lanes based on address.
++*
++******************************************************************************/
++#if (XPAR_XSYSACE_MEM_WIDTH == 16)
++void XSysAce_RegWrite16(u32 Address, u16 Data)
++{
++	u16 ConvertedData;
++
++	/*
++	 * The ACE registers are little-endian always. This code takes the incoming
++	 * 16-bit and endian converts it, then writes it to the ACE register.
++	 */
++	XIo_ToLittleEndian16(Data, &ConvertedData);
++	XIo_Out(Address, ConvertedData);
++}
++#else
++void XSysAce_RegWrite16(u32 Address, u16 Data)
++{
++	/*
++	 * The ACE registers are little-endian always. This code reads each 8-bit
++	 * register value, in order from LSB to MSB, and shifts it to the correct
++	 * byte lane of the 32-bit word. This code should work on both
++	 * little-endian and big-endian processors.
++	 */
++	XIo_Out(Address, (u8) Data);
++	XIo_Out(Address + (1 * XSA_ADDR_ALIGN), (u8) (Data >> 8));
++}
++#endif
++
++/*****************************************************************************/
++/**
++*
++* Read a CompactFlash sector. This is a blocking, low-level function which
++* does not return until the specified sector is read.
++*
++* @param BaseAddress is the base address of the device
++* @param SectorId is the id of the sector to read
++* @param BufferPtr is a pointer to a buffer where the data will be stored.
++*
++* @return
++*
++* The number of bytes read. If this number is not equal to the sector size,
++* 512 bytes, then an error occurred.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++int XSysAce_ReadSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr)
++{
++	int NumRead;
++
++	/* Request and wait for the lock */
++	XSysAce_mWaitForLock(BaseAddress);
++
++	/* See if the CF is ready for a command */
++	if (!XSysAce_mIsReadyForCmd(BaseAddress)) {
++		return 0;
++	}
++
++	/* Write the sector ID (LBA) */
++	XSysAce_RegWrite32(BaseAddress + XSA_MLR_OFFSET, SectorId);
++
++	/* Send a read command of one sector to the controller */
++	XSysAce_RegWrite16(BaseAddress + XSA_SCCR_OFFSET,
++			   XSA_SCCR_READDATA_MASK | 1);
++
++	/* Reset configuration controller (be sure to keep the lock) */
++	XSysAce_mOrControlReg(BaseAddress, XSA_CR_CFGRESET_MASK);
++
++	/* Read a sector of data from the data buffer */
++	NumRead = XSysAce_ReadDataBuffer(BaseAddress, BufferPtr,
++					 XSA_CF_SECTOR_SIZE);
++
++	/* Clear reset of configuration controller and locks */
++	XSysAce_mAndControlReg(BaseAddress, ~(XSA_CR_CFGRESET_MASK |
++					      XSA_CR_LOCKREQ_MASK));
++
++	return NumRead;
++}
++
++/*****************************************************************************/
++/**
++*
++* Write a CompactFlash sector. This is a blocking, low-level function which
++* does not return until the specified sector is written in its entirety.
++*
++* @param BaseAddress is the base address of the device
++* @param SectorId is the id of the sector to write
++* @param BufferPtr is a pointer to a buffer used to write the sector.
++*
++* @return
++*
++* The number of bytes written. If this number is not equal to the sector size,
++* 512 bytes, then an error occurred.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++int XSysAce_WriteSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr)
++{
++	int NumSent;
++
++	/* Get the lock */
++	XSysAce_mWaitForLock(BaseAddress);
++
++	/* See if the CF is ready for a command */
++	if (!XSysAce_mIsReadyForCmd(BaseAddress)) {
++		return 0;
++	}
++
++	/* Write the sector ID (LBA) */
++	XSysAce_RegWrite32(BaseAddress + XSA_MLR_OFFSET, SectorId);
++
++	/* Send a write command of one sector to the controller */
++	XSysAce_RegWrite16(BaseAddress + XSA_SCCR_OFFSET,
++			   XSA_SCCR_WRITEDATA_MASK | 1);
++
++	/* Reset configuration controller (be sure to keep the lock) */
++	XSysAce_mOrControlReg(BaseAddress, XSA_CR_CFGRESET_MASK);
++
++	/* Write a sector of data to the data buffer */
++	NumSent = XSysAce_WriteDataBuffer(BaseAddress, BufferPtr,
++					  XSA_CF_SECTOR_SIZE);
++
++	/* Clear reset of configuration controller and locks */
++	XSysAce_mAndControlReg(BaseAddress, ~(XSA_CR_CFGRESET_MASK |
++					      XSA_CR_LOCKREQ_MASK));
++
++	return NumSent;
++}
++
++/*****************************************************************************/
++/**
++*
++* Read the specified number of bytes from the data buffer of the ACE
++* controller. The data buffer, which is 32 bytes, can only be read two bytes
++* at a time.  Once the data buffer is read, we wait for it to be filled again
++* before reading the next buffer's worth of data.
++*
++* @param BaseAddress is the base address of the device
++* @param BufferPtr is a pointer to a buffer in which to store data.
++* @param Size is the number of bytes to read
++*
++* @return
++*
++* The total number of bytes read, or 0 if an error occurred.
++*
++* @note
++*
++* If Size is not aligned with the size of the data buffer (32 bytes), this
++* function will read the entire data buffer, dropping the extra bytes on the
++* floor since the user did not request them. This is necessary to get the
++* data buffer to be ready again.
++*
++******************************************************************************/
++int XSysAce_ReadDataBuffer(u32 BaseAddress, u8 * BufferPtr, int Size)
++{
++	int DataBytes;		/* number of data bytes written */
++	int BufferBytes;
++	u16 Data;
++
++	/*
++	 * Read data two bytes at a time. We need to wait for the data
++	 * buffer to be ready before reading the buffer.
++	 */
++	BufferBytes = 0;
++	for (DataBytes = 0; DataBytes < Size;) {
++		/*
++		 * If at any point during this read an error occurs, exit early
++		 */
++		if (XSysAce_mGetErrorReg(BaseAddress) != 0) {
++			return 0;
++		}
++
++		if (BufferBytes == 0) {
++			/*
++			 * Wait for CF data buffer to ready, then reset buffer byte count
++			 */
++			while ((XSysAce_mGetStatusReg(BaseAddress)
++				& XSA_SR_DATABUFRDY_MASK) == 0) ;
++
++			BufferBytes = XSA_DATA_BUFFER_SIZE;
++		}
++
++		/*
++		 * Need to read two bytes. Put the first one in the output buffer
++		 * because if we're here we know one more is needed. Put the second one
++		 * in the output buffer if there is still room, or just drop it on the
++		 * floor if the requested number of bytes have already been read.
++		 */
++		Data = XSysAce_RegRead16(BaseAddress + XSA_DBR_OFFSET);
++		*BufferPtr++ = (u8) Data;
++		DataBytes++;
++
++		if (DataBytes < Size) {
++			/* Still more room in the output buffer */
++			*BufferPtr++ = (u8) (Data >> 8);
++			DataBytes++;
++		}
++
++		BufferBytes -= 2;
++	}
++
++	/*
++	 * If a complete data buffer was not read, read and ignore the remaining
++	 * bytes
++	 */
++	while (BufferBytes != 0) {
++		/*
++		 * If at any point during this read an error occurs, exit early
++		 */
++		if (XSysAce_mGetErrorReg(BaseAddress) != 0) {
++			return 0;
++		}
++
++		(void)XSysAce_RegRead16(BaseAddress + XSA_DBR_OFFSET);
++		BufferBytes -= 2;
++	}
++
++	return DataBytes;
++}
++
++/*****************************************************************************/
++/**
++*
++* Write the specified number of bytes to the data buffer of the ACE controller.
++* The data buffer, which is 32 bytes, can only be written two bytes at a time.
++* Once the data buffer is written, we wait for it to be empty again before
++* writing the next buffer's worth of data. If the size of the incoming buffer
++* is not aligned with the System ACE data buffer size (32 bytes), then this
++* routine pads out the data buffer with zeros so the entire data buffer is
++* written. This is necessary for the ACE controller to process the data buffer.
++*
++* @param BaseAddress is the base address of the device
++* @param BufferPtr is a pointer to a buffer used to write to the controller.
++* @param Size is the number of bytes to write
++*
++* @return
++*
++* The total number of bytes written (not including pad bytes), or 0 if an
++* error occurs.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++int XSysAce_WriteDataBuffer(u32 BaseAddress, u8 * BufferPtr, int Size)
++{
++	int DataBytes;		/* number of data bytes written */
++	int BufferBytes;
++	u16 Data;
++
++	/*
++	 * Write a sector two bytes at a time. We need to wait for the data
++	 * buffer to be ready before writing the buffer.
++	 */
++	BufferBytes = 0;
++	for (DataBytes = 0; DataBytes < Size;) {
++		/*
++		 * If at any point during this write an error occurs, exit early
++		 */
++		if (XSysAce_mGetErrorReg(BaseAddress) != 0) {
++			return 0;
++		}
++
++		if (BufferBytes == 0) {
++			/*
++			 * Wait for CF read data buffer to ready, then reset buffer byte
++			 * count
++			 */
++			while ((XSysAce_mGetStatusReg(BaseAddress)
++				& XSA_SR_DATABUFRDY_MASK) == 0) ;
++
++			BufferBytes = XSA_DATA_BUFFER_SIZE;
++		}
++
++		/*
++		 * Need to send two bytes. Grab the first one from the incoming buffer
++		 * because if we're here we know one more exists. Grab the second one
++		 * from the incoming buffer if there are still any bytes remaining, or
++		 * send a pad byte if the incoming buffer has been expired.
++		 */
++		Data = *BufferPtr++;
++		DataBytes++;
++
++		if (DataBytes < Size) {
++			/* Still more data in the incoming buffer */
++			Data |= ((u16) * BufferPtr++ << 8);
++			DataBytes++;
++		} else {
++			/* No more data in the incoming buffer, send a pad byte of 0 */
++			Data |= ((u16) 0 << 8);
++		}
++
++		XSysAce_RegWrite16(BaseAddress + XSA_DBR_OFFSET, Data);
++
++		BufferBytes -= 2;
++	}
++
++	/*
++	 * If a complete data buffer was not filled, fill it with pad bytes (zeros)
++	 */
++	while (BufferBytes != 0) {
++		/*
++		 * If at any point during this write an error occurs, exit early
++		 */
++		if (XSysAce_mGetErrorReg(BaseAddress) != 0) {
++			return 0;
++		}
++
++		XSysAce_RegWrite16(BaseAddress + XSA_DBR_OFFSET, 0);
++		BufferBytes -= 2;
++	}
++
++	return DataBytes;
++}
+Index: linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/block/xilinx_sysace/xsysace_l.h
+@@ -0,0 +1,492 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xsysace_l.h
++*
++* Defines identifiers and low-level macros/functions for the XSysAce driver.
++* These identifiers include register offsets and bit masks. A high-level driver
++* interface is defined in xsysace.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a rpm  06/14/02 work in progress
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XSYSACE_L_H		/* prevent circular inclusions */
++#define XSYSACE_L_H		/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++
++/************************** Constant Definitions *****************************/
++
++/*
++ * Constant used to align the register offsets to the proper address. This was
++ * used during development to handle both byte-addressable (alignment=1) and
++ * word addressable (alignment=4) registers. The #ifndef allows the user to
++ * modify this at compile-time.
++ */
++#ifndef XSA_ADDR_ALIGN
++#define XSA_ADDR_ALIGN      1
++#endif
++
++/** @name Register Offsets
++ * System ACE register offsets
++ * @{
++ */
++#define XSA_BMR_OFFSET   (XSA_ADDR_ALIGN * 0)  /**< Bus mode (BUSMODEREG) */
++#define XSA_SR_OFFSET    (XSA_ADDR_ALIGN * 4)  /**< Status (STATUSREG) */
++#define XSA_ER_OFFSET    (XSA_ADDR_ALIGN * 8)  /**< Error (ERRORREG) */
++#define XSA_CLR_OFFSET   (XSA_ADDR_ALIGN * 12) /**< Config LBA (CFGLBAREG) */
++#define XSA_MLR_OFFSET   (XSA_ADDR_ALIGN * 16) /**< MPU LBA (MPULBAREG) */
++#define XSA_SCCR_OFFSET  (XSA_ADDR_ALIGN * 20) /**< Sector cnt (SECCNTCMDREG) */
++#define XSA_VR_OFFSET    (XSA_ADDR_ALIGN * 22) /**< Version (VERSIONREG) */
++#define XSA_CR_OFFSET    (XSA_ADDR_ALIGN * 24) /**< Control (CONTROLREG) */
++#define XSA_FSR_OFFSET   (XSA_ADDR_ALIGN * 28) /**< FAT status (FATSTATREG) */
++#define XSA_DBR_OFFSET   (XSA_ADDR_ALIGN * 64) /**< Data buffer (DATABUFREG) */
++/*@}*/
++
++/*
++ * Bus Mode Register masks
++ */
++#define XSA_BMR_16BIT_MASK      0x0101	/**< 16-bit access to ACE controller */
++
++/** @name Status Values
++ * Status Register masks
++ * @{
++ */
++#define XSA_SR_CFGLOCK_MASK     0x00000001  /**< Config port lock status */
++#define XSA_SR_MPULOCK_MASK     0x00000002  /**< MPU port lock status */
++#define XSA_SR_CFGERROR_MASK    0x00000004  /**< Config port error status */
++#define XSA_SR_CFCERROR_MASK    0x00000008  /**< CF error status */
++#define XSA_SR_CFDETECT_MASK    0x00000010  /**< CF detect flag */
++#define XSA_SR_DATABUFRDY_MASK  0x00000020  /**< Data buffer ready status */
++#define XSA_SR_DATABUFMODE_MASK 0x00000040  /**< Data buffer mode status */
++#define XSA_SR_CFGDONE_MASK     0x00000080  /**< Configuration done status */
++#define XSA_SR_RDYFORCMD_MASK   0x00000100  /**< Ready for CF command */
++#define XSA_SR_CFGMODE_MASK     0x00000200  /**< Configuration mode status */
++#define XSA_SR_CFGADDR_MASK     0x0000E000  /**< Configuration address  */
++#define XSA_SR_CFBSY_MASK       0x00020000  /**< CF busy (BSY bit) */
++#define XSA_SR_CFRDY_MASK       0x00040000  /**< CF ready (RDY bit) */
++#define XSA_SR_CFDWF_MASK       0x00080000  /**< CF data write fault (DWF bit) */
++#define XSA_SR_CFDSC_MASK       0x00100000  /**< CF ready (DSC bit) */
++#define XSA_SR_CFDRQ_MASK       0x00200000  /**< CF data request (DRQ) */
++#define XSA_SR_CFCORR_MASK      0x00400000  /**< CF correctable error (CORR bit) */
++#define XSA_SR_CFERR_MASK       0x00800000  /**< CF error (ERR bit) */
++/*@}*/
++
++/** @name Error Values
++ * Error Register masks.
++ * @{
++ */
++#define XSA_ER_CARD_RESET    0x00000001	 /**< CF card failed to reset */
++#define XSA_ER_CARD_READY    0x00000002	 /**< CF card failed to ready */
++#define XSA_ER_CARD_READ     0x00000004	 /**< CF read command failed */
++#define XSA_ER_CARD_WRITE    0x00000008	 /**< CF write command failed */
++#define XSA_ER_SECTOR_READY  0x00000010	 /**< CF sector failed to ready */
++#define XSA_ER_CFG_ADDR      0x00000020	 /**< Cfg address is invalid */
++#define XSA_ER_CFG_FAIL      0x00000040	 /**< Failed to configure a device */
++#define XSA_ER_CFG_READ      0x00000080	 /**< Cfg read of CF failed */
++#define XSA_ER_CFG_INSTR     0x00000100	 /**< Invalid instruction during cfg */
++#define XSA_ER_CFG_INIT      0x00000200	 /**< CFGINIT pin error - did not
++                                          *   go high within 500ms of start */
++#define XSA_ER_RESERVED      0x00000400	 /**< reserved */
++#define XSA_ER_BAD_BLOCK     0x00000800	 /**< CF bad block detected */
++#define XSA_ER_UNCORRECTABLE 0x00001000	 /**< CF uncorrectable error */
++#define XSA_ER_SECTOR_ID     0x00002000	 /**< CF sector ID not found */
++#define XSA_ER_ABORT         0x00004000	 /**< CF command aborted */
++#define XSA_ER_GENERAL       0x00008000	 /**< CF general error */
++/*@}*/
++
++/**
++ * Config LBA Register - address mask
++ */
++#define XSA_CLR_LBA_MASK    0x0FFFFFFF	/* Logical Block Address mask */
++
++/**
++ * MPU LBA Register - address mask
++ */
++#define XSA_MLR_LBA_MASK    0x0FFFFFFF	/* Logical Block Address mask */
++
++/** @name Sector Cound/Command Values
++ * Sector Count Command Register masks
++ * @{
++ */
++#define XSA_SCCR_COUNT_MASK     0x00FF	 /**< Sector count mask */
++#define XSA_SCCR_RESET_MASK     0x0100	 /**< Reset CF card command */
++#define XSA_SCCR_IDENTIFY_MASK  0x0200	 /**< Identify CF card command */
++#define XSA_SCCR_READDATA_MASK  0x0300	 /**< Read CF card command */
++#define XSA_SCCR_WRITEDATA_MASK 0x0400	 /**< Write CF card command */
++#define XSA_SCCR_ABORT_MASK     0x0600	 /**< Abort CF command */
++#define XSA_SCCR_CMD_MASK       0x0700	 /**< Command mask */
++/*@}*/
++
++/*
++ * Version Register masks
++ */
++#define XSA_VR_BUILD_MASK   0x00FF	/* Revision/build number */
++#define XSA_VR_MINOR_MASK   0x0F00	/* Minor version number */
++#define XSA_VR_MAJOR_MASK   0xF000	/* Major version number */
++
++/** @name Control Values
++ * Control Register masks
++ * @{
++ */
++#define XSA_CR_FORCELOCK_MASK       0x00000001	/**< Force lock request */
++#define XSA_CR_LOCKREQ_MASK         0x00000002	/**< MPU lock request */
++#define XSA_CR_FORCECFGADDR_MASK    0x00000004	/**< Force CFG address */
++#define XSA_CR_FORCECFGMODE_MASK    0x00000008	/**< Force CFG mode */
++#define XSA_CR_CFGMODE_MASK         0x00000010	/**< CFG mode */
++#define XSA_CR_CFGSTART_MASK        0x00000020	/**< CFG start */
++#define XSA_CR_CFGSEL_MASK          0x00000040	/**< CFG select */
++#define XSA_CR_CFGRESET_MASK        0x00000080	/**< CFG reset */
++#define XSA_CR_DATARDYIRQ_MASK      0x00000100	/**< Enable data ready IRQ */
++#define XSA_CR_ERRORIRQ_MASK        0x00000200	/**< Enable error IRQ */
++#define XSA_CR_CFGDONEIRQ_MASK      0x00000400	/**< Enable CFG done IRQ */
++#define XSA_CR_RESETIRQ_MASK        0x00000800	/**< Reset IRQ line */
++#define XSA_CR_CFGPROG_MASK         0x00001000	/**< Inverted CFGPROG pin */
++#define XSA_CR_CFGADDR_MASK         0x0000E000	/**< Config address mask */
++#define XSA_CR_CFGADDR_SHIFT                13	/**< Config address shift */
++/*@}*/
++
++/** @name FAT Status
++ *
++ * FAT filesystem status masks. The first valid partition of the CF
++ * is a FAT partition.
++ * @{
++ */
++#define XSA_FAT_VALID_BOOT_REC  0x0001	/**< Valid master boot record */
++#define XSA_FAT_VALID_PART_REC  0x0002	/**< Valid partition boot record */
++#define XSA_FAT_12_BOOT_REC     0x0004	/**< FAT12 in master boot rec */
++#define XSA_FAT_12_PART_REC     0x0008	/**< FAT12 in parition boot rec */
++#define XSA_FAT_16_BOOT_REC     0x0010	/**< FAT16 in master boot rec */
++#define XSA_FAT_16_PART_REC     0x0020	/**< FAT16 in partition boot rec */
++#define XSA_FAT_12_CALC         0x0040	/**< Calculated FAT12 from clusters */
++#define XSA_FAT_16_CALC         0x0080	/**< Calculated FAT16 from clusters */
++/*@}*/
++
++#define XSA_DATA_BUFFER_SIZE    32   /**< Size of System ACE data buffer */
++#define XSA_CF_SECTOR_SIZE     512   /**< Number of bytes in a CF sector */
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/*****************************************************************************
++*
++* Low-level driver macros and functions. The list below provides signatures
++* to help the user use the macros.
++*
++* u32 XSysAce_mGetControlReg(u32 BaseAddress)
++* void XSysAce_mSetControlReg(u32 BaseAddress, u32 Data)
++* void XSysAce_mOrControlReg(u32 BaseAddress, u32 Data)
++* void XSysAce_mAndControlReg(u32 BaseAddress, u32 Data)
++* u32 XSysAce_mGetErrorReg(u32 BaseAddress)
++* u32 XSysAce_mGetStatusReg(u32 BaseAddress)
++*
++* void XSysAce_mSetCfgAddr(u32 BaseAddress, unsigned int Address)
++* void XSysAce_mWaitForLock(u32 BaseAddress)
++* void XSysAce_mEnableIntr(u32 BaseAddress, u32 Mask)
++* void XSysAce_mDisableIntr(u32 BaseAddress, u32 Mask)
++*
++* u32 XSysAce_mIsReadyForCmd(u32 BaseAddress)
++* u32 XSysAce_mIsCfgDone(u32 BaseAddress)
++* u32 XSysAce_mIsMpuLocked(u32 BaseAddress)
++* u32 XSysAce_mIsIntrEnabled(u32 BaseAddress)
++*
++*****************************************************************************/
++
++/*****************************************************************************/
++/**
++*
++* Get the contents of the control register.
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   The 32-bit value of the control register.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mGetControlReg(BaseAddress) \
++                XSysAce_RegRead32((BaseAddress) + XSA_CR_OFFSET)
++
++/*****************************************************************************/
++/**
++*
++* Set the contents of the control register.
++*
++* @param    BaseAddress is the base address of the device.
++* @param    Data is the 32-bit value to write to the register.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mSetControlReg(BaseAddress, Data) \
++                XSysAce_RegWrite32((BaseAddress) + XSA_CR_OFFSET, (Data))
++
++/*****************************************************************************/
++/**
++*
++* Set the contents of the control register to the value specified OR'ed with
++* its current contents.
++*
++* @param    BaseAddress is the base address of the device.
++* @param    Data is the 32-bit value to OR with the register.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mOrControlReg(BaseAddress, Data) \
++                XSysAce_mSetControlReg((BaseAddress), \
++                        XSysAce_mGetControlReg(BaseAddress) | (Data))
++
++/*****************************************************************************/
++/**
++*
++* Set the contents of the control register to the value specified AND'ed with
++* its current contents.
++*
++* @param    BaseAddress is the base address of the device.
++* @param    Data is the 32-bit value to AND with the register.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mAndControlReg(BaseAddress, Data) \
++                XSysAce_mSetControlReg((BaseAddress), \
++                        XSysAce_mGetControlReg(BaseAddress) & (Data))
++
++/*****************************************************************************/
++/**
++*
++* Get the contents of the error register.
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   The 32-bit value of the register.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mGetErrorReg(BaseAddress) \
++                XSysAce_RegRead32((BaseAddress) + XSA_ER_OFFSET)
++
++/*****************************************************************************/
++/**
++*
++* Get the contents of the status register.
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   The 32-bit value of the register.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mGetStatusReg(BaseAddress) \
++                XSysAce_RegRead32((BaseAddress) + XSA_SR_OFFSET)
++
++/*****************************************************************************/
++/**
++*
++* Set the configuration address, or file, of the CompactFlash. This address
++* indicates which .ace bitstream to use to configure the target FPGA chain.
++*
++* @param    BaseAddress is the base address of the device.
++* @param    Address ranges from 0 to 7 and represents the eight possible .ace
++*           bitstreams that can reside on the CompactFlash.
++*
++* @return   None.
++*
++* @note     Used cryptic var names to avoid conflict with caller's var names.
++*
++******************************************************************************/
++#define XSysAce_mSetCfgAddr(BaseAddress, Address)                             \
++{                                                                             \
++    u32 A66rMask = ((Address) << XSA_CR_CFGADDR_SHIFT) & XSA_CR_CFGADDR_MASK; \
++    u32 C0ntr0l = XSysAce_mGetControlReg(BaseAddress);                    \
++    C0ntr0l &= ~XSA_CR_CFGADDR_MASK;    /* clear current address */           \
++    C0ntr0l |= (A66rMask | XSA_CR_FORCECFGADDR_MASK);                         \
++    XSysAce_mSetControlReg((BaseAddress), C0ntr0l);                           \
++}
++
++/*****************************************************************************/
++/**
++*
++* Request then wait for the MPU lock. This is not a forced lock, so we must
++* contend with the configuration controller.
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mWaitForLock(BaseAddress)                                    \
++{                                                                            \
++    XSysAce_mOrControlReg((BaseAddress), XSA_CR_LOCKREQ_MASK);               \
++    while ((XSysAce_mGetStatusReg(BaseAddress) & XSA_SR_MPULOCK_MASK) == 0); \
++}
++
++/*****************************************************************************/
++/**
++*
++* Enable ACE controller interrupts.
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mEnableIntr(BaseAddress, Mask) \
++            XSysAce_mOrControlReg((BaseAddress), (Mask));
++
++/*****************************************************************************/
++/**
++*
++* Disable ACE controller interrupts.
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   None.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mDisableIntr(BaseAddress, Mask) \
++            XSysAce_mAndControlReg((BaseAddress), ~(Mask));
++
++/*****************************************************************************/
++/**
++*
++* Is the CompactFlash ready for a command?
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   TRUE if it is ready, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mIsReadyForCmd(BaseAddress) \
++            (XSysAce_mGetStatusReg(BaseAddress) & XSA_SR_RDYFORCMD_MASK)
++
++/*****************************************************************************/
++/**
++*
++* Is the ACE controller locked for MPU access?
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   TRUE if it is locked, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mIsMpuLocked(BaseAddress) \
++                (XSysAce_mGetStatusReg(BaseAddress) & XSA_SR_MPULOCK_MASK)
++
++/*****************************************************************************/
++/**
++*
++* Is the CompactFlash configuration of the target FPGA chain complete?
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   TRUE if it is ready, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mIsCfgDone(BaseAddress) \
++            (XSysAce_mGetStatusReg(BaseAddress) & XSA_SR_CFGDONE_MASK)
++
++/*****************************************************************************/
++/**
++*
++* Have interrupts been enabled by the user? We look for the interrupt reset
++* bit to be clear (meaning interrupts are armed, even though none may be
++* individually enabled).
++*
++* @param    BaseAddress is the base address of the device.
++*
++* @return   TRUE if it is enabled, FALSE otherwise.
++*
++* @note     None.
++*
++******************************************************************************/
++#define XSysAce_mIsIntrEnabled(BaseAddress) \
++            ((XSysAce_mGetControlReg(BaseAddress) & XSA_CR_RESETIRQ_MASK) == 0)
++
++/************************** Function Prototypes ******************************/
++
++int XSysAce_ReadSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr);
++int XSysAce_WriteSector(u32 BaseAddress, u32 SectorId, u8 * BufferPtr);
++
++/*
++ * Utility functions to read and write registers and data buffer
++ */
++u32 XSysAce_RegRead32(u32 Address);
++u16 XSysAce_RegRead16(u32 Address);
++void XSysAce_RegWrite32(u32 Address, u32 Data);
++void XSysAce_RegWrite16(u32 Address, u16 Data);
++
++int XSysAce_ReadDataBuffer(u32 BaseAddress, u8 * BufferPtr, int NumBytes);
++int XSysAce_WriteDataBuffer(u32 BaseAddress, u8 * BufferPtr, int NumBytes);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/mvl_patches/pro-0339.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0339.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(339);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

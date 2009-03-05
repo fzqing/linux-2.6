@@ -1,0 +1,583 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_vrblade_bu9929fv
+# Date: Mon Mar 12 13:52:39 2007
+# Source: MontaVista Software, Inc.
+# MR:21157 
+# Type: Integration
+# Disposition: needs submitting to linux-mips community
+# Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+# Description: Support for ROHM BU9929FV chips on VRBlade VR4133 Wildcat
+# 
+
+PATCHNUM=1200
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR:21157 
+Type: Integration
+Disposition: needs submitting to linux-mips community
+Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+Description: Support for ROHM BU9929FV chips on VRBlade VR4133 Wildcat
+
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -437,4 +437,12 @@ config GPIOEXPANDER_OMAP
+ 	depends on I2C && ARCH_OMAP16XX
+ 	help
+ 		If you say yes here you get support for I/O expander calls to configure IrDA, Camera and audio devices
++
++config SENSORS_BU9929FV
++	tristate "ROHM BU9929FV"
++	depends on I2C && EXPERIMENTAL
++	select I2C_SENSOR
++	help
++	  If you say yes here you get support for ROHM BU9929FV chips.
++
+ endmenu
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -43,6 +43,7 @@ obj-$(CONFIG_SENSORS_TLV320AIC33) += tlv
+ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_expander_omap.o
+ obj-$(CONFIG_SENSORS_DS1338)	+= ds1338.o
+ obj-$(CONFIG_SENSORS_RV5C387A)	+= rv5c387a.o
++obj-$(CONFIG_SENSORS_BU9929FV)  += bu9929fv.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_CHIP),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/drivers/i2c/chips/bu9929fv.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/bu9929fv.c
+@@ -0,0 +1,322 @@
++/*
++    2006 (c) MontaVista Software, Inc.
++    Aleksey Makarov <amakarov@ru.mvista.com>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++*/
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/i2c-sensor.h>
++#include <linux/spinlock.h>
++
++#include <asm/vr41xx/giu.h>
++#include <asm/vr41xx/vr41xx.h>
++
++/* Addresses to scan */
++static unsigned short normal_i2c[] = { 0x3c, 0x3d, 0x3e, 0x3f, I2C_CLIENT_END };
++static unsigned int normal_isa[] = { I2C_CLIENT_ISA_END };
++
++/* Insmod parameters */
++SENSORS_INSMOD_1(bu9929fv);
++
++/* Initial values */
++#define BU9929FV_INIT 0
++#define BU9929FV_OUTPUT_INIT 0
++#define BU9929FV_WATCHING_INIT 0
++
++#define WATCH_IRQ_PIN 5
++
++/* Each client has this additional data */
++struct bu9929fv_data {
++	struct i2c_client client;
++
++	u16 write;
++	u16 output;
++	int watch;
++
++	wait_queue_head_t event_wait_queue;
++	spinlock_t irq_init_lock;
++	int irq_initialized;
++};
++
++static int bu9929fv_attach_adapter(struct i2c_adapter *adapter);
++static int bu9929fv_detect(struct i2c_adapter *adapter, int address, int kind);
++static int bu9929fv_detach_client(struct i2c_client *client);
++static void bu9929fv_read(struct bu9929fv_data * data, u16 * value);
++static void bu9929fv_write(struct bu9929fv_data * data, u16 value);
++static void bu9929fv_output(struct bu9929fv_data * data, u16 value);
++static void bu9929fv_watch(struct bu9929fv_data * data, int watch_pins);
++
++/* This is the driver that will be inserted */
++static struct i2c_driver bu9929fv_driver = {
++	.owner		= THIS_MODULE,
++	.name		= "bu9929fv",
++	.id		= I2C_DRIVERID_BU9929FV,
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter	= bu9929fv_attach_adapter,
++	.detach_client	= bu9929fv_detach_client,
++};
++
++static int bu9929fv_id;
++
++/* BEGIN sysfs callback functions */
++
++static void watch_reset (struct bu9929fv_data *data)
++{
++	bu9929fv_watch(data, data->watch);
++	wake_up_all (&data->event_wait_queue);
++}
++
++static ssize_t show_read(struct device *dev, char *buf)
++{
++	u16 read;
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	bu9929fv_read(data, &read);
++	return sprintf(buf, "%u\n", read);
++}
++
++static DEVICE_ATTR(read, S_IRUGO, show_read, NULL);
++
++static ssize_t show_write(struct device *dev, char *buf)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	return sprintf(buf, "%u\n", data->write);
++}
++
++static ssize_t set_write(struct device *dev, const char *buf,
++			 size_t count)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	data->write = simple_strtoul(buf, NULL, 10);
++	bu9929fv_write(data, data->write);
++	watch_reset (data);
++	return count;
++}
++
++static DEVICE_ATTR(write, S_IWUSR | S_IRUGO, show_write, set_write);
++
++static ssize_t show_output(struct device *dev, char *buf)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	return sprintf(buf, "%u\n", data->output);
++}
++
++static ssize_t set_output(struct device *dev, const char *buf,
++			 size_t count)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	data->output = simple_strtoul(buf, NULL, 10);
++	bu9929fv_output(data, data->output);
++	watch_reset (data);
++	return count;
++}
++
++static DEVICE_ATTR(output, S_IWUSR | S_IRUGO, show_output, set_output);
++
++static ssize_t show_watch(struct device *dev, char *buf)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	return sprintf(buf, "%d\n", data->watch);
++}
++
++static ssize_t set_watch(struct device *dev, const char *buf,
++			 size_t count)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++	int v = simple_strtol(buf, NULL, 10);
++
++	if (v & ~1)
++		return count;
++
++	data->watch = v;
++	bu9929fv_watch(data, data->watch);
++	return count;
++}
++
++static DEVICE_ATTR(watch, S_IWUSR | S_IRUGO, show_watch, set_watch);
++
++static irqreturn_t handler (int irq, void * dev_id, struct pt_regs * regs)
++{
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev_id));
++	wake_up_all (&data->event_wait_queue);
++	return IRQ_HANDLED;
++}
++
++static ssize_t show_event(struct device *dev, char *buf)
++{
++	int err;
++	DEFINE_WAIT(w);
++	struct bu9929fv_data *data = i2c_get_clientdata(to_i2c_client(dev));
++
++	spin_lock (&data->irq_init_lock);
++	if (!(data->irq_initialized++)) {
++		err = request_irq(GIU_IRQ(WATCH_IRQ_PIN), handler, 0, "bu9929fv", dev);
++		if (err) {
++			printk ("interrupt request error\n");
++			spin_unlock (&data->irq_init_lock);
++			goto exit;
++		}
++	}
++	spin_unlock (&data->irq_init_lock);
++
++	prepare_to_wait(&data->event_wait_queue, &w, TASK_INTERRUPTIBLE);
++	schedule();
++	finish_wait(&data->event_wait_queue, &w);
++
++	spin_lock (&data->irq_init_lock);
++	if (!--data->irq_initialized)
++		free_irq (GIU_IRQ(WATCH_IRQ_PIN), dev);
++	spin_unlock (&data->irq_init_lock);
++exit:
++	strcpy (buf, "0\n");
++	return strlen (buf);
++
++}
++
++static DEVICE_ATTR(event, S_IRUGO, show_event, NULL);
++
++/* END sysfs callback functions */
++
++/* BEGIN initialization/finalization */
++
++static int bu9929fv_attach_adapter(struct i2c_adapter *adapter)
++{
++	return i2c_detect(adapter, &addr_data, bu9929fv_detect);
++}
++
++static int bu9929fv_detect(struct i2c_adapter *adapter, int address, int kind)
++{
++	struct i2c_client *new_client;
++	struct bu9929fv_data *data;
++	int err = 0;
++
++	if (!(data = kmalloc(sizeof(struct bu9929fv_data), GFP_KERNEL))) {
++		err = -ENOMEM;
++		goto exit;
++	}
++	memset(data, 0, sizeof(struct bu9929fv_data));
++
++	new_client = &data->client;
++	i2c_set_clientdata(new_client, data);
++	new_client->addr = address;
++	new_client->adapter = adapter;
++	new_client->driver = &bu9929fv_driver;
++	new_client->flags = 0;
++	strlcpy(new_client->name, "bu9929fv", I2C_NAME_SIZE);
++	new_client->id = bu9929fv_id++;
++
++	init_waitqueue_head (&data->event_wait_queue);
++	data->irq_init_lock = SPIN_LOCK_UNLOCKED;
++	data->irq_initialized = 0;
++
++	data->output = BU9929FV_OUTPUT_INIT;
++	data->write = BU9929FV_INIT;
++	data->watch = BU9929FV_WATCHING_INIT;
++
++	if ((err = i2c_attach_client(new_client)))
++		goto exit_free;
++
++	bu9929fv_output(data, data->output);
++	bu9929fv_write(data, data->write);
++	bu9929fv_watch(data, data->watch);
++
++	vr41xx_set_irq_trigger(WATCH_IRQ_PIN, IRQ_TRIGGER_EDGE_FALLING, IRQ_SIGNAL_HOLD);
++
++	device_create_file(&new_client->dev, &dev_attr_read);
++	device_create_file(&new_client->dev, &dev_attr_write);
++	device_create_file(&new_client->dev, &dev_attr_output);
++	device_create_file(&new_client->dev, &dev_attr_watch);
++	device_create_file(&new_client->dev, &dev_attr_event);
++	return 0;
++
++      exit_free:
++	kfree(data);
++      exit:
++	return err;
++}
++
++static int bu9929fv_detach_client(struct i2c_client *client)
++{
++	int err;
++
++	if ((err = i2c_detach_client(client))) {
++		dev_err(&client->dev,
++			"Client deregistration failed, client not detached.\n");
++		return err;
++	}
++
++	kfree(i2c_get_clientdata(client));
++	return 0;
++}
++
++/* END initialization/finalization */
++
++/* BEGIN real communication with the chip */
++
++static void bu9929fv_read(struct bu9929fv_data * data, u16 * value)
++{
++	char c[2];
++	i2c_master_recv(&data->client, c, 2);
++	*value = c[0] | (c[1] << 8);
++}
++
++static void bu9929fv_write(struct bu9929fv_data * data, u16 value)
++{
++	char c[3] = { 1 << 4, value & 0xff, (value >> 8) & 0xff };
++	i2c_master_send(&data->client, c, 3);
++}
++
++static void bu9929fv_output(struct bu9929fv_data * data, u16 value)
++{
++	char c[3] = { 1 << 3, value & 0xff, (value >> 8) & 0xff };
++	i2c_master_send(&data->client, c, 3);
++}
++
++/*
++ * watch pins:
++ * 0 - PION0-PION7
++ * 1 - PION8-PIO15
++ */
++static void bu9929fv_watch(struct bu9929fv_data * data, int watch_pins)
++{
++	char c[3] = { 0x63 | ((watch_pins) << 2), 0, 0 };
++
++	if (watch_pins & ~1)
++		return;
++
++	i2c_master_send(&data->client, c, 3);
++}
++
++/* END real communication with the chip */
++
++static int __init bu9929fv_init(void)
++{
++	return i2c_add_driver(&bu9929fv_driver);
++}
++
++static void __exit bu9929fv_exit(void)
++{
++	i2c_del_driver(&bu9929fv_driver);
++}
++
++MODULE_AUTHOR("Aleksey Makarov <amakarov@ru.mvista.com>");
++MODULE_DESCRIPTION("bu9929fv driver");
++MODULE_LICENSE("GPL");
++
++module_init(bu9929fv_init);
++module_exit(bu9929fv_exit);
+Index: linux-2.6.10/mvl_patches/pro-1200.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1200.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1200);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,611 @@
+#! /usr/bin/env bash
+# Patch: -spi_5_core_tweaks
+# Date: Thu Jul  6 17:31:46 2006
+# [PATCH] SPI core tweaks, bugfix
+# 
+# This includes various updates to the SPI core:
+# 
+#   - Fixes a driver model refcount bug in spi_unregister_master() paths.
+# 
+#   - The spi_master structures now have wrappers which help keep drivers
+#     from needing class-level get/put for device data or for refcounts.
+# 
+#   - Check for a few setup errors that would cause oopsing later.
+# 
+#   - Docs say more about memory management.  Highlights the use of DMA-safe
+#     i/o buffers, and zero-initializing spi_message and such metadata.
+# 
+#   - Provide a simple alloc/free for spi_message and its spi_transfer;
+#     this is only one of the possible memory management policies.
+# 
+# Nothing to break code that already works.
+# 
+# Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+# 
+# commit 0c868461fcb8413cb9f691d68e5b99b0fd3c0737
+# tree b43db6239f5d72a279b35b14de85cf34d8f6bc74
+# parent b885244eb2628e0b8206e7edaaa6a314da78e9a4
+# author David Brownell <david-b@pacbell.net> Sun, 08 Jan 2006 13:34:25 -0800
+# committer Greg Kroah-Hartman <gregkh@suse.de> Fri, 13 Jan 2006 16:29:55 -0800
+# 
+#  Documentation/spi/spi-summary |   16 +++++++++
+#  drivers/spi/spi.c             |   45 +++++++++++++++----------
+#  include/linux/spi/spi.h       |   75 ++++++++++++++++++++++++++++++++++++++---
+#  3 files changed, 113 insertions(+), 23 deletions(-)
+# 
+
+PATCHNUM=742
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+[PATCH] SPI core tweaks, bugfix
+
+This includes various updates to the SPI core:
+
+  - Fixes a driver model refcount bug in spi_unregister_master() paths.
+
+  - The spi_master structures now have wrappers which help keep drivers
+    from needing class-level get/put for device data or for refcounts.
+
+  - Check for a few setup errors that would cause oopsing later.
+
+  - Docs say more about memory management.  Highlights the use of DMA-safe
+    i/o buffers, and zero-initializing spi_message and such metadata.
+
+  - Provide a simple alloc/free for spi_message and its spi_transfer;
+    this is only one of the possible memory management policies.
+
+Nothing to break code that already works.
+
+Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+commit 0c868461fcb8413cb9f691d68e5b99b0fd3c0737
+tree b43db6239f5d72a279b35b14de85cf34d8f6bc74
+parent b885244eb2628e0b8206e7edaaa6a314da78e9a4
+author David Brownell <david-b@pacbell.net> Sun, 08 Jan 2006 13:34:25 -0800
+committer Greg Kroah-Hartman <gregkh@suse.de> Fri, 13 Jan 2006 16:29:55 -0800
+
+ Documentation/spi/spi-summary |   16 ++++++++
+ drivers/spi/spi.c             |   45 +++++++++++++++----------
+ include/linux/spi/spi.h       |   75 ++++++++++++++++++++++++++++++++++++++----
+ mvl_patches/pro-0742.c        |   16 ++++++++
+ 4 files changed, 129 insertions(+), 23 deletions(-)
+
+diff --git a/Documentation/spi/spi-summary b/Documentation/spi/spi-summary
+index c6152d1..761debf 100644
+Index: linux-2.6.10/Documentation/spi/spi-summary
+===================================================================
+--- linux-2.6.10.orig/Documentation/spi/spi-summary
++++ linux-2.6.10/Documentation/spi/spi-summary
+@@ -363,6 +363,22 @@ upper boundaries might include sysfs (es
+ the input layer, ALSA, networking, MTD, the character device framework,
+ or other Linux subsystems.
+ 
++Note that there are two types of memory your driver must manage as part
++of interacting with SPI devices.
++
++  - I/O buffers use the usual Linux rules, and must be DMA-safe.
++    You'd normally allocate them from the heap or free page pool.
++    Don't use the stack, or anything that's declared "static".
++
++  - The spi_message and spi_transfer metadata used to glue those
++    I/O buffers into a group of protocol transactions.  These can
++    be allocated anywhere it's convenient, including as part of
++    other allocate-once driver data structures.  Zero-init these.
++
++If you like, spi_message_alloc() and spi_message_free() convenience
++routines are available to allocate and zero-initialize an spi_message
++with several transfers.
++
+ 
+ How do I write an "SPI Master Controller Driver"?
+ -------------------------------------------------
+Index: linux-2.6.10/drivers/spi/spi.c
+===================================================================
+--- linux-2.6.10.orig/drivers/spi/spi.c
++++ linux-2.6.10/drivers/spi/spi.c
+@@ -38,7 +38,7 @@ static void spidev_release(struct device
+ 	if (spi->master->cleanup)
+ 		spi->master->cleanup(spi);
+ 
+-	class_device_put(&spi->master->cdev);
++	spi_master_put(spi->master);
+ 	kfree(dev);
+ }
+ 
+@@ -90,7 +90,7 @@ static int spi_suspend(struct device *de
+ 	int			value;
+ 	struct spi_driver	*drv = to_spi_driver(dev->driver);
+ 
+-	if (!drv || !drv->suspend)
++	if (!drv->suspend)
+ 		return 0;
+ 
+ 	/* suspend will stop irqs and dma; no more i/o */
+@@ -105,7 +105,7 @@ static int spi_resume(struct device *dev
+ 	int			value;
+ 	struct spi_driver	*drv = to_spi_driver(dev->driver);
+ 
+-	if (!drv || !drv->resume)
++	if (!drv->resume)
+ 		return 0;
+ 
+ 	/* resume may restart the i/o queue */
+@@ -198,7 +198,7 @@ spi_new_device(struct spi_master *master
+ 
+ 	/* NOTE:  caller did any chip->bus_num checks necessary */
+ 
+-	if (!class_device_get(&master->cdev))
++	if (!spi_master_get(master))
+ 		return NULL;
+ 
+ 	proxy = kzalloc(sizeof *proxy, GFP_KERNEL);
+@@ -244,7 +244,7 @@ spi_new_device(struct spi_master *master
+ 	return proxy;
+ 
+ fail:
+-	class_device_put(&master->cdev);
++	spi_master_put(master);
+ 	kfree(proxy);
+ 	return NULL;
+ }
+@@ -324,8 +324,6 @@ static void spi_master_release(struct cl
+ 	struct spi_master *master;
+ 
+ 	master = container_of(cdev, struct spi_master, cdev);
+-	put_device(master->cdev.dev);
+-	master->cdev.dev = NULL;
+ 	kfree(master);
+ }
+ 
+@@ -339,8 +337,9 @@ static struct class spi_master_class = {
+ /**
+  * spi_alloc_master - allocate SPI master controller
+  * @dev: the controller, possibly using the platform_bus
+- * @size: how much driver-private data to preallocate; a pointer to this
+- * 	memory in the class_data field of the returned class_device
++ * @size: how much driver-private data to preallocate; the pointer to this
++ * 	memory is in the class_data field of the returned class_device,
++ *	accessible with spi_master_get_devdata().
+  *
+  * This call is used only by SPI master controller drivers, which are the
+  * only ones directly touching chip registers.  It's how they allocate
+@@ -350,14 +349,17 @@ static struct class spi_master_class = {
+  * master structure on success, else NULL.
+  *
+  * The caller is responsible for assigning the bus number and initializing
+- * the master's methods before calling spi_add_master(), or else (on error)
+- * calling class_device_put() to prevent a memory leak.
++ * the master's methods before calling spi_add_master(); and (after errors
++ * adding the device) calling spi_master_put() to prevent a memory leak.
+  */
+ struct spi_master * __init_or_module
+ spi_alloc_master(struct device *dev, unsigned size)
+ {
+ 	struct spi_master	*master;
+ 
++	if (!dev)
++		return NULL;
++
+ 	master = kzalloc(size + sizeof *master, SLAB_KERNEL);
+ 	if (!master)
+ 		return NULL;
+@@ -365,7 +367,7 @@ spi_alloc_master(struct device *dev, uns
+ 	class_device_initialize(&master->cdev);
+ 	master->cdev.class = &spi_master_class;
+ 	master->cdev.dev = get_device(dev);
+-	class_set_devdata(&master->cdev, &master[1]);
++	spi_master_set_devdata(master, &master[1]);
+ 
+ 	return master;
+ }
+@@ -387,6 +389,8 @@ EXPORT_SYMBOL_GPL(spi_alloc_master);
+  *
+  * This must be called from context that can sleep.  It returns zero on
+  * success, else a negative error code (dropping the master's refcount).
++ * After a successful return, the caller is responsible for calling
++ * spi_unregister_master().
+  */
+ int __init_or_module
+ spi_register_master(struct spi_master *master)
+@@ -396,6 +400,9 @@ spi_register_master(struct spi_master *m
+ 	int			status = -ENODEV;
+ 	int			dynamic = 0;
+ 
++	if (!dev)
++		return -ENODEV;
++
+ 	/* convention:  dynamically assigned bus IDs count down from the max */
+ 	if (master->bus_num == 0) {
+ 		master->bus_num = atomic_dec_return(&dyn_bus_id);
+@@ -425,7 +432,7 @@ EXPORT_SYMBOL_GPL(spi_register_master);
+ static int __unregister(struct device *dev, void *unused)
+ {
+ 	/* note: before about 2.6.14-rc1 this would corrupt memory: */
+-	device_unregister(dev);
++	spi_unregister_device(to_spi_device(dev));
+ 	return 0;
+ }
+ 
+@@ -440,8 +447,9 @@ static int __unregister(struct device *d
+  */
+ void spi_unregister_master(struct spi_master *master)
+ {
+-	class_device_unregister(&master->cdev);
+ 	(void) device_for_each_child(master->cdev.dev, NULL, __unregister);
++	class_device_unregister(&master->cdev);
++	master->cdev.dev = NULL;
+ }
+ EXPORT_SYMBOL_GPL(spi_unregister_master);
+ 
+@@ -487,6 +495,9 @@ EXPORT_SYMBOL_GPL(spi_busnum_to_master);
+  * by leaving it selected in anticipation that the next message will go
+  * to the same chip.  (That may increase power usage.)
+  *
++ * Also, the caller is guaranteeing that the memory associated with the
++ * message will not be freed before this call returns.
++ *
+  * The return value is a negative error code if the message could not be
+  * submitted, else zero.  When the value is zero, then message->status is
+  * also defined:  it's the completion code for the transfer, either zero
+@@ -524,9 +535,9 @@ static u8	*buf;
+  * is zero for success, else a negative errno status code.
+  * This call may only be used from a context that may sleep.
+  *
+- * Parameters to this routine are always copied using a small buffer,
+- * large transfers should use use spi_{async,sync}() calls with
+- * dma-safe buffers.
++ * Parameters to this routine are always copied using a small buffer;
++ * performance-sensitive or bulk transfer code should instead use
++ * spi_{async,sync}() calls with dma-safe buffers.
+  */
+ int spi_write_then_read(struct spi_device *spi,
+ 		const u8 *txbuf, unsigned n_tx,
+Index: linux-2.6.10/include/linux/spi/spi.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/spi/spi.h
++++ linux-2.6.10/include/linux/spi/spi.h
+@@ -60,8 +60,8 @@ struct spi_device {
+ 	u8			mode;
+ #define	SPI_CPHA	0x01			/* clock phase */
+ #define	SPI_CPOL	0x02			/* clock polarity */
+-#define	SPI_MODE_0	(0|0)
+-#define	SPI_MODE_1	(0|SPI_CPHA)		/* (original MicroWire) */
++#define	SPI_MODE_0	(0|0)			/* (original MicroWire) */
++#define	SPI_MODE_1	(0|SPI_CPHA)
+ #define	SPI_MODE_2	(SPI_CPOL|0)
+ #define	SPI_MODE_3	(SPI_CPOL|SPI_CPHA)
+ #define	SPI_CS_HIGH	0x04			/* chipselect active high? */
+@@ -209,6 +209,30 @@ struct spi_master {
+ 	void			(*cleanup)(const struct spi_device *spi);
+ };
+ 
++static inline void *spi_master_get_devdata(struct spi_master *master)
++{
++	return class_get_devdata(&master->cdev);
++}
++
++static inline void spi_master_set_devdata(struct spi_master *master, void *data)
++{
++	class_set_devdata(&master->cdev, data);
++}
++
++static inline struct spi_master *spi_master_get(struct spi_master *master)
++{
++	if (!master || !class_device_get(&master->cdev))
++		return NULL;
++	return master;
++}
++
++static inline void spi_master_put(struct spi_master *master)
++{
++	if (master)
++		class_device_put(&master->cdev);
++}
++
++
+ /* the spi driver core manages memory for the spi_master classdev */
+ extern struct spi_master *
+ spi_alloc_master(struct device *host, unsigned size);
+@@ -271,11 +295,17 @@ extern struct spi_master *spi_busnum_to_
+  * stay selected until the next transfer.  This is purely a performance
+  * hint; the controller driver may need to select a different device
+  * for the next message.
++ *
++ * The code that submits an spi_message (and its spi_transfers)
++ * to the lower layers is responsible for managing its memory.
++ * Zero-initialize every field you don't set up explicitly, to
++ * insulate against future API updates.
+  */
+ struct spi_transfer {
+ 	/* it's ok if tx_buf == rx_buf (right?)
+ 	 * for MicroWire, one buffer must be null
+-	 * buffers must work with dma_*map_single() calls
++	 * buffers must work with dma_*map_single() calls, unless
++	 *   spi_message.is_dma_mapped reports a pre-existing mapping
+ 	 */
+ 	const void	*tx_buf;
+ 	void		*rx_buf;
+@@ -302,6 +332,11 @@ struct spi_transfer {
+  * @status: zero for success, else negative errno
+  * @queue: for use by whichever driver currently owns the message
+  * @state: for use by whichever driver currently owns the message
++ *
++ * The code that submits an spi_message (and its spi_transfers)
++ * to the lower layers is responsible for managing its memory.
++ * Zero-initialize every field you don't set up explicitly, to
++ * insulate against future API updates.
+  */
+ struct spi_message {
+ 	struct spi_transfer	*transfers;
+@@ -336,6 +371,29 @@ struct spi_message {
+ 	void			*state;
+ };
+ 
++/* It's fine to embed message and transaction structures in other data
++ * structures so long as you don't free them while they're in use.
++ */
++
++static inline struct spi_message *spi_message_alloc(unsigned ntrans, gfp_t flags)
++{
++	struct spi_message *m;
++
++	m = kzalloc(sizeof(struct spi_message)
++			+ ntrans * sizeof(struct spi_transfer),
++			flags);
++	if (m) {
++		m->transfers = (void *)(m + 1);
++		m->n_transfer = ntrans;
++	}
++	return m;
++}
++
++static inline void spi_message_free(struct spi_message *m)
++{
++	kfree(m);
++}
++
+ /**
+  * spi_setup -- setup SPI mode and clock rate
+  * @spi: the device whose settings are being modified
+@@ -363,7 +421,10 @@ spi_setup(struct spi_device *spi)
+  * The completion callback is invoked in a context which can't sleep.
+  * Before that invocation, the value of message->status is undefined.
+  * When the callback is issued, message->status holds either zero (to
+- * indicate complete success) or a negative error code.
++ * indicate complete success) or a negative error code.  After that
++ * callback returns, the driver which issued the transfer request may
++ * deallocate the associated memory; it's no longer in use by any SPI
++ * core or controller driver code.
+  *
+  * Note that although all messages to a spi_device are handled in
+  * FIFO order, messages may go to different devices in other orders.
+@@ -445,6 +506,7 @@ spi_read(struct spi_device *spi, u8 *buf
+ 	return spi_sync(spi, &m);
+ }
+ 
++/* this copies txbuf and rxbuf data; for small transfers only! */
+ extern int spi_write_then_read(struct spi_device *spi,
+ 		const u8 *txbuf, unsigned n_tx,
+ 		u8 *rxbuf, unsigned n_rx);
+@@ -555,8 +617,9 @@ spi_register_board_info(struct spi_board
+ 
+ 
+ /* If you're hotplugging an adapter with devices (parport, usb, etc)
+- * use spi_new_device() to describe each device.  You would then call
+- * spi_unregister_device() to start making that device vanish.
++ * use spi_new_device() to describe each device.  You can also call
++ * spi_unregister_device() to start making that device vanish, but
++ * normally that would be handled by spi_unregister_master().
+  */
+ extern struct spi_device *
+ spi_new_device(struct spi_master *, struct spi_board_info *);
+Index: linux-2.6.10/mvl_patches/pro-0742.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0742.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(742);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,419 @@
+#! /usr/bin/env bash
+# Patch: -mpc834x_reset_cleanup.patch
+# Date: Thu Apr 20 12:18:55 2006
+# [PATCH] Cleanup mpc83xx_restart() code
+# 
+# The current Linux 2.6 mpc83xx_restart() routine which is supposed to
+# be common for all MPC83xx boards actually performs mpc834x_sys board
+# specific operations. This code was moved to
+# arch/ppc/platforms/83xx/mpc834x_sys.c, and mpc83xx_restart() was
+# replaced with generic MPC83xx reset code. Now mpc834x_sys uses it's
+# platform specific restart code and we can use common MPC83xx reset
+# code in other MPC83xx boards
+# 
+# 
+# ppc83xx common code cleanup, MPC834x_SYS platform specific code moved to
+# arch/ppc/platform/83xx/mpc834x_sys.c
+# 
+# Signed-off-by: Marian Balakowicz <m8@semihalf.com>
+# Signed-off-by: Wolfgang Denk <wd@denx.de>
+# 
+# commit 8176ad2d83c41be9697b475c8c0b975908cb7843
+# tree 16a5246f615529cf423b63231990723ab8a6bd13
+# parent 80387b45146a9e397c1fec1138f3eb3884c42ed8
+# author Marian Balakowicz <m8@semihalf.com> Tue, 18 Oct 2005 18:35:07 +0200
+# committer Marian Balakowicz <m8@semihalf.com> Tue, 18 Oct 2005 18:35:07 +0200
+# 
+#  arch/ppc/platforms/83xx/mpc834x_sys.c |   36 ++++++++++++++++++++++++
+#  arch/ppc/syslib/ppc83xx_setup.c       |   49 +++++++++++----------------------
+#  include/asm-ppc/mpc83xx.h             |   13 +++++++++
+#  3 files changed, 65 insertions(+), 33 deletions(-)
+# 
+
+PATCHNUM=448
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+[PATCH] Cleanup mpc83xx_restart() code
+
+The current Linux 2.6 mpc83xx_restart() routine which is supposed to
+be common for all MPC83xx boards actually performs mpc834x_sys board
+specific operations. This code was moved to
+arch/ppc/platforms/83xx/mpc834x_sys.c, and mpc83xx_restart() was
+replaced with generic MPC83xx reset code. Now mpc834x_sys uses it's
+platform specific restart code and we can use common MPC83xx reset
+code in other MPC83xx boards
+
+
+ppc83xx common code cleanup, MPC834x_SYS platform specific code moved to
+arch/ppc/platform/83xx/mpc834x_sys.c
+
+Signed-off-by: Marian Balakowicz <m8@semihalf.com>
+Signed-off-by: Wolfgang Denk <wd@denx.de>
+
+commit 8176ad2d83c41be9697b475c8c0b975908cb7843
+tree 16a5246f615529cf423b63231990723ab8a6bd13
+parent 80387b45146a9e397c1fec1138f3eb3884c42ed8
+author Marian Balakowicz <m8@semihalf.com> Tue, 18 Oct 2005 18:35:07 +0200
+committer Marian Balakowicz <m8@semihalf.com> Tue, 18 Oct 2005 18:35:07 +0200
+
+ arch/ppc/platforms/83xx/mpc834x_sys.c |   36 ++++++++++++++++++++++++
+ arch/ppc/syslib/ppc83xx_setup.c       |   49 +++++++++++-----------------------
+ include/asm-ppc/mpc83xx.h             |   13 +++++++++
+ mvl_patches/pro-0448.c                |   16 +++++++++++
+ 4 files changed, 81 insertions(+), 33 deletions(-)
+
+Index: linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/83xx/mpc834x_sys.c
++++ linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.c
+@@ -308,6 +308,40 @@ mpc834x_sys_set_bat(void)
+ 	mb();
+ }
+ 
++void
++mpc83xx_sys_restart(char *cmd)
++{
++	volatile unsigned char __iomem *reg;
++	unsigned char tmp;
++
++	reg = ioremap(BCSR_PHYS_ADDR, BCSR_SIZE);
++
++	local_irq_disable();
++
++	/*
++	 * Unlock the BCSR bits so a PRST will update the contents.
++	 * Otherwise the reset asserts but doesn't clear.
++	 */
++	tmp = in_8(reg + BCSR_MISC_REG3_OFF);
++	tmp |= BCSR_MISC_REG3_CNFLOCK; /* low true, high false */
++	out_8(reg + BCSR_MISC_REG3_OFF, tmp);
++
++	/*
++	 * Trigger a reset via a low->high transition of the
++	 * PORESET bit.
++	 */
++	tmp = in_8(reg + BCSR_MISC_REG2_OFF);
++	tmp &= ~BCSR_MISC_REG2_PORESET;
++	out_8(reg + BCSR_MISC_REG2_OFF, tmp);
++
++	udelay(1);
++
++	tmp |= BCSR_MISC_REG2_PORESET;
++	out_8(reg + BCSR_MISC_REG2_OFF, tmp);
++
++	for(;;);
++}
++
+ void __init
+ platform_init(unsigned long r3, unsigned long r4, unsigned long r5,
+ 	      unsigned long r6, unsigned long r7)
+@@ -376,7 +410,7 @@ platform_init(unsigned long r3, unsigned
+ 	ppc_md.init_IRQ = mpc834x_sys_init_IRQ;
+ 	ppc_md.get_irq = ipic_get_irq;
+ 
+-	ppc_md.restart = mpc83xx_restart;
++	ppc_md.restart = mpc83xx_sys_restart;
+ 	ppc_md.power_off = mpc83xx_power_off;
+ 	ppc_md.halt = mpc83xx_halt;
+ 
+Index: linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc83xx_setup.c
++++ linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.c
+@@ -64,13 +64,10 @@ mpc83xx_find_end_of_memory(void)
+ long __init
+ mpc83xx_time_init(void)
+ {
+-#define SPCR_OFFS   0x00000110
+-#define SPCR_TBEN   0x00400000
+-
+ 	bd_t *binfo = (bd_t *)__res;
+-	u32 *spcr = ioremap(binfo->bi_immr_base + SPCR_OFFS, 4);
++	u32 *spcr = ioremap(binfo->bi_immr_base + MPC83xx_SPCR, 4);
+ 
+-	*spcr |= SPCR_TBEN;
++	*spcr |= MPC83xx_SPCR_TBEN;
+ 
+ 	iounmap(spcr);
+ 
+@@ -133,35 +130,23 @@ mpc83xx_early_serial_map(void)
+ void
+ mpc83xx_restart(char *cmd)
+ {
+-	volatile unsigned char __iomem *reg;
+-	unsigned char tmp;
+-
+-	reg = ioremap(BCSR_PHYS_ADDR, BCSR_SIZE);
+-
+-	local_irq_disable();
+-
+-	/*
+-	 * Unlock the BCSR bits so a PRST will update the contents.
+-	 * Otherwise the reset asserts but doesn't clear.
+-	 */
+-	tmp = in_8(reg + BCSR_MISC_REG3_OFF);
+-	tmp |= BCSR_MISC_REG3_CNFLOCK; /* low true, high false */
+-	out_8(reg + BCSR_MISC_REG3_OFF, tmp);
+-
+-	/*
+-	 * Trigger a reset via a low->high transition of the
+-	 * PORESET bit.
+-	 */
+-	tmp = in_8(reg + BCSR_MISC_REG2_OFF);
+-	tmp &= ~BCSR_MISC_REG2_PORESET;
+-	out_8(reg + BCSR_MISC_REG2_OFF, tmp);
+-
+-	udelay(1);
++	bd_t *binfo = (bd_t *)__res;
+ 
+-	tmp |= BCSR_MISC_REG2_PORESET;
+-	out_8(reg + BCSR_MISC_REG2_OFF, tmp);
++	u32 *rcr = ioremap(binfo->bi_immr_base + MPC83xx_RCR, 4);
++	u32 *rpr = ioremap(binfo->bi_immr_base + MPC83xx_RPR, 4);
+ 
+-	for(;;);
++	/* apply reset protect unlock command to
++	 * reset control protection  register */
++	*rpr = MPC83xx_RPR_RSTE;
++
++	/* apply software hard reset to
++	 * reset control register*/
++	*rcr = MPC83xx_RCR_SWHR;
++
++	/* not reached, but... */
++	iounmap(rcr);
++	iounmap(rpr);
++	for (;;) ;
+ }
+ 
+ void
+Index: linux-2.6.10/include/asm-ppc/mpc83xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc83xx.h
++++ linux-2.6.10/include/asm-ppc/mpc83xx.h
+@@ -95,6 +95,19 @@ extern unsigned char __res[];
+ 
+ #define MPC83xx_CCSRBAR_SIZE	(1024*1024)
+ 
++/* system priority and configuration register */
++#define MPC83xx_SPCR            0x00000110
++#define MPC83xx_SPCR_TBEN       0x00400000
++
++/* reset protection register */
++#define MPC83xx_RPR		0x00000918
++#define MPC83xx_RPR_RSTE	0x52535445      /* "RSTE" in ASCII */
++
++/* reset control register*/
++#define MPC83xx_RCR		0x0000091c
++#define MPC83xx_RCR_SWHR	0x00000002      /* sw hard reset */
++#define MPC83xx_RCR_SWSR	0x00000001      /* sw soft reset */
++
+ /* Let modules/drivers get at immrbar (physical) */
+ extern phys_addr_t immrbar;
+ 
+Index: linux-2.6.10/mvl_patches/pro-0448.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0448.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(448);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

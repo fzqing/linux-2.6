@@ -1,0 +1,734 @@
+#! /usr/bin/env bash
+# Patch: -common_usb_gadget_chips_update
+# Date: Thu Jul  6 17:07:09 2006
+# Source: MontaVista Software, Inc. 
+# MR: 17087
+# Type: Enhancement
+# Disposition: backport
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Description:
+# Patch originally from David Brownell <david-b@pacbell.net>
+# 
+# This updates the MontaVista 2.6.10 kernel gadget stack to include two
+# small updates from newer kernels:
+# 
+#   - Newer "gadget_chips.h"
+# 	+ Adds gadget_is_XXX() support for more controllers, including
+# 	  notably ones using high speed Mentor cores;
+# 	+ Adds a convenience function that making it simpler to follow
+# 	  the bcdDevice convention, without needing to change so many
+# 	  gadget drivers each time a new controller is added
+# 	+ Changing those gadget drivers to use that function;
+#   - Stop using <linux/version.h>, just use system.utsname.
+# 
+# The first one is the most significant one for the DaVinci work (since
+# it recognizes the Mentor HDRC core) but it will also help when supporting
+# other controllers (which MontaVista does periodically).
+# 
+# 
+
+PATCHNUM=724
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 17087
+Type: Enhancement
+Disposition: backport
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Description:
+Patch originally from David Brownell <david-b@pacbell.net>
+
+This updates the MontaVista 2.6.10 kernel gadget stack to include two
+small updates from newer kernels:
+
+  - Newer "gadget_chips.h"
+	+ Adds gadget_is_XXX() support for more controllers, including
+	  notably ones using high speed Mentor cores;
+	+ Adds a convenience function that making it simpler to follow
+	  the bcdDevice convention, without needing to change so many
+	  gadget drivers each time a new controller is added
+	+ Changing those gadget drivers to use that function;
+  - Stop using <linux/version.h>, just use system.utsname.
+
+The first one is the most significant one for the DaVinci work (since
+it recognizes the Mentor HDRC core) but it will also help when supporting
+other controllers (which MontaVista does periodically).
+
+
+Index: linux-2.6.10/drivers/usb/gadget/gadget_chips.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/gadget_chips.h
++++ linux-2.6.10/drivers/usb/gadget/gadget_chips.h
+@@ -3,8 +3,9 @@
+  * gadget drivers or other code that needs to deal with them, and which
+  * autoconfigures instead of using early binding to the hardware.
+  *
+- * This could eventually work like the ARM mach_is_*() stuff, driven by
++ * This SHOULD eventually work like the ARM mach_is_*() stuff, driven by
+  * some config file that gets updated as new hardware is supported.
++ * (And avoiding all runtime comparisons in typical one-choice configs!)
+  *
+  * NOTE:  some of these controller drivers may not be available yet.
+  */
+@@ -74,14 +75,99 @@
+ #define	gadget_is_pxa27x(g)	0
+ #endif
+ 
++#ifdef CONFIG_USB_GADGET_S3C2410
++#define gadget_is_s3c2410(g)    !strcmp("s3c2410_udc", (g)->name)
++#else
++#define gadget_is_s3c2410(g)    0
++#endif
++
++#ifdef CONFIG_USB_GADGET_AT91
++#define gadget_is_at91(g)	!strcmp("at91_udc", (g)->name)
++#else
++#define gadget_is_at91(g)	0
++#endif
++
++#ifdef CONFIG_USB_GADGET_IMX
++#define gadget_is_imx(g)	!strcmp("imx_udc", (g)->name)
++#else
++#define gadget_is_imx(g)	0
++#endif
++
++/* Mentor high speed function controller */
+ #ifdef CONFIG_USB_GADGET_MUSBHSFC
+ #define gadget_is_musbhsfc(g)	!strcmp("musbhsfc_udc", (g)->name)
+ #else
+ #define gadget_is_musbhsfc(g)	0
+ #endif
+ 
+-// CONFIG_USB_GADGET_AT91RM9200
++/* Mentor OTG controller, peripheral mode */
++#ifdef CONFIG_USB_GADGET_MUSB_HDRC
++#define gadget_is_musbhdrc(g)	!strcmp("musb_hdrc", (g)->name)
++#else
++#define gadget_is_musbhdrc(g)	0
++#endif
++
++#ifdef CONFIG_USB_GADGET_MPC8272
++#define gadget_is_mpc8272(g)	!strcmp("mpc8272_udc", (g)->name)
++#else
++#define gadget_is_mpc8272(g)	0
++#endif
++
+ // CONFIG_USB_GADGET_SX2
+ // CONFIG_USB_GADGET_AU1X00
+ // ...
+ 
++
++/**
++ * usb_gadget_controller_number - support bcdDevice id convention
++ * @gadget: the controller being driven
++ *
++ * Return a 2-digit BCD value associated with the peripheral controller,
++ * suitable for use as part of a bcdDevice value, or a negative error code.
++ *
++ * NOTE:  this convention is purely optional, and has no meaning in terms of
++ * any USB specification.  If you want to use a different convention in your
++ * gadget driver firmware -- maybe a more formal revision ID -- feel free.
++ *
++ * Hosts see these bcdDevice numbers, and are allowed (but not encouraged!)
++ * to change their behavior accordingly.  For example it might help avoiding
++ * some chip bug.
++ */
++static inline int usb_gadget_controller_number(struct usb_gadget *gadget)
++{
++	if (gadget_is_net2280(gadget))
++		return 0x01;
++	else if (gadget_is_dummy(gadget))
++		return 0x02;
++	else if (gadget_is_pxa(gadget))
++		return 0x03;
++	else if (gadget_is_sh(gadget))
++		return 0x04;
++	else if (gadget_is_sa1100(gadget))
++		return 0x05;
++	else if (gadget_is_goku(gadget))
++		return 0x06;
++	else if (gadget_is_mq11xx(gadget))
++		return 0x07;
++	else if (gadget_is_omap(gadget))
++		return 0x08;
++	else if (gadget_is_lh7a40x(gadget))
++		return 0x09;
++	else if (gadget_is_n9604(gadget))
++		return 0x10;
++	else if (gadget_is_pxa27x(gadget))
++		return 0x11;
++	else if (gadget_is_s3c2410(gadget))
++		return 0x12;
++	else if (gadget_is_at91(gadget))
++		return 0x13;
++	else if (gadget_is_imx(gadget))
++		return 0x14;
++	else if (gadget_is_musbhsfc(gadget))
++		return 0x15;
++	else if (gadget_is_musbhdrc(gadget))
++		return 0x16;
++	else if (gadget_is_mpc8272(gadget))
++		return 0x17;
++	return -ENOENT;
++}
+Index: linux-2.6.10/drivers/usb/gadget/file_storage.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/file_storage.c
++++ linux-2.6.10/drivers/usb/gadget/file_storage.c
+@@ -236,8 +236,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
+ #include <linux/suspend.h>
+-#include <linux/uts.h>
+-#include <linux/version.h>
++#include <linux/utsname.h>
+ #include <linux/wait.h>
+ 
+ #include <linux/usb_ch9.h>
+@@ -3716,6 +3715,7 @@ static void fsg_unbind(struct usb_gadget
+ static int __init check_parameters(struct fsg_dev *fsg)
+ {
+ 	int	prot;
++	int	gcnum;
+ 
+ 	/* Store the default values */
+ 	mod_data.transport_type = USB_PR_BULK;
+@@ -3727,31 +3727,13 @@ static int __init check_parameters(struc
+ 		mod_data.can_stall = 0;
+ 
+ 	if (mod_data.release == 0xffff) {	// Parameter wasn't set
+-		if (gadget_is_net2280(fsg->gadget))
+-			mod_data.release = 0x0301;
+-		else if (gadget_is_dummy(fsg->gadget))
+-			mod_data.release = 0x0302;
+-		else if (gadget_is_pxa(fsg->gadget))
+-			mod_data.release = 0x0303;
+-		else if (gadget_is_sh(fsg->gadget))
+-			mod_data.release = 0x0304;
+-
+ 		/* The sa1100 controller is not supported */
+-
+-		else if (gadget_is_goku(fsg->gadget))
+-			mod_data.release = 0x0306;
+-		else if (gadget_is_mq11xx(fsg->gadget))
+-			mod_data.release = 0x0307;
+-		else if (gadget_is_omap(fsg->gadget))
+-			mod_data.release = 0x0308;
+-		else if (gadget_is_lh7a40x(fsg->gadget))
+-			mod_data.release = 0x0309;
+-		else if (gadget_is_n9604(fsg->gadget))
+-			mod_data.release = 0x0310;
+-		else if (gadget_is_pxa27x(fsg->gadget))
+-			mod_data.release = 0x0311;
+-		else if (gadget_is_musbhsfc(fsg->gadget))
+-			mod_data.release = 0x0315;
++		if (gadget_is_sa1100(fsg->gadget))
++			gcnum = -1;
++		else
++			gcnum = usb_gadget_controller_number(fsg->gadget);
++		if (gcnum >= 0)
++			mod_data.release = 0x0300 + gcnum;
+ 		else {
+ 			WARN(fsg, "controller '%s' not recognized\n",
+ 				fsg->gadget->name);
+@@ -3965,8 +3947,8 @@ static int __init fsg_bind(struct usb_ga
+ 	/* This should reflect the actual gadget power source */
+ 	usb_gadget_set_selfpowered(gadget);
+ 
+-	snprintf(manufacturer, sizeof manufacturer,
+-			UTS_SYSNAME " " UTS_RELEASE " with %s",
++	snprintf(manufacturer, sizeof manufacturer, "%s %s with %s",
++			system_utsname.sysname, system_utsname.release,
+ 			gadget->name);
+ 
+ 	/* On a real device, serial[] would be loaded from permanent
+Index: linux-2.6.10/drivers/usb/gadget/serial.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/serial.c
++++ linux-2.6.10/drivers/usb/gadget/serial.c
+@@ -31,8 +31,7 @@
+ #include <linux/timer.h>
+ #include <linux/list.h>
+ #include <linux/interrupt.h>
+-#include <linux/uts.h>
+-#include <linux/version.h>
++#include <linux/utsname.h>
+ #include <linux/wait.h>
+ #include <linux/proc_fs.h>
+ #include <linux/device.h>
+@@ -1506,46 +1505,20 @@ static int gs_bind(struct usb_gadget *ga
+ 	int ret;
+ 	struct usb_ep *ep;
+ 	struct gs_dev *dev;
++	int gcnum;
+ 
+-	/* device specific */
+-	if (gadget_is_net2280(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0001);
+-	} else if (gadget_is_pxa(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0002);
+-	} else if (gadget_is_sh(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0003);
+-		/* sh doesn't support multiple interfaces or configs */
++	/* Some controllers can't support CDC ACM:
++	 * - sh doesn't support multiple interfaces or configs;
++	 * - sa1100 doesn't have a third interrupt endpoint
++	 */
++	if (gadget_is_sh(gadget) || gadget_is_sa1100(gadget))
+ 		use_acm = 0;
+-	} else if (gadget_is_sa1100(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0004);
+-		/* sa1100 doesn't support necessary endpoints */
+-		use_acm = 0;
+-	} else if (gadget_is_goku(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0005);
+-	} else if (gadget_is_mq11xx(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0006);
+-	} else if (gadget_is_omap(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0007);
+-	} else if (gadget_is_lh7a40x(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0008);
+-	} else if (gadget_is_n9604(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0009);
+-	} else if (gadget_is_pxa27x(gadget)) {
+-		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0011);
+-	} else if (gadget_is_musbhsfc(gadget)) {
++
++	gcnum = usb_gadget_controller_number(gadget);
++	if (gcnum >= 0)
+ 		gs_device_desc.bcdDevice =
+-			__constant_cpu_to_le16(GS_VERSION_NUM|0x0015);
+-	} else {
++				cpu_to_le16(GS_VERSION_NUM | gcnum);
++	else {
+ 		printk(KERN_WARNING "gs_bind: controller '%s' not recognized\n",
+ 			gadget->name);
+ 		/* unrecognized, but safe unless bulk is REALLY quirky */
+@@ -1609,8 +1582,9 @@ static int gs_bind(struct usb_gadget *ga
+ 	if (dev == NULL)
+ 		return -ENOMEM;
+ 
+-	snprintf(manufacturer, sizeof(manufacturer),
+-		UTS_SYSNAME " " UTS_RELEASE " with %s", gadget->name);
++	snprintf(manufacturer, sizeof(manufacturer), "%s %s with %s",
++		system_utsname.sysname, system_utsname.release,
++		gadget->name);
+ 
+ 	memset(dev, 0, sizeof(struct gs_dev));
+ 	dev->dev_gadget = gadget;
+Index: linux-2.6.10/drivers/usb/gadget/ether.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/ether.c
++++ linux-2.6.10/drivers/usb/gadget/ether.c
+@@ -36,8 +36,7 @@
+ #include <linux/timer.h>
+ #include <linux/list.h>
+ #include <linux/interrupt.h>
+-#include <linux/uts.h>
+-#include <linux/version.h>
++#include <linux/utsname.h>
+ #include <linux/device.h>
+ #include <linux/moduleparam.h>
+ #include <linux/ctype.h>
+@@ -243,10 +242,18 @@ MODULE_PARM_DESC(host_addr, "Host Ethern
+ #define DEV_CONFIG_CDC
+ #endif
+ 
++#ifdef CONFIG_USB_GADGET_AT91
++#define DEV_CONFIG_CDC
++#endif
++
+ #ifdef CONFIG_USB_GADGET_MUSBHSFC
+ #define DEV_CONFIG_CDC
+ #endif
+ 
++#ifdef CONFIG_USB_GADGET_MUSB_HDRC
++#define DEV_CONFIG_CDC
++#endif
++
+ 
+ /* For CDC-incapable hardware, choose the simple cdc subset.
+  * Anything that talks bulk (without notable bugs) can do this.
+@@ -2288,6 +2295,7 @@ eth_bind (struct usb_gadget *gadget)
+ 	u8			cdc = 1, zlp = 1, rndis = 1;
+ 	struct usb_ep		*ep;
+ 	int			status = -ENOMEM;
++	int			gcnum;
+ 
+ 	/* these flags are only ever cleared; compiler take note */
+ #ifndef	DEV_CONFIG_CDC
+@@ -2301,42 +2309,26 @@ eth_bind (struct usb_gadget *gadget)
+ 	 * standard protocol is _strongly_ preferred for interop purposes.
+ 	 * (By everyone except Microsoft.)
+ 	 */
+-	if (gadget_is_net2280 (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0201);
+-	} else if (gadget_is_dummy (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0202);
+-	} else if (gadget_is_pxa (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0203);
++	if (gadget_is_pxa (gadget)) {
+ 		/* pxa doesn't support altsettings */
+ 		cdc = 0;
+ 	} else if (gadget_is_sh(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0204);
+ 		/* sh doesn't support multiple interfaces or configs */
+ 		cdc = 0;
+ 		rndis = 0;
+ 	} else if (gadget_is_sa1100 (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0205);
+ 		/* hardware can't write zlps */
+ 		zlp = 0;
+ 		/* sa1100 CAN do CDC, without status endpoint ... we use
+ 		 * non-CDC to be compatible with ARM Linux-2.4 "usb-eth".
+ 		 */
+ 		cdc = 0;
+-	} else if (gadget_is_goku (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0206);
+-	} else if (gadget_is_mq11xx (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0207);
+-	} else if (gadget_is_omap (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0208);
+-	} else if (gadget_is_lh7a40x(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0209);
+-	} else if (gadget_is_n9604(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0210);
+-	} else if (gadget_is_pxa27x(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0211);
+-	} else if (gadget_is_musbhsfc(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0215);
+-	} else {
++	}
++
++	gcnum = usb_gadget_controller_number (gadget);
++	if (gcnum >= 0)
++		device_desc.bcdDevice = cpu_to_le16 (0x0200 + gcnum);
++	else {
+ 		/* can't assume CDC works.  don't want to default to
+ 		 * anything less functional on CDC-capable hardware,
+ 		 * so we fail in this case.
+@@ -2346,8 +2338,8 @@ eth_bind (struct usb_gadget *gadget)
+ 			gadget->name);
+ 		return -ENODEV;
+ 	}
+-	snprintf (manufacturer, sizeof manufacturer,
+-		UTS_SYSNAME " " UTS_RELEASE "/%s",
++	snprintf (manufacturer, sizeof manufacturer, "%s %s/%s",
++		system_utsname.sysname, system_utsname.release,
+ 		gadget->name);
+ 
+ 	/* If there's an RNDIS configuration, that's what Windows wants to
+Index: linux-2.6.10/drivers/usb/gadget/zero.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/zero.c
++++ linux-2.6.10/drivers/usb/gadget/zero.c
+@@ -75,8 +75,7 @@
+ #include <linux/timer.h>
+ #include <linux/list.h>
+ #include <linux/interrupt.h>
+-#include <linux/uts.h>
+-#include <linux/version.h>
++#include <linux/utsname.h>
+ #include <linux/device.h>
+ #include <linux/moduleparam.h>
+ 
+@@ -1141,6 +1140,13 @@ zero_bind (struct usb_gadget *gadget)
+ {
+ 	struct zero_dev		*dev;
+ 	struct usb_ep		*ep;
++	int			gcnum;
++
++	/* FIXME this can't yet work right with SH ... it has only
++	 * one configuration, numbered one.
++	 */
++	if (gadget_is_sh(gadget))
++		return -ENODEV;
+ 
+ 	/* Bulk-only drivers like this one SHOULD be able to
+ 	 * autoconfigure on any sane usb controller driver,
+@@ -1163,41 +1169,10 @@ autoconf_fail:
+ 	EP_OUT_NAME = ep->name;
+ 	ep->driver_data = ep;	/* claim */
+ 
+-
+-	/*
+-	 * DRIVER POLICY CHOICE:  you may want to do this differently.
+-	 * One thing to avoid is reusing a bcdDevice revision code
+-	 * with different host-visible configurations or behavior
+-	 * restrictions -- using ep1in/ep2out vs ep1out/ep3in, etc
+-	 */
+-	if (gadget_is_net2280 (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0201);
+-	} else if (gadget_is_pxa (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0203);
+-#if 0
+-	} else if (gadget_is_sh(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0204);
+-		/* SH has only one configuration; see "loopdefault" */
+-		device_desc.bNumConfigurations = 1;
+-		/* FIXME make 1 == default.bConfigurationValue */
+-#endif
+-	} else if (gadget_is_sa1100 (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0205);
+-	} else if (gadget_is_goku (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0206);
+-	} else if (gadget_is_mq11xx (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0207);
+-	} else if (gadget_is_omap (gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0208);
+-	} else if (gadget_is_lh7a40x(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0209);
+-	} else if (gadget_is_n9604(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0210);
+-	} else if (gadget_is_pxa27x(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0211);
+-	} else if (gadget_is_musbhsfc(gadget)) {
+-		device_desc.bcdDevice = __constant_cpu_to_le16 (0x0215);
+-	} else {
++	gcnum = usb_gadget_controller_number (gadget);
++	if (gcnum >= 0)
++		device_desc.bcdDevice = cpu_to_le16 (0x0200 + gcnum);
++	else {
+ 		/* gadget zero is so simple (for now, no altsettings) that
+ 		 * it SHOULD NOT have problems with bulk-capable hardware.
+ 		 * so warn about unrcognized controllers, don't panic.
+@@ -1248,12 +1223,6 @@ autoconf_fail:
+ 		loopback_config.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
+ 	}
+ 
+-	if (gadget->is_otg) {
+-		otg_descriptor.bmAttributes |= USB_OTG_HNP,
+-		source_sink_config.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
+-		loopback_config.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
+-	}
+-
+ 	usb_gadget_set_selfpowered (gadget);
+ 
+ 	init_timer (&dev->resume);
+@@ -1270,8 +1239,8 @@ autoconf_fail:
+ 	INFO (dev, "using %s, OUT %s IN %s\n", gadget->name,
+ 		EP_OUT_NAME, EP_IN_NAME);
+ 
+-	snprintf (manufacturer, sizeof manufacturer,
+-		UTS_SYSNAME " " UTS_RELEASE " with %s",
++	snprintf (manufacturer, sizeof manufacturer, "%s %s with %s",
++		system_utsname.sysname, system_utsname.release,
+ 		gadget->name);
+ 
+ 	return 0;
+Index: linux-2.6.10/mvl_patches/pro-0724.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0724.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(724);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

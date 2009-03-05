@@ -1,0 +1,767 @@
+#! /usr/bin/env bash
+# Patch: -sd_initialize_SD_cards
+# Date: Thu Jul  6 17:33:11 2006
+# MR: 18881
+# Disposition: merged fromkernel.org
+# Description:
+# Commit: 335eadf2ef6a1122a720aea98e758e5d431da87d
+# Author: Pierre Ossman <drzeus-list@drzeus.cx>
+# Date:   Tue Sep 6 15:18:50 2005 -0700
+# 
+#     [PATCH] sd: initialize SD cards
+# 
+#     Support for the Secure Digital protocol in the MMC layer.
+# 
+#     A summary of the legal issues surrounding SD cards, as understood by yours
+#     truly:
+# 
+#     Members of the Secure Digital Association, hereafter SDA, are required to sign
+#     a NDA[1] before given access to any specifications.  It has been speculated
+#     that including an SD implementation would forbid these members to redistribute
+#     Linux.  This is the basic problem with SD support so it is unclear if it even
+#     is a problem since it has no effect on those of us that aren't members.
+# 
+#     The SDA doesn't seem to enforce these rules though since the patches included
+#     here are based on documentation made public by some of the members.  The most
+#     complete specs[2] are actually released by Sandisk, one of the founding
+#     companies of the SDA.
+# 
+#     Because of this the NDA is considered a non-issue by most involved in the
+#     discussions concerning these patches.  It might be that the SDA is only
+#     interested in protecting the so called "secure" bits of SD, which so far
+#     hasn't been found in any public spec.  (The card is split into two 
+#     sections, one "normal" and one "secure" which has an access scheme similar
+#     to TPM:s).
+# 
+#     (As a side note, Microsoft is working to make things easier for us since they
+#     want to be able to include the source code for a SD driver in one of their
+#     development kits.  HP is making sure that the new NDA will allow a Linux
+#     implementation.  So far only the SDIO specs have been opened up[3].  More will
+#     hopefully follow.)
+# 
+#      [1] http://www.sdcard.org/membership/images/ippolicy.pdf
+#      [2] http://www.sandisk.com/pdf/oem/ProdManualSDCardv1.9.pdf
+#      [3] http://www.sdcard.org/sdio/Simplified%20SDIO%20Card%20Specification.pdf
+# 
+#     This patch contains the central parts of the SD support.  If no MMC cards are
+#     found on a bus then the MMC layer proceeds looking for SD cards.  Helper
+#     functions are extended to handle the special needs of SD cards.
+# 
+#     Signed-off-by: Pierre Ossman <drzeus@drzeus.cx>
+#     Cc: Russell King <rmk@arm.linux.org.uk>
+#     Cc: David Brownell <david-b@pacbell.net>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# 
+
+PATCHNUM=756
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18881
+Disposition: merged fromkernel.org
+Description:
+Commit: 335eadf2ef6a1122a720aea98e758e5d431da87d
+Author: Pierre Ossman <drzeus-list@drzeus.cx>
+Date:   Tue Sep 6 15:18:50 2005 -0700
+
+    [PATCH] sd: initialize SD cards
+
+    Support for the Secure Digital protocol in the MMC layer.
+
+    A summary of the legal issues surrounding SD cards, as understood by yours
+    truly:
+
+    Members of the Secure Digital Association, hereafter SDA, are required to sign
+    a NDA[1] before given access to any specifications.  It has been speculated
+    that including an SD implementation would forbid these members to redistribute
+    Linux.  This is the basic problem with SD support so it is unclear if it even
+    is a problem since it has no effect on those of us that aren't members.
+
+    The SDA doesn't seem to enforce these rules though since the patches included
+    here are based on documentation made public by some of the members.  The most
+    complete specs[2] are actually released by Sandisk, one of the founding
+    companies of the SDA.
+
+    Because of this the NDA is considered a non-issue by most involved in the
+    discussions concerning these patches.  It might be that the SDA is only
+    interested in protecting the so called "secure" bits of SD, which so far
+    hasn't been found in any public spec.  (The card is split into two 
+    sections, one "normal" and one "secure" which has an access scheme similar
+    to TPM:s).
+
+    (As a side note, Microsoft is working to make things easier for us since they
+    want to be able to include the source code for a SD driver in one of their
+    development kits.  HP is making sure that the new NDA will allow a Linux
+    implementation.  So far only the SDIO specs have been opened up[3].  More will
+    hopefully follow.)
+
+     [1] http://www.sdcard.org/membership/images/ippolicy.pdf
+     [2] http://www.sandisk.com/pdf/oem/ProdManualSDCardv1.9.pdf
+     [3] http://www.sdcard.org/sdio/Simplified%20SDIO%20Card%20Specification.pdf
+
+    This patch contains the central parts of the SD support.  If no MMC cards are
+    found on a bus then the MMC layer proceeds looking for SD cards.  Helper
+    functions are extended to handle the special needs of SD cards.
+
+    Signed-off-by: Pierre Ossman <drzeus@drzeus.cx>
+    Cc: Russell King <rmk@arm.linux.org.uk>
+    Cc: David Brownell <david-b@pacbell.net>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+
+Index: linux-2.6.10/drivers/mmc/mmc.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc.c
++++ linux-2.6.10/drivers/mmc/mmc.c
+@@ -172,7 +172,79 @@ int mmc_wait_for_cmd(struct mmc_host *ho
+ 
+ EXPORT_SYMBOL(mmc_wait_for_cmd);
+ 
++/**
++ *	mmc_wait_for_app_cmd - start an application command and wait for
++ 			       completion
++ *	@host: MMC host to start command
++ *	@rca: RCA to send MMC_APP_CMD to
++ *	@cmd: MMC command to start
++ *	@retries: maximum number of retries
++ *
++ *	Sends a MMC_APP_CMD, checks the card response, sends the command
++ *	in the parameter and waits for it to complete. Return any error
++ *	that occurred while the command was executing.  Do not attempt to
++ *	parse the response.
++ */
++int mmc_wait_for_app_cmd(struct mmc_host *host, unsigned int rca,
++	struct mmc_command *cmd, int retries)
++{
++	struct mmc_request mrq;
++	struct mmc_command appcmd;
++
++	int i, err;
++
++	BUG_ON(host->card_busy == NULL);
++	BUG_ON(retries < 0);
++
++	err = MMC_ERR_INVALID;
++
++	/*
++	 * We have to resend MMC_APP_CMD for each attempt so
++	 * we cannot use the retries field in mmc_command.
++	 */
++	for (i = 0;i <= retries;i++) {
++		memset(&mrq, 0, sizeof(struct mmc_request));
++
++		appcmd.opcode = MMC_APP_CMD;
++		appcmd.arg = rca << 16;
++		appcmd.flags = MMC_RSP_R1;
++		appcmd.retries = 0;
++		memset(appcmd.resp, 0, sizeof(appcmd.resp));
++		appcmd.data = NULL;
++
++		mrq.cmd = &appcmd;
++		appcmd.data = NULL;
+ 
++		mmc_wait_for_req(host, &mrq);
++
++		if (appcmd.error) {
++			err = appcmd.error;
++			continue;
++		}
++
++		/* Check that card supported application commands */
++		if (!(appcmd.resp[0] & R1_APP_CMD))
++			return MMC_ERR_FAILED;
++
++		memset(&mrq, 0, sizeof(struct mmc_request));
++
++		memset(cmd->resp, 0, sizeof(cmd->resp));
++		cmd->retries = 0;
++
++		mrq.cmd = cmd;
++		cmd->data = NULL;
++
++		mmc_wait_for_req(host, &mrq);
++
++		err = cmd->error;
++		if (cmd->error == MMC_ERR_NONE)
++			break;
++	}
++
++	return err;
++}
++
++EXPORT_SYMBOL(mmc_wait_for_app_cmd);
+ 
+ /**
+  *	__mmc_claim_host - exclusively claim a host
+@@ -321,49 +393,71 @@ static void mmc_decode_cid(struct mmc_ca
+ 
+ 	memset(&card->cid, 0, sizeof(struct mmc_cid));
+ 
+-	/*
+-	 * The selection of the format here is guesswork based upon
+-	 * information people have sent to date.
+-	 */
+-	switch (card->csd.mmca_vsn) {
+-	case 0: /* MMC v1.? */
+-	case 1: /* MMC v1.4 */
+-		card->cid.manfid	= UNSTUFF_BITS(resp, 104, 24);
+-		card->cid.prod_name[0]	= UNSTUFF_BITS(resp, 96, 8);
+-		card->cid.prod_name[1]	= UNSTUFF_BITS(resp, 88, 8);
+-		card->cid.prod_name[2]	= UNSTUFF_BITS(resp, 80, 8);
+-		card->cid.prod_name[3]	= UNSTUFF_BITS(resp, 72, 8);
+-		card->cid.prod_name[4]	= UNSTUFF_BITS(resp, 64, 8);
+-		card->cid.prod_name[5]	= UNSTUFF_BITS(resp, 56, 8);
+-		card->cid.prod_name[6]	= UNSTUFF_BITS(resp, 48, 8);
+-		card->cid.hwrev		= UNSTUFF_BITS(resp, 44, 4);
+-		card->cid.fwrev		= UNSTUFF_BITS(resp, 40, 4);
+-		card->cid.serial	= UNSTUFF_BITS(resp, 16, 24);
+-		card->cid.month		= UNSTUFF_BITS(resp, 12, 4);
+-		card->cid.year		= UNSTUFF_BITS(resp, 8, 4) + 1997;
+-		break;
+-
+-	case 2: /* MMC v2.x ? */
+-	case 3: /* MMC v3.x ? */
+-	case 4: /* MMC v4.x ? */
+-		card->cid.manfid	= UNSTUFF_BITS(resp, 120, 8);
+-		card->cid.oemid		= UNSTUFF_BITS(resp, 104, 16);
+-		card->cid.prod_name[0]	= UNSTUFF_BITS(resp, 96, 8);
+-		card->cid.prod_name[1]	= UNSTUFF_BITS(resp, 88, 8);
+-		card->cid.prod_name[2]	= UNSTUFF_BITS(resp, 80, 8);
+-		card->cid.prod_name[3]	= UNSTUFF_BITS(resp, 72, 8);
+-		card->cid.prod_name[4]	= UNSTUFF_BITS(resp, 64, 8);
+-		card->cid.prod_name[5]	= UNSTUFF_BITS(resp, 56, 8);
+-		card->cid.serial	= UNSTUFF_BITS(resp, 16, 32);
+-		card->cid.month		= UNSTUFF_BITS(resp, 12, 4);
+-		card->cid.year		= UNSTUFF_BITS(resp, 8, 4) + 1997;
+-		break;
+-
+-	default:
+-		printk("%s: card has unknown MMCA version %d\n",
+-			mmc_hostname(card->host), card->csd.mmca_vsn);
+-		mmc_card_set_bad(card);
+-		break;
++	if (mmc_card_sd(card)) {
++		/*
++		 * SD doesn't currently have a version field so we will
++		 * have to assume we can parse this.
++		 */
++		card->cid.manfid		= UNSTUFF_BITS(resp, 120, 8);
++		card->cid.oemid			= UNSTUFF_BITS(resp, 104, 16);
++		card->cid.prod_name[0]		= UNSTUFF_BITS(resp, 96, 8);
++		card->cid.prod_name[1]		= UNSTUFF_BITS(resp, 88, 8);
++		card->cid.prod_name[2]		= UNSTUFF_BITS(resp, 80, 8);
++		card->cid.prod_name[3]		= UNSTUFF_BITS(resp, 72, 8);
++		card->cid.prod_name[4]		= UNSTUFF_BITS(resp, 64, 8);
++		card->cid.hwrev			= UNSTUFF_BITS(resp, 60, 4);
++		card->cid.fwrev			= UNSTUFF_BITS(resp, 56, 4);
++		card->cid.serial		= UNSTUFF_BITS(resp, 24, 32);
++		card->cid.year			= UNSTUFF_BITS(resp, 12, 8);
++		card->cid.month			= UNSTUFF_BITS(resp, 8, 4);
++
++		card->cid.year += 2000; /* SD cards year offset */
++	}
++	else {
++		/*
++		 * The selection of the format here is based upon published
++		 * specs from sandisk and from what people have reported.
++		 */
++		switch (card->csd.mmca_vsn) {
++		case 0: /* MMC v1.0 - v1.2 */
++		case 1: /* MMC v1.4 */
++			card->cid.manfid	= UNSTUFF_BITS(resp, 104, 24);
++			card->cid.prod_name[0]	= UNSTUFF_BITS(resp, 96, 8);
++			card->cid.prod_name[1]	= UNSTUFF_BITS(resp, 88, 8);
++			card->cid.prod_name[2]	= UNSTUFF_BITS(resp, 80, 8);
++			card->cid.prod_name[3]	= UNSTUFF_BITS(resp, 72, 8);
++			card->cid.prod_name[4]	= UNSTUFF_BITS(resp, 64, 8);
++			card->cid.prod_name[5]	= UNSTUFF_BITS(resp, 56, 8);
++			card->cid.prod_name[6]	= UNSTUFF_BITS(resp, 48, 8);
++			card->cid.hwrev		= UNSTUFF_BITS(resp, 44, 4);
++			card->cid.fwrev		= UNSTUFF_BITS(resp, 40, 4);
++			card->cid.serial	= UNSTUFF_BITS(resp, 16, 24);
++			card->cid.month		= UNSTUFF_BITS(resp, 12, 4);
++			card->cid.year		= UNSTUFF_BITS(resp, 8, 4) + 1997;
++			break;
++
++		case 2: /* MMC v2.0 - v2.2 */
++		case 3: /* MMC v3.1 - v3.3 */
++		case 4: /* MMC v4.x ? */
++			card->cid.manfid	= UNSTUFF_BITS(resp, 120, 8);
++			card->cid.oemid		= UNSTUFF_BITS(resp, 104, 16);
++			card->cid.prod_name[0]	= UNSTUFF_BITS(resp, 96, 8);
++			card->cid.prod_name[1]	= UNSTUFF_BITS(resp, 88, 8);
++			card->cid.prod_name[2]	= UNSTUFF_BITS(resp, 80, 8);
++			card->cid.prod_name[3]	= UNSTUFF_BITS(resp, 72, 8);
++			card->cid.prod_name[4]	= UNSTUFF_BITS(resp, 64, 8);
++			card->cid.prod_name[5]	= UNSTUFF_BITS(resp, 56, 8);
++			card->cid.serial	= UNSTUFF_BITS(resp, 16, 32);
++			card->cid.month		= UNSTUFF_BITS(resp, 12, 4);
++			card->cid.year		= UNSTUFF_BITS(resp, 8, 4) + 1997;
++			break;
++
++		default:
++			printk("%s: card has unknown MMCA version %d\n",
++				mmc_hostname(card->host), card->csd.mmca_vsn);
++			mmc_card_set_bad(card);
++			break;
++		}
+ 	}
+ }
+ 
+@@ -376,34 +470,61 @@ static void mmc_decode_csd(struct mmc_ca
+ 	unsigned int e, m, csd_struct;
+ 	u32 *resp = card->raw_csd;
+ 
+-	/*
+-	 * We only understand CSD structure v1.1 and v2.
+-	 * v2 has extra information in bits 15, 11 and 10.
+-	 */
+-	csd_struct = UNSTUFF_BITS(resp, 126, 2);
+-	if (csd_struct != 1 && csd_struct != 2) {
+-		printk("%s: unrecognised CSD structure version %d\n",
+-			mmc_hostname(card->host), csd_struct);
+-		mmc_card_set_bad(card);
+-		return;
++	if (mmc_card_sd(card)) {
++		csd_struct = UNSTUFF_BITS(resp, 126, 2);
++		if (csd_struct != 0) {
++			printk("%s: unrecognised CSD structure version %d\n",
++				mmc_hostname(card->host), csd_struct);
++			mmc_card_set_bad(card);
++			return;
++		}
++
++		m = UNSTUFF_BITS(resp, 115, 4);
++		e = UNSTUFF_BITS(resp, 112, 3);
++		csd->tacc_ns	 = (tacc_exp[e] * tacc_mant[m] + 9) / 10;
++		csd->tacc_clks	 = UNSTUFF_BITS(resp, 104, 8) * 100;
++
++		m = UNSTUFF_BITS(resp, 99, 4);
++		e = UNSTUFF_BITS(resp, 96, 3);
++		csd->max_dtr	  = tran_exp[e] * tran_mant[m];
++		csd->cmdclass	  = UNSTUFF_BITS(resp, 84, 12);
++
++		e = UNSTUFF_BITS(resp, 47, 3);
++		m = UNSTUFF_BITS(resp, 62, 12);
++		csd->capacity	  = (1 + m) << (e + 2);
++
++		csd->read_blkbits = UNSTUFF_BITS(resp, 80, 4);
+ 	}
++	else {
++		/*
++		 * We only understand CSD structure v1.1 and v1.2.
++		 * v1.2 has extra information in bits 15, 11 and 10.
++		 */
++		csd_struct = UNSTUFF_BITS(resp, 126, 2);
++		if (csd_struct != 1 && csd_struct != 2) {
++			printk("%s: unrecognised CSD structure version %d\n",
++				mmc_hostname(card->host), csd_struct);
++			mmc_card_set_bad(card);
++			return;
++		}
+ 
+-	csd->mmca_vsn	 = UNSTUFF_BITS(resp, 122, 4);
+-	m = UNSTUFF_BITS(resp, 115, 4);
+-	e = UNSTUFF_BITS(resp, 112, 3);
+-	csd->tacc_ns	 = (tacc_exp[e] * tacc_mant[m] + 9) / 10;
+-	csd->tacc_clks	 = UNSTUFF_BITS(resp, 104, 8) * 100;
+-
+-	m = UNSTUFF_BITS(resp, 99, 4);
+-	e = UNSTUFF_BITS(resp, 96, 3);
+-	csd->max_dtr	  = tran_exp[e] * tran_mant[m];
+-	csd->cmdclass	  = UNSTUFF_BITS(resp, 84, 12);
+-
+-	e = UNSTUFF_BITS(resp, 47, 3);
+-	m = UNSTUFF_BITS(resp, 62, 12);
+-	csd->capacity	  = (1 + m) << (e + 2);
++		csd->mmca_vsn	 = UNSTUFF_BITS(resp, 122, 4);
++		m = UNSTUFF_BITS(resp, 115, 4);
++		e = UNSTUFF_BITS(resp, 112, 3);
++		csd->tacc_ns	 = (tacc_exp[e] * tacc_mant[m] + 9) / 10;
++		csd->tacc_clks	 = UNSTUFF_BITS(resp, 104, 8) * 100;
++
++		m = UNSTUFF_BITS(resp, 99, 4);
++		e = UNSTUFF_BITS(resp, 96, 3);
++		csd->max_dtr	  = tran_exp[e] * tran_mant[m];
++		csd->cmdclass	  = UNSTUFF_BITS(resp, 84, 12);
++
++		e = UNSTUFF_BITS(resp, 47, 3);
++		m = UNSTUFF_BITS(resp, 62, 12);
++		csd->capacity	  = (1 + m) << (e + 2);
+ 
+-	csd->read_blkbits = UNSTUFF_BITS(resp, 80, 4);
++		csd->read_blkbits = UNSTUFF_BITS(resp, 80, 4);
++	}
+ }
+ 
+ /*
+@@ -536,6 +657,34 @@ static int mmc_send_op_cond(struct mmc_h
+ 	return err;
+ }
+ 
++static int mmc_send_app_op_cond(struct mmc_host *host, u32 ocr, u32 *rocr)
++{
++	struct mmc_command cmd;
++	int i, err = 0;
++
++	cmd.opcode = SD_APP_OP_COND;
++	cmd.arg = ocr;
++	cmd.flags = MMC_RSP_R3;
++
++	for (i = 100; i; i--) {
++		err = mmc_wait_for_app_cmd(host, 0, &cmd, CMD_RETRIES);
++		if (err != MMC_ERR_NONE)
++			break;
++
++		if (cmd.resp[0] & MMC_CARD_BUSY || ocr == 0)
++			break;
++
++		err = MMC_ERR_TIMEOUT;
++
++		mmc_delay(10);
++	}
++
++	if (rocr)
++		*rocr = cmd.resp[0];
++
++	return err;
++}
++
+ /*
+  * Discover cards by requesting their CID.  If this command
+  * times out, it is not an error; there are no further cards
+@@ -579,13 +728,28 @@ static void mmc_discover_cards(struct mm
+ 
+ 		card->state &= ~MMC_STATE_DEAD;
+ 
+-		cmd.opcode = MMC_SET_RELATIVE_ADDR;
+-		cmd.arg = card->rca << 16;
+-		cmd.flags = MMC_RSP_R1;
++		if (host->mode == MMC_MODE_SD) {
++			mmc_card_set_sd(card);
+ 
+-		err = mmc_wait_for_cmd(host, &cmd, CMD_RETRIES);
+-		if (err != MMC_ERR_NONE)
+-			mmc_card_set_dead(card);
++			cmd.opcode = SD_SEND_RELATIVE_ADDR;
++			cmd.arg = 0;
++			cmd.flags = MMC_RSP_R1;
++
++			err = mmc_wait_for_cmd(host, &cmd, CMD_RETRIES);
++			if (err != MMC_ERR_NONE)
++				mmc_card_set_dead(card);
++			else
++				card->rca = cmd.resp[0] >> 16;
++		}
++		else {
++			cmd.opcode = MMC_SET_RELATIVE_ADDR;
++			cmd.arg = card->rca << 16;
++			cmd.flags = MMC_RSP_R1;
++
++			err = mmc_wait_for_cmd(host, &cmd, CMD_RETRIES);
++			if (err != MMC_ERR_NONE)
++				mmc_card_set_dead(card);
++		}
+ 	}
+ }
+ 
+@@ -669,12 +833,25 @@ static void mmc_setup(struct mmc_host *h
+ 		int err;
+ 		u32 ocr;
+ 
++		host->mode = MMC_MODE_MMC;
++
+ 		mmc_power_up(host);
+ 		mmc_idle_cards(host);
+ 
+ 		err = mmc_send_op_cond(host, 0, &ocr);
++
++		/*
++		 * If we fail to detect any cards then try
++		 * searching for SD cards.
++		 */
+ 		if (err != MMC_ERR_NONE)
+-			return;
++		{
++			err = mmc_send_app_op_cond(host, 0, &ocr);
++			if (err != MMC_ERR_NONE)
++				return;
++
++			host->mode = MMC_MODE_SD;
++		}
+ 
+ 		host->ocr = mmc_select_voltage(host, ocr);
+ 
+@@ -714,7 +891,10 @@ static void mmc_setup(struct mmc_host *h
+ 	 * all get the idea that they should be ready for CMD2.
+ 	 * (My SanDisk card seems to need this.)
+ 	 */
+-	mmc_send_op_cond(host, host->ocr, NULL);
++	if (host->mode == MMC_MODE_SD)
++		mmc_send_app_op_cond(host, host->ocr, NULL);
++	else
++		mmc_send_op_cond(host, host->ocr, NULL);
+ 
+ 	mmc_discover_cards(host);
+ 
+Index: linux-2.6.10/include/linux/mmc/card.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/card.h
++++ linux-2.6.10/include/linux/mmc/card.h
+@@ -47,6 +47,7 @@ struct mmc_card {
+ #define MMC_STATE_PRESENT	(1<<0)		/* present in sysfs */
+ #define MMC_STATE_DEAD		(1<<1)		/* device no longer in stack */
+ #define MMC_STATE_BAD		(1<<2)		/* unrecognised device */
++#define MMC_STATE_SDCARD	(1<<3)		/* is an SD card */
+ 	u32			raw_cid[4];	/* raw card CID */
+ 	u32			raw_csd[4];	/* raw card CSD */
+ 	struct mmc_cid		cid;		/* card identification */
+@@ -56,10 +57,12 @@ struct mmc_card {
+ #define mmc_card_present(c)	((c)->state & MMC_STATE_PRESENT)
+ #define mmc_card_dead(c)	((c)->state & MMC_STATE_DEAD)
+ #define mmc_card_bad(c)		((c)->state & MMC_STATE_BAD)
++#define mmc_card_sd(c)		((c)->state & MMC_STATE_SDCARD)
+ 
+ #define mmc_card_set_present(c)	((c)->state |= MMC_STATE_PRESENT)
+ #define mmc_card_set_dead(c)	((c)->state |= MMC_STATE_DEAD)
+ #define mmc_card_set_bad(c)	((c)->state |= MMC_STATE_BAD)
++#define mmc_card_set_sd(c)	((c)->state |= MMC_STATE_SDCARD)
+ 
+ #define mmc_card_name(c)	((c)->cid.prod_name)
+ #define mmc_card_id(c)		((c)->dev.bus_id)
+Index: linux-2.6.10/include/linux/mmc/host.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/host.h
++++ linux-2.6.10/include/linux/mmc/host.h
+@@ -87,6 +87,10 @@ struct mmc_host {
+ 	struct mmc_ios		ios;		/* current io bus settings */
+ 	u32			ocr;		/* the current OCR setting */
+ 
++	unsigned int		mode;		/* current card mode of host */
++#define MMC_MODE_MMC		0
++#define MMC_MODE_SD		1
++
+ 	struct list_head	cards;		/* devices attached to this host */
+ 
+ 	wait_queue_head_t	wq;
+Index: linux-2.6.10/include/linux/mmc/mmc.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/mmc.h
++++ linux-2.6.10/include/linux/mmc/mmc.h
+@@ -89,6 +89,8 @@ struct mmc_card;
+ 
+ extern int mmc_wait_for_req(struct mmc_host *, struct mmc_request *);
+ extern int mmc_wait_for_cmd(struct mmc_host *, struct mmc_command *, int);
++extern int mmc_wait_for_app_cmd(struct mmc_host *, unsigned int,
++	struct mmc_command *, int);
+ 
+ extern int __mmc_claim_host(struct mmc_host *host, struct mmc_card *card);
+ 
+Index: linux-2.6.10/mvl_patches/pro-0756.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0756.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(756);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,440 @@
+#! /usr/bin/env bash
+# Patch: -USB_Patch_for_rtl8150_to_fix_unplug_problems
+# Date: Mon Jul 30 15:52:25 2007
+# Source: MontaVista Software
+# MR: 21609
+# Type: Defect fix
+# Disposition: backport of linux-2.6.18-rc4
+# added #define pm_message_t u32
+# 
+# From 23219c134865d524357e9bb90e5badb422ac8fff Mon Sep 17 00:00:00 2001
+# From: Peter Chubb <peterc@gelato.unsw.edu.au>
+# Date: Tue, 25 Jul 2006 20:39:14 +1000
+# Subject: [PATCH 1/1] USB: Patch for rtl8150 to fix unplug problems
+# 
+# The RTL8150 driver currently crashes the kernel if the USB lead is unplugged
+# while the device is active.  The attached patch adds error handling to
+# tell the network layer that the device has gone away when the device is
+# unplugged.  With this patch, the device can be plugged and unplugged
+# to one's hearts' content, without crashing anything.
+# 
+# Oh, I've also added rudimentary suspend and resume methods.
+# 
+# Signed-off-by: Peter Chubb <peter@gelato.unsw.edu.au>
+# Acked-by: Petko Manolov <petkan@nucleusys.com>
+# Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+# 
+
+PATCHNUM=1353
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software
+MR: 21609
+Type: Defect fix
+Disposition: backport of linux-2.6.18-rc4
+added #define pm_message_t u32
+
+From 23219c134865d524357e9bb90e5badb422ac8fff Mon Sep 17 00:00:00 2001
+From: Peter Chubb <peterc@gelato.unsw.edu.au>
+Date: Tue, 25 Jul 2006 20:39:14 +1000
+Subject: [PATCH 1/1] USB: Patch for rtl8150 to fix unplug problems
+
+The RTL8150 driver currently crashes the kernel if the USB lead is unplugged
+while the device is active.  The attached patch adds error handling to
+tell the network layer that the device has gone away when the device is
+unplugged.  With this patch, the device can be plugged and unplugged
+to one's hearts' content, without crashing anything.
+
+Oh, I've also added rudimentary suspend and resume methods.
+
+Signed-off-by: Peter Chubb <peter@gelato.unsw.edu.au>
+Acked-by: Petko Manolov <petkan@nucleusys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+Index: linux-2.6.10/drivers/usb/net/rtl8150.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/net/rtl8150.c
++++ linux-2.6.10/drivers/usb/net/rtl8150.c
+@@ -19,6 +19,8 @@
+ #include <linux/usb.h>
+ #include <asm/uaccess.h>
+ 
++#define pm_message_t u32
++
+ /* Version Information */
+ #define DRIVER_VERSION "v0.6.2 (2004/08/27)"
+ #define DRIVER_AUTHOR "Petko Manolov <petkan@users.sourceforge.net>"
+@@ -175,6 +177,8 @@ static inline struct sk_buff *pull_skb(r
+ static void rtl8150_disconnect(struct usb_interface *intf);
+ static int rtl8150_probe(struct usb_interface *intf,
+ 			   const struct usb_device_id *id);
++static int rtl8150_suspend(struct usb_interface *intf, pm_message_t message);
++static int rtl8150_resume(struct usb_interface *intf);
+ 
+ static const char driver_name [] = "rtl8150";
+ 
+@@ -184,6 +188,8 @@ static struct usb_driver rtl8150_driver 
+ 	.probe =	rtl8150_probe,
+ 	.disconnect =	rtl8150_disconnect,
+ 	.id_table =	rtl8150_table,
++	.suspend =	rtl8150_suspend,
++	.resume =	rtl8150_resume
+ };
+ 
+ /*
+@@ -239,9 +245,11 @@ static int async_set_registers(rtl8150_t
+ 	usb_fill_control_urb(dev->ctrl_urb, dev->udev,
+ 			 usb_sndctrlpipe(dev->udev, 0), (char *) &dev->dr,
+ 			 &dev->rx_creg, size, ctrl_callback, dev);
+-	if ((ret = usb_submit_urb(dev->ctrl_urb, GFP_ATOMIC)))
++	if ((ret = usb_submit_urb(dev->ctrl_urb, GFP_ATOMIC))) {
++		if (ret == -ENODEV)
++			netif_device_detach(dev->netdev);
+ 		err("control request submission failed: %d", ret);
+-	else
++	} else
+ 		set_bit(RX_REG_SET, &dev->flags);
+ 
+ 	return ret;
+@@ -417,6 +425,7 @@ static void read_bulk_callback(struct ur
+ 	struct sk_buff *skb;
+ 	struct net_device *netdev;
+ 	u16 rx_stat;
++	int status;
+ 
+ 	dev = urb->context;
+ 	if (!dev)
+@@ -466,7 +475,10 @@ static void read_bulk_callback(struct ur
+ goon:
+ 	usb_fill_bulk_urb(dev->rx_urb, dev->udev, usb_rcvbulkpipe(dev->udev, 1),
+ 		      dev->rx_skb->data, RTL8150_MTU, read_bulk_callback, dev);
+-	if (usb_submit_urb(dev->rx_urb, GFP_ATOMIC)) {
++	status = usb_submit_urb(dev->rx_urb, GFP_ATOMIC);
++	if (status == -ENODEV)
++		netif_device_detach(dev->netdev);
++	else if (status) {
+ 		set_bit(RX_URB_FAIL, &dev->flags);
+ 		goto resched;
+ 	} else {
+@@ -482,6 +494,7 @@ static void rx_fixup(unsigned long data)
+ {
+ 	rtl8150_t *dev;
+ 	struct sk_buff *skb;
++	int status;
+ 
+ 	dev = (rtl8150_t *)data;
+ 
+@@ -500,10 +513,13 @@ static void rx_fixup(unsigned long data)
+ 	usb_fill_bulk_urb(dev->rx_urb, dev->udev, usb_rcvbulkpipe(dev->udev, 1),
+ 		      dev->rx_skb->data, RTL8150_MTU, read_bulk_callback, dev);
+ try_again:
+-	if (usb_submit_urb(dev->rx_urb, GFP_ATOMIC)) {
++	status = usb_submit_urb(dev->rx_urb, GFP_ATOMIC);
++	if (status == -ENODEV) {
++		netif_device_detach(dev->netdev);
++	} else if (status) {
+ 		set_bit(RX_URB_FAIL, &dev->flags);
+ 		goto tlsched;
+-	 } else {
++	} else {
+ 		clear_bit(RX_URB_FAIL, &dev->flags);
+ 	}
+ 
+@@ -575,12 +591,43 @@ static void intr_callback(struct urb *ur
+ 
+ resubmit:
+ 	status = usb_submit_urb (urb, SLAB_ATOMIC);
+-	if (status)
++	if (status == -ENODEV)
++		netif_device_detach(dev->netdev);
++	else if (status)
+ 		err ("can't resubmit intr, %s-%s/input0, status %d",
+ 				dev->udev->bus->bus_name,
+ 				dev->udev->devpath, status);
+ }
+ 
++static int rtl8150_suspend(struct usb_interface *intf, pm_message_t message)
++{
++	rtl8150_t *dev = usb_get_intfdata(intf);
++
++	netif_device_detach(dev->netdev);
++
++	if (netif_running(dev->netdev)) {
++		usb_kill_urb(dev->rx_urb);
++		usb_kill_urb(dev->intr_urb);
++	}
++	return 0;
++}
++
++static int rtl8150_resume(struct usb_interface *intf)
++{
++	rtl8150_t *dev = usb_get_intfdata(intf);
++
++	netif_device_attach(dev->netdev);
++	if (netif_running(dev->netdev)) {
++		dev->rx_urb->status = 0;
++		dev->rx_urb->actual_length = 0;
++		read_bulk_callback(dev->rx_urb, NULL);
++
++		dev->intr_urb->status = 0;
++		dev->intr_urb->actual_length = 0;
++		intr_callback(dev->intr_urb, NULL);
++	}
++	return 0;
++}
+ 
+ /*
+ **
+@@ -692,9 +739,14 @@ static int rtl8150_start_xmit(struct sk_
+ 	usb_fill_bulk_urb(dev->tx_urb, dev->udev, usb_sndbulkpipe(dev->udev, 2),
+ 		      skb->data, count, write_bulk_callback, dev);
+ 	if ((res = usb_submit_urb(dev->tx_urb, GFP_ATOMIC))) {
+-		warn("failed tx_urb %d\n", res);
+-		dev->stats.tx_errors++;
+-		netif_start_queue(netdev);
++		/* Can we get/handle EPIPE here? */
++		if (res == -ENODEV)
++			netif_device_detach(dev->netdev);
++		else {
++			warn("failed tx_urb %d\n", res);
++			dev->stats.tx_errors++;
++			netif_start_queue(netdev);
++		}
+ 	} else {
+ 		dev->stats.tx_packets++;
+ 		dev->stats.tx_bytes += skb->len;
+@@ -731,16 +783,25 @@ static int rtl8150_open(struct net_devic
+ 	
+ 	usb_fill_bulk_urb(dev->rx_urb, dev->udev, usb_rcvbulkpipe(dev->udev, 1),
+ 		      dev->rx_skb->data, RTL8150_MTU, read_bulk_callback, dev);
+-	if ((res = usb_submit_urb(dev->rx_urb, GFP_KERNEL)))
++	if ((res = usb_submit_urb(dev->rx_urb, GFP_KERNEL))) {
++		if (res == -ENODEV)
++			netif_device_detach(dev->netdev);
+ 		warn("%s: rx_urb submit failed: %d", __FUNCTION__, res);
++		return res;
++	}
+ 	usb_fill_int_urb(dev->intr_urb, dev->udev, usb_rcvintpipe(dev->udev, 3),
+ 		     dev->intr_buff, INTBUFSIZE, intr_callback,
+ 		     dev, dev->intr_interval);
+-	if ((res = usb_submit_urb(dev->intr_urb, GFP_KERNEL)))
++	if ((res = usb_submit_urb(dev->intr_urb, GFP_KERNEL))) {
++		if (res == -ENODEV)
++			netif_device_detach(dev->netdev);
+ 		warn("%s: intr_urb submit failed: %d", __FUNCTION__, res);
+-	netif_start_queue(netdev);
++		usb_kill_urb(dev->rx_urb);
++		return res;
++	}
+ 	enable_net_traffic(dev);
+ 	set_carrier(netdev);
++	netif_start_queue(netdev);
+ 
+ 	return res;
+ }
+Index: linux-2.6.10/mvl_patches/pro-1353.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1353.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1353);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

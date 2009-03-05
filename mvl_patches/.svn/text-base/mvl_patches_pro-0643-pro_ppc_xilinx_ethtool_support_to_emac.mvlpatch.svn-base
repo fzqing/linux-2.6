@@ -1,0 +1,743 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc_xilinx_ethtool_support_to_emac
+# Date: Thu Jun 22 21:14:16 2006
+# Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+# MR: 18257
+# Type: Defect Fix
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Description:
+#     Port the Pro 3.1 ethtool support's emac driver code to 4.0.
+# 
+
+PATCHNUM=643
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+MR: 18257
+Type: Defect Fix
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Description:
+    Port the Pro 3.1 ethtool support's emac driver code to 4.0.
+
+Index: linux-2.6.10/drivers/net/xilinx_emac/adapter.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/xilinx_emac/adapter.c
++++ linux-2.6.10/drivers/net/xilinx_emac/adapter.c
+@@ -32,6 +32,7 @@
+ #include <linux/mm.h>
+ #include <linux/init.h>
+ #include <linux/xilinx_devices.h>
++#include <linux/ethtool.h>
+ 
+ #include <asm/io.h>
+ 
+@@ -43,6 +44,7 @@
+ #define XEMAC_MAX_DEVICE_ID 4
+ static XEmac_Config * xemac_cfgs[XEMAC_MAX_DEVICE_ID];
+ 
++DEFINE_SPINLOCK(XE_spinlock);
+ /*
+  * Lookup the device configuration based on the unique device ID.
+  * Prototyped in xemac.h.
+@@ -240,6 +242,7 @@ static void poll_mii(unsigned long data)
+ 	struct net_device *ndev = (struct net_device *) data;
+ 	struct net_local *lp = netdev_priv(ndev);
+ 	u32 Options;
++	unsigned long flags;
+ 	DUPLEX phy_duplex, mac_duplex;
+ 	int phy_carrier, netif_carrier;
+ 
+@@ -260,9 +263,9 @@ static void poll_mii(unsigned long data)
+ 		 * Make sure that no interrupts come in that could cause
+ 		 * reentrancy problems in reset.
+ 		 */
+-		disable_irq(ndev->irq);
++		spin_lock_irqsave(&XE_spinlock, flags);
+ 		xenet_reset(ndev, phy_duplex);
+-		enable_irq(ndev->irq);
++		spin_unlock_irqrestore(&XE_spinlock, flags);
+ 	}
+ 
+ 	netif_carrier = netif_carrier_ok(ndev) != 0;
+@@ -286,7 +289,7 @@ static void poll_mii(unsigned long data)
+ static void xenet_tx_timeout(struct net_device *ndev)
+ {
+ 	struct net_local *lp = netdev_priv(ndev);
+-
++	unsigned long flags;
+ 	printk("%s: Exceeded transmit timeout of %lu ms.  Resetting emac.\n",
+ 	       ndev->name, TX_TIMEOUT * 1000UL / HZ);
+ 
+@@ -296,9 +299,9 @@ static void xenet_tx_timeout(struct net_
+ 	 * Make sure that no interrupts come in that could cause reentrancy
+ 	 * problems in reset.
+ 	 */
+-	disable_irq(ndev->irq);
++	spin_lock_irqsave(&XE_spinlock, flags);
+ 	xenet_reset(ndev, UNKNOWN_DUPLEX);
+-	enable_irq(ndev->irq);
++	spin_unlock_irqrestore(&XE_spinlock, flags);
+ }
+ 
+ /*
+@@ -536,6 +539,421 @@ static void xenet_set_multicast_list(str
+ 	enable_irq(ndev->irq);
+ }
+ 
++static int xenet_ethtool_get_settings (struct net_device *dev, struct ethtool_cmd* ecmd)
++{
++	int ret;
++	struct net_local *lp = (struct net_local *) dev->priv;
++	u32 mac_options;
++	u8 threshold;
++	u16 mii_cmd;
++	u16 mii_status;
++	u16 mii_advControl;
++	XStatus xs;
++
++	memset (ecmd, 0, sizeof(struct ethtool_cmd));
++	mac_options = XEmac_GetOptions (&(lp->Emac));
++	xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_BMCR, &mii_cmd);
++	if (xs != XST_SUCCESS) {
++		printk(KERN_ERR
++		       "%s: Could not read mii command register; error %d\n",
++		       dev->name, xs);
++		return -1;
++	}
++	xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_BMSR, &mii_status);
++	if (xs != XST_SUCCESS) {
++		printk(KERN_ERR
++		       "%s: Could not read mii status register; error %d\n",
++		       dev->name, xs);
++		return -1;
++	}
++	xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_ADVERTISE, &mii_advControl);
++	if (xs != XST_SUCCESS) {
++		printk(KERN_ERR
++		       "%s: Could not read mii advertisement control register; error %d\n",
++		       dev->name, xs);
++		return -1;
++	}
++
++	if (mac_options & XEM_FDUPLEX_OPTION)
++		ecmd->duplex = DUPLEX_FULL;
++	else
++		ecmd->duplex = DUPLEX_HALF;
++	if (mii_status & BMSR_100FULL)
++		ecmd->supported |= SUPPORTED_100baseT_Full;
++	if (mii_status & BMSR_100HALF)
++		ecmd->supported |= SUPPORTED_100baseT_Half;
++	if (mii_status & BMSR_10FULL)
++		ecmd->supported |= SUPPORTED_10baseT_Full;
++	if (mii_status & BMSR_10HALF)
++		ecmd->supported |= SUPPORTED_10baseT_Half;
++		ecmd->supported |= SUPPORTED_MII;
++	if (mii_status & BMSR_ANEGCAPABLE)
++		ecmd->supported |= SUPPORTED_Autoneg;
++	if (mii_status & BMSR_ANEGCOMPLETE) {
++		ecmd->autoneg = AUTONEG_ENABLE;
++		ecmd->advertising |= ADVERTISED_Autoneg;
++		if ((mii_advControl & ADVERTISE_100FULL) || (mii_advControl & ADVERTISE_100HALF))
++			ecmd->speed = SPEED_100;
++		else
++			ecmd->speed = SPEED_10;
++	} else {
++		ecmd->autoneg = AUTONEG_DISABLE;
++		if (mii_cmd & BMCR_SPEED100)
++			ecmd->speed = SPEED_100;
++		else
++			ecmd->speed = SPEED_10;
++	}
++	if (mii_advControl & ADVERTISE_10FULL)
++		ecmd->advertising |= ADVERTISED_10baseT_Full;
++	if (mii_advControl & ADVERTISE_10HALF)
++		ecmd->advertising |= ADVERTISED_10baseT_Half;
++	if (mii_advControl & ADVERTISE_100FULL)
++		ecmd->advertising |= ADVERTISED_100baseT_Full;
++	if (mii_advControl & ADVERTISE_100HALF)
++		ecmd->advertising |= ADVERTISED_100baseT_Half;
++	ecmd->advertising |= ADVERTISED_MII;
++	ecmd->port = PORT_MII;
++	ecmd->phy_address = lp->Emac.PhysAddress;
++	ecmd->transceiver = XCVR_INTERNAL;
++	if (XEmac_mIsSgDma(&lp->Emac)) {
++		if ((ret = XEmac_GetPktThreshold(&lp->Emac, XEM_SEND, &threshold)) == XST_SUCCESS) {
++			ecmd->maxtxpkt = threshold;
++		} else
++			return -EIO;
++		if ((ret = XEmac_GetPktThreshold(&lp->Emac, XEM_RECV, &threshold)) == XST_SUCCESS) {
++			ecmd->maxrxpkt = threshold;
++		} else
++			return -EIO;
++	}
++	return 0;
++}
++
++static int xenet_ethtool_get_coalesce (struct net_device *dev, struct ethtool_coalesce* ec)
++{
++	int ret;
++	struct net_local *lp = (struct net_local *) dev->priv;
++	u8 threshold;
++
++	memset (ec, 0, sizeof(struct ethtool_coalesce));
++	if ((ret = XEmac_GetPktThreshold(&lp->Emac, XEM_RECV, &threshold)) != XST_SUCCESS) {
++		printk(KERN_INFO "XEmac_GetPktThreshold error %d\n", ret);
++		return -EIO;
++	}
++	ec->rx_max_coalesced_frames = threshold;
++	if ((ret = XEmac_GetPktWaitBound (&lp->Emac, XEM_RECV, &(ec->rx_coalesce_usecs))) != XST_SUCCESS) {
++		printk (KERN_INFO "XEmac_GetPktWaitBound error %d\n", ret);
++		return -EIO;
++	}
++	if ((ret = XEmac_GetPktThreshold(&lp->Emac, XEM_SEND, &threshold)) != XST_SUCCESS) {
++		printk (KERN_INFO "XEmac_GetPktThreshold send error %d\n", ret);
++		return -EIO;
++	}
++	ec->tx_max_coalesced_frames = threshold; 
++	if ((ret = XEmac_GetPktWaitBound (&lp->Emac, XEM_SEND, &(ec->tx_coalesce_usecs))) != XST_SUCCESS) {
++		printk (KERN_INFO "XEmac_GetPktWaitBound send error %d\n", ret);
++		return -EIO;
++	}
++	return 0;
++}
++
++static int xenet_ethtool_set_coalesce (struct net_device *dev, struct ethtool_coalesce* ec)
++{
++	int ret;
++	struct net_local *lp = (struct net_local *) dev->priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&XE_spinlock, flags);
++	if ((ret = XEmac_Stop(&lp->Emac)) != XST_SUCCESS){
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		return -EIO;
++	}
++	if ((ret = XEmac_SetPktThreshold(&lp->Emac, XEM_RECV, ec->rx_max_coalesced_frames)) != XST_SUCCESS) {
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		printk (KERN_INFO "XEmac_SetPktThreshold error %d\n", ret);
++		return -EIO;
++	} 
++	if ((ret = XEmac_SetPktWaitBound (&lp->Emac, XEM_RECV, ec->rx_coalesce_usecs)) != XST_SUCCESS) {
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		printk (KERN_INFO "XEmac_SetPktWaitBound error %d\n", ret);
++		return -EIO;
++	}
++	if ((ret = XEmac_SetPktThreshold(&lp->Emac, XEM_SEND, ec->tx_max_coalesced_frames)) != XST_SUCCESS) {
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		printk (KERN_INFO "XEmac_SetPktThreshold send error %d\n", ret);
++		return -EIO;
++	} 
++	if ((ret = XEmac_SetPktWaitBound (&lp->Emac, XEM_SEND, ec->tx_coalesce_usecs)) != XST_SUCCESS) {
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		printk (KERN_INFO "XEmac_SetPktWaitBound send error %d\n", ret);
++		return -EIO;
++	}
++	if ((ret = XEmac_Start(&lp->Emac)) != XST_SUCCESS){
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		return -EIO;
++	}
++	spin_unlock_irqrestore(&XE_spinlock, flags);
++	return 0;
++}
++
++static int xenet_ethtool_get_drvinfo (struct net_device *dev, struct ethtool_drvinfo* ed)
++{
++	memset (ed, 0, sizeof(struct ethtool_drvinfo));
++	strcpy (ed->driver, DRIVER_NAME);
++	strcpy (ed->version, DRIVER_VERSION);
++	return 0; 
++}
++
++static int xenet_ethtool_get_ringparam (struct net_device *dev, struct ethtool_ringparam* erp)
++{
++	memset (erp, 0, sizeof(struct ethtool_ringparam));
++	erp->rx_max_pending = XEM_DFT_RECV_DESC;
++	erp->tx_max_pending = XEM_DFT_SEND_DESC;
++	erp->rx_pending = XEM_DFT_RECV_DESC;
++	erp->tx_pending = XEM_DFT_SEND_DESC;
++	return 0;
++}
++
++#define EMAG_REGS_N	32
++struct mac_regsDump {
++	struct ethtool_regs hd;
++	u16 data[EMAG_REGS_N];
++};
++
++static void xenet_ethtool_get_regs (struct net_device *dev, struct ethtool_regs* regs, void* ret)
++{
++	struct net_local *lp = (struct net_local *) dev->priv;
++	struct mac_regsDump* dump = (struct mac_regsDump*)regs;
++	int i;
++	XStatus r;
++
++	dump->hd.version = 0;
++	dump->hd.len = EMAG_REGS_N * sizeof(dump->data);
++	for (i=0; i<EMAG_REGS_N; i++) {
++		if ((r = XEmac_PhyRead (&(lp->Emac), lp->mii_addr, i, &(dump->data[i]))) != XST_SUCCESS) {
++			printk (KERN_INFO "PhyRead ERROR %d\n", r);
++			*(int*)ret = -EIO;
++			return;
++		}
++	}
++	*(int*)ret = 0;
++}
++
++static int xenet_do_ethtool_ioctl (struct net_device *dev, struct ifreq *rq)
++{
++	struct net_local *lp = (struct net_local *) dev->priv;
++	struct ethtool_cmd ecmd;
++	struct ethtool_coalesce eco;
++	struct ethtool_drvinfo edrv;
++	struct ethtool_ringparam erp;
++	struct ethtool_pauseparam epp;
++	struct mac_regsDump regs;
++	int ret = -EOPNOTSUPP;
++	XStatus result;
++	u32 Options;
++	u16 mii_reg_sset;
++	u16 mii_reg_spause;
++	u16 mii_reg_autoneg;
++	u32 flags;
++
++	if (copy_from_user(&ecmd, rq->ifr_data, sizeof (ecmd.cmd)))
++		return -EFAULT;
++	switch (ecmd.cmd) {
++	case ETHTOOL_GSET:
++		ret = xenet_ethtool_get_settings(dev, &ecmd);
++		if (ret >= 0) {
++			if (copy_to_user(rq->ifr_data, &ecmd, sizeof (ecmd)))
++				ret = -EFAULT;
++		}
++		break;
++	case ETHTOOL_SSET:
++		if (copy_from_user(&ecmd, rq->ifr_data, sizeof (struct ethtool_cmd)))
++			return -EFAULT;
++		mii_reg_sset = 0;
++		if (ecmd.speed == SPEED_100)
++			mii_reg_sset |= BMCR_SPEED100;
++		if (ecmd.duplex == DUPLEX_FULL)
++			mii_reg_sset |= BMCR_FULLDPLX;
++		if (ecmd.autoneg == AUTONEG_ENABLE) {
++			mii_reg_sset |= (BMCR_ANENABLE | BMCR_ANRESTART);
++			spin_lock_irqsave(&XE_spinlock, flags);
++			result = XEmac_PhyWrite(&lp->Emac, lp->mii_addr,
++						MII_BMCR, mii_reg_sset);
++			if (result != XST_SUCCESS) {
++				spin_unlock_irqrestore(&XE_spinlock, flags);
++				ret = -EIO;
++				break;
++			}
++			result = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_ADVERTISE, &mii_reg_sset);
++			if (result != XST_SUCCESS) {
++				spin_unlock_irqrestore(&XE_spinlock, flags);
++				ret = -EIO;
++				break;
++			}
++			if (ecmd.speed == SPEED_100) {
++				if (ecmd.duplex == DUPLEX_FULL) {
++					mii_reg_sset |= (ADVERTISE_10FULL | ADVERTISE_100FULL |
++						ADVERTISE_10HALF | ADVERTISE_100HALF);
++				} else {
++					mii_reg_sset |= (ADVERTISE_10HALF | ADVERTISE_100HALF);
++					mii_reg_sset &= ~(ADVERTISE_10FULL | ADVERTISE_100FULL);
++				}
++			} else {
++				if (ecmd.duplex == DUPLEX_FULL) {
++					mii_reg_sset |= (ADVERTISE_10FULL | ADVERTISE_10HALF);
++					mii_reg_sset &= ~(ADVERTISE_100FULL| ADVERTISE_100HALF);
++				} else {
++					mii_reg_sset |= (ADVERTISE_10HALF);
++					mii_reg_sset &= ~(ADVERTISE_100FULL| ADVERTISE_100HALF | ADVERTISE_10FULL);
++				}
++			}
++			result = XEmac_PhyWrite(&lp->Emac, lp->mii_addr, MII_ADVERTISE, mii_reg_sset);
++			spin_unlock_irqrestore(&XE_spinlock, flags);
++			if (result != XST_SUCCESS) {
++				ret = -EIO;
++				break;
++			}
++		} else {
++			mii_reg_sset &= ~(BMCR_ANENABLE | BMCR_ANRESTART);
++			if (ecmd.duplex == DUPLEX_FULL) {
++				mii_reg_sset |= BMCR_FULLDPLX;
++			} else {
++				mii_reg_sset &= ~BMCR_FULLDPLX;
++			}
++			if (ecmd.speed == SPEED_100) {
++				mii_reg_sset |= BMCR_SPEED100;
++			} else {
++				mii_reg_sset &= ~BMCR_SPEED100;
++			}
++			spin_lock_irqsave(&XE_spinlock, flags);
++			result = XEmac_PhyWrite(&lp->Emac, lp->mii_addr,
++						MII_BMCR, mii_reg_sset);
++			spin_unlock_irqrestore(&XE_spinlock, flags);
++			if (result != XST_SUCCESS) {
++				ret = -EIO;
++				break;
++			}
++		}
++		ret = 0;
++		break;
++	case ETHTOOL_GPAUSEPARAM:
++		ret = xenet_ethtool_get_settings(dev, &ecmd);
++		if (ret < 0) {
++			break;
++		}
++		epp.cmd = ecmd.cmd;
++		epp.autoneg = ecmd.autoneg;
++		Options = XEmac_GetOptions(&lp->Emac);
++		if (Options & XEM_INSERT_PAD_OPTION) {
++			epp.rx_pause = 1;
++			epp.tx_pause = 1;
++		} else {
++			epp.rx_pause = 0;
++			epp.tx_pause = 0;
++		}
++		if (copy_to_user(rq->ifr_data, &epp, sizeof(struct ethtool_pauseparam)))
++			ret = -EFAULT;
++		else
++			ret = 0;
++		break;
++	case ETHTOOL_SPAUSEPARAM:
++		if (copy_from_user(&epp, rq->ifr_data, sizeof (struct ethtool_pauseparam)))
++			return -EFAULT;
++		ret = xenet_ethtool_get_settings(dev, &ecmd);
++		if (ret < 0) {
++			break;
++		}
++		epp.cmd = ecmd.cmd;
++		mii_reg_spause = 0;
++		if (epp.autoneg == AUTONEG_ENABLE) {
++			mii_reg_spause |= (BMCR_ANENABLE | BMCR_ANRESTART);
++		} else {
++			if (ecmd.speed == SPEED_100)
++				mii_reg_spause |= BMCR_SPEED100;
++			if (ecmd.duplex == DUPLEX_FULL)
++				mii_reg_spause |= BMCR_FULLDPLX;
++		}
++		spin_lock_irqsave(&XE_spinlock, flags);
++		result = XEmac_PhyWrite(&lp->Emac, lp->mii_addr,
++					MII_BMCR, mii_reg_spause);
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		if (result != XST_SUCCESS) {
++			ret = -EIO;
++			break;
++		}
++		if (epp.rx_pause != epp.tx_pause) {
++			ret = 0;
++			break;
++		} else {
++			spin_lock_irqsave(&XE_spinlock, flags);
++			(void)XEmac_Stop(&(lp->Emac));
++			Options = XEmac_GetOptions(&lp->Emac);
++			if (epp.rx_pause)
++				Options |= XEM_INSERT_PAD_OPTION;
++			else
++				Options &= ~XEM_INSERT_PAD_OPTION;
++			(void)XEmac_SetOptions(&lp->Emac,Options);
++			(void)XEmac_Start(&(lp->Emac));
++			spin_unlock_irqrestore(&XE_spinlock, flags);
++		}
++		ret = 0;
++		break;
++	case ETHTOOL_GCOALESCE:
++		eco.cmd = ecmd.cmd;
++		ret = xenet_ethtool_get_coalesce(dev, &eco);
++		if (ret >= 0) {
++			if (copy_to_user(rq->ifr_data, &eco, sizeof (struct ethtool_coalesce)))
++				ret = -EFAULT;
++		}
++		break;
++	case ETHTOOL_SCOALESCE:
++		if (copy_from_user(&eco, rq->ifr_data, sizeof (struct ethtool_coalesce)))
++			return -EFAULT;
++		ret = xenet_ethtool_set_coalesce(dev, &eco);
++		break;
++	case ETHTOOL_GDRVINFO:
++		edrv.cmd = edrv.cmd;
++		ret = xenet_ethtool_get_drvinfo(dev, &edrv);
++		if (ret >= 0) {
++			if (copy_to_user(rq->ifr_data, &edrv, sizeof (struct ethtool_drvinfo)))
++				ret = -EFAULT;
++		}
++		break;
++	case ETHTOOL_GREGS:
++		regs.hd.cmd = edrv.cmd;
++		xenet_ethtool_get_regs (dev, &(regs.hd), &ret);
++		if (ret >= 0) {
++			if (copy_to_user(rq->ifr_data, &regs, sizeof (struct mac_regsDump)))
++				ret = -EFAULT;
++		}
++		break;
++	case ETHTOOL_GRINGPARAM:
++		erp.cmd = edrv.cmd;
++		ret = xenet_ethtool_get_ringparam (dev, &(erp));
++		if (ret >= 0) {
++			if (copy_to_user(rq->ifr_data, &erp, sizeof (struct ethtool_ringparam)))
++				ret = -EFAULT;
++		}
++		break;
++	case ETHTOOL_NWAY_RST:
++		epp.cmd = ecmd.cmd;
++		mii_reg_autoneg = 0;
++		mii_reg_autoneg |= (BMCR_ANENABLE | BMCR_ANRESTART);
++		spin_lock_irqsave(&XE_spinlock, flags);
++		result = XEmac_PhyWrite(&lp->Emac, lp->mii_addr,
++					MII_BMCR, mii_reg_autoneg);
++		spin_unlock_irqrestore(&XE_spinlock, flags);
++		if (result != XST_SUCCESS) {
++			ret = -EIO;
++			break;
++		}
++		ret = 0;
++		break;
++	default:
++		break;
++	}
++	return ret;
++}
++
+ static int xenet_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
+ {
+ 	struct net_local *lp = netdev_priv(ndev);
+@@ -545,6 +963,8 @@ static int xenet_ioctl(struct net_device
+ 	XStatus Result;
+ 
+ 	switch (cmd) {
++	case SIOCETHTOOL:
++		return xenet_do_ethtool_ioctl(ndev, ifr);	
+ 	case SIOCGMIIPHY:	/* Get address of MII PHY in use. */
+ 		data->phy_id = lp->mii_addr;
+ 		/* Fall Through */
+@@ -616,9 +1036,10 @@ static void xenet_remove_ndev(struct net
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ static void xenet_netpoll (struct net_device *netdev)
+ {
+-       disable_irq(netdev->irq);
+-       xenet_interrupt(netdev->irq, netdev, NULL );
+-       enable_irq(netdev->irq);
++	unsigned long flags;
++	spin_lock_irqsave(&XE_spinlock, flags);
++	xenet_interrupt(netdev->irq, netdev, NULL );
++	spin_unlock_irqrestore(&XE_spinlock, flags);
+ }
+ #endif
+ 
+@@ -665,6 +1086,7 @@ static int xenet_probe(struct device *de
+ 	lp = netdev_priv(ndev);
+ 	lp->Config.DeviceId = pdev->id;
+ 	spin_lock_init(&lp->skb_lock);
++	spin_lock_init(&XE_spinlock);
+ 	init_timer(&lp->phy_timer);
+ 
+ 	/* Initialize the rest of the private data */
+Index: linux-2.6.10/mvl_patches/pro-0643.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0643.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(643);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

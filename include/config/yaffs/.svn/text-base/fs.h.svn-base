@@ -1,0 +1,1 @@
+#define CONFIG_YAFFS_FS 1

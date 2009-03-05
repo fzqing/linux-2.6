@@ -1,0 +1,2480 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_pm
+# Date: Fri Dec  7 11:51:54 2007
+# Source: MontaVista Software, Inc.
+# MR: 22943
+# Type: Integration
+# Disposition: merged from Marvell
+# Signed-off-by: yadviga grigorieva <yadviga@ru.mvista.com>
+# Description:
+# 	The base PM for PXA3xx
+# 
+
+PATCHNUM=1433
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 22943
+Type: Integration
+Disposition: merged from Marvell
+Signed-off-by: yadviga grigorieva <yadviga@ru.mvista.com>
+Description:
+	The base PM for PXA3xx
+
+Index: linux-2.6.10/arch/arm/mach-pxa/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-pxa/Makefile
++++ linux-2.6.10/arch/arm/mach-pxa/Makefile
+@@ -24,9 +24,13 @@ led-$(CONFIG_MACH_ZYLONITE) += leds-zylo
+ obj-$(CONFIG_LEDS) += $(led-y)
+ 
+ # Misc features
++ifeq ($(CONFIG_PXA3xx), y)
+ obj-$(CONFIG_PXA3xx) += mhn_gpio.o
++obj-$(CONFIG_PM) += pxa3xx_pm.o pxa3xx_suspend.o sleepwkr.o
+ 
++else
+ obj-$(CONFIG_PM) += pm.o sleep.o
++endif
+ 
+ ifeq ($(CONFIG_PXA27x),y)
+ obj-$(CONFIG_PM) += standby.o
+Index: linux-2.6.10/include/asm-arm/arch-pxa/mhn_pm.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-pxa/mhn_pm.h
+@@ -0,0 +1,408 @@
++/*
++ * Monahans Power Management Routines
++ *
++ * Copyright (C) 2004, Intel Corporation(chao.xie@intel.com).
++ *
++ * This software program is licensed subject to the GNU General Public License
++ * (GPL).Version 2,June 1991, available at http://www.fsf.org/copyleft/gpl.html
++
++ *(C) Copyright 2006 Marvell International Ltd.
++ * All Rights Reserved
++ */
++
++#ifndef	__MHN_PM_H__
++#define	__MHN_PM_H__
++
++#include <asm/types.h>
++
++/* The io memory map follows the definition in include/asm/arch/hardware.h.
++ */
++#define RSEG0(a)	(((a) & 0x01ffffff) + 0x40000000)
++#define KSEG0(a)	(((a) & 0x01ffffff) + 0xf6000000)
++#define RSEG1(a)	(((a) & 0x0fffffff) + 0x42000000)
++#define KSEG1(a)	((((a) & 0xfc000000) >> 3) + 0xf8000000)
++#define RTCBASE		(0x00900000)
++#define OSTBASE		(0x00a00000)
++#define CLKBASE		(0x01340000)
++#define INTCBASE	(0x00d00000)
++#define GPIOBASE	(0x00e00000)
++#define PMUBASE		(0x00f40000)
++
++#define ARBBASE		(0x04000000)
++#define SMCBASE		(0x08000000)
++
++/* Registers offset with CLKBASE */
++#define ACCR_OFF	0x0000
++#define ACCR_PCCE	(1 << 11)
++#define AICSR_OFF		0x0008
++#define AICSR_PCIE	(1 << 4)
++#define AICSR_TCIE	(1 << 2)
++#define AICSR_FCIE	(1 << 0)
++#define CKENA_OFF		0x000C
++#define CKENB_OFF		0x0010
++#define OSCC_OFF		0x10000
++/* Registers offset with OSTBASE */
++#define OSSR_OFF		0x0014
++#define OIER_OFF		0x001C
++#define OSCR4_OFF		0x0040
++#define OSMR4_OFF		0x0080
++#define OMCR4_OFF		0x00C0
++/* Registers offseti with RTCBASE */
++#define RTSR_OFF		0x0008
++#define RTSR_PICE	(1 << 15)
++#define RTSR_PIALE	(1 << 14)
++#define PICR_OFF		0x0034
++#define PIAR_OFF		0x0038
++/* Registers offset with INTCBASE */
++#define ICMR_OFF		0x0004
++#define ICPR_OFF		0x0010
++#define ICCR_OFF		0x0014
++#define IPR0_OFF		0x001C
++#define ICMR2_OFF		0x00A0
++#define IPR32_OFF		0x00B0
++/* Registers offset with PMUBASE */
++#define ASCR_OFF		0x0000
++#define ASCR_RDH		(1 << 31)
++#define ASCR_D1S		(1 << 2)
++#define ASCR_D2S		(1 << 1)
++#define ASCR_D3S		(1 << 0)
++#define ASCR_MASK		(ASCR_D1S | ASCR_D2S | ASCR_D3S)
++#define ARSR_OFF		0x0004
++#define AD3ER_OFF		0x0008
++#define AD3SR_OFF		0x000C
++#define AD2D0ER_OFF		0x0010
++#define AD2D0SR_OFF		0x0014
++#define AD2D1ER_OFF		0x0018
++#define AD2D1SR_OFF		0x001C
++#define AD1D0ER_OFF		0x0020
++#define AD1D0SR_OFF		0x0024
++#define AD3R_OFF		0x0030
++#define AD2R_OFF		0x0034
++#define AD1R_OFF		0x0038
++#define PMCR_OFF		0x10000
++#define PSR_OFF			0x10004
++#define PSR_MASK		0x07
++#define PSPR_OFF		0x10008
++#define PCFR_OFF		0x1000C
++#define PWER_OFF		0x10010
++#define PWSR_OFF		0x10014
++#define PECR_OFF		0x10018
++#define PECR_E1IS	(1 << 31)
++#define PECR_E1IE	(1 << 30)
++#define PECR_E0IS	(1 << 29)
++#define PECR_E0IE	(1 << 28)
++#define PECR_DIR1	(1 << 5)
++#define PECR_DIR0	(1 << 4)
++#define PVCR_OFF		0x10100
++/* Registers offset with ARBBASE */
++#define ARBCTL1_OFF		0xFE00
++#define ARBCTL2_OFF		0xFE80
++/* Registers offset with SMCBASE */
++#define MSC0_OFF		0x0008
++#define MSC1_OFF		0x000C
++#define MECR_OFF		0x0014
++#define SXCNFG_OFF		0x001C
++#define MCMEM0_OFF		0x0028
++#define MCATT0_OFF		0x0030
++#define MCIO0_OFF		0x0038
++#define MEMCLKCFG_OFF	0x0068
++#define CSADRCFG0_OFF	0x0080
++#define CSADRCFG1_OFF	0x0084
++#define CSADRCFG2_OFF	0x0088
++#define CSADRCFG3_OFF	0x008C
++#define CSADRCFG_P_OFF	0x0090
++#define CSMSADRCFG_OFF	0x00A0
++
++/* mode save flags */
++#define PM_MODE_SAVE_FLAG_SYS	0x1
++#define PM_MODE_SAVE_FLAG_IRQ	0x2
++#define PM_MODE_SAVE_FLAG_FIQ	0x4
++#define PM_MODE_SAVE_FLAG_ABT	0x8
++#define PM_MODE_SAVE_FLAG_UND	0x10
++#define PM_MODE_SAVE_FLAG_SVC	0x20
++
++/* value for PWRMODE register */
++#define	MHN_PM_S2D3C4		0x06
++#define	MHN_PM_S0D2C2		0x03
++#define	MHN_PM_S3D4C4		0x07
++#define	MHN_PM_S0D1C2		0x02
++#define	MHN_PM_S0D0C1		0x01
++
++/* CPSR Processor constants */
++#define CPSR_Mode_MASK		(0x0000001F)
++#define CPSR_Mode_USR		(0x10)
++#define CPSR_Mode_FIQ		(0x11)
++#define CPSR_Mode_IRQ		(0x12)
++#define CPSR_Mode_SVC		(0x13)
++#define CPSR_Mode_ABT		(0x17)
++#define CPSR_Mode_UND		(0x1B)
++#define CPSR_Mode_SYS		(0x1F)
++#define CPSR_I_Bit		(0x80)
++#define CPSR_F_Bit		(0x40)
++
++/****************************************************************************/
++#define MHN_PM_WE_EXTERNAL0 	(0x1UL << 0)
++#define MHN_PM_WE_EXTERNAL1 	(0x1UL << 1)
++#define	MHN_PM_WE_GENERIC0 	(0x1UL << 2)
++#define	MHN_PM_WE_GENERIC1 	(0x1UL << 3)
++#define	MHN_PM_WE_GENERIC2	(0x1UL << 4)
++#define	MHN_PM_WE_UART1		(0x1UL << 5)
++#define	MHN_PM_WE_UART2		(0x1UL << 6)
++#define	MHN_PM_WE_UART3		(0x1UL << 7)
++#define	MHN_PM_WE_MKEY		(0x1UL << 8)
++#define	MHN_PM_WE_GENERIC7	(0x1UL << 9)
++#define	MHN_PM_WE_GENERIC8	(0x1UL << 10)
++#define MHN_PM_WE_GENERIC9	(0x1UL << 11)
++#define	MHN_PM_WE_GENERIC10	(0x1UL << 12)
++#define	MHN_PM_WE_GENERIC11	(0x1UL << 13)
++#define	MHN_PM_WE_GENERIC12	(0x1UL << 14)
++#define	MHN_PM_WE_GENERIC13	(0x1UL << 15)
++#define	MHN_PM_WE_OTG		(0x1UL << 16)
++#define	MHN_PM_WE_RESERVE0	(0x1UL << 17)
++#define	MHN_PM_WE_MLCD  	(0x1UL << 18)
++#define	MHN_PM_WE_USIM0		(0x1UL << 19)
++#define	MHN_PM_WE_USIM1		(0x1UL << 20)
++#define	MHN_PM_WE_DKEY		(0x1UL << 21)
++#define	MHN_PM_WE_MUX2		(0x1UL << 22)
++#define	MHN_PM_WE_MUX3		(0x1UL << 23)
++#define	MHN_PM_WE_MSL0		(0x1UL << 24)
++#define	MHN_PM_WE_RESERVE1	(0x1UL << 25)
++#define	MHN_PM_WE_USB2		(0x1UL << 26)
++#define	MHN_PM_WE_RESERVE2	(0x1UL << 27)
++#define	MHN_PM_WE_USBH		(0x1UL << 28)
++#define	MHN_PM_WE_TSI		(0x1UL << 29)
++#define	MHN_PM_WE_OST		(0x1UL << 30)
++#define	MHN_PM_WE_RTC 		(0x1UL << 31)
++
++#define PWSR_EDR0	(0x1 << 0)
++#define PWSR_EDR1	(0x1 << 1)
++#define PWSR_EDF0	(0x1 << 2)
++#define PWSR_EDF1	(0x1 << 3)
++#define PWSR_EERTC	(0x1 << 31)
++
++#define PWER_WER0  (0x1 << 0)
++#define PWER_WER1  (0x1 << 1)
++#define PWER_WEF0  (0x1 << 2)
++#define PWER_WEF1  (0x1 << 3)
++#define PWER_WERTC (0x1 << 31)
++
++#define AD3ER_MASK  (MHN_PM_WE_EXTERNAL0 | MHN_PM_WE_EXTERNAL1 |\
++			MHN_PM_WE_UART1 | MHN_PM_WE_UART2 |	\
++			MHN_PM_WE_UART3 | MHN_PM_WE_MKEY |	\
++			MHN_PM_WE_OTG | MHN_PM_WE_DKEY |	\
++			MHN_PM_WE_USB2 | MHN_PM_WE_USBH |	\
++			MHN_PM_WE_TSI | MHN_PM_WE_RTC |		\
++			MHN_PM_WE_OST)
++
++#define AD2D1ER_MASK  (MHN_PM_WE_OST | MHN_PM_WE_RTC)
++
++#define AD2D0ER_MASK  (MHN_PM_WE_EXTERNAL0 | MHN_PM_WE_EXTERNAL1 |\
++			MHN_PM_WE_UART1 | MHN_PM_WE_UART2 |	\
++			MHN_PM_WE_UART3 | MHN_PM_WE_MKEY |	\
++			MHN_PM_WE_OTG | MHN_PM_WE_DKEY |	\
++			MHN_PM_WE_USB2 | MHN_PM_WE_USBH |	\
++			MHN_PM_WE_TSI | MHN_PM_WE_OST |		\
++			MHN_PM_WE_RTC)
++
++#define AD1D0ER_MASK  (MHN_PM_WE_EXTERNAL0 | MHN_PM_WE_EXTERNAL1 |\
++			MHN_PM_WE_UART1 | MHN_PM_WE_UART2 |	\
++			MHN_PM_WE_UART3 | MHN_PM_WE_MKEY |	\
++			MHN_PM_WE_OTG | MHN_PM_WE_MLCD |	\
++			MHN_PM_WE_DKEY | MHN_PM_WE_USB2 |	\
++			MHN_PM_WE_USBH | MHN_PM_WE_TSI |	\
++			MHN_PM_WE_OST | MHN_PM_WE_RTC)
++
++#define WORD_SIZE	4
++
++/* the position of each data memeber */
++#define	SleepState_begin		0x0
++#define SleepState_checksum		0x0
++#define SleepState_wordCount		(SleepState_checksum + WORD_SIZE)
++#define SleepState_areaAddress		(SleepState_wordCount + WORD_SIZE)
++#define SleepState_modeSaveFlags	(SleepState_areaAddress + WORD_SIZE)
++/* save ARM registers */
++#define	SleepState_ENTRY_REGS		(SleepState_modeSaveFlags + WORD_SIZE)
++#define SleepState_ENTRY_CPSR		(SleepState_ENTRY_REGS)
++#define SleepState_ENTRY_SPSR		(SleepState_ENTRY_CPSR + WORD_SIZE)
++#define SleepState_ENTRY_R0		(SleepState_ENTRY_SPSR + WORD_SIZE)
++#define	SleepState_ENTRY_R1		(SleepState_ENTRY_R0 + WORD_SIZE)
++#define SleepState_SYS_REGS		(SleepState_ENTRY_REGS + 17*WORD_SIZE)
++#define SleepState_FIQ_REGS		(SleepState_SYS_REGS + 2*WORD_SIZE)
++#define SleepState_IRQ_REGS		(SleepState_FIQ_REGS + 8*WORD_SIZE)
++#define SleepState_ABT_REGS		(SleepState_IRQ_REGS + 3*WORD_SIZE)
++#define SleepState_UND_REGS		(SleepState_ABT_REGS + 3*WORD_SIZE)
++#define SleepState_SVC_REGS		(SleepState_UND_REGS + 3*WORD_SIZE)
++/* save MMU settings */
++#define SleepState_Cp15_ACR_MMU		(SleepState_SVC_REGS + 3*WORD_SIZE)
++#define SleepState_Cp15_AUXCR_MMU	(SleepState_Cp15_ACR_MMU + WORD_SIZE)
++#define SleepState_Cp15_TTBR_MMU	(SleepState_Cp15_AUXCR_MMU + WORD_SIZE)
++#define SleepState_Cp15_DACR_MMU	(SleepState_Cp15_TTBR_MMU + WORD_SIZE)
++#define SleepState_Cp15_PID_MMU		(SleepState_Cp15_DACR_MMU + WORD_SIZE)
++#define SleepState_Cp15_CPAR		(SleepState_Cp15_PID_MMU + WORD_SIZE)
++
++#define SleepState_extendedChecksumByteCount	(SleepState_Cp15_CPAR + WORD_SIZE)
++#define SleepState_psprAddress	(SleepState_extendedChecksumByteCount + WORD_SIZE)
++#define SleepState_flushFunc	(SleepState_psprAddress + WORD_SIZE)
++#define	SleepState_end		(SleepState_flushFunc + WORD_SIZE)
++
++#define	SleepState_size		(SleepState_end - SleepState_begin)
++
++#ifndef __ASSEMBLY__
++
++struct intc_regs {
++	unsigned char __iomem *membase;
++	unsigned int iccr;
++	unsigned int ipr[32];
++	unsigned int ipr2[21];
++	unsigned int icmr;
++	unsigned int icmr2;
++	unsigned int iclr;
++	unsigned int iclr2;
++};
++
++struct clock_regs {
++	unsigned char __iomem *membase;
++	unsigned int aicsr;
++	unsigned int ckena;
++	unsigned int ckenb;
++	unsigned int oscc;
++};
++
++struct ost_regs {
++	unsigned char __iomem *membase;
++	unsigned int ossr;
++	unsigned int oier;
++	unsigned int oscr4;
++	unsigned int osmr4;
++	unsigned int omcr4;
++};
++
++struct rtc_regs {
++	unsigned char __iomem *membase;
++	unsigned int rtsr;
++	unsigned int piar;
++};
++
++struct smc_regs {
++	unsigned char __iomem *membase;
++	unsigned int msc0;
++	unsigned int msc1;
++	unsigned int mecr;
++	unsigned int sxcnfg;
++	unsigned int mcmem0;
++	unsigned int mcatt0;
++	unsigned int mcio0;
++	unsigned int memclkcfg;
++	unsigned int cscfg0;
++	unsigned int cscfg1;
++	unsigned int cscfg2;
++	unsigned int cscfg3;
++	unsigned int cscfg_p;
++	unsigned int csmscfg;
++};
++
++struct arb_regs {
++	unsigned char __iomem *membase;
++	unsigned int ctl1;
++	unsigned int ctl2;
++};
++
++struct pmu_regs {
++	unsigned char __iomem *membase;
++	unsigned int pcfr;
++	unsigned int pecr;
++	unsigned int pvcr;
++};
++
++struct pm_save_data {
++	u32 checksum;
++	u32 wordCount;
++	u32 areaAddress;
++	u32 modeSaveFlags;
++	/* current mode registers cpsr, sprsr, r0-r12, lr, sp */
++	u32 ENTRY_REGS[17];
++	/* SYS mode registers:sp, lr */
++	u32 SYS_REGS[2];
++	/* FIQ mode registers:spsr, r8-r12, sp, lr */
++	u32 FIQ_REGS[8];
++	/* IRQ mode registers:spsr, sp, lr */
++	u32 IRQ_REGS[3];
++	/* ABT mode registers:spsr, sp, lr */
++	u32 ABT_REGS[3];
++	/* UND mode registers:spsr, sp, lr */
++	u32 UND_REGS[3];
++	/* SVC mode registers:spsr, sp, lr */
++	u32 SVC_REGS[3];
++	/* MMU registers */
++	u32 CP15_ACR_MMU;
++	u32 CP15_AUXCR_MMU;
++	u32 CP15_TTBR_MMU;
++	u32 CP15_DACR_MMU;
++	u32 CP15_PID_MMU;
++	u32 CP15_CPAR;
++
++	u32 extendedChecksumByteCount;
++	/*u32 sramAddress; */
++	u32 psprAddress;
++	void (*flushFunc) (void);
++	/* the parameter is the reserved bytes from 0x5c010000 */
++	/* It returns the physical address of initlization code in SRAM */
++};
++
++struct mhn_pm_regs {
++	/* It's used to save core registers. */
++	struct pm_save_data pm_data;
++	struct intc_regs intc;
++	struct clock_regs clock;
++	struct ost_regs ost;
++	struct rtc_regs rtc;
++	struct smc_regs smc;
++	struct arb_regs arb;
++	struct pmu_regs pmu;
++	/* It's the virtual address of ISRAM that can be accessed by kernel.
++	 */
++	void *sram_map;
++	/* It's used to save ISRAM data. */
++	void *sram;
++	/* It's used to save OBM that loaded from NAND flash. */
++	void *obm;
++	/* It's the address of DDR that stores key information.
++	 * Two words are used from the address.
++	 */
++	void *data_pool;
++	unsigned int word0;
++	unsigned int word1;
++};
++
++/*
++ * According PM wakeup src table, set proper source.
++ */
++typedef union {
++	unsigned long value;
++	struct {
++		unsigned ext0:1;
++		unsigned ext1:1;
++		unsigned rev1:3;
++		unsigned uart1:1;
++		unsigned uart2:1;
++		unsigned uart3:1;
++		unsigned mkey:1;
++		unsigned rev2:7;
++		unsigned usbotg:1;
++		unsigned rev3:1;
++		unsigned mlcd:1;
++		unsigned rev4:2;
++		unsigned dkey:1;
++		unsigned rev5:4;
++		unsigned usb2:1;	/* USB 2.0 client */
++		unsigned rev6:1;
++		unsigned usbh:1;	/* USB Host Port 1 */
++		unsigned tsi:1;
++		unsigned ost:1;
++		unsigned rtc:1;
++	} bits;
++} pm_wakeup_src_t;
++
++#endif
++
++#endif
+Index: linux-2.6.10/arch/arm/mach-pxa/pxa3xx_pm.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-pxa/pxa3xx_pm.c
+@@ -0,0 +1,849 @@
++/*
++ * Monahans Power Management Routines
++ *
++ * Copyright (C) 2004, Intel Corporation(chao.xie@intel.com).
++ *
++ * This software program is licensed subject to the GNU General Public License
++ * (GPL).Version 2,June 1991, available at http://www.fsf.org/copyleft/gpl.html
++
++ *(C) Copyright 2006 Marvell International Ltd.
++ * All Rights Reserved
++ */
++
++#undef	DEBUG
++#define DEBUG
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/suspend.h>
++#include <linux/errno.h>
++#include <linux/time.h>
++#include <linux/delay.h>
++#include <linux/vmalloc.h>
++#include <asm/system.h>
++#include <asm/pgtable.h>
++#include <asm/io.h>
++#include <asm/mach/time.h>
++#include <asm/cacheflush.h>
++#include <asm/arch/mfp.h>
++#include <asm/arch/mhn_gpio.h>
++#include <asm/arch/mhn_pm.h>
++
++#include "sleepwkr.h"
++
++/* mtd.h declares another DEBUG macro definition */
++#undef DEBUG
++#include <linux/mtd/mtd.h>
++
++/* The first 32KB is reserved and can't be accessed by kernel.
++ * This restrict is only valid on BootROM V2.
++ */
++#define ISRAM_START	0x5c000000
++
++/* MOBM_START should be larger than SRAM_START */
++/* MOBM_START is used on MOBM V2.
++ * The address is 0x5c014000. It means MOBM will be copied on the address.
++ * On MOBM V3, it will be copied on 0x5c013000.
++ */
++#define MOBM_START	0x5c014000
++#define MOBM_SIZE	(32 * 1024)
++#define MOBM_OFFSET	8
++
++#define ISRAM_SIZE	(128 * 2 * 1024)
++
++/* MOBM V2 is used on MhnP B0/B1/B2, MhnPL B1 and MhnL A0
++ * MOBM V3 is used on MhnLV A0
++ */
++enum mhn_obm {
++	MHN_OBM_NULL,
++	MHN_OBM_V2,
++	MHN_OBM_V3,
++	MHN_OBM_INVAL,
++};
++
++enum mhn_pm_mode {
++	MHN_PM_RUN = 0,
++	MHN_PM_IDLE = 1,
++	MHN_PM_STANDBY = 3,
++	MHN_PM_D0CS = 5,
++	MHN_PM_SLEEP = 6,
++};
++
++extern struct subsystem power_subsys;
++
++pm_wakeup_src_t wakeup_src;
++EXPORT_SYMBOL(wakeup_src);
++
++/* How long we will in sleep mode if duty cycle. */
++unsigned int pm_sleeptime = 58;	/* In seconds. */
++EXPORT_SYMBOL(pm_sleeptime);
++unsigned int pm_msleeptime = 0;	/* In miliseconds. */
++
++extern void mhn_cpu_sleep(unsigned int, unsigned int);
++extern void mhn_cpu_resume(void);
++extern void mhn_cpu_standby(unsigned int);
++
++void (*event_notify) (int, int, void *, unsigned int) = NULL;
++EXPORT_SYMBOL(event_notify);
++
++static struct mhn_pm_regs mhn_pm_regs;
++
++/*************************************************************************/
++/* workaround for bug 2140448 */
++static int is_wkr_2140448(void)
++{
++	return 0;
++}
++
++/*
++ * MOBM V2 is applied on chips taped out before MhnLV A0.
++ * MOBM V3 is applied on chips taped out after MhnLV A0.
++ * MOBM V3 is also applied on MhnLV A0.
++ */
++static int calc_obm_ver(void)
++{
++	unsigned int cpuid;
++	/* read CPU ID */
++      __asm__("mrc p15, 0, %0, c0, c0, 0\n":"=r"(cpuid)
++	    );
++	if ((cpuid & 0xFFFF0000) != 0x69050000) {
++		/* It's not xscale chip. */
++		return MHN_OBM_INVAL;
++	}
++	if ((cpuid & 0x0000FFF0) == 0x00006420) {
++		/* It's MhnP Ax */
++		return MHN_OBM_V2;
++	}
++	if ((cpuid & 0x0000FFF0) == 0x00006820) {
++		/* It's MhnP Bx */
++		if ((cpuid & 0x0F) <= 6)
++			return MHN_OBM_V2;
++		else
++			return MHN_OBM_V3;
++	}
++	if ((cpuid & 0x0000FFF0) == 0x00006880) {
++		/* It's MhnL Ax */
++		if ((cpuid & 0x0F) == 0)
++			return MHN_OBM_V2;
++		else
++			return MHN_OBM_V3;
++	}
++	if ((cpuid & 0x0000FFF0) == 0x00006890) {
++		/* It's MhnLV Ax */
++		return MHN_OBM_V3;
++	}
++	return MHN_OBM_INVAL;
++}
++
++/* Return the address of OBM in RAM if successful.
++ * Otherwise, return negative value.
++ */
++static void* load_obm(void)
++{
++	void *addr = NULL;
++	struct mtd_info *mtd = NULL;
++	int obm_ver, retlen;
++
++	mtd = get_mtd_device(NULL, 0);
++	if (mtd == NULL)
++		return NULL;
++	addr = kmalloc(MOBM_SIZE, GFP_KERNEL);
++	if (!addr)
++		return NULL;
++
++	obm_ver = calc_obm_ver();
++	if (obm_ver == MHN_OBM_V2) {
++		/* MOBM begins from 0x0000 */
++		if (mtd->oobblock == 2048)
++			mtd->read(mtd, 0x0, MOBM_SIZE, &retlen, addr);
++		else {
++#if (MOBM_SIZE > 16 * 1024)
++			mtd->read(mtd, 0, 0x4000, &retlen, addr);
++			mtd->read(mtd, 0x4000, MOBM_SIZE - 0x4000, &retlen,
++				  addr + 0x3e00);
++#else
++			mtd->read(mtd, 0, MOBM_SIZE, &retlen, addr);
++#endif
++		}
++		addr += MOBM_OFFSET;
++	} else if (obm_ver == MHN_OBM_V3) {
++		/* MOBM begins from 0x20000 */
++		if (mtd->oobblock == 2048)
++			mtd->read(mtd, 0x20000, MOBM_SIZE, &retlen, addr);
++
++	}
++	pr_debug("load mobm into address: 0x%x\n", (unsigned int)addr);
++	return addr;
++}
++
++static void mhn_intc_save(struct intc_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	unsigned int temp, i;
++
++	context->iccr = readl(base + ICCR);
++	for (i = 0; i < 32; i++) {
++		context->ipr[i] = readl(base + IPR0_OFF + (i << 2));
++	}
++	for (i = 0; i < 21; i++) {
++		context->ipr2[i] = readl(base + IPR32_OFF + (i << 2));
++	}
++
++	/* load registers by accessing co-processor */
++      __asm__("mrc\tp6, 0, %0, c1, c0, 0":"=r"(temp));
++	context->icmr = temp;
++      __asm__("mrc\tp6, 0, %0, c7, c0, 0":"=r"(temp));
++	context->icmr2 = temp;
++      __asm__("mrc\tp6, 0, %0, c2, c0, 0":"=r"(temp));
++	context->iclr = temp;
++      __asm__("mrc\tp6, 0, %0, c8, c0, 0":"=r"(temp));
++	context->iclr2 = temp;
++}
++
++static void mhn_intc_restore(struct intc_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	unsigned int temp, i;
++
++	writel(context->iccr, base + ICCR_OFF);
++	for (i = 0; i < 32; i++) {
++		writel(context->ipr[i], base + IPR0_OFF + (i << 2));
++	}
++	for (i = 0; i < 21; i++) {
++		writel(context->ipr2[i], base + IPR32_OFF + (i << 2));
++	}
++
++	temp = context->icmr;
++      __asm__("mcr\tp6, 0, %0, c1, c0, 0": :"r"(temp));
++	temp = context->icmr2;
++      __asm__("mcr\tp6, 0, %0, c7, c0, 0": :"r"(temp));
++	temp = context->iclr;
++      __asm__("mcr\tp6, 0, %0, c2, c0, 0": :"r"(temp));
++	temp = context->iclr2;
++      __asm__("mcr\tp6, 0, %0, c8, c0, 0": :"r"(temp));
++}
++
++static void mhn_clk_save(struct clock_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	unsigned int tmp;
++	context->aicsr = readl(base + AICSR_OFF);
++	context->ckena = readl(base + CKENA_OFF);
++	context->ckenb = readl(base + CKENB_OFF);
++	context->oscc = readl(base + OSCC_OFF);
++	/* Disable the processor to use the ring oscillator output clock
++	 * as a clock source when transitioning from any low-power mode
++	 * to D0 mode.
++	 */
++	tmp = readl(base + ACCR_OFF);
++	tmp &= ~ACCR_PCCE;
++	writel(tmp, base + ACCR_OFF);
++}
++
++static void mhn_clk_restore(struct clock_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	context->aicsr &= (AICSR_PCIE | AICSR_TCIE | AICSR_FCIE);
++	writel(context->aicsr, base + AICSR_OFF);
++	writel(context->ckena, base + CKENA_OFF);
++	writel(context->ckenb, base + CKENB_OFF);
++	writel(context->oscc, base + OSCC_OFF);
++}
++
++static void mhn_ost_save(struct ost_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	context->oscr4 = readl(base + OSCR4_OFF);
++	context->omcr4 = readl(base + OMCR4_OFF);
++	context->oier = readl(base + OIER_OFF);
++}
++
++static void mhn_ost_restore(struct ost_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	writel(context->oscr4, base + OSCR4_OFF);
++	writel(context->omcr4, base + OMCR4_OFF);
++	writel(context->oier, base + OIER_OFF);
++}
++
++static void mhn_sysbus_init(struct mhn_pm_regs *context)
++{
++	context->clock.membase = (unsigned char *)KSEG0(CLKBASE);
++	context->intc.membase = (unsigned char *)KSEG0(INTCBASE);
++	context->rtc.membase = (unsigned char *)KSEG0(RTCBASE);
++	context->ost.membase = (unsigned char *)KSEG0(OSTBASE);
++	context->pmu.membase = (unsigned char *)KSEG0(PMUBASE);
++	context->smc.membase = (unsigned char *)KSEG1(SMCBASE);
++	context->arb.membase = (unsigned char *)KSEG1(ARBBASE);
++
++	context->sram_map = ioremap(ISRAM_START, ISRAM_SIZE);
++	context->sram = vmalloc(ISRAM_SIZE);
++	context->obm = (void *)load_obm();
++	/* Two words begun from 0xC0000000 are used to store key information.
++	 */
++	context->data_pool = (unsigned char *)0xC0000000;
++}
++
++static void mhn_sysbus_save(struct mhn_pm_regs *context)
++{
++	unsigned char __iomem *base = NULL;
++	unsigned int tmp;
++
++	/* static memory controller */
++	base = context->smc.membase;
++	context->smc.msc0 = readl(base + MSC0_OFF);
++	context->smc.msc1 = readl(base + MSC1_OFF);
++	context->smc.sxcnfg = readl(base + SXCNFG_OFF);
++	context->smc.memclkcfg = readl(base + MEMCLKCFG_OFF);
++	context->smc.cscfg0 = readl(base + CSADRCFG0_OFF);
++	context->smc.cscfg1 = readl(base + CSADRCFG1_OFF);
++	context->smc.cscfg2 = readl(base + CSADRCFG2_OFF);
++	context->smc.cscfg3 = readl(base + CSADRCFG3_OFF);
++
++	/* system bus arbiters */
++	base = context->arb.membase;
++	context->arb.ctl1 = readl(base + ARBCTL1_OFF);
++	context->arb.ctl2 = readl(base + ARBCTL2_OFF);
++
++	/* pmu controller */
++	base = context->pmu.membase;
++	context->pmu.pecr = readl(base + PECR_OFF);
++	context->pmu.pvcr = readl(base + PVCR_OFF);
++	/* clear PSR */
++	tmp = readl(base + PSR_OFF);
++	tmp &= 0x07;
++	writel(tmp, base + PSR_OFF);
++
++	mhn_intc_save(&(context->intc));
++	mhn_clk_save(&(context->clock));
++	mhn_ost_save(&(context->ost));
++	mhn_mfp_save();
++	mhn_gpio_save();
++}
++
++static void mhn_sysbus_restore(struct mhn_pm_regs *context)
++{
++	unsigned char __iomem *base = NULL;
++
++	mhn_mfp_restore();
++	mhn_gpio_restore();
++	mhn_ost_restore(&(context->ost));
++	mhn_intc_restore(&(context->intc));
++	mhn_clk_restore(&(context->clock));
++
++	/* PMU controller */
++	base = context->pmu.membase;
++	/* status information will be lost in PECR */
++	writel(0xA0000000, base + PECR_OFF);
++	writel((context->pmu.pecr | PECR_E1IS | PECR_E0IS), base + PECR_OFF);
++	writel(context->pmu.pvcr, base + PVCR_OFF);
++
++	/* system bus arbiters */
++	base = context->arb.membase;
++	writel(context->arb.ctl1, base + ARBCTL1_OFF);
++	writel(context->arb.ctl2, base + ARBCTL2_OFF);
++
++	/* static memory controller */
++	base = context->smc.membase;
++	writel(context->smc.msc0, base + MSC0_OFF);
++	writel(context->smc.msc1, base + MSC1_OFF);
++	writel(context->smc.sxcnfg, base + SXCNFG_OFF);
++	writel(context->smc.memclkcfg, base + MEMCLKCFG_OFF);
++	writel(context->smc.cscfg0, base + CSADRCFG0_OFF);
++	writel(context->smc.cscfg1, base + CSADRCFG1_OFF);
++	writel(context->smc.cscfg2, base + CSADRCFG2_OFF);
++	writel(context->smc.cscfg3, base + CSADRCFG3_OFF);
++
++}
++
++/* This function is used to set unit clock before system enters sleep.
++ */
++static void mhn_pm_set_cken(void)
++{
++	/*
++	 * turn off SMC, GPIO,INTC clocks to save power in sleep mode.
++	 * they will be turn on by BLOB during wakeup
++	 */
++	pxa_set_cken(CKEN_SMC, 0);
++	pxa_set_cken(CKEN_GPIO, 0);
++	pxa_set_cken(CKEN_INTC, 0);
++
++	/*
++	 * turn on clocks used by bootrom during wakeup
++	 * they will be turn off by BLOB during wakeup
++	 * D0CKEN_A clocks: bootrom, No.19
++	 */
++	pxa_set_cken(CKEN_BOOT, 1);
++	pxa_set_cken(CKEN_TPM, 1);
++	/* This bit must be enabled before entering low power mode. */
++	pxa_set_cken(CKEN_HSIO2, 1);
++}
++
++/* This function is used to restore unit clock after system resumes.
++ */
++static void mhn_pm_restore_cken(void)
++{
++	pxa_set_cken(CKEN_SMC, 1);
++	pxa_set_cken(CKEN_GPIO, 1);
++	pxa_set_cken(CKEN_INTC, 1);
++	pxa_set_cken(CKEN_BOOT, 0);
++	pxa_set_cken(CKEN_TPM, 0);
++}
++
++/* This function is used to clear power manager status.
++ */
++static void mhn_clear_pm_status(unsigned char __iomem * base, int sys_level)
++{
++	unsigned int tmp;
++
++	if (sys_level) {
++		/* clear power manager status */
++		tmp = readl(base + PSR_OFF);
++		tmp &= PSR_MASK;
++		writel(tmp, base + PSR_OFF);
++	}
++	/* clear application system status */
++	tmp = readl(base + ASCR_OFF);
++	tmp &= ASCR_MASK;
++	writel(tmp, base + ASCR_OFF);
++	/* clear all application subsystem reset status */
++	tmp = readl(base + ARSR_OFF);
++	writel(tmp, base + ARSR_OFF);
++}
++
++/* This function is used to set RTC time.
++ * When it timeouts, it will wakeup system from low power mode.
++ * There's limitation that only 65 seconds sleep time can be set by this way.
++ * And user should avoid to use PIAR because it will be used as wakeup timer.
++ *
++ * Notice:
++ * User can also choice use another RTC register to trigger wakeup event.
++ * If so, keep pm_sleeptime as 0. Otherwise, those RTC registers event
++ * will make user confused. System will only serve the first RTC event.
++ */
++static void mhn_set_wakeup_sec(int sleeptime, struct rtc_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	unsigned int tmp;
++	if (sleeptime) {
++		/* PIAR can not more than 65535 */
++		if (sleeptime > 65)
++			sleeptime = 65;
++		pr_debug("Set RTC to wakeup system after %d sec\n", sleeptime);
++		tmp = readl(base + RTSR_OFF);
++		tmp &= ~(RTSR_PICE | RTSR_PIALE);
++		writel(tmp, base + RTSR_OFF);
++		/* set PIAR to sleep time, in ms */
++		writel(sleeptime * 1000, base + PIAR_OFF);
++
++		tmp = readl(base + RTSR_OFF);
++		tmp |= RTSR_PICE;
++		writel(tmp, base + RTSR_OFF);
++	} else {
++		/* Disable PIAR */
++		tmp = readl(base + RTSR_OFF);
++		tmp &= ~(RTSR_PICE | RTSR_PIALE);
++		writel(tmp, base + RTSR_OFF);
++	}
++}
++
++/* This function is used to set OS Timer4 time.
++ * The time interval may not be accurate. Because it's derived from 32.768kHz
++ * oscillator.
++ */
++static void mhn_set_wakeup_msec(int msleeptime, struct ost_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	unsigned int tmp;
++	if (msleeptime) {
++		pr_debug("Set OS Timer4 to wakeup system after %d msec\n",
++			 msleeptime);
++		tmp = readl(base + OIER_OFF);
++		tmp &= ~0x0010;
++		writel(tmp, base + OIER_OFF);
++		/* set the time interval of sleep */
++		writel(msleeptime, base + OSMR4_OFF);
++		/* use 32.768kHz oscillator when cpu is in low power mode */
++		writel(0x0082, base + OMCR4_OFF);
++		tmp = readl(base + OIER_OFF);
++		tmp |= 0x0010;
++		writel(tmp, base + OIER_OFF);
++		/* kick off the OS Timer4 */
++		writel(0, base + OSCR4_OFF);
++	} else {
++		/* Disable OS Timer 4 */
++		tmp = readl(base + OIER_OFF);
++		tmp &= ~0x0010;
++		writel(tmp, base + OIER_OFF);
++	}
++}
++
++/*
++ * Clear the wakeup source event.
++ */
++static void pm_clear_wakeup_src(pm_wakeup_src_t src)
++{
++	/* set MFPR */
++	if (src.value & MHN_PM_WE_MKEY) {
++		mhn_mfp_set_edge(MFP_KP_MKIN_0, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_MKIN_1, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_MKIN_2, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_MKIN_3, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_MKIN_4, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_MKIN_5, MFP_EDGE_NONE);
++#ifdef	CONFIG_MACH_ZYLONITE
++		mhn_mfp_set_edge(MFP_KP_MKIN_6, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_MKIN_7, MFP_EDGE_NONE);
++#endif
++	}
++	if (src.value & MHN_PM_WE_DKEY) {
++		mhn_mfp_set_edge(MFP_KP_DKIN_0, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_KP_DKIN_1, MFP_EDGE_NONE);
++	}
++	if (src.value & MHN_PM_WE_UART1) {
++		mhn_mfp_set_edge(MFP_FFRXD, MFP_EDGE_NONE);
++	}
++	if (src.value & MHN_PM_WE_UART2) {
++		mhn_mfp_set_edge(MFP_RSVD_BT_RXD, MFP_EDGE_NONE);
++		mhn_mfp_set_edge(MFP_RSVD_BT_CTS, MFP_EDGE_NONE);
++	}
++	if (src.value & MHN_PM_WE_UART3) {
++		mhn_mfp_set_edge(MFP_STD_RXD, MFP_EDGE_NONE);
++	}
++	if (src.value & MHN_PM_WE_OST) {
++		unsigned char __iomem *base = mhn_pm_regs.ost.membase;
++		unsigned int tmp;
++		writel(0x10, base + OSSR_OFF);
++		tmp = readl(base + OIER_OFF);
++		tmp &= ~0x10;
++		writel(tmp, base + OIER_OFF);
++	}
++}
++
++static void pm_select_wakeup_src(enum mhn_pm_mode lp_mode,
++				 pm_wakeup_src_t src, struct pmu_regs *context)
++{
++	unsigned char __iomem *base = context->membase;
++	unsigned int tmp;
++	struct mhn_pm_regs *p = NULL;
++
++	/* set MFPR */
++	if (src.value & MHN_PM_WE_MKEY) {
++		mhn_mfp_set_edge(MFP_KP_MKIN_0, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_MKIN_1, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_MKIN_2, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_MKIN_3, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_MKIN_4, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_MKIN_5, MFP_EDGE_BOTH);
++#ifdef	CONFIG_MACH_ZYLONITE
++		mhn_mfp_set_edge(MFP_KP_MKIN_6, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_MKIN_7, MFP_EDGE_BOTH);
++#endif
++	}
++	if (src.value & MHN_PM_WE_DKEY) {
++		mhn_mfp_set_edge(MFP_KP_DKIN_0, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_KP_DKIN_1, MFP_EDGE_BOTH);
++	}
++	if (src.value & MHN_PM_WE_UART1)
++		mhn_mfp_set_edge(MFP_FFRXD, MFP_EDGE_FALL);
++	if (src.value & MHN_PM_WE_UART2) {
++		mhn_mfp_set_edge(MFP_RSVD_BT_RXD, MFP_EDGE_BOTH);
++		mhn_mfp_set_edge(MFP_RSVD_BT_CTS, MFP_EDGE_BOTH);
++	}
++	if (src.value & MHN_PM_WE_UART3)
++		mhn_mfp_set_edge(MFP_STD_RXD, MFP_EDGE_BOTH);
++	if (src.value & MHN_PM_WE_RTC) {
++		p = container_of(context, struct mhn_pm_regs, pmu);
++		mhn_set_wakeup_sec(pm_sleeptime, &(p->rtc));
++	}
++	if (src.value & MHN_PM_WE_OST) {
++		p = container_of(context, struct mhn_pm_regs, pmu);
++		mhn_set_wakeup_msec(pm_msleeptime, &(p->ost));
++	}
++
++	/* set wakeup register */
++	if (lp_mode == MHN_PM_SLEEP) {
++		writel(0xFFFFFFFF, base + PWSR_OFF);
++		writel(0, base + PWER_OFF);
++		writel(0xFFFFFFFF, base + AD3SR_OFF);
++		writel(0, base + AD3ER_OFF);
++
++		tmp = readl(base + PWER_OFF);
++		if (src.value & MHN_PM_WE_RTC)
++			tmp |= PWER_WERTC;
++		if (src.value & MHN_PM_WE_EXTERNAL0)
++			tmp |= (PWER_WER0 | PWER_WEF0);
++		if (src.value & MHN_PM_WE_EXTERNAL1)
++			tmp |= (PWER_WER1 | PWER_WEF1);
++		writel(tmp, base + PWER_OFF);
++
++		writel(src.value & AD3ER_MASK, base + AD3ER_OFF);
++	}
++	if (lp_mode == MHN_PM_STANDBY) {
++		writel(0xFFFFFFFF, base + AD2D0SR_OFF);
++		writel(0, base + AD2D0ER_OFF);
++		writel(src.value & AD2D0ER_MASK, base + AD2D0ER_OFF);
++	}
++}
++
++/* set the default wakeup source */
++static void pm_init_wakeup_src(pm_wakeup_src_t * src, struct pmu_regs *context)
++{
++	src->value = (MHN_PM_WE_EXTERNAL0 | MHN_PM_WE_RTC |
++		      MHN_PM_WE_MKEY | MHN_PM_WE_DKEY |
++		      MHN_PM_WE_TSI | MHN_PM_WE_UART1);
++
++	/* clear the related wakeup source */
++	pm_select_wakeup_src(MHN_PM_SLEEP, *src, context);
++	pm_clear_wakeup_src(*src);
++}
++
++/*************************************************************************/
++
++static void flush_cpu_cache(void)
++{
++	__cpuc_flush_kern_all();
++}
++
++struct os_header {
++	int version;
++	int identifier;
++	int address;
++	int size;
++	int reserved;
++};
++
++static int mhn_pm_enter_sleep(struct mhn_pm_regs *pm_regs)
++{
++	unsigned char __iomem *base = pm_regs->pmu.membase;
++	unsigned int tmp;
++
++	mhn_sysbus_save(pm_regs);
++
++	if (is_wkr_2140448())
++		sleep_wkr_start(0xf6f50084);
++
++	pm_select_wakeup_src(MHN_PM_SLEEP, wakeup_src, &(pm_regs->pmu));
++
++	mhn_pm_set_cken();
++
++	/* should set:modeSaveFlags, areaAddress, flushFunc, psprAddress,
++	 * extendedChecksumByteCount */
++	pm_regs->pm_data.modeSaveFlags = 0x3f;	/* PM_MODE_SAVE_FLAG_SVC; */
++	pm_regs->pm_data.flushFunc = flush_cpu_cache;
++	pm_regs->pm_data.areaAddress = (unsigned int)&(pm_regs->pm_data);
++	pm_regs->pm_data.psprAddress = (unsigned int)base + PSPR_OFF;
++	pm_regs->pm_data.extendedChecksumByteCount =
++	    sizeof(struct mhn_pm_regs) - sizeof(struct pm_save_data);
++	pr_debug("ext size:%d, save size%d\n",
++		 pm_regs->pm_data.extendedChecksumByteCount,
++		 sizeof(struct pm_save_data));
++
++	/* save the resume back address into SDRAM */
++	pm_regs->word0 = readl(pm_regs->data_pool);
++	pm_regs->word1 = readl(pm_regs->data_pool + 4);
++	writel(virt_to_phys(mhn_cpu_resume), pm_regs->data_pool);
++	writel(virt_to_phys(&(pm_regs->pm_data)), pm_regs->data_pool + 4);
++
++	mhn_clear_pm_status(base, 1);
++
++	/* make sure that sram bank 0 is not off */
++	tmp = readl(base + AD3R_OFF);
++	tmp |= 0x101;
++	writel(tmp, base + AD3R_OFF);
++
++	pr_debug("ready to sleep:0x%lx\n", virt_to_phys(&(pm_regs->pm_data)));
++
++	/* go to Zzzz */
++	mhn_cpu_sleep((unsigned int)&(pm_regs->pm_data),
++		      virt_to_phys(&(pm_regs->pm_data)));
++
++	/* come back */
++	if (is_wkr_2140448())
++		sleep_wkr_end(0xf6f50084);
++
++	writel(pm_regs->word0, pm_regs->data_pool);
++	writel(pm_regs->word1, pm_regs->data_pool + 4);
++
++	mhn_pm_restore_cken();
++	mhn_sysbus_restore(pm_regs);
++
++	mhn_clear_pm_status(base, 1);
++	/* clear RDH */
++	tmp = readl(base + ASCR_OFF);
++	tmp &= ~ASCR_RDH;
++	writel(tmp, base + ASCR_OFF);
++
++	pm_clear_wakeup_src(wakeup_src);
++
++	/* Clear this bit after returns from low power mode.
++	 * Clear this bit can save power.
++	 */
++	pxa_set_cken(CKEN_HSIO2, 0);
++
++	pr_debug("Resume Back\n");
++
++	return 0;
++}
++
++static int mhn_pm_enter_standby(struct mhn_pm_regs *pm_regs)
++{
++	unsigned char __iomem *base = pm_regs->pmu.membase;
++
++	/* This bit must be enabled before entering low power mode. */
++	pxa_set_cken(CKEN_HSIO2, 1);
++
++	mhn_clear_pm_status(base, 0);
++	/* make sure that sram bank 0 is not off */
++
++	writel(0x109, base + AD2R_OFF);
++
++	if (is_wkr_2140448())
++		sleep_wkr_start(0xf6f50084);
++
++	pm_select_wakeup_src(MHN_PM_STANDBY, wakeup_src, &(pm_regs->pmu));
++
++	mhn_cpu_standby((unsigned int)pm_regs->sram_map + 0x8000);
++
++	if (is_wkr_2140448())
++		sleep_wkr_end(0xf6f50084);
++
++	mhn_clear_pm_status(base, 0);
++	pm_clear_wakeup_src(wakeup_src);
++	/* This bit must be disabled after entering low power mode. */
++	pxa_set_cken(CKEN_HSIO2, 0);
++
++	pr_debug("*** made it back from standby\n");
++
++	return 0;
++}
++
++static int mhn_pm_enter(suspend_state_t state)
++{
++#ifdef CONFIG_FB_PXA
++	/* unless we are entering "lcdrefresh", turn off backlight */
++	mhn_gpio_set_level(14, 0);
++#endif
++	if (state == PM_SUSPEND_MEM)
++		return mhn_pm_enter_sleep(&mhn_pm_regs);
++	else if (state == PM_SUSPEND_STANDBY)
++		return mhn_pm_enter_standby(&mhn_pm_regs);
++	else
++		return -EINVAL;
++}
++
++/*
++ * Called after processes are frozen, but before we shut down devices.
++ */
++static int mhn_pm_prepare(suspend_state_t state)
++{
++	struct os_header header;
++	int obm_ver;
++
++	if (state == PM_SUSPEND_MEM) {
++		/* backup data in ISRAM */
++		memcpy(mhn_pm_regs.sram, mhn_pm_regs.sram_map, ISRAM_SIZE);
++		obm_ver = calc_obm_ver();
++		if (obm_ver == MHN_OBM_V2) {
++			/* load OBM into ISRAM
++			 * The target address is 0x5c014000
++			 */
++			if (mhn_pm_regs.obm)
++				memcpy(mhn_pm_regs.sram_map + 0x14000,
++				       mhn_pm_regs.obm, MOBM_SIZE);
++		} else if (obm_ver == MHN_OBM_V3) {
++			/* load OBM into ISRAM
++			 * The target address is 0x5c013000
++			 * The main purpose to load obm is to initialize DDR.
++			 * When OBM found it's a resume process, it will jump
++			 * to resume routine what resides in DDR.
++			 */
++			memset(&header, 0, sizeof(struct os_header));
++			header.version = 3;
++			header.identifier = 0x5265736D;	/* RESM */
++			header.address = 0x5c013000;
++			header.size = MOBM_SIZE;
++			/* 0x5c008000 */
++			memcpy(mhn_pm_regs.sram_map + 0x8000, &header,
++			       sizeof(struct os_header));
++			/* 0x5c013000 */
++			if (mhn_pm_regs.obm)
++				memcpy(mhn_pm_regs.sram_map + 0x13000,
++				       mhn_pm_regs.obm, MOBM_SIZE);
++		}
++	} else if ((state == PM_SUSPEND_STANDBY)) {
++		/* FIXME: allocat SRAM to execute D1/D2 entry/exit code.
++		 * Try not to use it in the future.
++		 */
++		/* backup data in ISRAM */
++		memcpy(mhn_pm_regs.sram, mhn_pm_regs.sram_map, 1024);
++	}
++
++	return 0;
++}
++
++/*
++ * Called after devices are re-setup, but before processes are thawed.
++ */
++static int mhn_pm_finish(suspend_state_t state)
++{
++	if (state == PM_SUSPEND_MEM) {
++		/* restore data in ISRAM */
++		memcpy(mhn_pm_regs.sram_map, mhn_pm_regs.sram, ISRAM_SIZE);
++	} else if ((state == PM_SUSPEND_STANDBY)) {
++		/* restore data in ISRAM */
++		memcpy(mhn_pm_regs.sram_map, mhn_pm_regs.sram, 1024);
++	}
++
++	return 0;
++}
++
++/*
++ * Set to PM_DISK_FIRMWARE so we can quickly veto suspend-to-disk.
++ */
++static struct pm_ops mhn_pm_ops = {
++	.pm_disk_mode = PM_DISK_FIRMWARE,
++	.prepare = mhn_pm_prepare,
++	.enter = mhn_pm_enter,
++	.finish = mhn_pm_finish,
++};
++
++#define pm_attr(_name, object) \
++static ssize_t _name##_store(struct subsystem * subsys,			\
++			const char * buf, size_t n)			\
++{									\
++	sscanf(buf, "%u", &object);					\
++	return n;							\
++}									\
++static ssize_t _name##_show(struct subsystem * subsys, char * buf)	\
++{									\
++	return sprintf(buf, "%u\n", object);				\
++}									\
++static struct subsys_attribute _name##_attr = { 			\
++	.attr   = {                             			\
++		.name = __stringify(_name),     			\
++		.mode = 0644,                   			\
++	},                                      			\
++	.show   = _name##_show,                 			\
++	.store  = _name##_store,                			\
++}
++
++pm_attr(sleeptime, pm_sleeptime);
++pm_attr(msleeptime, pm_msleeptime);
++
++static int __init mhn_pm_init(void)
++{
++	pm_set_ops(&mhn_pm_ops);
++
++	sysfs_create_file(&power_subsys.kset.kobj, &sleeptime_attr.attr);
++	sysfs_create_file(&power_subsys.kset.kobj, &msleeptime_attr.attr);
++
++	/* set memory base */
++	mhn_sysbus_init(&mhn_pm_regs);
++	/* set default wakeup src */
++	pm_init_wakeup_src(&wakeup_src, &(mhn_pm_regs.pmu));
++
++	return 0;
++}
++
++late_initcall(mhn_pm_init);
+Index: linux-2.6.10/arch/arm/mach-pxa/pxa3xx_suspend.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-pxa/pxa3xx_suspend.S
+@@ -0,0 +1,779 @@
++/*
++ * Low-level Monahans suspend/resume support
++ *
++ * Copyright (C) 2004, Intel Corporation(chao.xie@intel.com).
++ *
++ * This software program is licensed subject to the GNU General Public License
++ * (GPL).Version 2,June 1991, available at http://www.fsf.org/copyleft/gpl.html
++ */
++
++#include <linux/config.h>
++#include <linux/linkage.h>
++#include <asm/assembler.h>
++#include <asm/hardware.h>
++#include <asm/arch/mhn_pm.h>
++
++/* mhn_cpu_resume()
++ * Entry point for bootloader resume to kernel
++ *
++ * It will invoke pm_resume_from_sleep which use area_phy_address as parameter
++ */
++/* Note: The following code is located into the .data section.
++ *       This is to allow area_phy_address to be accessed with a relative load
++ *       while we can't rely on any MMU translation.  We could have put
++ *       area_phy_address in the .text section as well, but some setups might
++ *       insist on it to be truly read-only.
++ */
++
++	.data
++	.align 5
++ENTRY(mhn_cpu_resume)
++	ldr	r1, =0x80000004
++	ldr	r0, [r1]
++	bl	pm_resume_from_sleep
++	cmp	r0, #1
++	@ maybe turn on some lights for warning
++error_ret:
++	nop
++	beq	error_ret
++
++
++/* mhn_cpu_standby()
++ *
++ * Entry point for entering standby(S0D2C2).
++ */
++	.text
++	.align 5
++ENTRY(mhn_cpu_standby)
++/* lr register will be the instruction just after invoke of mhn_cpu_standby */
++	b	pm_enter_standby
++
++/* mhn_cpu_lcdrefresh()
++ *
++ * Entry point for entering lcdrefresh(S0D1C2).
++ */
++	.text
++	.align 5
++ENTRY(mhn_cpu_lcdrefresh)
++/* lr register will be the instruction just after invoke of mhn_cpu_lcdrefresh */
++	b	pm_enter_lcd_refresh
++
++/* mhn_cpu_sleep(unsigned int a, unsigned int b)
++ *
++ * Entry point for entering sleep mode(S2D3C4).
++ * a:
++ *	vitual address of the data save area for Monahans content
++ * b:
++ *	physical address of the data save area for Monahans content
++ *
++ * The API pm_enter_sleep will use the first parameter "a". The "b" will
++ * be stored in area_phy_adress which will be used by pm_resume_from_sleep.
++ */
++
++ENTRY(mhn_cpu_sleep)
++	b	pm_enter_sleep
++
++/* mhn_cpu_deepsleep(unsigned int a, unsigned int b)
++ *
++ * Entry point for entering sleep mode(S2D3C4).
++ * a:
++ *	vitual address of the data save area for Monahans content
++ * b:
++ *	physical address of the data save area for Monahans content
++ *
++ * The pm_enter_sleep will use the first parameter "a". The "b" will
++ * be stored in area_phy_adress which will be used by pm_resume_from_sleep.
++ */
++
++ENTRY(mhn_cpu_deepsleep)
++	b	pm_enter_deep_sleep
++
++
++@*****************************************************************************
++@ pm_checksum_calculate
++@
++@ Calculate checksum
++@
++@ Inputs:
++@	r0: the virutal address of the data area which will be calculated the
++@		checksum
++@	r1: the toltal word of the data area. Checksum is done on 4-byte word
++@
++@ Output:
++@	checksum
++@
++@ Registers used
++@	r0, r1, r2, r3
++@
++
++pm_checksum_calculate:
++
++	@ pick a non-zero seed
++	ldr	r2, =(0x5A72)
++calculate:
++	@ get value and increment pointer
++	ldr	r3, [r0], #4
++	add	r2, r2, r3
++	@ rotate left by one bit position
++	mov	r2, r2, ROR #31
++	subs	r1, r1, #1
++	bne	calculate
++	mov	r0, r2
++	mov	pc, lr
++
++
++
++@******************************************************************************
++@
++@ pm_resume_from_deep_sleep
++@
++@ Restore saved content and return back
++@
++@ Inputs:
++@	r0: The physical address of the saved data area
++@
++@ Outputs:
++@	None
++@
++pm_resume_from_deep_sleep:
++
++@******************************************************************************
++@
++@ pm_resume_from_sleep
++@
++@ Restore saved content and return back
++@
++@ Inputs:
++@	r0: The physical address of the saved data area
++@
++@ Outputs:
++@	None
++@
++
++pm_resume_from_sleep:
++	@ make sure that we are in SVC mode with irq and fiq off
++	mov     r1, #(CPSR_Mode_SVC | CPSR_I_Bit | CPSR_F_Bit)
++	msr     cpsr_c, r1
++
++	@ Step 1
++	@ validate checksum
++	@ get the address of the first word that is checksumable
++	mov	r9, r0
++	ldr	r1, [r9, #SleepState_wordCount]
++	mov	r8, lr
++	add	r0, r9, #4
++	bl	pm_checksum_calculate
++	ldr	r3, [r9, #SleepState_checksum]
++	subs	r1, r3, r0
++	mov	r0, #0
++	movne	r0, #1
++	@ return if checksum is wrong
++	movne	pc, r8
++	mov	r0, r9
++
++	@ Step 2
++	ldr	r9, [r0, #SleepState_Cp15_ACR_MMU]
++	ldr	r8, [r0, #SleepState_Cp15_AUXCR_MMU]
++	ldr	r7, [r0, #SleepState_Cp15_TTBR_MMU]
++	ldr	r6, [r0, #SleepState_Cp15_DACR_MMU]
++	ldr	r5, [r0, #SleepState_Cp15_PID_MMU]
++	ldr	r4, [r0, #SleepState_Cp15_CPAR]
++	ldr	r0, [r0, #SleepState_areaAddress]
++
++	@ invalidate I, D caches & BTB
++	mcr     p15, 0, ip, c7, c7, 0
++	@ Drain Write (& Fill) Buffer
++	mcr     p15, 0, ip, c7, c10, 4
++	@ Prefetch Flush
++	mcr     p15, 0, ip, c7, c5, 4
++	@ invalidate I, D TLBs
++	mcr     p15, 0, ip, c8, c7, 0
++
++	@ Step 3
++	@ Rrestore MMU settings and turn on MMU
++	mcr	p15, 0, r4, c15, c1, 0
++	mcr	p15, 0, r5, c13, c0, 0
++	mcr	p15, 0, r6, c3, c0, 0
++	mcr	p15, 0, r7, c2, c0, 0
++	mcr	p15, 0, r8, c1, c0, 1
++
++	@ Get page table address
++	mrc     p15, 0, r1, c2, c0, 0
++	bic     r1, r1, #0xff
++	bic     r1, r1, #0x3f00
++	ldr	r2, =0x542e
++
++	@ Mapping resume_turn_on_mmu in the pagetable
++	adr	r3, resume_turn_on_mmu
++	mov	r3, r3, lsr #20
++	orr	r4, r2, r3, lsl #20
++	ldr	r5, [r1, r3, lsl #2]
++	str     r4, [r1, r3, lsl #2]
++
++	@ Mapping page table address in the page table
++	mov	r6, r1, lsr #20
++	orr	r7, r2, r6, lsl #20
++	ldr	r8, [r1, r6, lsl #2]
++	str	r7, [r1, r6, lsl #2]
++
++	ldr	r10, =resume_after_turn_on_mmu
++	mov	r10, r10
++        b	resume_turn_on_mmu
++
++	.align	5
++
++resume_turn_on_mmu:
++	mcr	p15, 0, r9, c1, c0, 0
++
++	@ cp_wait
++	mrc	p15, 0, r2, c2, c0, 0
++	mov	r2, r2
++	mov	r2, r2
++	mov	pc, r10
++	nop
++	nop
++	nop
++	nop
++
++resume_after_turn_on_mmu:
++	@ Restore the Mappings in page table
++	str	r5, [r1, r3, lsl #2]
++	str	r8, [r1, r6, lsl #2]
++
++	@ Step 4
++	@ r0 stores the virtual address of the content save area
++	@ compare "modeSaveFlag" to decide which mode will be saved
++	ldr	r6, [r0, #SleepState_modeSaveFlags]
++1:
++	@ restore SVC content?
++	ands     r1, r6, #(PM_MODE_SAVE_FLAG_SVC)
++	beq	2f
++	add	r7, r0, #SleepState_SVC_REGS
++        ldmia   r7, {r2, sp, lr}
++	msr     spsr, r2
++
++2:
++	@ restore UND mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_UND)
++	beq	3f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++    	orr	r3, r3, #(CPSR_Mode_UND | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	add	r7, r0, #SleepState_UND_REGS
++        ldmia   r7, {r2, sp, lr}
++	msr     spsr, r2
++
++3:
++	@ restore ABT mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_ABT)
++	beq	4f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_ABT | CPSR_I_Bit | CPSR_F_Bit)
++	msr     cpsr_c, r3
++	add	r7, r0, #SleepState_ABT_REGS
++        ldmia   r7, {r2, sp, lr}
++	msr     spsr, r2
++
++4:
++	@ restore IRQ mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_IRQ)
++	beq	5f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_IRQ | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	add	r7, r0, #SleepState_IRQ_REGS
++        ldmia   r7, {r2, sp, lr}
++	msr	spsr, r2
++
++5:
++	@ restore FIQ mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_FIQ)
++	beq	6f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_FIQ | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	add	r7, r0, #SleepState_FIQ_REGS
++        ldmia   r7, {r2, r8-r12, sp, lr}
++	msr     spsr, r2
++
++6:
++	@ restore SYS mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_SYS)
++	beq	7f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_SYS | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	add	r7, r0, #SleepState_SYS_REGS
++        ldmia   r7, {sp, lr}
++
++7:
++	@ Step 5
++	@ Re-establish whatever mode was in use at the time pm_enter_sleep()
++	@ was invoked and restore complete register context.  Before restoring
++	@ the SPSR, make sure that the entry mode was not SYS mode, which has
++	@ no SPSR.
++
++	@  Load CPSR, sp and (if not SYS mode) SPSR
++	ldr	r3, [r0, #SleepState_ENTRY_CPSR]
++	msr	cpsr, r3
++	ldr	r2, =CPSR_Mode_SYS
++	and	r3, r3, r2
++	cmp	r3, r2
++	ldrne	r2, [r0, #SleepState_ENTRY_SPSR]
++	msrne	spsr, r2
++	add	r0, r0, #SleepState_ENTRY_R0
++	@ use "increase after" to skip r0 register restore,
++	ldmib	r0, {r1 - r12, sp, lr}
++	@ restore r0 reigster
++	ldr	r0, [r0]
++
++	@ return to next instruction after pm_enter_sleep
++	mov	pc, lr
++
++@******************************************************************************
++@
++@ pm_enter_standby
++@
++@ Put the system into S0D2C2 state
++@
++@ Inputs:
++@	None
++@
++@ Outputs:
++@	None
++@
++
++pm_enter_standby:
++
++	@save registers on stack
++	stmfd	sp!, {r2 - r10, lr}
++	ldr	r2, =pm_enter_standby_start
++	ldr	r3, =pm_enter_standby_end
++
++	mov	r4, r0		@ ISRAM start address
++	@ copy standby routine to ISRAM
++rel_sram:
++	ldmia	r2!, {r5-r9}
++	stmia	r4!, {r5-r9}
++	cmp	r2, r3
++	ble	rel_sram
++
++	ldr	r4, =0xF8D00000		@ DMEMC_REG_BASE (MDCNFG)
++	ldr	r5, [r4]
++
++	mov	pc, r0
++
++pm_enter_standby_start:
++	b	1f
++
++	.align  5
++
++1:
++	@ enter S0D2C2 state
++	mov	r5, #MHN_PM_S0D2C2
++	mcr     p14, 0, r5, c7, c0, 0
++
++	@ wait for standby
++	nop
++	nop
++	nop
++	nop
++	nop
++	nop
++	nop
++	nop
++
++	@ r4 stores MDCNFG address
++        @ disable DDR_HCAL[HCEN]
++	ldr	r5, [r4, #0x60]		@ DDR_HCAL offset 0x60
++        bic     r5, r5, #0x80000000     @ clear HCEN
++        str     r5, [r4, #0x60]
++1:
++        ldr     r5, [r4, #0x60]
++        tst     r5, #0x80000000
++        bne     1b
++
++        @ initiate RCOMP[SWEAL]
++        ldr     r6, [r4, #0x100]	@ RCOMP offset 0x100
++        orr     r6, r6, #0x80000000
++        str     r6, [r4, #0x100]
++
++        @ clear EDLP interrupt
++        ldr     r7, =0xFFFFFFFF
++        str     r7, [r4, #0x78]		@ DMCISR offset 0x78
++
++                @ set DMCIER[EDLP]
++        ldr     r7, [r4, #0x70]
++        orr     r7, r7, #0x20000000
++        str     r7, [r4, #0x70]		@ DMCIER offset 0x70
++
++                @ set DDR_HCAL[HCEN]
++                @ set DDR_HCAL[PROG]
++                @ clear DDR_HCAL[HCRNG]
++        ldr     r8, [r4, #0x60]
++        bic     r8, r8, #0x0000001F
++        orr     r8, r8, #0x09
++        str     r8, [r4, #0x60]
++
++        @ enable MDCNFG[DMCEN]
++        ldr     r5, [r4]		@ MDCNFG offset 0x00
++        orr     r5, r5, #0x40000000
++        str     r5, [r4]
++3:
++        ldr     r5, [r4]
++        tst     r5, #0x40000000
++        beq     3b
++
++        @ set DDR_HCAL[HCRNG]
++        ldr     r6, [r4, #0x60]
++        orr     r6, r6, #2
++        str     r6, [r4, #0x60]
++
++
++        @ clear interrupt
++        ldr     r8, [r4, #0x70]		@ DMCIER offset 0x70
++        bic     r8, r8, #0x20000000
++        str     r8, [r4, #0x70]
++
++        ldmfd   sp!, {r2 - r10, pc}
++pm_enter_standby_end:
++        nop
++
++@******************************************************************************
++@
++@ pm_enter_lcd_refresh
++@
++@ Put the system into S0D1C2 state
++@
++@ Inputs:
++@	None
++@
++@ Outputs:
++@	None
++@
++
++pm_enter_lcd_refresh:
++
++	@save registers on stack
++	stmfd	sp!, {r2 - r10, lr}
++	ldr	r2, =pm_enter_lcd_ref_start
++	ldr	r3, =pm_enter_lcd_ref_end
++
++	mov	r4, r0		@ ISRAM start address
++	@ copy standby routine to ISRAM
++rel_sram_lcd_ref:
++	ldmia	r2!, {r5-r9}
++	stmia	r4!, {r5-r9}
++	cmp	r2, r3
++	ble	rel_sram_lcd_ref
++
++	ldr	r4, =0xF8D00000		@ DMEMC_REG_BASE (MDCNFG)
++	ldr	r5, [r4]
++
++	mov	pc, r0
++
++pm_enter_lcd_ref_start:
++	b	1f
++
++	.align  5
++
++1:
++	@ enter S0D1C2 state
++	mov	r5, #MHN_PM_S0D1C2
++	mcr     p14, 0, r5, c7, c0, 0
++
++	@ wait for lcd refresh
++	nop
++	nop
++	nop
++	nop
++	nop
++	nop
++	nop
++	nop
++
++
++	@ r4 stores MDCNFG address
++        @ disable DDR_HCAL[HCEN]
++	ldr	r5, [r4, #0x60]		@ DDR_HCAL offset 0x60
++        bic     r5, r5, #0x80000000     @ clear HCEN
++        str     r5, [r4, #0x60]
++1:
++        ldr     r5, [r4, #0x60]
++        tst     r5, #0x80000000
++        bne     1b
++
++        @ initiate RCOMP[SWEAL]
++        ldr     r6, [r4, #0x100]	@ RCOMP offset 0x100
++        orr     r6, r6, #0x80000000
++        str     r6, [r4, #0x100]
++
++        @ clear EDLP interrupt
++        ldr     r7, =0xFFFFFFFF
++        str     r7, [r4, #0x78]		@ DMCISR offset 0x78
++
++                @ set DMCIER[EDLP]
++        ldr     r7, [r4, #0x70]
++        orr     r7, r7, #0x20000000
++        str     r7, [r4, #0x70]		@ DMCIER offset 0x70
++
++                @ set DDR_HCAL[HCEN]
++                @ set DDR_HCAL[PROG]
++                @ clear DDR_HCAL[HCRNG]
++        ldr     r8, [r4, #0x60]
++        bic     r8, r8, #0x0000001F
++        orr     r8, r8, #0x09
++        str     r8, [r4, #0x60]
++
++        @ enable MDCNFG[DMCEN]
++        ldr     r5, [r4]		@ MDCNFG offset 0x00
++        orr     r5, r5, #0x40000000
++        str     r5, [r4]
++3:
++        ldr     r5, [r4]
++        tst     r5, #0x40000000
++        beq     3b
++
++        @ set DDR_HCAL[HCRNG]
++        ldr     r6, [r4, #0x60]
++        orr     r6, r6, #2
++        str     r6, [r4, #0x60]
++
++        @ clear interrupt
++        ldr     r8, [r4, #0x70]		@ DMCIER offset 0x70
++        bic     r8, r8, #0x20000000
++        str     r8, [r4, #0x70]
++
++        ldmfd   sp!, {r2 - r10, pc}
++pm_enter_lcd_ref_end:
++        nop
++
++
++
++@*****************************************************************************
++@ pm_enter_sleep_or_deep_sleep
++@
++@ Put the system into S2D3C4 or S3D4C4 state
++@
++@ Inputs:
++@	r0: the virutal address of the data area to save the content of core
++@	r1: sleep type, 6(sleep), 7(deep sleep)
++@
++@ Outputs:
++@	None
++@
++@ Notes:
++@      r1 should be saved previously
++@
++
++pm_enter_sleep_or_deep_sleep:
++
++	@ Step 1
++	@ store registers(r0-r12), sp, lr of current mode in the data array
++	@ ENTRY_REGS
++	@ the r0 changes to be virutal address of ENTRY_REGS
++	add	r0, r0, #SleepState_ENTRY_R0
++	@ skip r0 and r1 save
++	add     r0, r0, #4
++	stmib	r0, {r2 - r12, sp, lr}
++	sub     r0, r0, #4
++	mov     r11, r1 @save the sleep type
++	@ save r0 register
++	sub	r5, r0, #SleepState_ENTRY_R0
++	str	r5, [r0]
++
++	@ store cpsr of current mode in the data array ENTRY_REGS.
++	mrs	r3, cpsr
++	str	r3, [r5, #SleepState_ENTRY_CPSR]
++
++	@ store spsr(if not SYS mode) of current mode in the content area
++	ldr	r2, =CPSR_Mode_SYS
++	and	r1, r3, r2
++	cmp	r1, r2
++	mrsne	r2, spsr
++	strne	r2, [r5, #SleepState_ENTRY_SPSR]
++
++	@ Step 2
++	@ compare "modeSaveFlag" to decide which mode will be saved
++	@ the private registers are saved in an array. the consequence should
++	@ be "spsr", "r8-r12", sp, lr
++	@ the data array stores registers from low address to high address.
++	ldr	r6, [r5, #SleepState_modeSaveFlags]
++
++1:
++	@ save SYS mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_SYS)
++	beq	2f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_SYS | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	add	r7, r5, #SleepState_SYS_REGS
++	stmia	r7, {sp, lr}
++
++2:
++	@ save FIQ mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_FIQ)
++	beq	3f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_FIQ | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	mrs     r2, spsr
++	add	r7, r5, #SleepState_FIQ_REGS
++	stmia   r7, {r2, r8 - r12, sp, lr}
++
++3:
++	@ save IRQ mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_IRQ)
++	beq	4f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_IRQ | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	mrs	r2, spsr
++	add	r7, r5, #SleepState_IRQ_REGS
++	stmia	r7, {r2, sp, lr}
++
++4:
++	@ save ABT mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_ABT)
++	beq	5f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++	orr	r3, r3, #(CPSR_Mode_ABT | CPSR_I_Bit | CPSR_F_Bit)
++	msr     cpsr_c, r3
++	mrs     r2, spsr
++	add	r7, r5, #SleepState_ABT_REGS
++	stmia	r7, {r2, sp, lr}
++
++5:
++	@ save UND mode content?
++	ands	r1, r6, #(PM_MODE_SAVE_FLAG_UND)
++	beq	6f
++	bic	r3, r3, #(CPSR_Mode_MASK)
++    	orr	r3, r3, #(CPSR_Mode_UND | CPSR_I_Bit | CPSR_F_Bit)
++	msr	cpsr_c, r3
++	mrs     r2, spsr
++	add	r7, r5, #SleepState_UND_REGS
++	stmia	r7, {r2, sp, lr}
++
++6:
++	@ save SVC mode content?
++	ands    r1, r6, #(PM_MODE_SAVE_FLAG_SVC)
++	beq	7f
++	bic     r3, r3, #(CPSR_Mode_MASK)
++        orr     r3, r3, #(CPSR_Mode_SVC | CPSR_I_Bit | CPSR_F_Bit)
++        msr     cpsr_c, r3
++	mrs     r2, spsr
++	add	r7, r5, #SleepState_SVC_REGS
++	stmia	r7, {r2, sp, lr}
++
++7:
++	@ Step 3
++	@ save MMU settings
++	@ r5 is pointer to sleep save data area
++
++	@ Cp15_ACR_MMU
++	mrc	p15, 0, r0, c1, c0, 0
++	str	r0, [r5, #SleepState_Cp15_ACR_MMU]
++
++	@ Cp15_AUXCR_MMU;
++	mrc	p15, 0, r0, c1, c0, 1
++	str	r0, [r5, #SleepState_Cp15_AUXCR_MMU]
++
++	@ Cp15_TTBR_MMU;
++	mrc	p15, 0, r0, c2, c0, 0
++	str	r0, [r5, #SleepState_Cp15_TTBR_MMU]
++
++        @ Cp15_DACR_MMU;
++	mrc	p15, 0, r0, c3, c0, 0
++	str	r0, [r5, #SleepState_Cp15_DACR_MMU]
++
++        @ Cp15_PID_MMU;
++	mrc	p15, 0, r0, c13, c0, 0
++	str	r0, [r5, #SleepState_Cp15_PID_MMU]
++
++	@ Cp15_CPAR;
++	mrc	p15, 0, r0, c15, c1, 0
++	str	r0, [r5, #SleepState_Cp15_CPAR]
++
++	@ Now enable access to all valid coprocessors
++	mcr	p15, 0, r1, c15, c1, 0
++
++	@ cp_wait
++	mrc	p15, 0, r0, c2, c0, 0
++	mov	r0, r0
++	sub	pc, pc, #4
++
++	@ Step 4
++	@ The block 0 of nand flash should be copied to SRAM 0x5c014000
++	@ The OS should save the resume back address and the content save area address
++	@ load current pspr to r12 register
++	ldr	r12, [r5, #SleepState_psprAddress]
++	@ Store 0x5c014000 to PSPR
++	ldr	r1, =0x5c014000
++	str	r1, [r12]
++
++	@ Step 5
++	@ calculate checksum
++	@ get total word count for ckecksum and should not include "checksum"
++	mov	r1, #SleepState_size - 4
++	ldr	r2, [r5, #SleepState_extendedChecksumByteCount]
++	add	r1, r1, r2
++	@ get the word count by /4
++	mov	r1, r1, lsr #2
++	mov	r0, r5
++	str	r1, [r0, #SleepState_wordCount]!
++	bl	pm_checksum_calculate
++	str	r0, [r5, #SleepState_checksum]
++	@ Step 6
++	@ invoke user flush function
++	ldr	r0, [r5, #SleepState_flushFunc]
++	cmp	r0, #0
++	movne	lr, pc
++	movne	pc, r0
++
++       	b	1f
++	.align	5
++1:
++     	@ Step 7
++	@ enter sleep or deep sleep
++	mcr     p14, 0, r11, c7, c0, 0
++
++	@ wait for sleep
++20:
++	nop
++        b       20b
++
++
++@*****************************************************************************
++@ pm_enter_sleep
++@
++@ Put the system into S2D3C4 state
++@
++@ Inputs:
++@	r0: the virutal address of the data area to save the content of core
++@
++@ Outputs:
++@	None
++@
++
++pm_enter_sleep:
++	str     r1, [r0, #SleepState_ENTRY_R1]
++	mov	r1, #MHN_PM_S2D3C4
++	b       pm_enter_sleep_or_deep_sleep
++
++@*****************************************************************************
++@ pm_enter_deep_sleep
++@
++@ Put the system into S3D4C4 state
++@
++@ Inputs:
++@	r0: the virutal address of the data area to save the content of core
++@
++@ Outputs:
++@	None
++@
++
++pm_enter_deep_sleep:
++	str     r1, [r0, #SleepState_ENTRY_R1]
++	mov	r1, #MHN_PM_S3D4C4
++	b       pm_enter_sleep_or_deep_sleep
++
+Index: linux-2.6.10/arch/arm/mach-pxa/sleepwkr.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-pxa/sleepwkr.c
+@@ -0,0 +1,143 @@
++/*
++ * arch/arm/mach-pxa/sleepwkr.c
++ *
++ * Copyright (C) 2006, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++
++ *(C) Copyright 2006 Marvell International Ltd.
++ * All Rights Reserved
++ */
++#include <linux/string.h>
++#include "sleepwkr.h"
++
++static char start_str[] = "0000110000000000000000000000001";
++static char end_str[] = "0000000000000000000000000000000";
++
++static unsigned long mpu_reg;
++
++void sleep_wbit(unsigned int tdi, unsigned int tms)
++{
++	volatile unsigned long *pmpu_reg = (unsigned long *)mpu_reg;
++
++	*pmpu_reg = SIG_ENABLE | tdi | tms;
++	*pmpu_reg = SIG_ENABLE | tdi | tms | SIG_TCK;
++}
++int sleep_wreg(unsigned int portal, char *bit_field)
++{
++	unsigned int tms;
++	unsigned int i,j;
++
++	sleep_wbit(0,0);
++
++	sleep_wbit(0,1);
++
++	sleep_wbit(0,1);
++
++	sleep_wbit(0,0);
++
++	sleep_wbit(0,0);
++
++	for (i=0;i<11;i++)
++	{
++		if (i < 10)
++			sleep_wbit((portal >> i) & 1, 0);
++		else
++			sleep_wbit((portal >> i) & 1, 1);
++	}
++
++	/*
++	 * On the the last data shift, the loop sets TMS to 1
++	 * causing the TAP controller to move to the "Exit1-IR" state
++	 */
++
++	/* move the TAP controller to the "Update-IR" state
++	 */
++	sleep_wbit(0,1);
++
++	if (bit_field == NULL)
++	{
++   		/* move the TAP controller to the "Run-Test/Idle" state
++		 */
++	   	sleep_wbit(0,0);
++		return(0);
++	}
++
++	/* move the TAP controller to the "Select-DR-Scan" state
++	 */
++	sleep_wbit(0,1);
++
++	/* move the TAP controller to the "Capture-DR" state
++	 */
++	sleep_wbit(0,0);
++
++	/* move the TAP controller to the "Shift-DR" state
++	 */
++	sleep_wbit(0,0);
++
++	/* clock in the data
++	 * remove possible bad character from end that would mess up tms check...
++	 */
++	i = strlen(bit_field);
++	while ( i && (bit_field[i]=='_' || bit_field[i]==' ') )
++	{
++		bit_field[i] = 0;
++		i--;
++	}
++
++	for (i=0;i<1000000;i++)
++	{
++		/* skip human readability elements... */
++		if (bit_field[i] == '_' || bit_field[i] == ' ')
++			continue;
++		if (bit_field[i+1] == 0)
++			tms = 1;
++		else
++			tms = 0;
++		if (bit_field[i] == '1')
++			sleep_wbit(1,tms);
++		else if (bit_field[i] == '0')
++			sleep_wbit(0,tms);
++		else if (bit_field[i] == 'F')
++		{
++			for(j=0; j<4; j++)
++				sleep_wbit(1,tms);
++		}else if (bit_field[i] == 0)
++			break;
++		else
++			return (-1);
++	}
++
++	if (i == 1000000)
++		return (-1);
++
++	/* On the the last data shift, the loop sets TMS to 1
++	 * causing the TAP controller to move to the "Exit1-DR" state
++	 */
++
++	/* move the TAP controller to the "Update DR" state
++	 */
++	sleep_wbit(0,1);
++
++	/* move the TAP controller to the "Run-Test/Idle" state
++	 */
++	sleep_wbit(0,0);
++	return (0);
++}
++
++int sleep_wkr_start(unsigned long reg)
++{
++	mpu_reg = reg;
++	sleep_wreg(0x0b, start_str);
++	return 0;
++}
++
++int sleep_wkr_end(unsigned long reg)
++{
++	mpu_reg = reg;
++	sleep_wreg(0x0b, end_str);
++	return 0;
++}
++
+Index: linux-2.6.10/arch/arm/mach-pxa/sleepwkr.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-pxa/sleepwkr.h
+@@ -0,0 +1,29 @@
++/*
++ * arch/arm/mach-pxa/sleepwkr.h
++ *
++ * Copyright (C) 2006, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++
++ *(C) Copyright 2006 Marvell International Ltd.
++ * All Rights Reserved
++ */
++
++#ifndef __SLEEPWA_H__INCLUDED
++
++#define __SLEEPWA_H__INCLUDED
++
++#define SIG_ENABLE	0x80000000
++#define SIG_TCK		0x00000040
++#define SIG_TMS		0x00000020
++#define SIG_TDI		0x00000010
++#define SIG_TDO		0x00000001
++
++
++extern int sleep_wreg(unsigned int portal, char *bitfield);
++extern int sleep_wkr_start(unsigned long reg);
++extern int sleep_wkr_end(unsigned long reg);
++
++#endif
+Index: linux-2.6.10/mvl_patches/pro-1433.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1433.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1433);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

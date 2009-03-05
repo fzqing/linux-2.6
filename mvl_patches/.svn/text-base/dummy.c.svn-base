@@ -1,0 +1,1 @@
+/* This is here so a directory with no patches still works. */

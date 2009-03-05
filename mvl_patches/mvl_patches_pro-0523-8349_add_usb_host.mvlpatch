@@ -1,0 +1,503 @@
+#! /usr/bin/env bash
+# Patch: -8349_add_usb_host
+# Date: Fri Apr 28 12:35:45 2006
+# Source: MontaVista Software, Inc.
+# MR: 15590
+# Type: Enhancement
+# Disposition: submitted to Kumar Gala
+# Signed-off-by: Randy Vinson <rvinson@mvista.com>
+# Description:
+# Adding platform support for the 834x Host Mode USB controller.
+# 
+# This patch provides the platform-specific hardware setup required by the
+# 83xx Host Mode USB controller on the Freescale 8349CDS reference system.
+# 
+
+PATCHNUM=523
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15590
+Type: Enhancement
+Disposition: submitted to Kumar Gala
+Signed-off-by: Randy Vinson <rvinson@mvista.com>
+Description:
+Adding platform support for the 834x Host Mode USB controller.
+
+This patch provides the platform-specific hardware setup required by the
+83xx Host Mode USB controller on the Freescale 8349CDS reference system.
+
+ arch/ppc/Kconfig                      |    2 
+ arch/ppc/platforms/83xx/Kconfig       |   28 +++++++++
+ arch/ppc/platforms/83xx/mpc834x_sys.c |   97 ++++++++++++++++++++++++++++++++++
+ arch/ppc/platforms/83xx/mpc834x_sys.h |    3 +
+ arch/ppc/syslib/mpc83xx_devices.c     |   16 +++++
+ include/asm-ppc/mpc83xx.h             |   17 +++++
+ mvl_patches/pro-0523.c                |   16 +++++
+ 7 files changed, 179 insertions(+)
+
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -732,6 +732,8 @@ config MPC834x_SYS
+ 
+ endchoice
+ 
++source arch/ppc/platforms/83xx/Kconfig
++
+ config PQ2ADS
+ 	bool
+ 	depends on ADS8272
+Index: linux-2.6.10/arch/ppc/platforms/83xx/Kconfig
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/platforms/83xx/Kconfig
+@@ -0,0 +1,28 @@
++config 834x_USB_SUPPORT
++	bool "834x USB Support"
++	depends on MPC834x_SYS
++	default y
++	---help---
++	  Enables support for the USB controllers on the MPC834x chip. The 834x
++	  reference board is wired for only one USB port. That port may be
++	  used by either the MPH or DR USB controller.
++	  Requires USB Host EHCI support.
++	  If unsure, say Y.
++choice
++	prompt "834x USB Controller Selection"
++	depends on 834x_USB_SUPPORT
++	default 834x_DR_USB_SUPPORT
++
++config 834x_DR_USB_SUPPORT
++	bool "DR Controller"
++	select USB_EHCI_ROOT_HUB_TT
++	---help---
++	  Select if using the Dual-Role (DR) USB controller.
++
++config 834x_MPH_USB_SUPPORT
++	bool "MPH Controller"
++	---help---
++	  Select if using the Multi-Port-Host (MPH) USB controller.
++
++endchoice
++
+Index: linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/83xx/mpc834x_sys.c
++++ linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.c
+@@ -11,6 +11,9 @@
+  * under  the terms of  the GNU General  Public License as published by the
+  * Free Software Foundation;  either version 2 of the  License, or (at your
+  * option) any later version.
++ *
++ * USB setup added by Randy Vinson <rvinson@mvista.com> based on code from
++ * Hunter Wu.
+  */
+ 
+ #include <linux/config.h>
+@@ -93,6 +96,93 @@ mpc83xx_exclude_device(u_char bus, u_cha
+ }
+ #endif /* CONFIG_PCI */
+ 
++#ifdef CONFIG_834x_USB_SUPPORT
++/*
++ * Configure the on-chip USB controller. The MPC834xMDS only supports the
++ * second USB interface (port 1). This code sets up the hardware and then
++ * lets the platform driver take over device setup.
++ */
++
++void mpc834x_board_init(void)
++{
++	void __iomem *bcsr;
++	unsigned char bcsr5;
++
++	/*
++	 * force to use the PHY on SYS board
++	 * */
++	bcsr = ioremap(BCSR_PHYS_ADDR, BCSR_SIZE);
++	bcsr5 = in_8(bcsr + BCSR5_OFF);
++	bcsr5 |= BCSR5_INT_USB;
++	out_8(bcsr + BCSR5_OFF, bcsr5);
++	iounmap(bcsr);
++}
++
++void mpc834x_usb_clk_cfg(void)
++{
++	unsigned long sccr;
++
++	sccr = in_be32((void*)VIRT_IMMRBAR + MPC83XX_SCCR_OFFS);
++
++	sccr |= MPC83XX_SCCR_USB_MPHCM_11 | MPC83XX_SCCR_USB_DRCM_11;
++
++	out_be32((void*)VIRT_IMMRBAR + MPC83XX_SCCR_OFFS, sccr);
++}
++
++void mpc834x_usb_pin_cfg(struct fsl_usb2_platform_data *pdata)
++{
++	unsigned long sicrl;
++
++	sicrl = in_be32((void*)VIRT_IMMRBAR + MPC83XX_SICRL_OFFS);
++
++	/* set both ports to MPH mode */
++	sicrl &= ~(MPC83XX_SICRL_USB0 | MPC83XX_SICRL_USB1);
++
++	if (pdata->operating_mode == FSL_USB2_DR_HOST) {
++		if (pdata->phy_mode == FSL_USB2_PHY_UTMI_WIDE) {
++			/* UTMI WIDE combines both ports into a single 16-bit port */
++			sicrl |= MPC83XX_SICRL_USB0 | MPC83XX_SICRL_USB1;
++		}
++		else {
++			if (pdata->port_enables & FSL_USB2_PORT1_ENABLED)
++				sicrl |= MPC83XX_SICRL_USB1;
++		}
++	}
++	out_be32((void*)VIRT_IMMRBAR + MPC83XX_SICRL_OFFS, sicrl);
++}
++
++static void __init
++mpc834x_usb_init(void)
++{
++	struct fsl_usb2_platform_data *pdata;
++
++#ifdef CONFIG_834x_DR_USB_SUPPORT
++	ppc_sys_device_remove(MPC83xx_USB2_MPH);
++	pdata = (struct fsl_usb2_platform_data *) ppc_sys_get_pdata(MPC83xx_USB2_DR);
++
++	if (pdata) {
++		pdata->phy_mode = FSL_USB2_PHY_ULPI;
++		pdata->operating_mode = FSL_USB2_DR_HOST;
++		pdata->port_enables = FSL_USB2_PORT1_ENABLED;
++	}
++
++#elif defined(CONFIG_834x_MPH_USB_SUPPORT)
++	ppc_sys_device_remove(MPC83xx_USB2_DR);
++	pdata = (struct fsl_usb2_platform_data *) ppc_sys_get_pdata(MPC83xx_USB2_MPH);
++
++	if (pdata) {
++		pdata->phy_mode = FSL_USB2_PHY_ULPI;
++		pdata->operating_mode = FSL_USB2_MPH_HOST;
++		pdata->port_enables = FSL_USB2_PORT1_ENABLED;
++	}
++
++#endif
++	mpc834x_board_init();
++	mpc834x_usb_pin_cfg(pdata);
++	mpc834x_usb_clk_cfg();
++}
++#endif /* CONFIG_834x_USB_SUPPORT */
++
+ /* ************************************************************************
+  *
+  * Setup the architecture
+@@ -143,6 +233,13 @@ mpc834x_sys_setup_arch(void)
+ 		memcpy(pdata->mac_addr, binfo->bi_enet1addr, 6);
+ 	}
+ 
++#ifdef CONFIG_834x_USB_SUPPORT
++	mpc834x_usb_init();
++#else
++	ppc_sys_device_remove(MPC83xx_USB2_MPH);
++	ppc_sys_device_remove(MPC83xx_USB2_DR);
++#endif
++
+ #ifdef CONFIG_BLK_DEV_INITRD
+ 	if (initrd_start)
+ 		ROOT_DEV = Root_RAM0;
+Index: linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.h
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/83xx/mpc834x_sys.h
++++ linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.h
+@@ -28,6 +28,9 @@
+ #define BCSR_PHYS_ADDR		((uint)0xf8000000)
+ #define BCSR_SIZE		((uint)(128 * 1024))
+ 
++#define BCSR5_OFF		0x05
++#define BCSR5_INT_USB		0x02
++
+ #define BCSR_MISC_REG2_OFF	0x07
+ #define BCSR_MISC_REG2_PORESET	0x01
+ 
+Index: linux-2.6.10/arch/ppc/syslib/mpc83xx_devices.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/mpc83xx_devices.c
++++ linux-2.6.10/arch/ppc/syslib/mpc83xx_devices.c
+@@ -22,6 +22,8 @@
+ #include <asm/irq.h>
+ #include <asm/ppc_sys.h>
+ 
++static u64 mpc83xx_dma_mask = 0xffffffffULL;
++
+ /* We use offsets for IORESOURCE_MEM since we do not know at compile time
+  * what IMMRBAR is, will get fixed up by mach_mpc83xx_fixup
+  */
+@@ -50,6 +52,14 @@ static struct fsl_i2c_platform_data mpc8
+ 	.device_flags = FSL_I2C_DEV_SEPARATE_DFSRR,
+ };
+ 
++/* Placeholder to be filled in by board code */
++static struct fsl_usb2_platform_data mpc83xx_fsl_dr_pdata = {
++};
++
++/* Placeholder to be filled in by board code */
++static struct fsl_usb2_platform_data mpc83xx_fsl_mph_pdata = {
++};
++
+ static struct plat_serial8250_port serial_platform_data[] = {
+ 	[0] = {
+ 		.mapbase	= 0x4500,
+@@ -189,7 +199,10 @@ struct platform_device ppc_sys_platform_
+ 	[MPC83xx_USB2_DR] = {
+ 		.name = "fsl-usb2-dr",
+ 		.id	= 1,
++		.dev.platform_data = &mpc83xx_fsl_dr_pdata,
+ 		.num_resources	 = 2,
++		.dev.dma_mask	= &mpc83xx_dma_mask,
++		.dev.coherent_dma_mask = 0xffffffffULL,
+ 		.resource = (struct resource[]) {
+ 			{
+ 				.start	= 0x23000,
+@@ -207,6 +220,9 @@ struct platform_device ppc_sys_platform_
+ 		.name = "fsl-usb2-mph",
+ 		.id	= 1,
+ 		.num_resources	 = 2,
++		.dev.platform_data = &mpc83xx_fsl_mph_pdata,
++		.dev.dma_mask	= &mpc83xx_dma_mask,
++		.dev.coherent_dma_mask = 0xffffffffULL,
+ 		.resource = (struct resource[]) {
+ 			{
+ 				.start	= 0x22000,
+Index: linux-2.6.10/include/asm-ppc/mpc83xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc83xx.h
++++ linux-2.6.10/include/asm-ppc/mpc83xx.h
+@@ -108,6 +108,23 @@ extern unsigned char __res[];
+ #define MPC83xx_RCR_SWHR	0x00000002      /* sw hard reset */
+ #define MPC83xx_RCR_SWSR	0x00000001      /* sw soft reset */
+ 
++#define MPC83XX_SCCR_OFFS          0xA08
++#define MPC83XX_SCCR_USB_MPHCM_11  0x00c00000
++#define MPC83XX_SCCR_USB_MPHCM_01  0x00400000
++#define MPC83XX_SCCR_USB_MPHCM_10  0x00800000
++#define MPC83XX_SCCR_USB_DRCM_11   0x00300000
++#define MPC83XX_SCCR_USB_DRCM_01   0x00100000
++#define MPC83XX_SCCR_USB_DRCM_10   0x00200000
++
++/* system i/o configuration register low */
++#define MPC83XX_SICRL_OFFS         0x114
++#define MPC83XX_SICRL_USB1         0x40000000
++#define MPC83XX_SICRL_USB0         0x20000000
++
++/* system i/o configuration register high */
++#define MPC83XX_SICRH_OFFS         0x118
++#define MPC83XX_SICRH_USB_UTMI     0x00020000
++
+ /* Let modules/drivers get at immrbar (physical) */
+ extern phys_addr_t immrbar;
+ 
+Index: linux-2.6.10/mvl_patches/pro-0523.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0523.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(523);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

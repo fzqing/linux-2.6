@@ -1,0 +1,871 @@
+#! /usr/bin/env bash
+# Patch: -ppc32_refactor_fpu_exception_code
+# Date: Wed Dec 28 14:56:23 2005
+# [PATCH] ppc32: refactor FPU exception handling
+# 
+# Moved common FPU exception handling code out of head.S so it can be used by
+# several of the sub-architectures that might of a full PowerPC FPU.
+# 
+# Also, uses new CONFIG_PPC_FPU define to fix alignment exception handling
+# for floating point load/store instructions to only occur if we have a
+# hardware FPU.
+# 
+# Signed-off-by: Jason McMullan <jason.mcmullan@timesys.com>
+# Signed-off-by: Kumar Gala <kumar.gala@freescale.com>
+# Signed-off-by: Paul Mackerras <paulus@samba.org>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# commit 443a848cd30eb5bb5c1038e6371d83404775dcfc
+# tree f61d62eebf19498395257a7cddee828c4edfa876
+# parent f1c55dea0bb2df94aa2b01b0871cb02f2e206676
+# author Paul Mackerras <paulus@samba.org> Sun, 01 May 2005 08:58:40 -0700
+# committer Linus Torvalds <torvalds@ppc970.osdl.org> Sun, 01 May 2005 08:58:40 -0700
+# 
+#  arch/ppc/Kconfig                 |    4 
+#  arch/ppc/Makefile                |    1 
+#  arch/ppc/kernel/Makefile         |    1 
+#  arch/ppc/kernel/align.c          |    8 +
+#  arch/ppc/kernel/entry.S          |   59 ++++++++++++++
+#  arch/ppc/kernel/fpu.S            |  133 +++++++++++++++++++++++++++++++
+#  arch/ppc/kernel/head.S           |  163 ---------------------------------------
+#  arch/ppc/kernel/head_44x.S       |    6 +
+#  arch/ppc/kernel/head_booke.h     |    7 +
+#  arch/ppc/kernel/head_fsl_booke.S |    8 +
+#  arch/ppc/kernel/misc.S           |   12 --
+#  arch/ppc/kernel/traps.c          |    2 
+#  include/asm-ppc/reg_booke.h      |    1 
+#  13 files changed, 229 insertions(+), 176 deletions(-)
+# 
+
+PATCHNUM=58
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+[PATCH] ppc32: refactor FPU exception handling
+
+Moved common FPU exception handling code out of head.S so it can be used by
+several of the sub-architectures that might of a full PowerPC FPU.
+
+Also, uses new CONFIG_PPC_FPU define to fix alignment exception handling
+for floating point load/store instructions to only occur if we have a
+hardware FPU.
+
+Signed-off-by: Jason McMullan <jason.mcmullan@timesys.com>
+Signed-off-by: Kumar Gala <kumar.gala@freescale.com>
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+commit 443a848cd30eb5bb5c1038e6371d83404775dcfc
+tree f61d62eebf19498395257a7cddee828c4edfa876
+parent f1c55dea0bb2df94aa2b01b0871cb02f2e206676
+author Paul Mackerras <paulus@samba.org> Sun, 01 May 2005 08:58:40 -0700
+committer Linus Torvalds <torvalds@ppc970.osdl.org> Sun, 01 May 2005 08:58:40 -0700
+
+ arch/ppc/Kconfig                 |    4 
+ arch/ppc/Makefile                |    1 
+ arch/ppc/kernel/Makefile         |    1 
+ arch/ppc/kernel/align.c          |    8 +
+ arch/ppc/kernel/entry.S          |   59 ++++++++++++++
+ arch/ppc/kernel/fpu.S            |  133 +++++++++++++++++++++++++++++++
+ arch/ppc/kernel/head.S           |  163 ---------------------------------------
+ arch/ppc/kernel/head_44x.S       |    6 +
+ arch/ppc/kernel/head_booke.h     |    7 +
+ arch/ppc/kernel/head_fsl_booke.S |    8 +
+ arch/ppc/kernel/misc.S           |   12 --
+ arch/ppc/kernel/traps.c          |    2 
+ include/asm-ppc/reg_booke.h      |    1 
+ mvl_patches/pro-0058.c           |   16 +++
+ 14 files changed, 245 insertions(+), 176 deletions(-)
+
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -56,6 +56,7 @@ choice
+ 
+ config 6xx
+ 	bool "6xx/7xx/74xx/52xx/8260"
++	select PPC_FPU
+ 	help
+ 	  There are four types of PowerPC chips supported.  The more common
+ 	  types (601, 603, 604, 740, 750, 7400), the Motorola embedded
+@@ -89,6 +90,9 @@ config E500
+ 
+ endchoice
+ 
++config PPC_FPU
++	bool
++
+ config BOOKE
+ 	bool
+ 	depends on E500
+Index: linux-2.6.10/arch/ppc/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Makefile
++++ linux-2.6.10/arch/ppc/Makefile
+@@ -50,6 +50,7 @@ head-$(CONFIG_FSL_BOOKE)	:= arch/ppc/ker
+ 
+ head-$(CONFIG_6xx)		+= arch/ppc/kernel/idle_6xx.o
+ head-$(CONFIG_POWER4)		+= arch/ppc/kernel/idle_power4.o
++head-$(CONFIG_PPC_FPU)		+= arch/ppc/kernel/fpu.o
+ 
+ core-y				+= arch/ppc/kernel/ arch/ppc/platforms/ \
+ 				   arch/ppc/mm/ arch/ppc/lib/ arch/ppc/syslib/
+Index: linux-2.6.10/arch/ppc/kernel/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/Makefile
++++ linux-2.6.10/arch/ppc/kernel/Makefile
+@@ -9,6 +9,7 @@ extra-$(CONFIG_E500)		:= head_fsl_booke.
+ extra-$(CONFIG_8xx)		:= head_8xx.o
+ extra-$(CONFIG_6xx)		+= idle_6xx.o
+ extra-$(CONFIG_POWER4)		+= idle_power4.o
++extra-$(CONFIG_PPC_FPU)		+= fpu.o
+ extra-y				+= vmlinux.lds
+ 
+ obj-y				:= entry.o traps.o irq.o idle.o time.o misc.o \
+Index: linux-2.6.10/arch/ppc/kernel/align.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/align.c
++++ linux-2.6.10/arch/ppc/kernel/align.c
+@@ -368,16 +368,24 @@ fix_alignment(struct pt_regs *regs)
+ 
+ 	/* Single-precision FP load and store require conversions... */
+ 	case LD+F+S:
++#ifdef CONFIG_PPC_FPU
+ 		preempt_disable();
+ 		enable_kernel_fp();
+ 		cvt_fd(&data.f, &data.d, &current->thread.fpscr);
+ 		preempt_enable();
++#else
++		return 0;
++#endif
+ 		break;
+ 	case ST+F+S:
++#ifdef CONFIG_PPC_FPU
+ 		preempt_disable();
+ 		enable_kernel_fp();
+ 		cvt_df(&data.d, &data.f, &current->thread.fpscr);
+ 		preempt_enable();
++#else
++		return 0;
++#endif
+ 		break;
+ 	}
+ 
+Index: linux-2.6.10/arch/ppc/kernel/entry.S
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/entry.S
++++ linux-2.6.10/arch/ppc/kernel/entry.S
+@@ -619,6 +619,65 @@ END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC)
+ 	addi	r1,r1,INT_FRAME_SIZE
+ 	blr
+ 
++	.globl	fast_exception_return
++fast_exception_return:
++#if !(defined(CONFIG_4xx) || defined(CONFIG_BOOKE))
++	andi.	r10,r9,MSR_RI		/* check for recoverable interrupt */
++	beq	1f			/* if not, we've got problems */
++#endif
++
++2:	REST_4GPRS(3, r11)
++	lwz	r10,_CCR(r11)
++	REST_GPR(1, r11)
++	mtcr	r10
++	lwz	r10,_LINK(r11)
++	mtlr	r10
++	REST_GPR(10, r11)
++	mtspr	SPRN_SRR1,r9
++	mtspr	SPRN_SRR0,r12
++	REST_GPR(9, r11)
++	REST_GPR(12, r11)
++	lwz	r11,GPR11(r11)
++	SYNC
++	RFI
++
++#if !(defined(CONFIG_4xx) || defined(CONFIG_BOOKE))
++/* check if the exception happened in a restartable section */
++1:	lis	r3,exc_exit_restart_end@ha
++	addi	r3,r3,exc_exit_restart_end@l
++	cmplw	r12,r3
++	bge	3f
++	lis	r4,exc_exit_restart@ha
++	addi	r4,r4,exc_exit_restart@l
++	cmplw	r12,r4
++	blt	3f
++	lis	r3,fee_restarts@ha
++	tophys(r3,r3)
++	lwz	r5,fee_restarts@l(r3)
++	addi	r5,r5,1
++	stw	r5,fee_restarts@l(r3)
++	mr	r12,r4		/* restart at exc_exit_restart */
++	b	2b
++
++	.comm	fee_restarts,4
++
++/* aargh, a nonrecoverable interrupt, panic */
++/* aargh, we don't know which trap this is */
++/* but the 601 doesn't implement the RI bit, so assume it's OK */
++3:
++BEGIN_FTR_SECTION
++	b	2b
++END_FTR_SECTION_IFSET(CPU_FTR_601)
++	li	r10,-1
++	stw	r10,TRAP(r11)
++	addi	r3,r1,STACK_FRAME_OVERHEAD
++	lis	r10,MSR_KERNEL@h
++	ori	r10,r10,MSR_KERNEL@l
++	bl	transfer_to_handler_full
++	.long	nonrecoverable_exception
++	.long	ret_from_except
++#endif
++
+ 	.globl	sigreturn_exit
+ sigreturn_exit:
+ 	subi	r1,r3,STACK_FRAME_OVERHEAD
+Index: linux-2.6.10/arch/ppc/kernel/fpu.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/kernel/fpu.S
+@@ -0,0 +1,133 @@
++/*
++ *  FPU support code, moved here from head.S so that it can be used
++ *  by chips which use other head-whatever.S files.
++ *
++ *  This program is free software; you can redistribute it and/or
++ *  modify it under the terms of the GNU General Public License
++ *  as published by the Free Software Foundation; either version
++ *  2 of the License, or (at your option) any later version.
++ *
++ */
++
++#include <linux/config.h>
++#include <asm/processor.h>
++#include <asm/page.h>
++#include <asm/mmu.h>
++#include <asm/pgtable.h>
++#include <asm/cputable.h>
++#include <asm/cache.h>
++#include <asm/thread_info.h>
++#include <asm/ppc_asm.h>
++#include <asm/offsets.h>
++
++/*
++ * This task wants to use the FPU now.
++ * On UP, disable FP for the task which had the FPU previously,
++ * and save its floating-point registers in its thread_struct.
++ * Load up this task's FP registers from its thread_struct,
++ * enable the FPU for the current task and return to the task.
++ */
++	.globl	load_up_fpu
++load_up_fpu:
++	mfmsr	r5
++	ori	r5,r5,MSR_FP
++#ifdef CONFIG_PPC64BRIDGE
++	clrldi	r5,r5,1			/* turn off 64-bit mode */
++#endif /* CONFIG_PPC64BRIDGE */
++	SYNC
++	MTMSRD(r5)			/* enable use of fpu now */
++	isync
++/*
++ * For SMP, we don't do lazy FPU switching because it just gets too
++ * horrendously complex, especially when a task switches from one CPU
++ * to another.  Instead we call giveup_fpu in switch_to.
++ */
++#ifndef CONFIG_SMP
++	tophys(r6,0)			/* get __pa constant */
++	addis	r3,r6,last_task_used_math@ha
++	lwz	r4,last_task_used_math@l(r3)
++	cmpwi	0,r4,0
++	beq	1f
++	add	r4,r4,r6
++	addi	r4,r4,THREAD		/* want last_task_used_math->thread */
++	SAVE_32FPRS(0, r4)
++	mffs	fr0
++	stfd	fr0,THREAD_FPSCR-4(r4)
++	lwz	r5,PT_REGS(r4)
++	add	r5,r5,r6
++	lwz	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
++	li	r10,MSR_FP|MSR_FE0|MSR_FE1
++	andc	r4,r4,r10		/* disable FP for previous task */
++	stw	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
++1:
++#endif /* CONFIG_SMP */
++	/* enable use of FP after return */
++	mfspr	r5,SPRN_SPRG3		/* current task's THREAD (phys) */
++	lwz	r4,THREAD_FPEXC_MODE(r5)
++	ori	r9,r9,MSR_FP		/* enable FP for current */
++	or	r9,r9,r4
++	lfd	fr0,THREAD_FPSCR-4(r5)
++	mtfsf	0xff,fr0
++	REST_32FPRS(0, r5)
++#ifndef CONFIG_SMP
++	subi	r4,r5,THREAD
++	sub	r4,r4,r6
++	stw	r4,last_task_used_math@l(r3)
++#endif /* CONFIG_SMP */
++	/* restore registers and return */
++	/* we haven't used ctr or xer or lr */
++	b	fast_exception_return
++
++/*
++ * FP unavailable trap from kernel - print a message, but let
++ * the task use FP in the kernel until it returns to user mode.
++ */
++ 	.globl	KernelFP
++KernelFP:
++	lwz	r3,_MSR(r1)
++	ori	r3,r3,MSR_FP
++	stw	r3,_MSR(r1)		/* enable use of FP after return */
++	lis	r3,86f@h
++	ori	r3,r3,86f@l
++	mr	r4,r2			/* current */
++	lwz	r5,_NIP(r1)
++	bl	printk
++	b	ret_from_except
++86:	.string	"floating point used in kernel (task=%p, pc=%x)\n"
++	.align	4,0
++
++/*
++ * giveup_fpu(tsk)
++ * Disable FP for the task given as the argument,
++ * and save the floating-point registers in its thread_struct.
++ * Enables the FPU for use in the kernel on return.
++ */
++	.globl	giveup_fpu
++giveup_fpu:
++	mfmsr	r5
++	ori	r5,r5,MSR_FP
++	SYNC_601
++	ISYNC_601
++	MTMSRD(r5)			/* enable use of fpu now */
++	SYNC_601
++	isync
++	cmpwi	0,r3,0
++	beqlr-				/* if no previous owner, done */
++	addi	r3,r3,THREAD	        /* want THREAD of task */
++	lwz	r5,PT_REGS(r3)
++	cmpwi	0,r5,0
++	SAVE_32FPRS(0, r3)
++	mffs	fr0
++	stfd	fr0,THREAD_FPSCR-4(r3)
++	beq	1f
++	lwz	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
++	li	r3,MSR_FP|MSR_FE0|MSR_FE1
++	andc	r4,r4,r3		/* disable FP for previous task */
++	stw	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
++1:
++#ifndef CONFIG_SMP
++	li	r5,0
++	lis	r4,last_task_used_math@ha
++	stw	r5,last_task_used_math@l(r4)
++#endif /* CONFIG_SMP */
++	blr
+Index: linux-2.6.10/arch/ppc/kernel/head.S
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/head.S
++++ linux-2.6.10/arch/ppc/kernel/head.S
+@@ -775,133 +775,6 @@ InstructionSegment:
+ 	EXC_XFER_STD(0x480, UnknownException)
+ #endif /* CONFIG_PPC64BRIDGE */
+ 
+-/*
+- * This task wants to use the FPU now.
+- * On UP, disable FP for the task which had the FPU previously,
+- * and save its floating-point registers in its thread_struct.
+- * Load up this task's FP registers from its thread_struct,
+- * enable the FPU for the current task and return to the task.
+- */
+-load_up_fpu:
+-	mfmsr	r5
+-	ori	r5,r5,MSR_FP
+-#ifdef CONFIG_PPC64BRIDGE
+-	clrldi	r5,r5,1			/* turn off 64-bit mode */
+-#endif /* CONFIG_PPC64BRIDGE */
+-	SYNC
+-	MTMSRD(r5)			/* enable use of fpu now */
+-	isync
+-/*
+- * For SMP, we don't do lazy FPU switching because it just gets too
+- * horrendously complex, especially when a task switches from one CPU
+- * to another.  Instead we call giveup_fpu in switch_to.
+- */
+-#ifndef CONFIG_SMP
+-	tophys(r6,0)			/* get __pa constant */
+-	addis	r3,r6,last_task_used_math@ha
+-	lwz	r4,last_task_used_math@l(r3)
+-	cmpwi	0,r4,0
+-	beq	1f
+-	add	r4,r4,r6
+-	addi	r4,r4,THREAD		/* want last_task_used_math->thread */
+-	SAVE_32FPRS(0, r4)
+-	mffs	fr0
+-	stfd	fr0,THREAD_FPSCR-4(r4)
+-	lwz	r5,PT_REGS(r4)
+-	add	r5,r5,r6
+-	lwz	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
+-	li	r10,MSR_FP|MSR_FE0|MSR_FE1
+-	andc	r4,r4,r10		/* disable FP for previous task */
+-	stw	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
+-1:
+-#endif /* CONFIG_SMP */
+-	/* enable use of FP after return */
+-	mfspr	r5,SPRG3		/* current task's THREAD (phys) */
+-	lwz	r4,THREAD_FPEXC_MODE(r5)
+-	ori	r9,r9,MSR_FP		/* enable FP for current */
+-	or	r9,r9,r4
+-	lfd	fr0,THREAD_FPSCR-4(r5)
+-	mtfsf	0xff,fr0
+-	REST_32FPRS(0, r5)
+-#ifndef CONFIG_SMP
+-	subi	r4,r5,THREAD
+-	sub	r4,r4,r6
+-	stw	r4,last_task_used_math@l(r3)
+-#endif /* CONFIG_SMP */
+-	/* restore registers and return */
+-	/* we haven't used ctr or xer or lr */
+-	/* fall through to fast_exception_return */
+-
+-	.globl	fast_exception_return
+-fast_exception_return:
+-	andi.	r10,r9,MSR_RI		/* check for recoverable interrupt */
+-	beq	1f			/* if not, we've got problems */
+-2:	REST_4GPRS(3, r11)
+-	lwz	r10,_CCR(r11)
+-	REST_GPR(1, r11)
+-	mtcr	r10
+-	lwz	r10,_LINK(r11)
+-	mtlr	r10
+-	REST_GPR(10, r11)
+-	mtspr	SRR1,r9
+-	mtspr	SRR0,r12
+-	REST_GPR(9, r11)
+-	REST_GPR(12, r11)
+-	lwz	r11,GPR11(r11)
+-	SYNC
+-	RFI
+-
+-/* check if the exception happened in a restartable section */
+-1:	lis	r3,exc_exit_restart_end@ha
+-	addi	r3,r3,exc_exit_restart_end@l
+-	cmplw	r12,r3
+-	bge	3f
+-	lis	r4,exc_exit_restart@ha
+-	addi	r4,r4,exc_exit_restart@l
+-	cmplw	r12,r4
+-	blt	3f
+-	lis	r3,fee_restarts@ha
+-	tophys(r3,r3)
+-	lwz	r5,fee_restarts@l(r3)
+-	addi	r5,r5,1
+-	stw	r5,fee_restarts@l(r3)
+-	mr	r12,r4		/* restart at exc_exit_restart */
+-	b	2b
+-
+-	.comm	fee_restarts,4
+-
+-/* aargh, a nonrecoverable interrupt, panic */
+-/* aargh, we don't know which trap this is */
+-/* but the 601 doesn't implement the RI bit, so assume it's OK */
+-3:
+-BEGIN_FTR_SECTION
+-	b	2b
+-END_FTR_SECTION_IFSET(CPU_FTR_601)
+-	li	r10,-1
+-	stw	r10,TRAP(r11)
+-	addi	r3,r1,STACK_FRAME_OVERHEAD
+-	li	r10,MSR_KERNEL
+-	bl	transfer_to_handler_full
+-	.long	nonrecoverable_exception
+-	.long	ret_from_except
+-
+-/*
+- * FP unavailable trap from kernel - print a message, but let
+- * the task use FP in the kernel until it returns to user mode.
+- */
+-KernelFP:
+-	lwz	r3,_MSR(r1)
+-	ori	r3,r3,MSR_FP
+-	stw	r3,_MSR(r1)		/* enable use of FP after return */
+-	lis	r3,86f@h
+-	ori	r3,r3,86f@l
+-	mr	r4,r2			/* current */
+-	lwz	r5,_NIP(r1)
+-	bl	printk
+-	b	ret_from_except
+-86:	.string	"floating point used in kernel (task=%p, pc=%x)\n"
+-	.align	4,0
+-
+ #ifdef CONFIG_ALTIVEC
+ /* Note that the AltiVec support is closely modeled after the FP
+  * support.  Changes to one are likely to be applicable to the
+@@ -1016,42 +889,6 @@ giveup_altivec:
+ #endif /* CONFIG_ALTIVEC */
+ 
+ /*
+- * giveup_fpu(tsk)
+- * Disable FP for the task given as the argument,
+- * and save the floating-point registers in its thread_struct.
+- * Enables the FPU for use in the kernel on return.
+- */
+-	.globl	giveup_fpu
+-giveup_fpu:
+-	mfmsr	r5
+-	ori	r5,r5,MSR_FP
+-	SYNC_601
+-	ISYNC_601
+-	MTMSRD(r5)			/* enable use of fpu now */
+-	SYNC_601
+-	isync
+-	cmpwi	0,r3,0
+-	beqlr-				/* if no previous owner, done */
+-	addi	r3,r3,THREAD	        /* want THREAD of task */
+-	lwz	r5,PT_REGS(r3)
+-	cmpwi	0,r5,0
+-	SAVE_32FPRS(0, r3)
+-	mffs	fr0
+-	stfd	fr0,THREAD_FPSCR-4(r3)
+-	beq	1f
+-	lwz	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
+-	li	r3,MSR_FP|MSR_FE0|MSR_FE1
+-	andc	r4,r4,r3		/* disable FP for previous task */
+-	stw	r4,_MSR-STACK_FRAME_OVERHEAD(r5)
+-1:
+-#ifndef CONFIG_SMP
+-	li	r5,0
+-	lis	r4,last_task_used_math@ha
+-	stw	r5,last_task_used_math@l(r4)
+-#endif /* CONFIG_SMP */
+-	blr
+-
+-/*
+  * This code is jumped to from the startup code to copy
+  * the kernel image to physical address 0.
+  */
+Index: linux-2.6.10/arch/ppc/kernel/head_44x.S
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/head_44x.S
++++ linux-2.6.10/arch/ppc/kernel/head_44x.S
+@@ -426,7 +426,11 @@ interrupt_base:
+ 	PROGRAM_EXCEPTION
+ 
+ 	/* Floating Point Unavailable Interrupt */
++#ifdef CONFIG_PPC_FPU
++	FP_UNAVAILABLE_EXCEPTION
++#else
+ 	EXCEPTION(0x2010, FloatingPointUnavailable, UnknownException, EXC_XFER_EE)
++#endif
+ 
+ 	/* System Call Interrupt */
+ 	START_EXCEPTION(SystemCall)
+@@ -686,8 +690,10 @@ _GLOBAL(giveup_altivec)
+  *
+  * The 44x core does not have an FPU.
+  */
++#ifndef CONFIG_PPC_FPU
+ _GLOBAL(giveup_fpu)
+ 	blr
++#endif
+ 
+ /*
+  * extern void abort(void)
+Index: linux-2.6.10/arch/ppc/kernel/head_booke.h
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/head_booke.h
++++ linux-2.6.10/arch/ppc/kernel/head_booke.h
+@@ -337,4 +337,11 @@ label:
+ 	addi    r3,r1,STACK_FRAME_OVERHEAD;				      \
+ 	EXC_XFER_LITE(0x0900, timer_interrupt)
+ 
++#define FP_UNAVAILABLE_EXCEPTION					      \
++	START_EXCEPTION(FloatingPointUnavailable)			      \
++	NORMAL_EXCEPTION_PROLOG;					      \
++	bne	load_up_fpu;		/* if from user, just load it up */   \
++	addi	r3,r1,STACK_FRAME_OVERHEAD;				      \
++	EXC_XFER_EE_LITE(0x800, KernelFP)
++
+ #endif /* __HEAD_BOOKE_H__ */
+Index: linux-2.6.10/arch/ppc/kernel/head_fsl_booke.S
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/head_fsl_booke.S
++++ linux-2.6.10/arch/ppc/kernel/head_fsl_booke.S
+@@ -477,7 +477,11 @@ interrupt_base:
+ 	PROGRAM_EXCEPTION
+ 
+ 	/* Floating Point Unavailable Interrupt */
++#ifdef CONFIG_PPC_FPU
++	FP_UNAVAILABLE_EXCEPTION
++#else
+ 	EXCEPTION(0x0800, FloatingPointUnavailable, UnknownException, EXC_XFER_EE)
++#endif
+ 
+ 	/* System Call Interrupt */
+ 	START_EXCEPTION(SystemCall)
+@@ -882,10 +886,12 @@ _GLOBAL(giveup_spe)
+ /*
+  * extern void giveup_fpu(struct task_struct *prev)
+  *
+- * The e500 core does not have an FPU.
++ * Not all FSL Book-E cores have an FPU
+  */
++#ifndef CONFIG_PPC_FPU
+ _GLOBAL(giveup_fpu)
+ 	blr
++#endif
+ 
+ /*
+  * extern void abort(void)
+Index: linux-2.6.10/arch/ppc/kernel/misc.S
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/misc.S
++++ linux-2.6.10/arch/ppc/kernel/misc.S
+@@ -1096,17 +1096,7 @@ _GLOBAL(_get_SP)
+  * and exceptions as if the cpu had performed the load or store.
+  */
+ 
+-#if defined(CONFIG_4xx) || defined(CONFIG_E500)
+-_GLOBAL(cvt_fd)
+-	lfs	0,0(r3)
+-	stfd	0,0(r4)
+-	blr
+-
+-_GLOBAL(cvt_df)
+-	lfd	0,0(r3)
+-	stfs	0,0(r4)
+-	blr
+-#else
++#ifdef CONFIG_PPC_FPU
+ _GLOBAL(cvt_fd)
+ 	lfd	0,-4(r5)	/* load up fpscr value */
+ 	mtfsf	0xff,0
+Index: linux-2.6.10/arch/ppc/kernel/traps.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/traps.c
++++ linux-2.6.10/arch/ppc/kernel/traps.c
+@@ -177,7 +177,7 @@ static inline int check_io_access(struct
+ #else
+ #define get_mc_reason(regs)	(mfspr(SPRN_MCSR))
+ #endif
+-#define REASON_FP		0
++#define REASON_FP		ESR_FP
+ #define REASON_ILLEGAL		ESR_PIL
+ #define REASON_PRIVILEGED	ESR_PPR
+ #define REASON_TRAP		ESR_PTR
+Index: linux-2.6.10/include/asm-ppc/reg_booke.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/reg_booke.h
++++ linux-2.6.10/include/asm-ppc/reg_booke.h
+@@ -251,6 +251,7 @@ do {						\
+ #define ESR_PIL		0x08000000	/* Program Exception - Illegal */
+ #define ESR_PPR		0x04000000	/* Program Exception - Priveleged */
+ #define ESR_PTR		0x02000000	/* Program Exception - Trap */
++#define ESR_FP		0x01000000	/* Floating Point Operation */
+ #define ESR_DST		0x00800000	/* Storage Exception - Data miss */
+ #define ESR_DIZ		0x00400000	/* Storage Exception - Zone fault */
+ #define ESR_ST		0x00800000	/* Store Operation */
+Index: linux-2.6.10/mvl_patches/pro-0058.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0058.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(58);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

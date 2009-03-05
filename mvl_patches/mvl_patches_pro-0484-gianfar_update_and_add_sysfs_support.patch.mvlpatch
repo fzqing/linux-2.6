@@ -1,0 +1,1366 @@
+#! /usr/bin/env bash
+# Patch: -gianfar_update_and_add_sysfs_support.patch
+# Date: Thu Apr 20 12:21:00 2006
+
+PATCHNUM=484
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree 7f7f53168dbee6d6a462acea666fddd18aad4f08 (from fed5eccdcf542742786701b2514b5cb7ab282b93)
+tree 9c59f9b4b7c06f70b48197408f37398e54b4771e
+parent fed5eccdcf542742786701b2514b5cb7ab282b93
+author Andy Fleming <afleming@freescale.com> 1131734339 -0600
+committer Jeff Garzik <jgarzik@pobox.com> 1132338686 -0500
+
+    [PATCH] Gianfar update and sysfs support
+    
+    This seems to have gotten lost, so I'll resend.
+    
+    Signed-off-by: Andy Fleming <afleming@freescale.com>
+    
+    * Added sysfs support to gianfar for modifying FIFO and stashing parameters
+    * Updated driver to support 10 Mbit, full duplex operation
+    * Improved comments throughout
+    * Cleaned up and optimized offloading code
+    * Fixed a bug where rx buffers were being improperly mapped and unmapped
+    * (only manifested if cache-coherency was off)
+    * Added support for using the eTSEC exact-match MAC registers
+    * Bumped the version to 1.3
+    * Added support for distinguishing between reduced 100 and 10 Mbit modes
+    * Modified default coalescing values to lower latency
+    * Added documentation
+    Signed-off-by: Jeff Garzik <jgarzik@pobox.com>
+
+diff --git a/Documentation/networking/gianfar.txt b/Documentation/networking/gianfar.txt
+new file mode 100644
+index 0000000..ad474ea
+ Documentation/networking/gianfar.txt |   72 ++++++++
+ drivers/net/Makefile                 |    5 
+ drivers/net/gianfar.c                |  233 +++++++++++++++++---------
+ drivers/net/gianfar.h                |   69 ++++---
+ drivers/net/gianfar_ethtool.c        |    2 
+ drivers/net/gianfar_mii.h            |    1 
+ drivers/net/gianfar_sysfs.c          |  311 +++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0484.c               |   16 +
+ 8 files changed, 596 insertions(+), 113 deletions(-)
+
+Index: linux-2.6.10/Documentation/networking/gianfar.txt
+===================================================================
+--- /dev/null
++++ linux-2.6.10/Documentation/networking/gianfar.txt
+@@ -0,0 +1,72 @@
++The Gianfar Ethernet Driver
++Sysfs File description
++
++Author: Andy Fleming <afleming@freescale.com>
++Updated: 2005-07-28
++
++SYSFS
++
++Several of the features of the gianfar driver are controlled
++through sysfs files.  These are:
++
++bd_stash:
++To stash RX Buffer Descriptors in the L2, echo 'on' or '1' to
++bd_stash, echo 'off' or '0' to disable
++
++rx_stash_len:
++To stash the first n bytes of the packet in L2, echo the number
++of bytes to buf_stash_len.  echo 0 to disable.
++
++WARNING: You could really screw these up if you set them too low or high!
++fifo_threshold:
++To change the number of bytes the controller needs in the
++fifo before it starts transmission, echo the number of bytes to 
++fifo_thresh.  Range should be 0-511.
++
++fifo_starve:
++When the FIFO has less than this many bytes during a transmit, it
++enters starve mode, and increases the priority of TX memory
++transactions.  To change, echo the number of bytes to
++fifo_starve.  Range should be 0-511.
++
++fifo_starve_off:
++Once in starve mode, the FIFO remains there until it has this
++many bytes.  To change, echo the number of bytes to
++fifo_starve_off.  Range should be 0-511.
++
++CHECKSUM OFFLOADING
++
++The eTSEC controller (first included in parts from late 2005 like
++the 8548) has the ability to perform TCP, UDP, and IP checksums
++in hardware.  The Linux kernel only offloads the TCP and UDP
++checksums (and always performs the pseudo header checksums), so
++the driver only supports checksumming for TCP/IP and UDP/IP
++packets.  Use ethtool to enable or disable this feature for RX
++and TX.
++
++VLAN
++
++In order to use VLAN, please consult Linux documentation on
++configuring VLANs.  The gianfar driver supports hardware insertion and
++extraction of VLAN headers, but not filtering.  Filtering will be
++done by the kernel.
++
++MULTICASTING
++
++The gianfar driver supports using the group hash table on the
++TSEC (and the extended hash table on the eTSEC) for multicast
++filtering.  On the eTSEC, the exact-match MAC registers are used
++before the hash tables.  See Linux documentation on how to join
++multicast groups.
++
++PADDING
++
++The gianfar driver supports padding received frames with 2 bytes
++to align the IP header to a 16-byte boundary, when supported by
++hardware.
++
++ETHTOOL
++
++The gianfar driver supports the use of ethtool for many
++configuration options.  You must run ethtool only on currently
++open interfaces.  See ethtool documentation for details.
+Index: linux-2.6.10/drivers/net/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/net/Makefile
++++ linux-2.6.10/drivers/net/Makefile
+@@ -12,7 +12,10 @@ obj-$(CONFIG_IXGB) += ixgb/
+ obj-$(CONFIG_BONDING) += bonding/
+ obj-$(CONFIG_GIANFAR) += gianfar_driver.o
+ 
+-gianfar_driver-objs := gianfar.o gianfar_ethtool.o gianfar_mii.o
++gianfar_driver-objs := gianfar.o \
++		gianfar_ethtool.o \
++		gianfar_mii.o \
++		gianfar_sysfs.o
+ 
+ #
+ # link order important here
+Index: linux-2.6.10/drivers/net/gianfar.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar.c
++++ linux-2.6.10/drivers/net/gianfar.c
+@@ -2,7 +2,8 @@
+  * drivers/net/gianfar.c
+  *
+  * Gianfar Ethernet Driver
+- * Driver for FEC on MPC8540 and TSEC on MPC8540/MPC8560
++ * This driver is designed for the non-CPM ethernet controllers
++ * on the 85xx and 83xx family of integrated processors
+  * Based on 8260_io/fcc_enet.c
+  *
+  * Author: Andy Fleming
+@@ -22,8 +23,6 @@
+  *  B-V +1.62
+  *
+  *  Theory of operation
+- *  This driver is designed for the non-CPM ethernet controllers
+- *  on the 85xx and 83xx family of integrated processors
+  *
+  *  The driver is initialized through platform_device.  Structures which
+  *  define the configuration needed by the board are defined in a
+@@ -111,7 +110,7 @@
+ #endif
+ 
+ const char gfar_driver_name[] = "Gianfar Ethernet";
+-const char gfar_driver_version[] = "1.2";
++const char gfar_driver_version[] = "1.3";
+ 
+ static int gfar_enet_open(struct net_device *dev);
+ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev);
+@@ -143,6 +142,10 @@ static int gfar_process_frame(struct net
+ static void gfar_vlan_rx_register(struct net_device *netdev,
+ 		                struct vlan_group *grp);
+ static void gfar_vlan_rx_kill_vid(struct net_device *netdev, uint16_t vid);
++void gfar_halt(struct net_device *dev);
++void gfar_start(struct net_device *dev);
++static void gfar_clear_exact_match(struct net_device *dev);
++static void gfar_set_mac_for_addr(struct net_device *dev, int num, u8 *addr);
+ 
+ extern struct ethtool_ops gfar_ethtool_ops;
+ 
+@@ -150,12 +153,10 @@ MODULE_AUTHOR("Freescale Semiconductor, 
+ MODULE_DESCRIPTION("Gianfar Ethernet Driver");
+ MODULE_LICENSE("GPL");
+ 
+-int gfar_uses_fcb(struct gfar_private *priv)
++/* Returns 1 if incoming frames use an FCB */
++static inline int gfar_uses_fcb(struct gfar_private *priv)
+ {
+-	if (priv->vlan_enable || priv->rx_csum_enable)
+-		return 1;
+-	else
+-		return 0;
++	return (priv->vlan_enable || priv->rx_csum_enable);
+ }
+ 
+ /* Set up the ethernet device structure, private data,
+@@ -328,15 +329,10 @@ static int gfar_probe(struct device *dev
+ 	else
+ 		priv->padding = 0;
+ 
+-	dev->hard_header_len += priv->padding;
+-
+ 	if (dev->features & NETIF_F_IP_CSUM)
+ 		dev->hard_header_len += GMAC_FCB_LEN;
+ 
+ 	priv->rx_buffer_size = DEFAULT_RX_BUFFER_SIZE;
+-#ifdef CONFIG_GFAR_BUFSTASH
+-	priv->rx_stash_size = STASH_LENGTH;
+-#endif
+ 	priv->tx_ring_size = DEFAULT_TX_RING_SIZE;
+ 	priv->rx_ring_size = DEFAULT_RX_RING_SIZE;
+ 
+@@ -358,6 +354,9 @@ static int gfar_probe(struct device *dev
+ 		goto register_fail;
+ 	}
+ 
++	/* Create all the sysfs files */
++	gfar_init_sysfs(dev);
++
+ 	/* Print out the device info */
+ 	printk(KERN_INFO DEVICE_NAME, dev->name);
+ 	for (idx = 0; idx < 6; idx++)
+@@ -365,8 +364,7 @@ static int gfar_probe(struct device *dev
+ 	printk("\n");
+ 
+ 	/* Even more device info helps when determining which kernel */
+-	/* provided which set of benchmarks.  Since this is global for all */
+-	/* devices, we only print it once */
++	/* provided which set of benchmarks. */
+ #ifdef CONFIG_GFAR_NAPI
+ 	printk(KERN_INFO "%s: Running with NAPI enabled\n", dev->name);
+ #else
+@@ -471,19 +469,9 @@ static void init_registers(struct net_de
+ 	/* Initialize the max receive buffer length */
+ 	gfar_write(&priv->regs->mrblr, priv->rx_buffer_size);
+ 
+-#ifdef CONFIG_GFAR_BUFSTASH
+-	/* If we are stashing buffers, we need to set the
+-	 * extraction length to the size of the buffer */
+-	gfar_write(&priv->regs->attreli, priv->rx_stash_size << 16);
+-#endif
+-
+ 	/* Initialize the Minimum Frame Length Register */
+ 	gfar_write(&priv->regs->minflr, MINFLR_INIT_SETTINGS);
+ 
+-	/* Setup Attributes so that snooping is on for rx */
+-	gfar_write(&priv->regs->attr, ATTR_INIT_SETTINGS);
+-	gfar_write(&priv->regs->attreli, ATTRELI_INIT_SETTINGS);
+-
+ 	/* Assign the TBI an address which won't conflict with the PHYs */
+ 	gfar_write(&priv->regs->tbipa, TBIPA_VALUE);
+ }
+@@ -585,8 +573,7 @@ static void free_skb_resources(struct gf
+ 		for (i = 0; i < priv->rx_ring_size; i++) {
+ 			if (priv->rx_skbuff[i]) {
+ 				dma_unmap_single(NULL, rxbdp->bufPtr,
+-						priv->rx_buffer_size
+-						+ RXBUF_ALIGNMENT,
++						priv->rx_buffer_size,
+ 						DMA_FROM_DEVICE);
+ 
+ 				dev_kfree_skb_any(priv->rx_skbuff[i]);
+@@ -644,6 +631,7 @@ int startup_gfar(struct net_device *dev)
+ 	struct gfar *regs = priv->regs;
+ 	int err = 0;
+ 	u32 rctrl = 0;
++	u32 attrs = 0;
+ 
+ 	gfar_write(&regs->imask, IMASK_INIT_CLEAR);
+ 
+@@ -803,18 +791,50 @@ int startup_gfar(struct net_device *dev)
+ 	if (priv->rx_csum_enable)
+ 		rctrl |= RCTRL_CHECKSUMMING;
+ 
+-	if (priv->extended_hash)
++	if (priv->extended_hash) {
+ 		rctrl |= RCTRL_EXTHASH;
+ 
++		gfar_clear_exact_match(dev);
++		rctrl |= RCTRL_EMEN;
++	}
++
+ 	if (priv->vlan_enable)
+ 		rctrl |= RCTRL_VLAN;
+ 
++	if (priv->padding) {
++		rctrl &= ~RCTRL_PAL_MASK;
++		rctrl |= RCTRL_PADDING(priv->padding);
++	}
++
+ 	/* Init rctrl based on our settings */
+ 	gfar_write(&priv->regs->rctrl, rctrl);
+ 
+ 	if (dev->features & NETIF_F_IP_CSUM)
+ 		gfar_write(&priv->regs->tctrl, TCTRL_INIT_CSUM);
+ 
++	/* Set the extraction length and index */
++	attrs = ATTRELI_EL(priv->rx_stash_size) |
++		ATTRELI_EI(priv->rx_stash_index);
++
++	gfar_write(&priv->regs->attreli, attrs);
++
++	/* Start with defaults, and add stashing or locking
++	 * depending on the approprate variables */
++	attrs = ATTR_INIT_SETTINGS;
++
++	if (priv->bd_stash_en)
++		attrs |= ATTR_BDSTASH;
++
++	if (priv->rx_stash_size != 0)
++		attrs |= ATTR_BUFSTASH;
++
++	gfar_write(&priv->regs->attr, attrs);
++
++	gfar_write(&priv->regs->fifo_tx_thr, priv->fifo_threshold);
++	gfar_write(&priv->regs->fifo_tx_starve, priv->fifo_starve);
++	gfar_write(&priv->regs->fifo_tx_starve_shutoff, priv->fifo_starve_off);
++
++	/* Start the controller */
+ 	gfar_start(dev);
+ 
+ 	return 0;
+@@ -859,34 +879,32 @@ static int gfar_enet_open(struct net_dev
+ 	return err;
+ }
+ 
+-static struct txfcb *gfar_add_fcb(struct sk_buff *skb, struct txbd8 *bdp)
++static inline struct txfcb *gfar_add_fcb(struct sk_buff *skb, struct txbd8 *bdp)
+ {
+ 	struct txfcb *fcb = (struct txfcb *)skb_push (skb, GMAC_FCB_LEN);
+ 
+ 	memset(fcb, 0, GMAC_FCB_LEN);
+ 
+-	/* Flag the bd so the controller looks for the FCB */
+-	bdp->status |= TXBD_TOE;
+-
+ 	return fcb;
+ }
+ 
+ static inline void gfar_tx_checksum(struct sk_buff *skb, struct txfcb *fcb)
+ {
+-	int len;
++	u8 flags = 0;
+ 
+ 	/* If we're here, it's a IP packet with a TCP or UDP
+ 	 * payload.  We set it to checksum, using a pseudo-header
+ 	 * we provide
+ 	 */
+-	fcb->ip = 1;
+-	fcb->tup = 1;
+-	fcb->ctu = 1;
+-	fcb->nph = 1;
+-
+-	/* Notify the controller what the protocol is */
+-	if (skb->nh.iph->protocol == IPPROTO_UDP)
+-		fcb->udp = 1;
++	flags = TXFCB_DEFAULT;
++
++	/* Tell the controller what the protocol is */
++	/* And provide the already calculated phcs */
++	if (skb->nh.iph->protocol == IPPROTO_UDP) {
++		flags |= TXFCB_UDP;
++		fcb->phcs = skb->h.uh->check;
++	} else
++		fcb->phcs = skb->h.th->check;
+ 
+ 	/* l3os is the distance between the start of the
+ 	 * frame (skb->data) and the start of the IP hdr.
+@@ -895,17 +913,12 @@ static inline void gfar_tx_checksum(stru
+ 	fcb->l3os = (u16)(skb->nh.raw - skb->data - GMAC_FCB_LEN);
+ 	fcb->l4os = (u16)(skb->h.raw - skb->nh.raw);
+ 
+-	len = skb->nh.iph->tot_len - fcb->l4os;
+-
+-	/* Provide the pseudoheader csum */
+-	fcb->phcs = ~csum_tcpudp_magic(skb->nh.iph->saddr,
+-			skb->nh.iph->daddr, len,
+-			skb->nh.iph->protocol, 0);
++	fcb->flags = flags;
+ }
+ 
+-void gfar_tx_vlan(struct sk_buff *skb, struct txfcb *fcb)
++void inline gfar_tx_vlan(struct sk_buff *skb, struct txfcb *fcb)
+ {
+-	fcb->vln = 1;
++	fcb->flags |= TXFCB_VLN;
+ 	fcb->vlctl = vlan_tx_tag_get(skb);
+ }
+ 
+@@ -916,6 +929,7 @@ static int gfar_start_xmit(struct sk_buf
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	struct txfcb *fcb = NULL;
+ 	struct txbd8 *txbdp;
++	u16 status;
+ 
+ 	/* Update transmit stats */
+ 	priv->stats.tx_bytes += skb->len;
+@@ -927,19 +941,22 @@ static int gfar_start_xmit(struct sk_buf
+ 	txbdp = priv->cur_tx;
+ 
+ 	/* Clear all but the WRAP status flags */
+-	txbdp->status &= TXBD_WRAP;
++	status = txbdp->status & TXBD_WRAP;
+ 
+ 	/* Set up checksumming */
+-	if ((dev->features & NETIF_F_IP_CSUM)
+-			&& (CHECKSUM_HW == skb->ip_summed)) {
++	if (likely((dev->features & NETIF_F_IP_CSUM)
++			&& (CHECKSUM_HW == skb->ip_summed))) {
+ 		fcb = gfar_add_fcb(skb, txbdp);
++		status |= TXBD_TOE;
+ 		gfar_tx_checksum(skb, fcb);
+ 	}
+ 
+ 	if (priv->vlan_enable &&
+ 			unlikely(priv->vlgrp && vlan_tx_tag_present(skb))) {
+-		if (NULL == fcb)
++		if (unlikely(NULL == fcb)) {
+ 			fcb = gfar_add_fcb(skb, txbdp);
++			status |= TXBD_TOE;
++		}
+ 
+ 		gfar_tx_vlan(skb, fcb);
+ 	}
+@@ -957,14 +974,16 @@ static int gfar_start_xmit(struct sk_buf
+ 	    (priv->skb_curtx + 1) & TX_RING_MOD_MASK(priv->tx_ring_size);
+ 
+ 	/* Flag the BD as interrupt-causing */
+-	txbdp->status |= TXBD_INTERRUPT;
++	status |= TXBD_INTERRUPT;
+ 
+ 	/* Flag the BD as ready to go, last in frame, and  */
+ 	/* in need of CRC */
+-	txbdp->status |= (TXBD_READY | TXBD_LAST | TXBD_CRC);
++	status |= (TXBD_READY | TXBD_LAST | TXBD_CRC);
+ 
+ 	dev->trans_start = jiffies;
+ 
++	txbdp->status = status;
++
+ 	/* If this was the last BD in the ring, the next one */
+ 	/* is at the beginning of the ring */
+ 	if (txbdp->status & TXBD_WRAP)
+@@ -1043,21 +1062,7 @@ static struct net_device_stats * gfar_ge
+ /* Changes the mac address if the controller is not running. */
+ int gfar_set_mac_address(struct net_device *dev)
+ {
+-	struct gfar_private *priv = netdev_priv(dev);
+-	int i;
+-	char tmpbuf[MAC_ADDR_LEN];
+-	u32 tempval;
+-
+-	/* Now copy it into the mac registers backwards, cuz */
+-	/* little endian is silly */
+-	for (i = 0; i < MAC_ADDR_LEN; i++)
+-		tmpbuf[MAC_ADDR_LEN - 1 - i] = dev->dev_addr[i];
+-
+-	gfar_write(&priv->regs->macstnaddr1, *((u32 *) (tmpbuf)));
+-
+-	tempval = *((u32 *) (tmpbuf + 4));
+-
+-	gfar_write(&priv->regs->macstnaddr2, tempval);
++	gfar_set_mac_for_addr(dev, 0, dev->dev_addr);
+ 
+ 	return 0;
+ }
+@@ -1143,7 +1148,7 @@ static int gfar_change_mtu(struct net_de
+ 	    INCREMENTAL_BUFFER_SIZE;
+ 
+ 	/* Only stop and start the controller if it isn't already
+-	 * stopped */
++	 * stopped, and we changed something */
+ 	if ((oldsize != tempsize) && (dev->flags & IFF_UP))
+ 		stop_gfar(dev);
+ 
+@@ -1253,6 +1258,7 @@ static irqreturn_t gfar_transmit(int irq
+ 
+ struct sk_buff * gfar_new_skb(struct net_device *dev, struct rxbd8 *bdp)
+ {
++	unsigned int alignamount;
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	struct sk_buff *skb = NULL;
+ 	unsigned int timeout = SKB_ALLOC_TIMEOUT;
+@@ -1264,18 +1270,18 @@ struct sk_buff * gfar_new_skb(struct net
+ 	if (NULL == skb)
+ 		return NULL;
+ 
++	alignamount = RXBUF_ALIGNMENT -
++		(((unsigned) skb->data) & (RXBUF_ALIGNMENT - 1));
++
+ 	/* We need the data buffer to be aligned properly.  We will reserve
+ 	 * as many bytes as needed to align the data properly
+ 	 */
+-	skb_reserve(skb,
+-		    RXBUF_ALIGNMENT -
+-		    (((unsigned) skb->data) & (RXBUF_ALIGNMENT - 1)));
++	skb_reserve(skb, alignamount);
+ 
+ 	skb->dev = dev;
+ 
+ 	bdp->bufPtr = dma_map_single(NULL, skb->data,
+-			priv->rx_buffer_size + RXBUF_ALIGNMENT,
+-			DMA_FROM_DEVICE);
++			priv->rx_buffer_size, DMA_FROM_DEVICE);
+ 
+ 	bdp->length = 0;
+ 
+@@ -1383,7 +1389,7 @@ static inline void gfar_rx_checksum(stru
+ 	/* If valid headers were found, and valid sums
+ 	 * were verified, then we tell the kernel that no
+ 	 * checksumming is necessary.  Otherwise, it is */
+-	if (fcb->cip && !fcb->eip && fcb->ctu && !fcb->etu)
++	if ((fcb->flags & RXFCB_CSUM_MASK) == (RXFCB_CIP | RXFCB_CTU))
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 	else
+ 		skb->ip_summed = CHECKSUM_NONE;
+@@ -1434,7 +1440,7 @@ static int gfar_process_frame(struct net
+ 		skb->protocol = eth_type_trans(skb, dev);
+ 
+ 		/* Send the packet up the stack */
+-		if (unlikely(priv->vlgrp && fcb->vln))
++		if (unlikely(priv->vlgrp && (fcb->flags & RXFCB_VLN)))
+ 			ret = gfar_rx_vlan(skb, priv->vlgrp, fcb->vlctl);
+ 		else
+ 			ret = RECEIVE(skb);
+@@ -1653,6 +1659,7 @@ static void adjust_link(struct net_devic
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 	if (phydev->link) {
+ 		u32 tempval = gfar_read(&regs->maccfg2);
++		u32 ecntrl = gfar_read(&regs->ecntrl);
+ 
+ 		/* Now we make sure that we can be in full duplex mode.
+ 		 * If not, we operate in half-duplex mode. */
+@@ -1677,6 +1684,13 @@ static void adjust_link(struct net_devic
+ 			case 10:
+ 				tempval =
+ 				    ((tempval & ~(MACCFG2_IF)) | MACCFG2_MII);
++
++				/* Reduced mode distinguishes
++				 * between 10 and 100 */
++				if (phydev->speed == SPEED_100)
++					ecntrl |= ECNTRL_R100;
++				else
++					ecntrl &= ~(ECNTRL_R100);
+ 				break;
+ 			default:
+ 				if (netif_msg_link(priv))
+@@ -1690,6 +1704,7 @@ static void adjust_link(struct net_devic
+ 		}
+ 
+ 		gfar_write(&regs->maccfg2, tempval);
++		gfar_write(&regs->ecntrl, ecntrl);
+ 
+ 		if (!priv->oldlink) {
+ 			new_state = 1;
+@@ -1754,6 +1769,9 @@ static void gfar_set_multi(struct net_de
+ 		gfar_write(&regs->gaddr6, 0xffffffff);
+ 		gfar_write(&regs->gaddr7, 0xffffffff);
+ 	} else {
++		int em_num;
++		int idx;
++
+ 		/* zero out the hash */
+ 		gfar_write(&regs->igaddr0, 0x0);
+ 		gfar_write(&regs->igaddr1, 0x0);
+@@ -1772,18 +1790,47 @@ static void gfar_set_multi(struct net_de
+ 		gfar_write(&regs->gaddr6, 0x0);
+ 		gfar_write(&regs->gaddr7, 0x0);
+ 
++		/* If we have extended hash tables, we need to
++		 * clear the exact match registers to prepare for
++		 * setting them */
++		if (priv->extended_hash) {
++			em_num = GFAR_EM_NUM + 1;
++			gfar_clear_exact_match(dev);
++			idx = 1;
++		} else {
++			idx = 0;
++			em_num = 0;
++		}
++
+ 		if(dev->mc_count == 0)
+ 			return;
+ 
+ 		/* Parse the list, and set the appropriate bits */
+ 		for(mc_ptr = dev->mc_list; mc_ptr; mc_ptr = mc_ptr->next) {
+-			gfar_set_hash_for_addr(dev, mc_ptr->dmi_addr);
++			if (idx < em_num) {
++				gfar_set_mac_for_addr(dev, idx,
++						mc_ptr->dmi_addr);
++				idx++;
++			} else
++				gfar_set_hash_for_addr(dev, mc_ptr->dmi_addr);
+ 		}
+ 	}
+ 
+ 	return;
+ }
+ 
++
++/* Clears each of the exact match registers to zero, so they
++ * don't interfere with normal reception */
++static void gfar_clear_exact_match(struct net_device *dev)
++{
++	int idx;
++	u8 zero_arr[MAC_ADDR_LEN] = {0,0,0,0,0,0};
++
++	for(idx = 1;idx < GFAR_EM_NUM + 1;idx++)
++		gfar_set_mac_for_addr(dev, idx, (u8 *)zero_arr);
++}
++
+ /* Set the appropriate hash bit for the given addr */
+ /* The algorithm works like so:
+  * 1) Take the Destination Address (ie the multicast address), and
+@@ -1814,6 +1861,32 @@ static void gfar_set_hash_for_addr(struc
+ 	return;
+ }
+ 
++
++/* There are multiple MAC Address register pairs on some controllers
++ * This function sets the numth pair to a given address
++ */
++static void gfar_set_mac_for_addr(struct net_device *dev, int num, u8 *addr)
++{
++	struct gfar_private *priv = netdev_priv(dev);
++	int idx;
++	char tmpbuf[MAC_ADDR_LEN];
++	u32 tempval;
++	u32 *macptr = &priv->regs->macstnaddr1;
++
++	macptr += num*2;
++
++	/* Now copy it into the mac registers backwards, cuz */
++	/* little endian is silly */
++	for (idx = 0; idx < MAC_ADDR_LEN; idx++)
++		tmpbuf[MAC_ADDR_LEN - 1 - idx] = addr[idx];
++
++	gfar_write(macptr, *((u32 *) (tmpbuf)));
++
++	tempval = *((u32 *) (tmpbuf + 4));
++
++	gfar_write(macptr+1, tempval);
++}
++
+ /* GFAR error interrupt handler */
+ static irqreturn_t gfar_error(int irq, void *dev_id, struct pt_regs *regs)
+ {
+Index: linux-2.6.10/drivers/net/gianfar.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar.h
++++ linux-2.6.10/drivers/net/gianfar.h
+@@ -91,12 +91,26 @@ extern const char gfar_driver_version[];
+ #define GFAR_RX_MAX_RING_SIZE   256
+ #define GFAR_TX_MAX_RING_SIZE   256
+ 
++#define GFAR_MAX_FIFO_THRESHOLD 511
++#define GFAR_MAX_FIFO_STARVE	511
++#define GFAR_MAX_FIFO_STARVE_OFF 511
++
+ #define DEFAULT_RX_BUFFER_SIZE  1536
+ #define TX_RING_MOD_MASK(size) (size-1)
+ #define RX_RING_MOD_MASK(size) (size-1)
+ #define JUMBO_BUFFER_SIZE 9728
+ #define JUMBO_FRAME_SIZE 9600
+ 
++#define DEFAULT_FIFO_TX_THR 0x100
++#define DEFAULT_FIFO_TX_STARVE 0x40
++#define DEFAULT_FIFO_TX_STARVE_OFF 0x80
++#define DEFAULT_BD_STASH 1
++#define DEFAULT_STASH_LENGTH	64
++#define DEFAULT_STASH_INDEX	0
++
++/* The number of Exact Match registers */
++#define GFAR_EM_NUM	15
++
+ /* Latency of interface clock in nanoseconds */
+ /* Interface clock latency , in this case, means the
+  * time described by a value of 1 in the interrupt
+@@ -113,11 +127,11 @@ extern const char gfar_driver_version[];
+ 
+ #define DEFAULT_TX_COALESCE 1
+ #define DEFAULT_TXCOUNT	16
+-#define DEFAULT_TXTIME	400
++#define DEFAULT_TXTIME	4
+ 
+ #define DEFAULT_RX_COALESCE 1
+ #define DEFAULT_RXCOUNT	16
+-#define DEFAULT_RXTIME	400
++#define DEFAULT_RXTIME	4
+ 
+ #define TBIPA_VALUE		0x1f
+ #define MIIMCFG_INIT_VALUE	0x00000007
+@@ -148,6 +162,7 @@ extern const char gfar_driver_version[];
+ 
+ #define ECNTRL_INIT_SETTINGS	0x00001000
+ #define ECNTRL_TBI_MODE         0x00000020
++#define ECNTRL_R100		0x00000008
+ 
+ #define MRBLR_INIT_SETTINGS	DEFAULT_RX_BUFFER_SIZE
+ 
+@@ -182,10 +197,12 @@ extern const char gfar_driver_version[];
+ #define RCTRL_PRSDEP_MASK	0x000000c0
+ #define RCTRL_PRSDEP_INIT	0x000000c0
+ #define RCTRL_PROM		0x00000008
++#define RCTRL_EMEN		0x00000002
+ #define RCTRL_CHECKSUMMING	(RCTRL_IPCSEN \
+ 		| RCTRL_TUCSEN | RCTRL_PRSDEP_INIT)
+ #define RCTRL_EXTHASH		(RCTRL_GHTX)
+ #define RCTRL_VLAN		(RCTRL_PRSDEP_INIT)
++#define RCTRL_PADDING(x)	((x << 16) & RCTRL_PAL_MASK)
+ 
+ 
+ #define RSTAT_CLEAR_RHALT       0x00800000
+@@ -252,28 +269,26 @@ extern const char gfar_driver_version[];
+ 		IMASK_XFUN | IMASK_RXC | IMASK_BABT | IMASK_DPE \
+ 		| IMASK_PERR)
+ 
++/* Fifo management */
++#define FIFO_TX_THR_MASK	0x01ff
++#define FIFO_TX_STARVE_MASK	0x01ff
++#define FIFO_TX_STARVE_OFF_MASK	0x01ff
+ 
+ /* Attribute fields */
+ 
+ /* This enables rx snooping for buffers and descriptors */
+-#ifdef CONFIG_GFAR_BDSTASH
+ #define ATTR_BDSTASH		0x00000800
+-#else
+-#define ATTR_BDSTASH		0x00000000
+-#endif
+ 
+-#ifdef CONFIG_GFAR_BUFSTASH
+ #define ATTR_BUFSTASH		0x00004000
+-#define STASH_LENGTH		64
+-#else
+-#define ATTR_BUFSTASH		0x00000000
+-#endif
+ 
+ #define ATTR_SNOOPING		0x000000c0
+-#define ATTR_INIT_SETTINGS      (ATTR_SNOOPING \
+-		| ATTR_BDSTASH | ATTR_BUFSTASH)
++#define ATTR_INIT_SETTINGS      ATTR_SNOOPING
+ 
+ #define ATTRELI_INIT_SETTINGS   0x0
++#define ATTRELI_EL_MASK		0x3fff0000
++#define ATTRELI_EL(x) (x << 16)
++#define ATTRELI_EI_MASK		0x00003fff
++#define ATTRELI_EI(x) (x)
+ 
+ 
+ /* TxBD status field bits */
+@@ -329,6 +344,7 @@ extern const char gfar_driver_version[];
+ #define RXFCB_CTU		0x0400
+ #define RXFCB_EIP		0x0200
+ #define RXFCB_ETU		0x0100
++#define RXFCB_CSUM_MASK		0x0f00
+ #define RXFCB_PERR_MASK		0x000c
+ #define RXFCB_PERR_BADL3	0x0008
+ 
+@@ -340,14 +356,7 @@ struct txbd8
+ };
+ 
+ struct txfcb {
+-	u8	vln:1,
+-		ip:1,
+-		ip6:1,
+-		tup:1,
+-		udp:1,
+-		cip:1,
+-		ctu:1,
+-		nph:1;
++	u8	flags;
+ 	u8	reserved;
+ 	u8	l4os;	/* Level 4 Header Offset */
+ 	u8	l3os; 	/* Level 3 Header Offset */
+@@ -363,14 +372,7 @@ struct rxbd8
+ };
+ 
+ struct rxfcb {
+-	u16	vln:1,
+-		ip:1,
+-		ip6:1,
+-		tup:1,
+-		cip:1,
+-		ctu:1,
+-		eip:1,
+-		etu:1;
++	u16	flags;
+ 	u8	rq;	/* Receive Queue index */
+ 	u8	pro;	/* Layer 4 Protocol */
+ 	u16	reserved;
+@@ -689,12 +691,17 @@ struct gfar_private {
+ 	spinlock_t lock;
+ 	unsigned int rx_buffer_size;
+ 	unsigned int rx_stash_size;
++	unsigned int rx_stash_index;
+ 	unsigned int tx_ring_size;
+ 	unsigned int rx_ring_size;
++	unsigned int fifo_threshold;
++	unsigned int fifo_starve;
++	unsigned int fifo_starve_off;
+ 
+ 	unsigned char vlan_enable:1,
+ 		rx_csum_enable:1,
+-		extended_hash:1;
++		extended_hash:1,
++		bd_stash_en:1;
+ 	unsigned short padding;
+ 	struct vlan_group *vlgrp;
+ 	/* Info structure initialized by board setup code */
+@@ -732,6 +739,6 @@ extern void stop_gfar(struct net_device 
+ extern void gfar_halt(struct net_device *dev);
+ extern void gfar_phy_test(struct mii_bus *bus, struct phy_device *phydev,
+ 		int enable, u32 regnum, u32 read);
+-void gfar_setup_stashing(struct net_device *dev);
++void gfar_init_sysfs(struct net_device *dev);
+ 
+ #endif /* __GIANFAR_H */
+Index: linux-2.6.10/drivers/net/gianfar_ethtool.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar_ethtool.c
++++ linux-2.6.10/drivers/net/gianfar_ethtool.c
+@@ -126,7 +126,7 @@ static char stat_gstrings[][ETH_GSTRING_
+ static void gfar_gstrings(struct net_device *dev, u32 stringset, u8 * buf)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
+-	
++
+ 	if (priv->einfo->device_flags & FSL_GIANFAR_DEV_HAS_RMON)
+ 		memcpy(buf, stat_gstrings, GFAR_STATS_LEN * ETH_GSTRING_LEN);
+ 	else
+Index: linux-2.6.10/drivers/net/gianfar_mii.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/gianfar_mii.h
++++ linux-2.6.10/drivers/net/gianfar_mii.h
+@@ -24,6 +24,7 @@
+ #define MII_READ_COMMAND       0x00000001
+ 
+ #define GFAR_SUPPORTED (SUPPORTED_10baseT_Half \
++		| SUPPORTED_10baseT_Full \
+ 		| SUPPORTED_100baseT_Half \
+ 		| SUPPORTED_100baseT_Full \
+ 		| SUPPORTED_Autoneg \
+Index: linux-2.6.10/drivers/net/gianfar_sysfs.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/gianfar_sysfs.c
+@@ -0,0 +1,311 @@
++/*
++ * drivers/net/gianfar_sysfs.c
++ *
++ * Gianfar Ethernet Driver
++ * This driver is designed for the non-CPM ethernet controllers
++ * on the 85xx and 83xx family of integrated processors
++ * Based on 8260_io/fcc_enet.c
++ *
++ * Author: Andy Fleming
++ * Maintainer: Kumar Gala (kumar.gala@freescale.com)
++ *
++ * Copyright (c) 2002-2005 Freescale Semiconductor, Inc.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ * Sysfs file creation and management
++ */
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/unistd.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/etherdevice.h>
++#include <linux/spinlock.h>
++#include <linux/mm.h>
++#include <linux/device.h>
++
++#include <asm/uaccess.h>
++#include <linux/module.h>
++#include <linux/version.h>
++
++#include "gianfar.h"
++
++#define GFAR_ATTR(_name) \
++static ssize_t gfar_show_##_name(struct class_device *cdev, char *buf); \
++static ssize_t gfar_set_##_name(struct class_device *cdev, \
++		const char *buf, size_t count); \
++static CLASS_DEVICE_ATTR(_name, 0644, gfar_show_##_name, gfar_set_##_name)
++
++#define GFAR_CREATE_FILE(_dev, _name) \
++	class_device_create_file(&_dev->class_dev, &class_device_attr_##_name)
++
++GFAR_ATTR(bd_stash);
++GFAR_ATTR(rx_stash_size);
++GFAR_ATTR(rx_stash_index);
++GFAR_ATTR(fifo_threshold);
++GFAR_ATTR(fifo_starve);
++GFAR_ATTR(fifo_starve_off);
++
++#define to_net_dev(cd) container_of(cd, struct net_device, class_dev)
++
++static ssize_t gfar_show_bd_stash(struct class_device *cdev, char *buf)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++
++	return sprintf(buf, "%s\n", priv->bd_stash_en? "on" : "off");
++}
++
++static ssize_t gfar_set_bd_stash(struct class_device *cdev,
++		const char *buf, size_t count)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++	int new_setting = 0;
++	u32 temp;
++	unsigned long flags;
++
++	/* Find out the new setting */
++	if (!strncmp("on", buf, count-1) || !strncmp("1", buf, count-1))
++		new_setting = 1;
++	else if (!strncmp("off", buf, count-1) || !strncmp("0", buf, count-1))
++		new_setting = 0;
++	else
++		return count;
++
++	spin_lock_irqsave(&priv->lock, flags);
++
++	/* Set the new stashing value */
++	priv->bd_stash_en = new_setting;
++
++	temp = gfar_read(&priv->regs->attr);
++	
++	if (new_setting)
++		temp |= ATTR_BDSTASH;
++	else
++		temp &= ~(ATTR_BDSTASH);
++
++	gfar_write(&priv->regs->attr, temp);
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return count;
++}
++
++static ssize_t gfar_show_rx_stash_size(struct class_device *cdev, char *buf)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++
++	return sprintf(buf, "%d\n", priv->rx_stash_size);
++}
++
++static ssize_t gfar_set_rx_stash_size(struct class_device *cdev,
++		const char *buf, size_t count)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++	unsigned int length = simple_strtoul(buf, NULL, 0);
++	u32 temp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	if (length > priv->rx_buffer_size)
++		return count;
++
++	if (length == priv->rx_stash_size)
++		return count;
++
++	priv->rx_stash_size = length;
++
++	temp = gfar_read(&priv->regs->attreli);
++	temp &= ~ATTRELI_EL_MASK;
++	temp |= ATTRELI_EL(length);
++	gfar_write(&priv->regs->attreli, temp);
++
++	/* Turn stashing on/off as appropriate */
++	temp = gfar_read(&priv->regs->attr);
++
++	if (length)
++		temp |= ATTR_BUFSTASH;
++	else
++		temp &= ~(ATTR_BUFSTASH);
++
++	gfar_write(&priv->regs->attr, temp);
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return count;
++}
++
++
++/* Stashing will only be enabled when rx_stash_size != 0 */
++static ssize_t gfar_show_rx_stash_index(struct class_device *cdev, char *buf)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++
++	return sprintf(buf, "%d\n", priv->rx_stash_index);
++}
++
++static ssize_t gfar_set_rx_stash_index(struct class_device *cdev,
++		const char *buf, size_t count)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++	unsigned short index = simple_strtoul(buf, NULL, 0);
++	u32 temp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	if (index > priv->rx_stash_size)
++		return count;
++
++	if (index == priv->rx_stash_index)
++		return count;
++
++	priv->rx_stash_index = index;
++
++	temp = gfar_read(&priv->regs->attreli);
++	temp &= ~ATTRELI_EI_MASK;
++	temp |= ATTRELI_EI(index);
++	gfar_write(&priv->regs->attreli, flags);
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return count;
++}
++
++static ssize_t gfar_show_fifo_threshold(struct class_device *cdev, char *buf)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++
++	return sprintf(buf, "%d\n", priv->fifo_threshold);
++}
++
++static ssize_t gfar_set_fifo_threshold(struct class_device *cdev,
++		const char *buf, size_t count)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++	unsigned int length = simple_strtoul(buf, NULL, 0);
++	u32 temp;
++	unsigned long flags;
++
++	if (length > GFAR_MAX_FIFO_THRESHOLD)
++		return count;
++
++	spin_lock_irqsave(&priv->lock, flags);
++
++	priv->fifo_threshold = length;
++
++	temp = gfar_read(&priv->regs->fifo_tx_thr);
++	temp &= ~FIFO_TX_THR_MASK;
++	temp |= length;
++	gfar_write(&priv->regs->fifo_tx_thr, temp);
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return count;
++}
++
++static ssize_t gfar_show_fifo_starve(struct class_device *cdev, char *buf)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++
++	return sprintf(buf, "%d\n", priv->fifo_starve);
++}
++
++
++static ssize_t gfar_set_fifo_starve(struct class_device *cdev,
++		const char *buf, size_t count)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++	unsigned int num = simple_strtoul(buf, NULL, 0);
++	u32 temp;
++	unsigned long flags;
++
++	if (num > GFAR_MAX_FIFO_STARVE)
++		return count;
++
++	spin_lock_irqsave(&priv->lock, flags);
++
++	priv->fifo_starve = num;
++
++	temp = gfar_read(&priv->regs->fifo_tx_starve);
++	temp &= ~FIFO_TX_STARVE_MASK;
++	temp |= num;
++	gfar_write(&priv->regs->fifo_tx_starve, temp);
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return count;
++}
++
++static ssize_t gfar_show_fifo_starve_off(struct class_device *cdev, char *buf)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++
++	return sprintf(buf, "%d\n", priv->fifo_starve_off);
++}
++
++static ssize_t gfar_set_fifo_starve_off(struct class_device *cdev,
++		const char *buf, size_t count)
++{
++	struct net_device *dev = to_net_dev(cdev);
++	struct gfar_private *priv = netdev_priv(dev);
++	unsigned int num = simple_strtoul(buf, NULL, 0);
++	u32 temp;
++	unsigned long flags;
++
++	if (num > GFAR_MAX_FIFO_STARVE_OFF)
++		return count;
++
++	spin_lock_irqsave(&priv->lock, flags);
++
++	priv->fifo_starve_off = num;
++
++	temp = gfar_read(&priv->regs->fifo_tx_starve_shutoff);
++	temp &= ~FIFO_TX_STARVE_OFF_MASK;
++	temp |= num;
++	gfar_write(&priv->regs->fifo_tx_starve_shutoff, temp);
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return count;
++}
++
++void gfar_init_sysfs(struct net_device *dev)
++{
++	struct gfar_private *priv = netdev_priv(dev);
++
++	/* Initialize the default values */
++	priv->rx_stash_size = DEFAULT_STASH_LENGTH;
++	priv->rx_stash_index = DEFAULT_STASH_INDEX;
++	priv->fifo_threshold = DEFAULT_FIFO_TX_THR;
++	priv->fifo_starve = DEFAULT_FIFO_TX_STARVE;
++	priv->fifo_starve_off = DEFAULT_FIFO_TX_STARVE_OFF;
++	priv->bd_stash_en = DEFAULT_BD_STASH;
++
++	/* Create our sysfs files */
++	GFAR_CREATE_FILE(dev, bd_stash);
++	GFAR_CREATE_FILE(dev, rx_stash_size);
++	GFAR_CREATE_FILE(dev, rx_stash_index);
++	GFAR_CREATE_FILE(dev, fifo_threshold);
++	GFAR_CREATE_FILE(dev, fifo_starve);
++	GFAR_CREATE_FILE(dev, fifo_starve_off);
++
++}
+Index: linux-2.6.10/mvl_patches/pro-0484.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0484.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(484);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

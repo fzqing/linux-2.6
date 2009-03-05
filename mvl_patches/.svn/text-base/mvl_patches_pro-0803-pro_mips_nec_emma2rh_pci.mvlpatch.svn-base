@@ -1,0 +1,986 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_nec_emma2rh_pci
+# Date: Wed Jul 26 21:43:31 2006
+# Source: MontaVista Software, Inc.
+# MR: 18172
+# Type: Integration
+# Disposition: needs submitting to LKML/linux-mips
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	Support of PCI bus on NEC EMMA2RH board
+# 
+
+PATCHNUM=803
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18172
+Type: Integration
+Disposition: needs submitting to LKML/linux-mips
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	Support of PCI bus on NEC EMMA2RH board
+
+Index: linux-2.6.10/arch/mips/pci/fixup-emma2rh.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/fixup-emma2rh.c
+@@ -0,0 +1,101 @@
++/*
++ *  arch/mips/pci/fixup-emma2rh.c
++ *      This file defines the PCI configration.
++ *
++ *  Copyright (C) NEC Electronics Corporation 2004-2006
++ *
++ *  This file is based on the arch/mips/ddb5xxx/ddb5477/pci.c
++ *
++ *	Copyright 2001 MontaVista Software Inc.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/types.h>
++#include <linux/pci.h>
++
++#include <asm/bootinfo.h>
++#include <asm/debug.h>
++
++#include <asm/emma2rh/emma2rh.h>
++
++#define EMMA2RH_PCI_HOST_SLOT 0x09
++#define EMMA2RH_USB_SLOT 0x03
++
++/*
++ * we fix up irqs based on the slot number.
++ * The first entry is at AD:11.
++ * Fortunately this works because, although we have two pci buses,
++ * they all have different slot numbers (except for rockhopper slot 20
++ * which is handled below).
++ *
++ */
++
++#define	MAX_SLOT_NUM 10
++static unsigned char irq_map[][5] __initdata = {
++	[3] = {0, MARKEINS_PCI_IRQ_INTB, MARKEINS_PCI_IRQ_INTC,
++	       MARKEINS_PCI_IRQ_INTD, 0,},
++	[4] = {0, MARKEINS_PCI_IRQ_INTA, 0, 0, 0,},
++	[5] = {0, 0, 0, 0, 0,},
++	[6] = {0, MARKEINS_PCI_IRQ_INTC, MARKEINS_PCI_IRQ_INTD,
++	       MARKEINS_PCI_IRQ_INTA, MARKEINS_PCI_IRQ_INTB,},
++};
++
++static void __devinit nec_usb_controller_fixup(struct pci_dev *dev)
++{
++	if (PCI_SLOT(dev->devfn) == EMMA2RH_USB_SLOT)
++		/* on board USB controller configuration */
++		pci_write_config_dword(dev, 0xe4, 1 << 5);
++}
++
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_NEC, PCI_DEVICE_ID_NEC_USB,
++			nec_usb_controller_fixup);
++
++/*
++ * Prevent the PCI layer from seeing the resources allocated to this device
++ * if it is the host bridge by marking it as such.  These resources are of
++ * no consequence to the PCI layer (they are handled elsewhere).
++ */
++static void __devinit emma2rh_pci_host_fixup(struct pci_dev *dev)
++{
++	int i;
++
++	if (PCI_SLOT(dev->devfn) == EMMA2RH_PCI_HOST_SLOT) {
++		dev->class &= 0xff;
++		dev->class |= PCI_CLASS_BRIDGE_HOST << 8;
++		for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++			dev->resource[i].start = 0;
++			dev->resource[i].end = 0;
++			dev->resource[i].flags = 0;
++		}
++	}
++}
++
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_NEC, PCI_DEVICE_ID_NEC_EMMA2RH,
++			 emma2rh_pci_host_fixup);
++
++int __init pcibios_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
++{
++	return irq_map[slot][pin];
++}
++
++/* Do platform specific device initialization at pci_enable_device() time */
++int pcibios_plat_dev_init(struct pci_dev *dev)
++{
++	return 0;
++}
+Index: linux-2.6.10/arch/mips/pci/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/mips/pci/Makefile
++++ linux-2.6.10/arch/mips/pci/Makefile
+@@ -56,3 +56,4 @@ obj-$(CONFIG_TOSHIBA_RBTX4939)	+= fixup-
+ obj-$(CONFIG_VICTOR_MPC30X)	+= fixup-mpc30x.o
+ obj-$(CONFIG_ZAO_CAPCELLA)	+= fixup-capcella.o
+ obj-$(CONFIG_VR5701_SG2)	+= pci-vr5701_sg2.o ops-vr5701_sg2.o
++obj-$(CONFIG_MARKEINS)		+= ops-emma2rh.o pci-emma2rh.o fixup-emma2rh.o
+Index: linux-2.6.10/arch/mips/pci/ops-emma2rh.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/ops-emma2rh.c
+@@ -0,0 +1,186 @@
++/*
++ *  arch/mips/pci/ops-emma2rh.c
++ *      This file defines the PCI operation for EMMA2RH.
++ *
++ *  Copyright (C) NEC Electronics Corporation 2004-2006
++ *
++ *  This file is based on the arch/mips/pci/ops-vr41xx.c
++ *
++ *	Copyright 2001 MontaVista Software Inc.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/config.h>
++#include <linux/pci.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++
++#include <asm/addrspace.h>
++#include <asm/debug.h>
++
++#include <asm/emma2rh/emma2rh.h>
++
++#define RTABORT (0x1<<9)
++#define RMABORT (0x1<<10)
++#define EMMA2RH_PCI_SLOT_NUM 9	/* 0000:09.0 is final PCI device */
++
++/*
++ * access config space
++ */
++
++static int check_args(struct pci_bus *bus, u32 devfn, u32 * bus_num)
++{
++	/* check if the bus is top-level */
++	if (bus->parent != NULL) {
++		*bus_num = bus->number;
++		db_assert(bus_num != 0);
++	} else
++		*bus_num = 0;
++
++	if (*bus_num == 0) {
++		/* Type 0 */
++		if (PCI_SLOT(devfn) >= 10)
++			return PCIBIOS_DEVICE_NOT_FOUND;
++	} else {
++		/* Type 1 */
++		if ((*bus_num >= 64) || (PCI_SLOT(devfn) >= 16))
++			return PCIBIOS_DEVICE_NOT_FOUND;
++	}
++	return 0;
++}
++
++static inline int set_pci_configuration_address(unsigned char bus_num,
++						unsigned int devfn, int where)
++{
++	u32 config_win0;
++
++	emma2rh_out32(EMMA2RH_PCI_INT, ~RMABORT);
++	if (bus_num == 0)
++		/*
++		 * Type 0 configuration
++		 */
++		config_win0 = (1 << (22 + PCI_SLOT(devfn))) | (5 << 9);
++	else
++		/*
++		 * Type 1 configuration
++		 */
++		config_win0 = (bus_num << 26) | (PCI_SLOT(devfn) << 22) |
++		    (1 << 15) | (5 << 9);
++
++	emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, config_win0);
++
++	return 0;
++}
++
++static int pci_config_read(struct pci_bus *bus, unsigned int devfn, int where,
++			   int size, uint32_t * val)
++{
++	u32 bus_num;
++	u32 base = KSEG1ADDR(EMMA2RH_PCI_CONFIG_BASE);
++	u32 backup_win0;
++	u32 data;
++
++	*val = 0xffffffffU;
++
++	if (check_args(bus, devfn, &bus_num) == PCIBIOS_DEVICE_NOT_FOUND)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	backup_win0 = emma2rh_in32(EMMA2RH_PCI_IWIN0_CTR);
++
++	if (set_pci_configuration_address(bus_num, devfn, where) < 0)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	data =
++	    *(volatile u32 *)(base + (PCI_FUNC(devfn) << 8) +
++			      (where & 0xfffffffc));
++
++	switch (size) {
++	case 1:
++		*val = (data >> ((where & 3) << 3)) & 0xffU;
++		break;
++	case 2:
++		*val = (data >> ((where & 2) << 3)) & 0xffffU;
++		break;
++	case 4:
++		*val = data;
++		break;
++	default:
++		emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, backup_win0);
++		return PCIBIOS_FUNC_NOT_SUPPORTED;
++	}
++
++	emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, backup_win0);
++
++	if (emma2rh_in32(EMMA2RH_PCI_INT) & RMABORT)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static int pci_config_write(struct pci_bus *bus, unsigned int devfn, int where,
++			    int size, u32 val)
++{
++	u32 bus_num;
++	u32 base = KSEG1ADDR(EMMA2RH_PCI_CONFIG_BASE);
++	u32 backup_win0;
++	u32 data;
++	int shift;
++
++	if (check_args(bus, devfn, &bus_num) == PCIBIOS_DEVICE_NOT_FOUND)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	backup_win0 = emma2rh_in32(EMMA2RH_PCI_IWIN0_CTR);
++
++	if (set_pci_configuration_address(bus_num, devfn, where) < 0)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	/* read modify write */
++	data =
++	    *(volatile u32 *)(base + (PCI_FUNC(devfn) << 8) +
++			      (where & 0xfffffffc));
++
++	switch (size) {
++	case 1:
++		shift = (where & 3) << 3;
++		data &= ~(0xffU << shift);
++		data |= ((val & 0xffU) << shift);
++		break;
++	case 2:
++		shift = (where & 2) << 3;
++		data &= ~(0xffffU << shift);
++		data |= ((val & 0xffffU) << shift);
++		break;
++	case 4:
++		data = val;
++		break;
++	default:
++		emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, backup_win0);
++		return PCIBIOS_FUNC_NOT_SUPPORTED;
++	}
++	*(volatile u32 *)(base + (PCI_FUNC(devfn) << 8) +
++			  (where & 0xfffffffc)) = data;
++
++	emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, backup_win0);
++	if (emma2rh_in32(EMMA2RH_PCI_INT) & RMABORT)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++struct pci_ops emma2rh_pci_ops = {
++	.read = pci_config_read,
++	.write = pci_config_write,
++};
+Index: linux-2.6.10/arch/mips/pci/pci-emma2rh.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/pci-emma2rh.c
+@@ -0,0 +1,90 @@
++/*
++ *  arch/mips/pci/pci-emma2rh.c
++ *      This file defines the PCI configration.
++ *
++ *  Copyright (C) NEC Electronics Corporation 2004-2006
++ *
++ *  This file is based on the arch/mips/ddb5xxx/ddb5477/pci.c
++ *
++ *	Copyright 2001 MontaVista Software Inc.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/types.h>
++#include <linux/pci.h>
++
++#include <asm/bootinfo.h>
++#include <asm/debug.h>
++
++#include <asm/emma2rh/emma2rh.h>
++
++static struct resource pci_io_resource = {
++	.name = "pci IO space",
++	.start = EMMA2RH_PCI_IO_BASE,
++	.end = EMMA2RH_PCI_IO_BASE + EMMA2RH_PCI_IO_SIZE - 1,
++	.flags = IORESOURCE_IO,
++};
++
++static struct resource pci_mem_resource = {
++	.name = "pci memory space",
++	.start = EMMA2RH_PCI_MEM_BASE,
++	.end = EMMA2RH_PCI_MEM_BASE + EMMA2RH_PCI_MEM_SIZE - 1,
++	.flags = IORESOURCE_MEM,
++};
++
++extern struct pci_ops emma2rh_pci_ops;
++
++static struct pci_controller emma2rh_pci_controller = {
++	.pci_ops = &emma2rh_pci_ops,
++	.mem_resource = &pci_mem_resource,
++	.io_resource = &pci_io_resource,
++	.mem_offset = -0x04000000,
++	.io_offset = 0,
++};
++
++static void __init emma2rh_pci_init(void)
++{
++	/* setup PCI interface */
++	emma2rh_out32(EMMA2RH_PCI_ARBIT_CTR, 0x70f);
++
++	emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, 0x80000a18);
++	emma2rh_out32(EMMA2RH_PCI_CONFIG_BASE + PCI_COMMAND,
++		      PCI_STATUS_DEVSEL_MEDIUM | PCI_STATUS_CAP_LIST |
++		      PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY);
++	emma2rh_out32(EMMA2RH_PCI_CONFIG_BASE + PCI_BASE_ADDRESS_0, 0x10000000);
++	emma2rh_out32(EMMA2RH_PCI_CONFIG_BASE + PCI_BASE_ADDRESS_1, 0x00000000);
++
++	emma2rh_out32(EMMA2RH_PCI_IWIN0_CTR, 0x12000000 | 0x218);
++	emma2rh_out32(EMMA2RH_PCI_IWIN1_CTR, 0x18000000 | 0x600);
++	emma2rh_out32(EMMA2RH_PCI_INIT_ESWP, 0x00000200);
++
++	emma2rh_out32(EMMA2RH_PCI_TWIN_CTR, 0x00009200);
++	emma2rh_out32(EMMA2RH_PCI_TWIN_BADR, 0x00000000);
++	emma2rh_out32(EMMA2RH_PCI_TWIN0_DADR, 0x00000000);
++	emma2rh_out32(EMMA2RH_PCI_TWIN1_DADR, 0x00000000);
++}
++
++static int __init emma2rh_pci_setup(void)
++{
++	emma2rh_pci_init();
++	register_pci_controller(&emma2rh_pci_controller);
++	return 0;
++}
++
++arch_initcall(emma2rh_pci_setup);
+Index: linux-2.6.10/drivers/pci/pci.ids
+===================================================================
+--- linux-2.6.10.orig/drivers/pci/pci.ids
++++ linux-2.6.10/drivers/pci/pci.ids
+@@ -1511,6 +1511,7 @@
+ 	00f2  uPD72874 IEEE1394 OHCI 1.1 3-port PHY-Link Ctrlr
+ 	00f3  uPD6113x Multimedia Decoder/Processor [EMMA2]
+ 	010c  VR7701
++	014b  uPD6129x Multimedia Encode/Decode Processor [EMMA2RH]
+ 1034  Framatome Connectors USA Inc.
+ 1035  Comp. & Comm. Research Lab
+ 1036  Future Domain Corp.
+Index: linux-2.6.10/include/linux/pci_ids.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/pci_ids.h
++++ linux-2.6.10/include/linux/pci_ids.h
+@@ -576,6 +576,7 @@
+ #define PCI_DEVICE_ID_NEC_VRC5476       0x009b
+ #define PCI_DEVICE_ID_NEC_VRC4173	0x00a5
+ #define PCI_DEVICE_ID_NEC_VRC5477_AC97  0x00a6
++#define PCI_DEVICE_ID_NEC_EMMA2RH	0x014b /* EMMA2RH PCI Host */
+ #define PCI_DEVICE_ID_NEC_PC9821CS01    0x800c /* PC-9821-CS01 */
+ #define PCI_DEVICE_ID_NEC_PC9821NRB06   0x800d /* PC-9821NR-B06 */
+ 
+Index: linux-2.6.10/arch/mips/configs/emma2rh_defconfig
+===================================================================
+--- linux-2.6.10.orig/arch/mips/configs/emma2rh_defconfig
++++ linux-2.6.10/arch/mips/configs/emma2rh_defconfig
+@@ -1,7 +1,7 @@
+ #
+ # Automatically generated make config: don't edit
+-# Linux kernel version: 2.6.10_mvl402
+-# Sat May 13 21:37:18 2006
++# Linux kernel version: 2.6.10_mvl401
++# Tue May 16 15:39:03 2006
+ #
+ CONFIG_MIPS=y
+ # CONFIG_MIPS64 is not set
+@@ -159,14 +159,17 @@ CONFIG_PAGE_SIZE_4KB=y
+ # CONFIG_CPU_ADVANCED is not set
+ CONFIG_CPU_HAS_LLSC=y
+ CONFIG_CPU_HAS_SYNC=y
+-# CONFIG_HIGH_RES_TIMERS is not set
+-# CONFIG_CPU_TIMER is not set
++CONFIG_HIGH_RES_TIMERS=y
++CONFIG_HIGH_RES_RESOLUTION=10000
++CONFIG_CPU_TIMER=y
+ 
+ #
+ # Bus options (PCI, PCMCIA, EISA, ISA, TC)
+ #
+ CONFIG_HW_HAS_PCI=y
+-# CONFIG_PCI is not set
++CONFIG_PCI=y
++# CONFIG_PCI_LEGACY_PROC is not set
++CONFIG_PCI_NAMES=y
+ CONFIG_MMU=y
+ 
+ #
+@@ -181,6 +184,7 @@ CONFIG_MMU=y
+ #
+ # PCI Hotplug Support
+ #
++# CONFIG_HOTPLUG_PCI is not set
+ 
+ #
+ # Executable file formats
+@@ -243,7 +247,7 @@ CONFIG_MTD_CFI_AMDSTD=y
+ CONFIG_MTD_CFI_AMDSTD_RETRY=0
+ # CONFIG_MTD_CFI_STAA is not set
+ CONFIG_MTD_CFI_UTIL=y
+-CONFIG_MTD_RAM=y
++# CONFIG_MTD_RAM is not set
+ # CONFIG_MTD_ROM is not set
+ # CONFIG_MTD_ABSENT is not set
+ # CONFIG_MTD_OBSOLETE_CHIPS is not set
+@@ -263,6 +267,7 @@ CONFIG_MTD_PHYSMAP_BANKWIDTH=2
+ #
+ # Self-contained MTD device drivers
+ #
++# CONFIG_MTD_PMC551 is not set
+ # CONFIG_MTD_SLRAM is not set
+ # CONFIG_MTD_PHRAM is not set
+ # CONFIG_MTD_MTDRAM is not set
+@@ -295,9 +300,14 @@ CONFIG_MTD_PHYSMAP_BANKWIDTH=2
+ # Block devices
+ #
+ # CONFIG_BLK_DEV_FD is not set
++# CONFIG_BLK_CPQ_DA is not set
++# CONFIG_BLK_CPQ_CISS_DA is not set
++# CONFIG_BLK_DEV_DAC960 is not set
++# CONFIG_BLK_DEV_UMEM is not set
+ CONFIG_BLK_DEV_LOOP=m
+ CONFIG_BLK_DEV_CRYPTOLOOP=m
+ # CONFIG_BLK_DEV_NBD is not set
++# CONFIG_BLK_DEV_SX8 is not set
+ # CONFIG_BLK_DEV_RAM is not set
+ CONFIG_BLK_DEV_RAM_COUNT=16
+ CONFIG_INITRAMFS_SOURCE=""
+@@ -348,7 +358,46 @@ CONFIG_CHR_DEV_SG=m
+ #
+ # SCSI low-level drivers
+ #
++# CONFIG_BLK_DEV_3W_XXXX_RAID is not set
++# CONFIG_SCSI_3W_9XXX is not set
++# CONFIG_SCSI_ACARD is not set
++# CONFIG_SCSI_AACRAID is not set
++# CONFIG_SCSI_AIC7XXX is not set
++# CONFIG_SCSI_AIC7XXX_OLD is not set
++# CONFIG_SCSI_AIC79XX is not set
++# CONFIG_SCSI_ADP94XX is not set
++# CONFIG_SCSI_DPT_I2O is not set
++# CONFIG_SCSI_ADVANSYS is not set
++# CONFIG_MEGARAID_NEWGEN is not set
++# CONFIG_MEGARAID_LEGACY is not set
+ # CONFIG_SCSI_SATA is not set
++# CONFIG_SCSI_BUSLOGIC is not set
++# CONFIG_SCSI_CPQFCTS is not set
++# CONFIG_SCSI_DMX3191D is not set
++# CONFIG_SCSI_EATA is not set
++# CONFIG_SCSI_EATA_PIO is not set
++# CONFIG_SCSI_FUTURE_DOMAIN is not set
++# CONFIG_SCSI_GDTH is not set
++# CONFIG_SCSI_IPS is not set
++# CONFIG_SCSI_INITIO is not set
++# CONFIG_SCSI_INIA100 is not set
++# CONFIG_SCSI_SYM53C8XX_2 is not set
++# CONFIG_SCSI_IPR is not set
++# CONFIG_SCSI_PCI2000 is not set
++# CONFIG_SCSI_PCI2220I is not set
++# CONFIG_SCSI_QLOGIC_ISP is not set
++# CONFIG_SCSI_QLOGIC_FC is not set
++# CONFIG_SCSI_QLOGIC_1280 is not set
++CONFIG_SCSI_QLA2XXX=m
++# CONFIG_SCSI_QLA21XX is not set
++# CONFIG_SCSI_QLA22XX is not set
++# CONFIG_SCSI_QLA2300 is not set
++# CONFIG_SCSI_QLA2322 is not set
++# CONFIG_SCSI_QLA6312 is not set
++# CONFIG_SCSI_QLA6322 is not set
++# CONFIG_SCSI_DC395x is not set
++# CONFIG_SCSI_DC390T is not set
++# CONFIG_SCSI_NSP32 is not set
+ # CONFIG_SCSI_DEBUG is not set
+ 
+ #
+@@ -359,6 +408,7 @@ CONFIG_CHR_DEV_SG=m
+ #
+ # Fusion MPT device support
+ #
++# CONFIG_FUSION is not set
+ 
+ #
+ # IEEE 1394 (FireWire) support
+@@ -368,6 +418,7 @@ CONFIG_CHR_DEV_SG=m
+ #
+ # I2O device support
+ #
++# CONFIG_I2O is not set
+ 
+ #
+ # Networking support
+@@ -490,6 +541,11 @@ CONFIG_NETDEVICES=y
+ CONFIG_TUN=m
+ 
+ #
++# ARCnet devices
++#
++# CONFIG_ARCNET is not set
++
++#
+ # PHY device support
+ #
+ # CONFIG_PHYLIB is not set
+@@ -499,23 +555,66 @@ CONFIG_TUN=m
+ #
+ CONFIG_NET_ETHERNET=y
+ CONFIG_MII=y
++# CONFIG_HAPPYMEAL is not set
++# CONFIG_SUNGEM is not set
++# CONFIG_NET_VENDOR_3COM is not set
+ # CONFIG_SMC91X is not set
+ 
+ #
++# Tulip family network device support
++#
++# CONFIG_NET_TULIP is not set
++# CONFIG_HP100 is not set
++
++#
+ # Broadcom network devices
+ #
++# CONFIG_HND is not set
++CONFIG_NET_PCI=y
++# CONFIG_PCNET32 is not set
++# CONFIG_AMD8111_ETH is not set
++# CONFIG_ADAPTEC_STARFIRE is not set
++# CONFIG_B44 is not set
++# CONFIG_FORCEDETH is not set
++# CONFIG_DGRS is not set
++# CONFIG_EEPRO100 is not set
++# CONFIG_E100 is not set
++# CONFIG_FEALNX is not set
++CONFIG_NATSEMI=y
++# CONFIG_NE2K_PCI is not set
++# CONFIG_8139CP is not set
++# CONFIG_8139TOO is not set
++# CONFIG_SIS900 is not set
++# CONFIG_EPIC100 is not set
++# CONFIG_SUNDANCE is not set
++# CONFIG_TLAN is not set
++# CONFIG_VIA_RHINE is not set
++# CONFIG_LAN_SAA9730 is not set
+ 
+ #
+ # Ethernet (1000 Mbit)
+ #
++# CONFIG_ACENIC is not set
++# CONFIG_DL2K is not set
++# CONFIG_E1000 is not set
++# CONFIG_NS83820 is not set
++# CONFIG_HAMACHI is not set
++# CONFIG_YELLOWFIN is not set
++# CONFIG_R8169 is not set
++# CONFIG_SK98LIN is not set
++# CONFIG_VIA_VELOCITY is not set
++# CONFIG_TIGON3 is not set
+ 
+ #
+ # Ethernet (10000 Mbit)
+ #
++# CONFIG_IXGB is not set
++# CONFIG_S2IO is not set
+ 
+ #
+ # Token Ring devices
+ #
++# CONFIG_TR is not set
+ 
+ #
+ # Wireless LAN (non-hamradio)
+@@ -526,6 +625,8 @@ CONFIG_MII=y
+ # Wan interfaces
+ #
+ # CONFIG_WAN is not set
++# CONFIG_FDDI is not set
++# CONFIG_HIPPI is not set
+ CONFIG_PPP=m
+ # CONFIG_PPP_MULTILINK is not set
+ # CONFIG_PPP_FILTER is not set
+@@ -535,6 +636,7 @@ CONFIG_PPP_DEFLATE=m
+ # CONFIG_PPP_BSDCOMP is not set
+ # CONFIG_PPPOE is not set
+ # CONFIG_SLIP is not set
++# CONFIG_NET_FC is not set
+ # CONFIG_SHAPER is not set
+ # CONFIG_NETCONSOLE is not set
+ 
+@@ -619,6 +721,7 @@ CONFIG_GEN_RTC=m
+ CONFIG_GEN_RTC_X=y
+ # CONFIG_DTLK is not set
+ # CONFIG_R3964 is not set
++# CONFIG_APPLICOM is not set
+ 
+ #
+ # Ftape, the floppy tape device driver
+@@ -639,15 +742,35 @@ CONFIG_I2C_CHARDEV=y
+ # CONFIG_I2C_ALGOPCF is not set
+ # CONFIG_I2C_ALGOPCA is not set
+ # CONFIG_I2C_ALGO_SGI is not set
++# CONFIG_I2C_ALGO_EMMA2RH is not set
+ 
+ #
+ # I2C Hardware Bus support
+ #
++# CONFIG_I2C_ALI1535 is not set
++# CONFIG_I2C_ALI1563 is not set
++# CONFIG_I2C_ALI15X3 is not set
++# CONFIG_I2C_AMD756 is not set
++# CONFIG_I2C_AMD8111 is not set
++# CONFIG_I2C_I801 is not set
++# CONFIG_I2C_I810 is not set
+ # CONFIG_I2C_ISA is not set
++# CONFIG_I2C_NFORCE2 is not set
+ # CONFIG_I2C_PARPORT_LIGHT is not set
++# CONFIG_I2C_PIIX4 is not set
++# CONFIG_I2C_PROSAVAGE is not set
++# CONFIG_I2C_SAVAGE4 is not set
++# CONFIG_SCx200_ACB is not set
++# CONFIG_I2C_SIS5595 is not set
++# CONFIG_I2C_SIS630 is not set
++# CONFIG_I2C_SIS96X is not set
+ # CONFIG_I2C_STUB is not set
++# CONFIG_I2C_VIA is not set
++# CONFIG_I2C_VIAPRO is not set
++# CONFIG_I2C_VOODOO3 is not set
+ # CONFIG_I2C_PCA_ISA is not set
+ # CONFIG_I2C_OMAP is not set
++# CONFIG_I2C_EMMA2RH is not set
+ 
+ #
+ # Hardware Sensors Chip support
+@@ -674,6 +797,7 @@ CONFIG_I2C_CHARDEV=y
+ # CONFIG_SENSORS_MAX1619 is not set
+ # CONFIG_SENSORS_PC87360 is not set
+ # CONFIG_SENSORS_SMSC47M1 is not set
++# CONFIG_SENSORS_VIA686A is not set
+ # CONFIG_SENSORS_W83781D is not set
+ # CONFIG_SENSORS_W83L785TS is not set
+ # CONFIG_SENSORS_W83627HF is not set
+@@ -687,9 +811,9 @@ CONFIG_I2C_CHARDEV=y
+ # CONFIG_SENSORS_PCF8591 is not set
+ # CONFIG_SENSORS_RTC8564 is not set
+ # CONFIG_TPS65010 is not set
+-# CONFIG_I2C_DEBUG_CORE is not set
++CONFIG_I2C_DEBUG_CORE=y
+ # CONFIG_I2C_DEBUG_ALGO is not set
+-# CONFIG_I2C_DEBUG_BUS is not set
++CONFIG_I2C_DEBUG_BUS=y
+ # CONFIG_I2C_DEBUG_CHIP is not set
+ 
+ #
+@@ -734,8 +858,13 @@ CONFIG_I2C_CHARDEV=y
+ #
+ # USB support
+ #
+-# CONFIG_USB_ARCH_HAS_HCD is not set
+-# CONFIG_USB_ARCH_HAS_OHCI is not set
++# CONFIG_USB is not set
++CONFIG_USB_ARCH_HAS_HCD=y
++CONFIG_USB_ARCH_HAS_OHCI=y
++
++#
++# Enable Host or Gadget support to see Inventra options
++#
+ 
+ #
+ # NOTE: USB_STORAGE enables SCSI, and 'SCSI disk support' may also be needed; see USB_STORAGE Help for more information
+@@ -929,7 +1058,7 @@ CONFIG_NLS_UTF8=m
+ #
+ # MontaVista System tools
+ #
+-# CONFIG_ILATENCY is not set
++CONFIG_ILATENCY=y
+ 
+ #
+ # Profiling support
+@@ -945,7 +1074,7 @@ CONFIG_NLS_UTF8=m
+ # CONFIG_CRITICAL_PREEMPT_TIMING is not set
+ # CONFIG_CRITICAL_IRQSOFF_TIMING is not set
+ CONFIG_CROSSCOMPILE=y
+-CONFIG_CMDLINE="console=ttyS0,115200 mem=192m root=/dev/nfs rw"
++CONFIG_CMDLINE="console=ttyS0,115200 mem=192m ip=bootp root=/dev/nfs rw"
+ 
+ #
+ # Security options
+Index: linux-2.6.10/mvl_patches/pro-0803.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0803.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(803);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,755 @@
+#! /usr/bin/env bash
+# Patch: -pro_hpt37x_optimize_timing_tables
+# Date: Mon Nov 26 16:55:02 2007
+# Source: MontaVista Software, Inc.
+# MR: 14142
+# Type: Defect Fix
+# Disposition: accepted into 2.6.20-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# Description:
+# 
+# [PATCH] ide: optimize HPT37x timing tables
+# 
+# Save some space on the timing tables by introducing the separate transfer mode
+# table in which the mode lookup is done to get the index into the timing table
+# itself.  Get rid of the rest of the obsolete/duplicate tables and use one set
+# of tables for the whole HPT37x chip family like the HighPoint open-source
+# drivers do.  Document the different timing register layout for the HPT36x
+# chip family (this is my guesswork based on the timing values).
+# 
+# Have been tested and works fine on HPT370/302/371N.
+# 
+# commit 471a0bda5a2de5b0fd3b58255791eb831517a52c
+# tree 6ddbac9495ae7a45a07aa511b957bb8488303e97
+# parent 9448732f6c9ef4932b226056338d1084f3669752
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 13 Dec 2006 00:35:49 -0800
+# committer Linus Torvalds <torvalds@woody.osdl.org> Wed, 13 Dec 2006 09:05:55 -0800
+# 
+#  drivers/ide/pci/hpt366.c |  404 ++++++++++++++++++++---------------------------
+#  1 files changed, 174 insertions(+), 230 deletions(-)
+# 
+
+PATCHNUM=1385
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14142
+Type: Defect Fix
+Disposition: accepted into 2.6.20-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+Description:
+
+[PATCH] ide: optimize HPT37x timing tables
+
+Save some space on the timing tables by introducing the separate transfer mode
+table in which the mode lookup is done to get the index into the timing table
+itself.  Get rid of the rest of the obsolete/duplicate tables and use one set
+of tables for the whole HPT37x chip family like the HighPoint open-source
+drivers do.  Document the different timing register layout for the HPT36x
+chip family (this is my guesswork based on the timing values).
+
+Have been tested and works fine on HPT370/302/371N.
+
+commit 471a0bda5a2de5b0fd3b58255791eb831517a52c
+tree 6ddbac9495ae7a45a07aa511b957bb8488303e97
+parent 9448732f6c9ef4932b226056338d1084f3669752
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 13 Dec 2006 00:35:49 -0800
+committer Linus Torvalds <torvalds@woody.osdl.org> Wed, 13 Dec 2006 09:05:55 -0800
+
+ drivers/ide/pci/hpt366.c |  404 ++++++++++++++++++++---------------------------
+ mvl_patches/pro-1385.c   |   16 +
+ 2 files changed, 190 insertions(+), 230 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/hpt366.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.c
++++ linux-2.6.10/drivers/ide/pci/hpt366.c
+@@ -67,10 +67,9 @@
+  * - add support for HPT302N and HPT371N clocking (the same as for HPT372N)
+  * - HPT371/N are single channel chips, so avoid touching the primary channel
+  *   which exists only virtually (there's no pins for it)
+- * - fix/remove bad/unused timing tables: HPT370/A  66 MHz tables weren't really
+- *   needed and had many modes over- and  underclocked,  HPT372 33 MHz table was
+- *   for 66 MHz and 50 MHz table missed UltraDMA mode 6, HPT374 33 MHz table was
+- *   really for 50 MHz; switch to using HPT372 tables for HPT374...
++ * - fix/remove bad/unused timing tables and use one set of tables for the whole
++ *   HPT37x chip family; save space by introducing the separate transfer mode
++ *   table in which the mode lookup is done
+  *		<source@mvista.com>
+  *
+  */
+@@ -163,214 +162,168 @@ static const char *bad_ata33[] = {
+ 	NULL
+ };
+ 
+-struct chipset_bus_clock_list_entry {
+-	u8		xfer_speed;
+-	unsigned int	chipset_settings;
++static u8 xfer_speeds[] = {
++	XFER_UDMA_6,
++	XFER_UDMA_5,
++	XFER_UDMA_4,
++	XFER_UDMA_3,
++	XFER_UDMA_2,
++	XFER_UDMA_1,
++	XFER_UDMA_0,
++
++	XFER_MW_DMA_2,
++	XFER_MW_DMA_1,
++	XFER_MW_DMA_0,
++
++	XFER_PIO_4,
++	XFER_PIO_3,
++	XFER_PIO_2,
++	XFER_PIO_1,
++	XFER_PIO_0
+ };
+ 
+-/* key for bus clock timings
+- * bit
+- * 0:3    data_high_time. inactive time of DIOW_/DIOR_ for PIO and MW
+- *        DMA. cycles = value + 1
+- * 4:8    data_low_time. active time of DIOW_/DIOR_ for PIO and MW
+- *        DMA. cycles = value + 1
+- * 9:12   cmd_high_time. inactive time of DIOW_/DIOR_ during task file
+- *        register access.
+- * 13:17  cmd_low_time. active time of DIOW_/DIOR_ during task file
+- *        register access.
+- * 18:21  udma_cycle_time. clock freq and clock cycles for UDMA xfer.
+- *        during task file register access.
+- * 22:24  pre_high_time. time to initialize 1st cycle for PIO and MW DMA
+- *        xfer.
+- * 25:27  cmd_pre_high_time. time to initialize 1st PIO cycle for task
+- *        register access.
+- * 28     UDMA enable
+- * 29     DMA enable
+- * 30     PIO_MST enable. if set, the chip is in bus master mode during
+- *        PIO.
+- * 31     FIFO enable.
++/* Key for bus clock timings
++ * 36x   37x
++ * bits  bits
++ * 0:3	 0:3	data_high_time. Inactive time of DIOW_/DIOR_ for PIO and MW DMA.
++ *		cycles = value + 1
++ * 4:7	 4:8	data_low_time. Active time of DIOW_/DIOR_ for PIO and MW DMA.
++ *		cycles = value + 1
++ * 8:11  9:12	cmd_high_time. Inactive time of DIOW_/DIOR_ during task file
++ *		register access.
++ * 12:15 13:17	cmd_low_time. Active time of DIOW_/DIOR_ during task file
++ *		register access.
++ * 16:18 18:20	udma_cycle_time. Clock cycles for UDMA xfer.
++ * -	 21	CLK frequency: 0=ATA clock, 1=dual ATA clock.
++ * 19:21 22:24	pre_high_time. Time to initialize the 1st cycle for PIO and
++ *		MW DMA xfer.
++ * 22:24 25:27	cmd_pre_high_time. Time to initialize the 1st PIO cycle for
++ *		task file register access.
++ * 28	 28	UDMA enable.
++ * 29	 29	DMA  enable.
++ * 30	 30	PIO MST enable. If set, the chip is in bus master mode during
++ *		PIO xfer.
++ * 31	 31	FIFO enable.
+  */
+-static struct chipset_bus_clock_list_entry forty_base_hpt366[] = {
+-	{	XFER_UDMA_4,	0x900fd943	},
+-	{	XFER_UDMA_3,	0x900ad943	},
+-	{	XFER_UDMA_2,	0x900bd943	},
+-	{	XFER_UDMA_1,	0x9008d943	},
+-	{	XFER_UDMA_0,	0x9008d943	},
+-
+-	{	XFER_MW_DMA_2,	0xa008d943	},
+-	{	XFER_MW_DMA_1,	0xa010d955	},
+-	{	XFER_MW_DMA_0,	0xa010d9fc	},
+-
+-	{	XFER_PIO_4,	0xc008d963	},
+-	{	XFER_PIO_3,	0xc010d974	},
+-	{	XFER_PIO_2,	0xc010d997	},
+-	{	XFER_PIO_1,	0xc010d9c7	},
+-	{	XFER_PIO_0,	0xc018d9d9	},
+-	{	0,		0x0120d9d9	}
+-};
+-
+-static struct chipset_bus_clock_list_entry thirty_three_base_hpt366[] = {
+-	{	XFER_UDMA_4,	0x90c9a731	},
+-	{	XFER_UDMA_3,	0x90cfa731	},
+-	{	XFER_UDMA_2,	0x90caa731	},
+-	{	XFER_UDMA_1,	0x90cba731	},
+-	{	XFER_UDMA_0,	0x90c8a731	},
+-
+-	{	XFER_MW_DMA_2,	0xa0c8a731	},
+-	{	XFER_MW_DMA_1,	0xa0c8a732	},	/* 0xa0c8a733 */
+-	{	XFER_MW_DMA_0,	0xa0c8a797	},
+-
+-	{	XFER_PIO_4,	0xc0c8a731	},
+-	{	XFER_PIO_3,	0xc0c8a742	},
+-	{	XFER_PIO_2,	0xc0d0a753	},
+-	{	XFER_PIO_1,	0xc0d0a7a3	},	/* 0xc0d0a793 */
+-	{	XFER_PIO_0,	0xc0d0a7aa	},	/* 0xc0d0a7a7 */
+-	{	0,		0x0120a7a7	}
+-};
+ 
+-static struct chipset_bus_clock_list_entry twenty_five_base_hpt366[] = {
+-	{	XFER_UDMA_4,	0x90c98521	},
+-	{	XFER_UDMA_3,	0x90cf8521	},
+-	{	XFER_UDMA_2,	0x90cf8521	},
+-	{	XFER_UDMA_1,	0x90cb8521	},
+-	{	XFER_UDMA_0,	0x90cb8521	},
+-
+-	{	XFER_MW_DMA_2,	0xa0ca8521	},
+-	{	XFER_MW_DMA_1,	0xa0ca8532	},
+-	{	XFER_MW_DMA_0,	0xa0ca8575	},
+-
+-	{	XFER_PIO_4,	0xc0ca8521	},
+-	{	XFER_PIO_3,	0xc0ca8532	},
+-	{	XFER_PIO_2,	0xc0ca8542	},
+-	{	XFER_PIO_1,	0xc0d08572	},
+-	{	XFER_PIO_0,	0xc0d08585	},
+-	{	0,		0x01208585	}
++static u32 forty_base_hpt36x[] = {
++	/* XFER_UDMA_6 */	0x900fd943,
++	/* XFER_UDMA_5 */	0x900fd943,
++	/* XFER_UDMA_4 */	0x900fd943,
++	/* XFER_UDMA_3 */	0x900ad943,
++	/* XFER_UDMA_2 */	0x900bd943,
++	/* XFER_UDMA_1 */	0x9008d943,
++	/* XFER_UDMA_0 */	0x9008d943,
++
++	/* XFER_MW_DMA_2 */	0xa008d943,
++	/* XFER_MW_DMA_1 */	0xa010d955,
++	/* XFER_MW_DMA_0 */	0xa010d9fc,
++
++	/* XFER_PIO_4 */	0xc008d963,
++	/* XFER_PIO_3 */	0xc010d974,
++	/* XFER_PIO_2 */	0xc010d997,
++	/* XFER_PIO_1 */	0xc010d9c7,
++	/* XFER_PIO_0 */	0xc018d9d9
+ };
+ 
+-/* from highpoint documentation. these are old values */
+-static struct chipset_bus_clock_list_entry thirty_three_base_hpt370[] = {
+-/*	{	XFER_UDMA_5,	0x1A85F442,	0x16454e31	}, */
+-	{	XFER_UDMA_5,	0x16454e31	},
+-	{	XFER_UDMA_4,	0x16454e31	},
+-	{	XFER_UDMA_3,	0x166d4e31	},
+-	{	XFER_UDMA_2,	0x16494e31	},
+-	{	XFER_UDMA_1,	0x164d4e31	},
+-	{	XFER_UDMA_0,	0x16514e31	},
+-
+-	{	XFER_MW_DMA_2,	0x26514e21	},
+-	{	XFER_MW_DMA_1,	0x26514e33	},
+-	{	XFER_MW_DMA_0,	0x26514e97	},
+-
+-	{	XFER_PIO_4,	0x06514e21	},
+-	{	XFER_PIO_3,	0x06514e22	},
+-	{	XFER_PIO_2,	0x06514e33	},
+-	{	XFER_PIO_1,	0x06914e43	},
+-	{	XFER_PIO_0,	0x06914e57	},
+-	{	0,		0x06514e57	}
++static u32 thirty_three_base_hpt36x[] = {
++	/* XFER_UDMA_6 */	0x90c9a731,
++	/* XFER_UDMA_5 */	0x90c9a731,
++	/* XFER_UDMA_4 */	0x90c9a731,
++	/* XFER_UDMA_3 */	0x90cfa731,
++	/* XFER_UDMA_2 */	0x90caa731,
++	/* XFER_UDMA_1 */	0x90cba731,
++	/* XFER_UDMA_0 */	0x90c8a731,
++
++	/* XFER_MW_DMA_2 */	0xa0c8a731,
++	/* XFER_MW_DMA_1 */	0xa0c8a732,	/* 0xa0c8a733 */
++	/* XFER_MW_DMA_0 */	0xa0c8a797,
++
++	/* XFER_PIO_4 */	0xc0c8a731,
++	/* XFER_PIO_3 */	0xc0c8a742,
++	/* XFER_PIO_2 */	0xc0d0a753,
++	/* XFER_PIO_1 */	0xc0d0a7a3,	/* 0xc0d0a793 */
++	/* XFER_PIO_0 */	0xc0d0a7aa	/* 0xc0d0a7a7 */
+ };
+ 
+-/* these are the current (4 sep 2001) timings from highpoint */
+-static struct chipset_bus_clock_list_entry thirty_three_base_hpt370a[] = {
+-	{	XFER_UDMA_5,	0x12446231	},
+-	{	XFER_UDMA_4,	0x12446231	},
+-	{	XFER_UDMA_3,	0x126c6231	},
+-	{	XFER_UDMA_2,	0x12486231	},
+-	{	XFER_UDMA_1,	0x124c6233	},
+-	{	XFER_UDMA_0,	0x12506297	},
+-
+-	{	XFER_MW_DMA_2,	0x22406c31	},
+-	{	XFER_MW_DMA_1,	0x22406c33	},
+-	{	XFER_MW_DMA_0,	0x22406c97	},
+-
+-	{	XFER_PIO_4,	0x06414e31	},
+-	{	XFER_PIO_3,	0x06414e42	},
+-	{	XFER_PIO_2,	0x06414e53	},
+-	{	XFER_PIO_1,	0x06814e93	},
+-	{	XFER_PIO_0,	0x06814ea7	},
+-	{	0,		0x06814ea7	}
++static u32 twenty_five_base_hpt36x[] = {
++	/* XFER_UDMA_6 */	0x90c98521,
++	/* XFER_UDMA_5 */	0x90c98521,
++	/* XFER_UDMA_4 */	0x90c98521,
++	/* XFER_UDMA_3 */	0x90cf8521,
++	/* XFER_UDMA_2 */	0x90cf8521,
++	/* XFER_UDMA_1 */	0x90cb8521,
++	/* XFER_UDMA_0 */	0x90cb8521,
++
++	/* XFER_MW_DMA_2 */	0xa0ca8521,
++	/* XFER_MW_DMA_1 */	0xa0ca8532,
++	/* XFER_MW_DMA_0 */	0xa0ca8575,
++
++	/* XFER_PIO_4 */	0xc0ca8521,
++	/* XFER_PIO_3 */	0xc0ca8532,
++	/* XFER_PIO_2 */	0xc0ca8542,
++	/* XFER_PIO_1 */	0xc0d08572,
++	/* XFER_PIO_0 */	0xc0d08585
+ };
+ 
+-static struct chipset_bus_clock_list_entry fifty_base_hpt370a[] = {
+-	{	XFER_UDMA_5,	0x12848242	},
+-	{	XFER_UDMA_4,	0x12ac8242	},
+-	{	XFER_UDMA_3,	0x128c8242	},
+-	{	XFER_UDMA_2,	0x120c8242	},
+-	{	XFER_UDMA_1,	0x12148254	},
+-	{	XFER_UDMA_0,	0x121882ea	},
+-
+-	{	XFER_MW_DMA_2,	0x22808242	},
+-	{	XFER_MW_DMA_1,	0x22808254	},
+-	{	XFER_MW_DMA_0,	0x228082ea	},
+-
+-	{	XFER_PIO_4,	0x0a81f442	},
+-	{	XFER_PIO_3,	0x0a81f443	},
+-	{	XFER_PIO_2,	0x0a81f454	},
+-	{	XFER_PIO_1,	0x0ac1f465	},
+-	{	XFER_PIO_0,	0x0ac1f48a	},
+-	{	0,		0x0ac1f48a	}
++static u32 thirty_three_base_hpt37x[] = {
++	/* XFER_UDMA_6 */	0x12446231,	/* 0x12646231 ?? */
++	/* XFER_UDMA_5 */	0x12446231,
++	/* XFER_UDMA_4 */	0x12446231,
++	/* XFER_UDMA_3 */	0x126c6231,
++	/* XFER_UDMA_2 */	0x12486231,
++	/* XFER_UDMA_1 */	0x124c6233,
++	/* XFER_UDMA_0 */	0x12506297,
++
++	/* XFER_MW_DMA_2 */	0x22406c31,
++	/* XFER_MW_DMA_1 */	0x22406c33,
++	/* XFER_MW_DMA_0 */	0x22406c97,
++
++	/* XFER_PIO_4 */	0x06414e31,
++	/* XFER_PIO_3 */	0x06414e42,
++	/* XFER_PIO_2 */	0x06414e53,
++	/* XFER_PIO_1 */	0x06814e93,
++	/* XFER_PIO_0 */	0x06814ea7
+ };
+ 
+-static struct chipset_bus_clock_list_entry thirty_three_base_hpt372[] = {
+-	{	XFER_UDMA_6,	0x12446231	},	/* 0x12646231 ?? */
+-	{	XFER_UDMA_5,	0x12446231	},
+-	{	XFER_UDMA_4,	0x12446231	},
+-	{	XFER_UDMA_3,	0x126c6231	},
+-	{	XFER_UDMA_2,	0x12486231	},
+-	{	XFER_UDMA_1,	0x124c6233	},
+-	{	XFER_UDMA_0,	0x12506297	},
+-
+-	{	XFER_MW_DMA_2,	0x22406c31	},
+-	{	XFER_MW_DMA_1,	0x22406c33	},
+-	{	XFER_MW_DMA_0,	0x22406c97	},
+-
+-	{	XFER_PIO_4,	0x06414e31	},
+-	{	XFER_PIO_3,	0x06414e42	},
+-	{	XFER_PIO_2,	0x06414e53	},
+-	{	XFER_PIO_1,	0x06814e93	},
+-	{	XFER_PIO_0,	0x06814ea7	},
+-	{	0,		0x06814ea7	}
++static u32 fifty_base_hpt37x[] = {
++	/* XFER_UDMA_6 */	0x12848242,
++	/* XFER_UDMA_5 */	0x12848242,
++	/* XFER_UDMA_4 */	0x12ac8242,
++	/* XFER_UDMA_3 */	0x128c8242,
++	/* XFER_UDMA_2 */	0x120c8242,
++	/* XFER_UDMA_1 */	0x12148254,
++	/* XFER_UDMA_0 */	0x121882ea,
++
++	/* XFER_MW_DMA_2 */	0x22808242,
++	/* XFER_MW_DMA_1 */	0x22808254,
++	/* XFER_MW_DMA_0 */	0x228082ea,
++
++	/* XFER_PIO_4 */	0x0a81f442,
++	/* XFER_PIO_3 */	0x0a81f443,
++	/* XFER_PIO_2 */	0x0a81f454,
++	/* XFER_PIO_1 */	0x0ac1f465,
++	/* XFER_PIO_0 */	0x0ac1f48a
+ };
+ 
+-static struct chipset_bus_clock_list_entry fifty_base_hpt372[] = {
+-	{	XFER_UDMA_6,	0x12848242	},
+-	{	XFER_UDMA_5,	0x12848242	},
+-	{	XFER_UDMA_4,	0x12ac8242	},
+-	{	XFER_UDMA_3,	0x128c8242	},
+-	{	XFER_UDMA_2,	0x120c8242	},
+-	{	XFER_UDMA_1,	0x12148254	},
+-	{	XFER_UDMA_0,	0x121882ea	},
+-
+-	{	XFER_MW_DMA_2,	0x22808242	},
+-	{	XFER_MW_DMA_1,	0x22808254	},
+-	{	XFER_MW_DMA_0,	0x228082ea	},
+-
+-	{	XFER_PIO_4,	0x0a81f442	},
+-	{	XFER_PIO_3,	0x0a81f443	},
+-	{	XFER_PIO_2,	0x0a81f454	},
+-	{	XFER_PIO_1,	0x0ac1f465	},
+-	{	XFER_PIO_0,	0x0ac1f48a	},
+-	{	0,		0x0a81f443	}
+-};
+-
+-static struct chipset_bus_clock_list_entry sixty_six_base_hpt372[] = {
+-	{	XFER_UDMA_6,	0x1c869c62	},
+-	{	XFER_UDMA_5,	0x1cae9c62	},	/* 0x1c8a9c62 */
+-	{	XFER_UDMA_4,	0x1c8a9c62	},
+-	{	XFER_UDMA_3,	0x1c8e9c62	},
+-	{	XFER_UDMA_2,	0x1c929c62	},
+-	{	XFER_UDMA_1,	0x1c9a9c62	},
+-	{	XFER_UDMA_0,	0x1c829c62	},
+-
+-	{	XFER_MW_DMA_2,	0x2c829c62	},
+-	{	XFER_MW_DMA_1,	0x2c829c66	},
+-	{	XFER_MW_DMA_0,	0x2c829d2e	},
+-
+-	{	XFER_PIO_4,	0x0c829c62	},
+-	{	XFER_PIO_3,	0x0c829c84	},
+-	{	XFER_PIO_2,	0x0c829ca6	},
+-	{	XFER_PIO_1,	0x0d029d26	},
+-	{	XFER_PIO_0,	0x0d029d5e	},
+-	{	0,		0x0d029d26	}
++static u32 sixty_six_base_hpt37x[] = {
++	/* XFER_UDMA_6 */	0x1c869c62,
++	/* XFER_UDMA_5 */	0x1cae9c62,	/* 0x1c8a9c62 */
++	/* XFER_UDMA_4 */	0x1c8a9c62,
++	/* XFER_UDMA_3 */	0x1c8e9c62,
++	/* XFER_UDMA_2 */	0x1c929c62,
++	/* XFER_UDMA_1 */	0x1c9a9c62,
++	/* XFER_UDMA_0 */	0x1c829c62,
++
++	/* XFER_MW_DMA_2 */	0x2c829c62,
++	/* XFER_MW_DMA_1 */	0x2c829c66,
++	/* XFER_MW_DMA_0 */	0x2c829d2e,
++
++	/* XFER_PIO_4 */	0x0c829c62,
++	/* XFER_PIO_3 */	0x0c829c84,
++	/* XFER_PIO_2 */	0x0c829ca6,
++	/* XFER_PIO_1 */	0x0d029d26,
++	/* XFER_PIO_0 */	0x0d029d5e
+ };
+ 
+ #define HPT366_DEBUG_DRIVE_INFO		0
+@@ -402,7 +355,7 @@ struct hpt_info
+ #define IS_3xxN 	2
+ #define PCI_66MHZ	4
+ 				/* Speed table */
+-	struct chipset_bus_clock_list_entry *speed;
++	u32 *speed;
+ };
+ 
+ /*
+@@ -539,12 +492,20 @@ static int check_in_drive_lists (ide_dri
+ 	return 0;
+ }
+ 
+-static unsigned int pci_bus_clock_list (u8 speed, struct chipset_bus_clock_list_entry * chipset_table)
++static u32 pci_bus_clock_list(u8 speed, u32 *chipset_table)
+ {
+-	for ( ; chipset_table->xfer_speed ; chipset_table++)
+-		if (chipset_table->xfer_speed == speed)
+-			return chipset_table->chipset_settings;
+-	return chipset_table->chipset_settings;
++	int i;
++
++	/*
++	 * Lookup the transfer mode table to get the index into
++	 * the timing table.
++	 *
++	 * NOTE: For XFER_PIO_SLOW, PIO mode 0 timings will be used.
++	 */
++	for (i = 0; i < ARRAY_SIZE(xfer_speeds) - 1; i++)
++		if (xfer_speeds[i] == speed)
++			break;
++	return chipset_table[i];
+ }
+ 
+ static int hpt36x_tune_chipset(ide_drive_t *drive, u8 xferspeed)
+@@ -1062,14 +1023,14 @@ static void __devinit hpt366_clocking(id
+ 	/* detect bus speed by looking at control reg timing: */
+ 	switch((reg1 >> 8) & 7) {
+ 		case 5:
+-			info->speed = forty_base_hpt366;
++			info->speed = forty_base_hpt36x;
+ 			break;
+ 		case 9:
+-			info->speed = twenty_five_base_hpt366;
++			info->speed = twenty_five_base_hpt36x;
+ 			break;
+ 		case 7:
+ 		default:
+-			info->speed = thirty_three_base_hpt366;
++			info->speed = thirty_three_base_hpt36x;
+ 			break;
+ 	}
+ }
+@@ -1132,27 +1093,16 @@ static void __devinit hpt37x_clocking(id
+ 			pll = F_LOW_PCI_66;
+ 	
+ 		if (pll == F_LOW_PCI_33) {
+-			if (info->revision >= 5)
+-				info->speed = thirty_three_base_hpt372;
+-			else if (info->revision >= 4)
+-				info->speed = thirty_three_base_hpt370a;
+-			else
+-				info->speed = thirty_three_base_hpt370;
++			info->speed = thirty_three_base_hpt37x;
+ 			printk(KERN_DEBUG "HPT37X: using 33MHz PCI clock\n");
+ 		} else if (pll == F_LOW_PCI_40) {
+ 			/* Unsupported */
+ 		} else if (pll == F_LOW_PCI_50) {
+-			if (info->revision >= 5)
+-				info->speed = fifty_base_hpt372;
+-			else
+-				info->speed = fifty_base_hpt370a;
++			info->speed = fifty_base_hpt37x;
+ 			printk(KERN_DEBUG "HPT37X: using 50MHz PCI clock\n");
+ 		} else {
+-			if (info->revision >= 5) {
+-				info->speed = sixty_six_base_hpt372;
+-				printk(KERN_DEBUG "HPT37X: using 66MHz PCI clock\n");
+-			} else
+-				printk(KERN_ERR "HPT37x: 66MHz timings not supported.\n");
++			info->speed = sixty_six_base_hpt37x;
++			printk(KERN_DEBUG "HPT37X: using 66MHz PCI clock\n");
+ 		}
+ 	}
+ 
+@@ -1202,14 +1152,8 @@ static void __devinit hpt37x_clocking(id
+ 				pci_write_config_dword(dev, 0x5c, 
+ 						       pll & ~0x100);
+ 				pci_write_config_byte(dev, 0x5b, 0x21);
+-				if (info->revision >= 8)
+-					info->speed = fifty_base_hpt370a;
+-				else if (info->revision >= 5)
+-					info->speed = fifty_base_hpt372;
+-				else if (info->revision >= 4)
+-					info->speed = fifty_base_hpt370a;
+-				else
+-					info->speed = fifty_base_hpt370a;
++
++				info->speed = fifty_base_hpt37x;
+ 				printk("HPT37X: using 50MHz internal PLL\n");
+ 				goto init_hpt37X_done;
+ 			}
+Index: linux-2.6.10/mvl_patches/pro-1385.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1385.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1385);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

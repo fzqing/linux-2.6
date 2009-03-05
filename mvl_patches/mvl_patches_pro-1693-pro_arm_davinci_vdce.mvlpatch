@@ -1,0 +1,4271 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_vdce
+# Date: Mon Jan 21 23:07:21 2008
+# Source: Texas Instruments, Inc.
+# MR: 26251
+# Type: Enhancements 
+# Disposition: local
+# Signed-off-by: Steve Chen <schen@mvista.com>
+# Description:
+# Add VDCE (Video Data Conversion Engine) for DM6467.
+# 
+
+PATCHNUM=1693
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments, Inc.
+MR: 26251
+Type: Enhancements 
+Disposition: local
+Signed-off-by: Steve Chen <schen@mvista.com>
+Description:
+Add VDCE (Video Data Conversion Engine) for DM6467.
+
+Index: linux-2.6.10/drivers/char/davinci_vdce.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/davinci_vdce.c
+@@ -0,0 +1,2957 @@
++/* *
++ * Copyright (C) 2007 Texas Instruments	Inc
++ *
++ * This	program	is free	software; you can redistribute it and/or modify
++ * it under the	terms of the GNU General Public	License	as published by
++ * the Free Software Foundation; either	version	2 of the License, or
++ * (at your option)any	later version.
++ *
++ * This	program	is distributed in the hope that	it will	be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not,write to the	Free Software
++ * Foundation, Inc., 59	Temple Place, Suite 330, Boston, MA  02111-1307	USA
++ */
++/* davinci_vdce.c	file */
++
++/*Header files*/
++#include <linux/kernel.h>
++#include <linux/fs.h>		/*     everything... */
++#include <linux/errno.h>	/*     error codes     */
++#include <linux/types.h>	/*     size_t */
++#include <linux/cdev.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <asm/uaccess.h>
++#include <linux/device.h>
++#include <asm/arch/davinci_vdce_hw.h>
++#include <asm/arch/davinci_vdce.h>
++#include <linux/init.h>
++#include <asm/cacheflush.h>
++#include <asm/arch/edma.h>
++#define TCINTEN_SHIFT               20
++#define ITCINTEN_SHIFT              21
++
++/* edma isr status tracking variable */
++static int irqraised1;
++#define	DRIVERNAME	"DavinciHD_vdce"
++#define VDCE_INTERRUPT	12
++
++MODULE_LICENSE("GPL");
++DECLARE_TASKLET(short_tasklet, process_bottomhalf, 0);
++
++/*Global structute shared between all applications
++  struct device_params device_config;*/
++device_params_t device_config;
++/* For registeration of	character device*/
++static struct cdev c_dev;
++/* device structure to make entry in device*/
++static dev_t dev;
++/* for holding device entry*/
++struct device *vdce_device = NULL;
++
++static u32 inter_bufsize = 1920 * 1080;
++module_param(inter_bufsize, uint, S_IRUGO);
++
++/* default values for various modes */
++#define COMMON_DEFAULT_PARAMS {VDCE_PROGRESSIVE, VDCE_FRAME_MODE, \
++VDCE_FRAME_MODE, VDCE_FRAME_MODE, VDCE_LUMA_CHROMA_ENABLE, \
++VDCE_TOP_BOT_ENABLE, 720, 480, 120, 60, 0, 0, 0, 0, 0, 720, 480, 0, 0, 0}
++
++#define RSZ_DEFAULT_PARAMS {VDCE_MODE_422, VDCE_CODECMODE_MPEG2_MPEG4, \
++VDCE_ALGO_TAP_4LINEAR_INTERPOLATION, VDCE_ALGO_TAP_4LINEAR_INTERPOLATION, \
++VDCE_FEATURE_DISABLE, VDCE_FEATURE_DISABLE, VDCE_ALFMODE_AUTOMATIC, 0}
++
++#define CCV_DEFAULT_PARAMS {VDCE_CCV_MODE_422_420, VDCE_CODECMODE_MPEG2_MPEG4, \
++VDCE_CODECMODE_MPEG2_MPEG4, VDCE_ALGO_TAP_4LINEAR_INTERPOLATION, \
++VDCE_ALGO_TAP_4LINEAR_INTERPOLATION }
++
++#define RMAP_DEFAULT_PARAMS {10, VDCE_FEATURE_ENABLE, 10, VDCE_FEATURE_ENABLE}
++
++#define BLEND_TABLE {0x36, 0x22, 0x91, 0xff}
++
++#define BLEND_DEFAULT_PARAMS {VDCE_MODE_422, BLEND_TABLE, BLEND_TABLE, \
++BLEND_TABLE, BLEND_TABLE}
++
++#define EPAD_DEFAULT_PARAMS {16, 8, 16, 8}
++
++#define PRECODEC_PARAMS	{RSZ_DEFAULT_PARAMS, CCV_DEFAULT_PARAMS}
++
++#define POSTCODEC_PARAMS {RSZ_DEFAULT_PARAMS, RMAP_DEFAULT_PARAMS, \
++BLEND_DEFAULT_PARAMS, CCV_DEFAULT_PARAMS}
++
++#define TRANSCODEC_PARAMS {RSZ_DEFAULT_PARAMS, RMAP_DEFAULT_PARAMS, \
++BLEND_DEFAULT_PARAMS, EPAD_DEFAULT_PARAMS, CCV_DEFAULT_PARAMS}
++
++/* Default pre-codec params */
++static vdce_params_t precodec_default_params = {
++	VDCE_OPERATION_PRE_CODECMODE,
++	0x5,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.precodec_params = PRECODEC_PARAMS
++};
++
++/* Default post-codec params */
++static vdce_params_t postcodec_default_params = {
++	VDCE_OPERATION_POST_CODECMODE,
++	0x1,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.postcodec_params.rsz_params = RSZ_DEFAULT_PARAMS,
++	.vdce_mode_params.postcodec_params.rmap_params = RMAP_DEFAULT_PARAMS,
++	.vdce_mode_params.postcodec_params.blend_params.blend_mode =
++	    VDCE_MODE_422,
++	.vdce_mode_params.postcodec_params.blend_params.bld_lut[0] =
++	    BLEND_TABLE,
++	.vdce_mode_params.postcodec_params.blend_params.bld_lut[1] =
++	    BLEND_TABLE,
++	.vdce_mode_params.postcodec_params.blend_params.bld_lut[2] =
++	    BLEND_TABLE,
++	.vdce_mode_params.postcodec_params.blend_params.bld_lut[3] =
++	    BLEND_TABLE,
++	.vdce_mode_params.postcodec_params.ccv_params = CCV_DEFAULT_PARAMS
++};
++
++/* Default trans-codec params */
++static vdce_params_t transcodec_default_params = {
++	VDCE_OPERATION_TRANS_CODECMODE,
++	0x1,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.transcodec_params.rsz_params = RSZ_DEFAULT_PARAMS,
++	.vdce_mode_params.transcodec_params.rmap_params = RMAP_DEFAULT_PARAMS,
++	.vdce_mode_params.transcodec_params.blend_params.blend_mode =
++	    VDCE_MODE_422,
++	.vdce_mode_params.transcodec_params.blend_params.bld_lut[0] =
++	    BLEND_TABLE,
++	.vdce_mode_params.transcodec_params.blend_params.bld_lut[1] =
++	    BLEND_TABLE,
++	.vdce_mode_params.transcodec_params.blend_params.bld_lut[2] =
++	    BLEND_TABLE,
++	.vdce_mode_params.transcodec_params.blend_params.bld_lut[3] =
++	    BLEND_TABLE,
++	.vdce_mode_params.transcodec_params.epad_params = EPAD_DEFAULT_PARAMS,
++	.vdce_mode_params.transcodec_params.ccv_params = CCV_DEFAULT_PARAMS
++};
++
++/* Default edgepadding params */
++static vdce_params_t epad_default_params = {
++	VDCE_OPERATION_EDGE_PADDING,
++	0x0,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.epad_params = EPAD_DEFAULT_PARAMS
++};
++
++/* Default resising params */
++static vdce_params_t rsz_default_params = {
++	VDCE_OPERATION_RESIZING,
++	0x0,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.rsz_params = RSZ_DEFAULT_PARAMS
++};
++
++/* Default CCV params */
++static vdce_params_t ccv_default_params = {
++	VDCE_OPERATION_CHROMINANCE_CONVERSION,
++	0x0,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.ccv_params = CCV_DEFAULT_PARAMS
++};
++
++/* Default blending params */
++static vdce_params_t blend_default_params = {
++	VDCE_OPERATION_BLENDING,
++	0x0,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.blend_params.blend_mode = VDCE_MODE_422,
++	.vdce_mode_params.blend_params.bld_lut[0] = BLEND_TABLE,
++	.vdce_mode_params.blend_params.bld_lut[1] = BLEND_TABLE,
++	.vdce_mode_params.blend_params.bld_lut[2] = BLEND_TABLE,
++	.vdce_mode_params.blend_params.bld_lut[3] = BLEND_TABLE
++};
++
++/* Default rangemapping params */
++static vdce_params_t rmap_default_params = {
++	VDCE_OPERATION_RANGE_MAPPING,
++	0x0,
++	COMMON_DEFAULT_PARAMS,
++	.vdce_mode_params.rmap_params = RMAP_DEFAULT_PARAMS
++};
++static int prcs_array_value[] = { 16, 32, 64, 128, 256 };
++
++/*
++ * vdce_free_pages : Function to free memory of buffers
++ */
++inline void vdce_free_pages(unsigned long addr, unsigned long bufsize)
++{
++	unsigned long size;
++	unsigned long tempaddr = addr;
++	if (!addr)
++		return;
++	size = PAGE_SIZE << (get_order(bufsize));
++	while (size > 0) {
++		ClearPageReserved(virt_to_page(addr));
++		addr += PAGE_SIZE;
++		size -= PAGE_SIZE;
++	}
++	free_pages(tempaddr, get_order(bufsize));
++}
++
++/*
++ * vdce_uservirt_to_phys : This inline function is used to
++ * convert user space virtual address to physical address.
++ */
++static inline unsigned long vdce_uservirt_to_phys(unsigned long virtp)
++{
++	unsigned long physp = 0;
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma;
++	/* For kernel direct-mapped memory, take the easy way */
++	if (virtp >= PAGE_OFFSET)
++		physp = virt_to_phys((void *)virtp);
++
++	/* this will catch, kernel-allocated, mmaped-to-usermode addresses */
++	else if ((vma = find_vma(mm, virtp)) &&
++		 (vma->vm_flags & VM_IO) && (vma->vm_pgoff)) {
++		physp = (vma->vm_pgoff << PAGE_SHIFT) + (virtp - vma->vm_start);
++	}
++	/* otherwise, use get_user_pages() for general userland pages */
++	else {
++		int res, nr_pages = 1;
++		struct page *pages;
++		down_read(&current->mm->mmap_sem);
++
++		res = get_user_pages(current, current->mm,
++				     virtp, nr_pages, 1, 0, &pages, NULL);
++		up_read(&current->mm->mmap_sem);
++
++		if (res == nr_pages) {
++			physp =
++			    __pa(page_address(&pages[0]) +
++				 (virtp & ~PAGE_MASK));
++		} else {
++			dev_err(vdce_device,
++				" Unable to find phys addr for 0x%08lx\n",
++				virtp);
++			dev_err(vdce_device,
++				"get_user_pages() failed: %d\n", res);
++		}
++	}
++	return physp;
++}
++
++/*
++ * malloc_buff : Function to allocate memory to input
++ * and output buffers
++ */
++int malloc_buff(vdce_reqbufs_t * reqbuff, channel_config_t * vdce_conf_chan)
++{
++	/* for looping purpose */
++	int i = 0;
++	/* for pointing to input output buffer or bitmap pointer */
++	int *buf_ptr;
++	/* to calculate no of max buffers; */
++	int maxbuffers;
++	/* to calculate number of buffers allocated */
++	int numbuffers = 0;
++	/* for storing buffer size */
++	int *buf_size;
++	/* Stores requested buffer size */
++	unsigned int req_buffersize = 0;
++	/* to make sure buffer pointer never swapped */
++	unsigned long adr;
++	unsigned long size;
++	int multiplier;
++
++	dev_dbg(vdce_device, " <fn> malloc_buff Entering E </fn>\n");
++
++	dev_dbg(vdce_device, "Input buffer requested \n");
++	buf_ptr =
++	    (unsigned int *)vdce_conf_chan->vdce_buffer[reqbuff->
++							buf_type].buffers;
++	buf_size = &vdce_conf_chan->vdce_buffer[reqbuff->buf_type].size;
++	maxbuffers = MAX_BUFFERS;
++	numbuffers =
++	    vdce_conf_chan->vdce_buffer[reqbuff->buf_type].num_allocated;
++	if (reqbuff->buf_type > VDCE_BUF_BMP) {
++		dev_dbg(vdce_device, "Invalid type \n");
++		return -EINVAL;
++	}
++	multiplier = GET_DIVIDE_FACTOR(reqbuff->image_type);
++	req_buffersize =
++	    ((reqbuff->num_lines * reqbuff->bytes_per_line * multiplier) / 2);
++	/* check the request for number of buffers */
++	if (reqbuff->count > maxbuffers)
++		return -EINVAL;
++
++	/* free all the buffers if the count is zero */
++	if ((reqbuff->count == FREE_BUFFER) ||
++	    ((numbuffers != 0) && (req_buffersize != *buf_size))) {
++		/* free all the buffers */
++		free_num_buffers(buf_ptr, *buf_size, numbuffers);
++		return 0;
++	}
++	dev_dbg(vdce_device,
++		"The	no of requested	buffers	are %d \n ", reqbuff->count);
++	/* free the remainning buffers . ie total allocated is 7 requested is 5
++	   than free 2 buffers */
++	if ((numbuffers - reqbuff->count) > 0) {
++		buf_ptr = buf_ptr + reqbuff->count;
++		/* free the remainning buffers */
++		free_num_buffers(buf_ptr, *buf_size,
++				 (numbuffers - reqbuff->count));
++	} else {
++		buf_ptr = buf_ptr + numbuffers;
++		for (i = numbuffers; i < reqbuff->count; i++) {
++			/* assign memory to buffer */
++			*buf_ptr =
++			    (int)(__get_free_pages
++				  (GFP_KERNEL | GFP_DMA,
++				   get_order(req_buffersize)));
++			if (!(*buf_ptr)) {
++				reqbuff->count = numbuffers + i;
++				*buf_size = req_buffersize;
++				dev_dbg(vdce_device,
++					"requestbuffer:not enough memory");
++				return -ENOMEM;
++			}
++			adr = *buf_ptr;
++			size = PAGE_SIZE << (get_order(req_buffersize));
++			while (size > 0) {
++				/* make  sure the frame buffers
++				   are never swapped out of memory */
++				SetPageReserved(virt_to_page(adr));
++				adr += PAGE_SIZE;
++				size -= PAGE_SIZE;
++			}
++			buf_ptr++;
++		}
++	}
++	reqbuff->count = numbuffers + i;
++
++	vdce_conf_chan->vdce_buffer[reqbuff->buf_type].num_allocated =
++	    numbuffers + i;
++	/* set the buffer size to requested size */
++	/* this will be useful only when numbuffers = 0 */
++	*buf_size = req_buffersize;
++	dev_dbg(vdce_device, "<fn> malloc_buff Leaving </fn>\n");
++	return 0;
++}
++
++/*
++ * free_num_buffers :Function to free the number of
++ *  buffers specified by count
++ */
++int free_num_buffers(int *addr, unsigned long bufsize, unsigned long count)
++{
++	int i;
++	for (i = 0; i < count; i++) {
++		/* free memory allocate for the image */
++		dev_dbg(vdce_device, "Free all the allocated	buffers	\n");
++		/* free buffers using free_pages */
++		vdce_free_pages((int)*addr, bufsize);
++		/* assign buffer zero to indicate its free */
++		*addr = (int)NULL;
++		addr++;
++	}
++	return 0;
++}
++
++/*
++ * get_buf_address : Function to query the  physical address
++ * of the buffer  requested by index
++ */
++int get_buf_address(vdce_buffer_t * buffer, channel_config_t * vdce_conf_chan)
++{
++	dev_dbg(vdce_device, "<fn>get_buf_address Entering </fn>\n");
++	if (!buffer || !vdce_conf_chan) {
++		dev_err(vdce_device, "query_buffer: error in argument\n");
++		return -EINVAL;
++	}
++	if (buffer->buf_type > VDCE_BUF_BMP) {
++		dev_dbg(vdce_device, "Invalid type \n");
++		return -EINVAL;
++	}
++	/*checking the index requested */
++	if (buffer->index >=
++	    (vdce_conf_chan->vdce_buffer[buffer->buf_type].num_allocated)) {
++		dev_dbg(vdce_device, "Requested buffer not allocated	\n");
++		return -EINVAL;
++	}
++	/* assignning the  input address to offset which will be
++	   used in mmap */
++	buffer->offset =
++	    (unsigned int)vdce_conf_chan->vdce_buffer[buffer->buf_type].
++	    buffers[buffer->index];
++	buffer->size = vdce_conf_chan->vdce_buffer[buffer->buf_type].size;
++	buffer->offset = virt_to_phys((void *)buffer->offset);
++
++	dev_dbg(vdce_device, "the physical offset returned after query \
++						is %x", buffer->offset);
++	dev_dbg(vdce_device, "<fn>get_buf_address Leaving </fn>\n");
++	return 0;
++}
++
++/*
++ * free_buff : This function free the input and output buffers alloated
++ */
++int free_buff(channel_config_t * vdce_conf_chan)
++{
++	int buffercounter = 0;
++	int i;
++	dev_dbg(vdce_device, " <fn>free_buff E</fn>\n");
++	/* free all the  buffers */
++	for (i = 0; i < 3; i++) {
++		while ((vdce_conf_chan->vdce_buffer[i].
++			buffers[buffercounter] != NULL)
++		       && buffercounter < MAX_BUFFERS) {
++			/* free the memory */
++			vdce_free_pages((unsigned long)vdce_conf_chan->
++					vdce_buffer[i].buffers[buffercounter]
++					, vdce_conf_chan->vdce_buffer[i].size);
++			/* assign buffer zero to indicate its free */
++			vdce_conf_chan->vdce_buffer[i].
++			    buffers[buffercounter] = (unsigned long)NULL;
++			buffercounter++;
++		}
++		buffercounter = 0;
++	}
++	dev_dbg(vdce_device, "<fn> free_buff L</fn>\n");
++	return 0;
++}
++
++/*
++edma call back function.
++*/
++static void callback1(int lch, unsigned short ch_status, void *data)
++{
++	switch (ch_status) {
++	case DMA_COMPLETE:
++		irqraised1 = 1;
++		break;
++	case DMA_EVT_MISS_ERROR:
++		irqraised1 = -1;
++		break;
++	case QDMA_EVT_MISS_ERROR:
++		irqraised1 = -2;
++		break;
++	default:
++		break;
++	}
++	complete(&(device_config.edma_sem));
++}
++
++/* edma3 memcpy functiom which copies the luma data
++*/
++static int edma3_memcpy(int acnt, int bcnt, int ccnt,
++			vdce_address_start_t * vdce_start)
++{
++	int result = 0;
++	unsigned int dma_ch = 0;
++	unsigned int tcc = EDMA_TCC_ANY;
++	int i, p = 0;
++	unsigned int Istestpassed = 0u;
++	unsigned int numenabled = 0;
++	unsigned int BRCnt = 0;
++	int srcbidx = 0;
++	int desbidx = 0;
++	int srccidx = 0;
++	int descidx = 0;
++	int ret = 0;
++	edmacc_paramentry_regs param_set;
++	unsigned int numtimes = 0;
++	unsigned int src_inc = 0, dst_inc = 0;
++
++	/* Setting up the SRC/DES Index */
++	srcbidx = vdce_start->src_horz_pitch;
++	desbidx = vdce_start->res_horz_pitch;
++
++	if (ccnt == 2 && (((bcnt != vdce_start->buffers[1].
++			    size / (vdce_start->res_horz_pitch * 4))) ||
++			  ((bcnt != vdce_start->buffers[0].
++			    size / (vdce_start->src_horz_pitch * 4))))) {
++
++		numtimes = 1;
++		srccidx = acnt;
++		descidx = acnt;
++		BRCnt = bcnt;
++		src_inc = 0;
++		dst_inc = 0;
++		ccnt = 1;
++	} else {
++		/* A Sync Transfer Mode */
++		srccidx = acnt;
++		descidx = acnt;
++		BRCnt = bcnt;
++		src_inc = 0;
++		dst_inc = 0;
++		numtimes = 0;
++	}
++	if (ccnt == 2 && ((bcnt == vdce_start->buffers[1].
++			   size / (vdce_start->res_horz_pitch * 4)))) {
++		bcnt = bcnt * 2;
++	}
++	src_inc = 0;
++	dst_inc = 0;
++
++	for (p = 0; p <= numtimes; p++) {
++		result = davinci_request_dma(EDMA_DMA_CHANNEL_ANY,
++					     "AB-SYNC_DMA0",
++					     callback1, NULL,
++					     &dma_ch, &tcc, EVENTQ_1);
++
++		if (0 != result) {
++			dev_err(vdce_device, "emda request error:%d\n", result);
++			return result;
++		}
++
++		davinci_set_dma_src_params(dma_ch,
++					   (unsigned long)vdce_start->
++					   buffers[0].offset + src_inc,
++					   INCR, W8BIT);
++
++		davinci_set_dma_dest_params(dma_ch,
++					    (unsigned long)vdce_start->
++					    buffers[1].offset + dst_inc,
++					    INCR, W8BIT);
++
++		davinci_set_dma_src_index(dma_ch, srcbidx, srccidx);
++
++		davinci_set_dma_dest_index(dma_ch, desbidx, descidx);
++
++		/* A Sync Transfer Mode */
++		davinci_set_dma_transfer_params(dma_ch, acnt, bcnt, ccnt,
++						BRCnt, ABSYNC);
++
++		/* Enable the Interrupts on Channel 1 */
++		davinci_get_dma_params(dma_ch, &param_set);
++		param_set.opt |= (1 << ITCINTEN_SHIFT);
++		param_set.opt |= (1 << TCINTEN_SHIFT);
++		davinci_set_dma_params(dma_ch, &param_set);
++
++		numenabled = 1;
++
++		for (i = 0; i < numenabled; i++) {
++			irqraised1 = 0;
++
++			/*
++			 * Now enable the transfer as calculated above.
++			 */
++			device_config.edma_sem.done = 0;
++			result = davinci_start_dma(dma_ch);
++			if (result != 0) {
++				dev_err(vdce_device, "dma start failed \n");
++				break;
++			}
++			ret =
++			    wait_for_completion_interruptible_timeout(&
++								      (device_config.
++								       edma_sem),
++								      10000);
++			if (ret <= 0) {
++				davinci_stop_dma(dma_ch);
++				davinci_free_dma(dma_ch);
++				dev_err(vdce_device, "EDMA Interrupt did not \
++					Occur \n");
++				return -EINVAL;
++			}
++			/* Check the status of the completed transfer */
++			if (irqraised1 < 0) {
++				/* Some error occured, break from the FOR loop. */
++				break;
++			}
++		}
++		if (0 == result) {
++			Istestpassed = 1;
++			davinci_stop_dma(dma_ch);
++			davinci_free_dma(dma_ch);
++		}
++		src_inc = vdce_start->buffers[0].size / 4;
++		dst_inc = vdce_start->buffers[1].size / 4;
++	}
++	return result;
++}
++
++/*
++ * vdce_set_address : This function is used to set the addres register
++ */
++int vdce_set_address(vdce_address_start_t * vdce_start,
++		     channel_config_t * vdce_conf_chan, int num_pass,
++		     unsigned int res_size, unsigned int address,
++		     unsigned int pitch)
++{
++
++	int no_of_lines = 0, no_of_lines_output = 0;
++	int divider;
++	unsigned int multiplier = 1;
++	unsigned int temp_lines = 1;
++	unsigned int src_vsp = 0;
++	unsigned int res_vsp = 0;
++	int res_mode, src_mode;
++	unsigned int src_pitch, res_pitch, src_address;
++	unsigned int flag = 0, buffer_index, res_address;
++
++	dev_dbg(vdce_device, "<fn> vdce_set_address	E </fn>\n");
++	/* Top field luma address is the src starting address */
++	src_address = vdce_start->buffers[0].offset;
++	src_pitch = vdce_start->src_horz_pitch;
++	/* For resizing set source mode for second pass equals result mode */
++	src_mode = vdce_conf_chan->get_params.common_params.src_mode;
++
++	if (vdce_conf_chan->num_pass == VDCE_MULTIPASS) {
++		if (num_pass == 1 &&
++		    (vdce_conf_chan->luma_chroma_phased == 0) &&
++		    vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING) {
++			src_mode =
++			    vdce_conf_chan->get_params.common_params.res_mode;
++		}
++	}
++	if (num_pass == 1) {
++
++		if (vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING) {
++			src_address = address;
++			src_pitch = vdce_start->res_horz_pitch;
++		} else {
++			src_pitch =
++			    vdce_conf_chan->register_config[0].
++			    vdce_res_strt_off_ytop;
++
++			src_address =
++			    vdce_conf_chan->
++			    register_config[0].vdce_res_strt_add_ytop;
++		}
++	}
++	vdce_conf_chan->register_config[num_pass].vdce_src_strt_add_ytop =
++	    src_address +
++	    (vdce_conf_chan->get_params.common_params.src_vsp_luminance *
++	     vdce_start->src_horz_pitch);
++	if (vdce_conf_chan->get_params.common_params.src_mode ==
++	    VDCE_FIELD_MODE) {
++		src_vsp =
++		    vdce_conf_chan->get_params.common_params.
++		    src_vsp_luminance * vdce_start->src_horz_pitch;
++	}
++	/* no of lines in horizonatl direction for top/bottom field data */
++	/* ie if v pitch is 48num_pass  than ytop will be of 240 lines */
++	if (vdce_conf_chan->image_type_in == VDCE_IMAGE_FMT_420) {
++		vdce_start->buffers[0].size =
++		    (vdce_start->buffers[0].size * 4) / 3;
++	}
++	no_of_lines = (vdce_start->buffers[0].size / (4));
++
++	if ((vdce_conf_chan->get_params.common_params.
++	     src_processing_mode == VDCE_INTERLACED)
++	    && (src_mode == VDCE_FRAME_MODE)) {
++		multiplier = 1;
++	}
++	/* offset would be horizontal luma size */
++	vdce_conf_chan->register_config[num_pass].vdce_src_add_ofst_ytop =
++	    src_pitch * multiplier;
++	/* offset configuration */
++	vdce_conf_chan->register_config[num_pass].vdce_src_add_ofst_ybot =
++	    src_pitch * multiplier;
++	vdce_conf_chan->register_config[num_pass].vdce_src_add_ofst_ctop =
++	    vdce_start->src_horz_pitch * multiplier;
++	vdce_conf_chan->register_config[num_pass].vdce_src_add_ofst_cbot =
++	    vdce_start->src_horz_pitch * multiplier;
++
++/* configure bottom field luma addreess is ytop + (no_of_lines*hpitch) */
++	multiplier = src_pitch;
++	if (src_mode == VDCE_FIELD_MODE) {
++		temp_lines = no_of_lines;
++		multiplier = 1;
++	}
++	/* offset would be horizontal luma size */
++	vdce_conf_chan->register_config[num_pass].vdce_src_strt_add_ybot =
++	    (vdce_conf_chan->register_config[num_pass].
++	     vdce_src_strt_add_ytop + (temp_lines * multiplier));
++
++	if (num_pass == 1 && (src_mode == VDCE_FIELD_MODE)) {
++		vdce_conf_chan->register_config[num_pass].
++		    vdce_src_strt_add_ybot = vdce_conf_chan->
++		    register_config[0].vdce_res_strt_add_ybot;
++	}
++	src_address = vdce_start->buffers[0].offset +
++	    (vdce_conf_chan->get_params.common_params.src_vsp_luminance *
++	     src_pitch);
++	if (num_pass != 1) {
++		src_address = (src_address + ((no_of_lines * 2)));
++	}
++	vdce_conf_chan->register_config[num_pass].vdce_src_strt_add_ctop =
++	    (src_address);
++
++	divider = GET_CHROMA_DIVIDE_FACTOR(vdce_conf_chan->image_type_in);
++	if (src_mode == VDCE_FRAME_MODE) {
++		vdce_conf_chan->register_config[num_pass].
++		    vdce_src_strt_add_cbot =
++		    (vdce_conf_chan->register_config[num_pass].
++		     vdce_src_strt_add_ctop + vdce_start->src_horz_pitch);
++	} else {
++		vdce_conf_chan->register_config[num_pass].
++		    vdce_src_strt_add_cbot =
++		    (vdce_conf_chan->register_config[num_pass].
++		     vdce_src_strt_add_ctop + ((temp_lines * 2 / divider)));
++	}
++	/* bitmap offset configuration is bitmap hsize */
++	vdce_conf_chan->register_config[num_pass].
++	    vdce_src_strt_off_bmp_top = vdce_start->bmp_pitch;
++
++	vdce_conf_chan->register_config[num_pass].
++	    vdce_src_strt_off_bmp_bot = vdce_start->bmp_pitch;
++	/* bitmap starting address is starting address for bitmap offset */
++	vdce_conf_chan->register_config[num_pass].
++	    vdce_src_strt_add_bmp_top = vdce_start->buffers[2].offset;
++
++	/* bitmap bottom field starting address */
++	vdce_conf_chan->register_config[num_pass].
++	    vdce_src_strt_add_bmp_bot =
++	    vdce_conf_chan->register_config[num_pass].
++	    vdce_src_strt_add_bmp_top +
++	    (vdce_conf_chan->get_params.common_params.bmp_vsize / 2);
++
++	/* result address for top field */
++	if (vdce_conf_chan->image_type_out == VDCE_IMAGE_FMT_420) {
++		vdce_start->buffers[1].size =
++		    (vdce_start->buffers[1].size * 4) / 3;
++	}
++	no_of_lines_output = (vdce_start->buffers[1].size / (2));
++
++	res_mode = vdce_conf_chan->get_params.common_params.res_mode;
++	if (vdce_conf_chan->num_pass == VDCE_MULTIPASS) {
++		if (num_pass == 0 && (vdce_conf_chan->luma_chroma_phased == 0)) {
++			if (vdce_conf_chan->mode_state ==
++			    VDCE_OPERATION_BLENDING) {
++				res_mode = vdce_conf_chan->
++				    get_params.common_params.src_mode;
++				address = vdce_start->buffers[0].offset;
++			}
++			flag = 1;
++		}
++	}
++	buffer_index = (flag == 1) ? 0 : 1;
++	res_pitch = vdce_start->res_horz_pitch;
++	if (buffer_index == 0) {
++		res_pitch = pitch;
++
++	}
++	if (vdce_conf_chan->num_pass != VDCE_MULTIPASS) {
++		address = vdce_start->buffers[buffer_index].offset;
++	}
++
++	/* top field luma address is the src starting address */
++	vdce_conf_chan->register_config[num_pass].vdce_res_strt_add_ytop =
++	    address +
++	    (vdce_conf_chan->get_params.common_params.res_vsp_luminance *
++	     vdce_start->res_horz_pitch);
++	if (vdce_conf_chan->get_params.common_params.res_mode ==
++	    VDCE_FIELD_MODE) {
++		res_vsp =
++		    vdce_conf_chan->get_params.common_params.
++		    res_vsp_luminance * vdce_start->res_horz_pitch;
++	}
++	multiplier = 1;
++	/* offset would be horizontal luma size */
++	if ((vdce_conf_chan->get_params.common_params.
++	     src_processing_mode == VDCE_INTERLACED)
++	    && (vdce_conf_chan->get_params.common_params.res_mode ==
++		VDCE_FRAME_MODE)) {
++		multiplier = 1;
++	}
++	vdce_conf_chan->register_config[num_pass].vdce_res_strt_off_ytop =
++	    res_pitch * multiplier;
++	/* offset configuration */
++	vdce_conf_chan->register_config[num_pass].vdce_res_strt_off_ybot =
++	    res_pitch * multiplier;
++	vdce_conf_chan->register_config[num_pass].vdce_res_strt_off_ctop =
++	    vdce_start->res_horz_pitch * multiplier;
++	vdce_conf_chan->register_config[num_pass].vdce_res_strt_off_cbot =
++	    vdce_start->res_horz_pitch * multiplier;
++
++	/* no of lines in horizonatl direction for top/bottom field data */
++	/* ie if v pitch is 48num_pass  than ytop will be of 24num_pass lines */
++	dev_dbg(vdce_device, "The number of lines are %d\n\n",
++		no_of_lines_output);
++
++	/* configure bottom field luma addreess */
++	if (res_mode == VDCE_FRAME_MODE) {
++		vdce_conf_chan->
++		    register_config[num_pass].vdce_res_strt_add_ybot =
++		    (vdce_conf_chan->register_config[num_pass].
++		     vdce_res_strt_add_ytop + res_pitch);
++	} else {
++
++		if ((vdce_conf_chan->num_pass == VDCE_MULTIPASS) &&
++		    (num_pass == 0)
++		    && (vdce_conf_chan->luma_chroma_phased == 0)) {
++			if (vdce_conf_chan->mode_state ==
++			    VDCE_OPERATION_BLENDING) {
++
++				vdce_conf_chan->register_config[num_pass].
++				    vdce_res_strt_add_ybot =
++				    vdce_conf_chan->
++				    register_config[num_pass].
++				    vdce_src_strt_add_ybot;
++			} else {
++				vdce_conf_chan->register_config[num_pass].
++				    vdce_res_strt_add_ybot =
++				    (vdce_conf_chan->
++				     register_config[num_pass].
++				     vdce_res_strt_add_ytop) + (res_size / 4);
++			}
++
++		} else {
++
++			vdce_conf_chan->
++			    register_config[num_pass].
++			    vdce_res_strt_add_ybot =
++			    (vdce_conf_chan->register_config[num_pass].
++			     vdce_res_strt_add_ytop +
++			     (((no_of_lines_output / 2))));
++		}
++	}
++	/* configure top field chroma addreess */
++	res_address = vdce_start->buffers[1].offset +
++	    (vdce_conf_chan->get_params.common_params.res_vsp_luminance *
++	     vdce_start->res_horz_pitch);
++	if (flag == 0) {
++		res_address = (res_address + (no_of_lines_output));
++	}
++	vdce_conf_chan->register_config[num_pass].vdce_res_strt_add_ctop =
++	    (res_address);
++
++	/* configuration of cbottom */
++	divider = GET_CHROMA_DIVIDE_FACTOR(vdce_conf_chan->image_type_out);
++	if (res_mode == VDCE_FRAME_MODE) {
++		vdce_conf_chan->
++		    register_config[num_pass].vdce_res_strt_add_cbot =
++		    (vdce_conf_chan->register_config[num_pass].
++		     vdce_res_strt_add_ctop + vdce_start->res_horz_pitch);
++	} else {
++		vdce_conf_chan->
++		    register_config[num_pass].vdce_res_strt_add_cbot =
++		    (vdce_conf_chan->register_config[num_pass].
++		     vdce_res_strt_add_ctop + ((no_of_lines_output / divider)));
++	}
++	dev_dbg(vdce_device, "<fn	>Leaving out of	set address </fn>\n");
++	/* configure top field chroma addreess */
++	return 0;
++}
++
++/*
++ * vdce_set_multipass_address :This function is process in 4:2:2 format for
++ * resizing and blending mode
++ */
++int vdce_set_multipass_address(vdce_address_start_t * vdce_start,
++			       channel_config_t * vdce_conf_chan)
++{
++
++	static unsigned int temp_address, temp_hsz_pitch;
++	int ret = 0;
++	int temp_size;
++	int divider = 2;
++	int req_size = 0;
++	unsigned int address = 0, pitch = 0, res_size = 0;
++	dev_dbg(vdce_device,
++		"<fn>vdce_set_multipass_address	Entering\n</fn>");
++	/* initially this first pass , so we have this flag as started */
++	/* take the offset and pitch into temporary variables */
++	req_size = (vdce_conf_chan->get_params.common_params.
++		    src_hsz_luminance *
++		    vdce_conf_chan->get_params.common_params.src_vsz_luminance);
++	if (device_config.inter_size < req_size) {
++		dev_err(vdce_device,
++			"intermediate buffer size is less than required\n");
++		return -EINVAL;
++	}
++	temp_address = vdce_start->buffers[1].offset;
++	address = vdce_start->buffers[1].offset;
++	if (vdce_conf_chan->mode_state == VDCE_OPERATION_BLENDING) {
++		pitch = vdce_start->src_horz_pitch;
++	} else {
++		pitch = vdce_start->res_horz_pitch;
++	}
++	temp_hsz_pitch = vdce_start->res_horz_pitch;
++	vdce_start->res_horz_pitch =
++	    (vdce_conf_chan->get_params.common_params.dst_hsz_luminance);
++	temp_size = vdce_start->buffers[1].size;
++	res_size = temp_size;
++
++	vdce_start->buffers[1].size = ((device_config.inter_size * 2));
++
++	/* Since first we have to do 4:2:2 to 4:2:0  */
++	/* assign in intermediate address to output address */
++	vdce_start->buffers[1].offset =
++	    virt_to_phys(((void *)device_config.inter_buffer));
++	/* change the output size */
++	vdce_conf_chan->register_config[0].res_Y_sz =
++	    ((vdce_conf_chan->get_params.common_params.
++	      dst_hsz_luminance << RES_Y_HSZ_SHIFT)
++	     & (RES_Y_HSZ_MASK));
++	if (vdce_conf_chan->get_params.common_params.src_processing_mode ==
++	    VDCE_INTERLACED) {
++		divider = 4;
++	}
++	vdce_conf_chan->register_config[0].res_C_sz |=
++	    ((vdce_conf_chan->get_params.common_params.dst_vsz_luminance /
++	      divider << RES_C_VSZ_SHIFT) & (RES_C_VSZ_MASK));
++	if (vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING) {
++		vdce_conf_chan->register_config[1].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[1].
++			   vdce_ctrl, SET_CHROMA_ENABLE);
++		vdce_conf_chan->register_config[1].vdce_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[1].
++			     vdce_ctrl, SET_LUMA_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[0].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[0].
++			   vdce_ctrl, SET_CHROMA_ENABLE);
++		vdce_conf_chan->register_config[0].vdce_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[0].
++			     vdce_ctrl, SET_LUMA_ENABLE);
++	}
++	/* assignning the address to the register configuration */
++	ret = vdce_set_address(vdce_start, vdce_conf_chan, 0,
++			       res_size, address, pitch);
++
++	/* second pass. configuration */
++	vdce_start->buffers[0].offset =
++	    virt_to_phys(((void *)device_config.inter_buffer));
++	/* configure input pitch */
++	vdce_start->src_horz_pitch =
++	    (vdce_conf_chan->get_params.common_params.dst_hsz_luminance);
++	vdce_start->buffers[0].size = ((device_config.inter_size * 2));
++	vdce_start->buffers[1].size = temp_size;
++	/*configure output pitch and address */
++	vdce_start->buffers[1].offset = temp_address;
++	vdce_start->res_horz_pitch = temp_hsz_pitch;
++
++	/* configure the addrress */
++	ret = vdce_set_address(vdce_start, vdce_conf_chan, 1,
++			       res_size, address, pitch);
++	/* configure input and output size */
++	vdce_conf_chan->register_config[1].src_Y_sz &= ~(SRC_Y_VSZ_MASK);
++	if (vdce_conf_chan->get_params.common_params.src_processing_mode ==
++	    VDCE_INTERLACED) {
++		divider = 2;
++	} else {
++		divider = 1;
++	}
++
++	vdce_conf_chan->register_config[0].res_Y_sz |=
++	    ((vdce_conf_chan->get_params.common_params.
++	      dst_vsz_luminance / divider << RES_Y_VSZ_SHIFT)
++	     & (RES_Y_VSZ_MASK));
++
++	vdce_conf_chan->register_config[1].src_Y_sz =
++	    ((vdce_conf_chan->get_params.common_params.dst_hsz_luminance
++	      << SRC_Y_HSZ_SHIFT) & (SRC_Y_HSZ_MASK));
++
++	vdce_conf_chan->register_config[1].src_C_sz =
++	    ((vdce_conf_chan->get_params.common_params.
++	      dst_hsz_luminance << SRC_C_HSZ_SHIFT) & (SRC_C_HSZ_MASK));
++
++	vdce_conf_chan->register_config[1].res_Y_sz |=
++	    ((vdce_conf_chan->get_params.common_params.
++	      dst_hsz_luminance << RES_Y_HSZ_SHIFT)
++	     & (RES_Y_HSZ_MASK));
++
++	if (vdce_conf_chan->get_params.common_params.src_processing_mode
++	    == VDCE_INTERLACED) {
++
++		vdce_conf_chan->register_config[1].res_Y_sz |=
++		    (((vdce_conf_chan->get_params.common_params.
++		       dst_vsz_luminance / 2) << RES_Y_VSZ_SHIFT) &
++		     (RES_Y_VSZ_MASK));
++		vdce_conf_chan->register_config[1].src_Y_sz |=
++		    ((vdce_conf_chan->get_params.common_params.
++		      dst_vsz_luminance / 2 << SRC_Y_VSZ_SHIFT) &
++		     (SRC_Y_VSZ_MASK));
++		vdce_conf_chan->register_config[1].src_C_sz |=
++		    ((vdce_conf_chan->get_params.common_params.
++		      dst_vsz_luminance / 4 << SRC_C_VSZ_SHIFT) &
++		     (SRC_C_VSZ_MASK));
++	} else {
++		vdce_conf_chan->register_config[1].res_Y_sz |=
++		    ((vdce_conf_chan->get_params.common_params.
++		      dst_vsz_luminance << RES_Y_VSZ_SHIFT) & (RES_Y_VSZ_MASK));
++		vdce_conf_chan->register_config[1].src_Y_sz |=
++		    ((vdce_conf_chan->get_params.common_params.
++		      dst_vsz_luminance << SRC_Y_VSZ_SHIFT) & (SRC_Y_VSZ_MASK));
++		vdce_conf_chan->register_config[1].src_C_sz |=
++		    ((vdce_conf_chan->get_params.common_params.
++		      dst_vsz_luminance / 2 << SRC_C_VSZ_SHIFT) &
++		     (SRC_C_VSZ_MASK));
++	}
++	/* function to enable hardware */
++	dev_dbg(vdce_device,
++		"<fn>vdce_set_multipass_address	Leaving\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_start : This function enable the resize bit after doing
++ * the hardware register configuration after which resizing
++ * will be carried on.
++ */
++int vdce_start(vdce_address_start_t * vdce_start,
++	       channel_config_t * vdce_conf_chan)
++{
++	/* holds the return value; */
++	int ret = 0;
++	/* conatains the input put and output buffer allocated size */
++	int bufsize[3];
++	int divider_in, divider_out, blend_enable, i;
++	int dst_hsz_luma = 0, dst_vsz_luma = 0;
++	int ccnt = 1;
++	unsigned int edma_operation = 0, ccv_only = 0, luma_status = 0;
++	if (vdce_conf_chan->status == VDCE_CHAN_BUSY) {
++		dev_err(vdce_device, "Channel is busy.Try after some time \n");
++		return -EINVAL;
++	}
++	/* checking the configuartion status */
++	if (vdce_conf_chan->status == VDCE_CHAN_FREE) {
++		vdce_conf_chan->status = VDCE_CHAN_PARAMS_INITIALISED;
++	}
++	if (vdce_conf_chan->status != VDCE_CHAN_PARAMS_INITIALISED) {
++		dev_err(vdce_device, "State not configured \n");
++		return -EINVAL;
++	}
++	/* channel status is FREE */
++	vdce_conf_chan->status = VDCE_CHAN_FREE;
++
++	/* check tht hpitch and vpitch should be greater or equal
++	   than hsize and vsize */
++	if (vdce_start->src_horz_pitch <
++	    vdce_conf_chan->get_params.common_params.src_hsz_luminance) {
++		dev_err(vdce_device, "src horizontal pitch less than width \n");
++		return -EINVAL;
++	}
++	if (vdce_start->res_horz_pitch
++	    < vdce_conf_chan->get_params.common_params.dst_hsz_luminance) {
++		dev_err(vdce_device, "horizontal pitch less than width \n");
++		return -EINVAL;
++	}
++	divider_in = GET_DIVIDE_FACTOR(vdce_conf_chan->image_type_in);
++	divider_out = GET_DIVIDE_FACTOR(vdce_conf_chan->image_type_out);
++	/* check for the 8byte alignment for input address of
++	   ytop,ybot,ctop and cbot in both image format */
++
++	/* get the buffer size */
++	bufsize[VDCE_BUF_IN] =
++	    (vdce_start->src_horz_pitch *
++	     (vdce_conf_chan->get_params.common_params.src_vsz_luminance *
++	      divider_in / 2));
++	bufsize[VDCE_BUF_OUT] =
++	    (vdce_start->res_horz_pitch *
++	     (vdce_conf_chan->get_params.common_params.dst_vsz_luminance *
++	      divider_out) / 2);
++	if ((vdce_start->res_horz_pitch) % 0x8 != 0) {
++		dev_err(vdce_device, " invalid resultant pitch offset \n");
++		return -EINVAL;
++	}
++	if ((vdce_start->src_horz_pitch) % 0x8 != 0) {
++		dev_err(vdce_device, " invalid source  pitch offset \n");
++		return -EINVAL;
++	}
++	bufsize[VDCE_BUF_BMP] =
++	    (vdce_conf_chan->get_params.common_params.bmp_hsize *
++	     vdce_conf_chan->get_params.common_params.bmp_vsize) / 4;
++	blend_enable =
++	    BITGET(vdce_conf_chan->register_config[0].vdce_ctrl,
++		   SET_BLEND_ENABLE);
++	blend_enable |=
++	    BITGET(vdce_conf_chan->register_config[1].vdce_ctrl,
++		   SET_BLEND_ENABLE);
++	for (i = VDCE_BUF_IN; i <= VDCE_BUF_BMP; i++) {
++		if (i == VDCE_BUF_BMP && blend_enable != 1) {
++			continue;
++		}		/* user pointer case */
++		if (vdce_start->buffers[i].index < 0) {
++			/* assignning the address to the register conf  */
++			if (vdce_start->buffers[i].size < bufsize[i]) {
++				dev_err(vdce_device, " invalid size \n");
++				return -EINVAL;
++			}
++			if ((void *)vdce_start->buffers[i].virt_ptr == NULL) {
++				dev_err(vdce_device, " Address is NULL \n");
++				return -EINVAL;
++			}
++			/* user virtual pointer to physical address */
++			vdce_start->buffers[i].offset =
++			    vdce_uservirt_to_phys(vdce_start->buffers[i].
++						  virt_ptr /*offset */ );
++		} else {
++			/*checking the index requested */
++			if ((vdce_start->buffers[i].index)
++			    > ((vdce_conf_chan->vdce_buffer[i].
++				num_allocated - 1))) {
++				dev_err(vdce_device,
++					"Requested buffer not allocatedn");
++				return -EINVAL;
++			}
++			vdce_start->buffers[i].offset = virt_to_phys(((void *)
++								      vdce_conf_chan->vdce_buffer[i].
++								      buffers
++								      [vdce_start->
++								       buffers
++								       [i].
++								       index]));
++			vdce_start->buffers[i].size =
++			    vdce_conf_chan->vdce_buffer[i].size;
++		}
++		/* check alignment for ytop */
++		if (vdce_start->buffers[i].offset % 0x8 != 0) {
++			dev_err(vdce_device, "Address not 8 byte aligned \n");
++			return -EINVAL;
++		}
++	}
++	if (blend_enable) {
++		if ((vdce_start->bmp_pitch * 4) <
++		    vdce_conf_chan->get_params.common_params.bmp_hsize) {
++			dev_err(vdce_device, "bmp pitch less than width \n");
++			return -EINVAL;
++		}
++		if (vdce_start->bmp_pitch % 0x8 != 0) {
++			dev_err(vdce_device, " bmp pitch not aligned \n");
++			return -EINVAL;
++		}
++	}
++	/* check for the 8byte alignment for output address of
++	   ytop,ybot,ctop and cbot in both image format */
++	if ((((vdce_start->buffers[0].size) / 4) % 0x8) != 0) {
++		dev_err(vdce_device, " invalid src address  \n");
++		return -EINVAL;
++	}
++	if (((vdce_start->buffers[1].size) / 4) % 0x8) {
++		dev_err(vdce_device, " invalid resultant address \n");
++		return -EINVAL;
++	}
++
++	if ((vdce_conf_chan->num_pass == VDCE_MULTIPASS) &&
++	    (vdce_conf_chan->luma_chroma_phased == 0)) {
++		ret = vdce_set_multipass_address(vdce_start, vdce_conf_chan);
++		if (ret < 0) {
++			return -EINVAL;
++		}
++	} else {
++		/* assignning the address to the register configuration */
++		ret = vdce_set_address(vdce_start, vdce_conf_chan, 0, 0, 0, 0);
++
++		if (vdce_conf_chan->luma_chroma_phased == 1) {
++			memcpy(&vdce_conf_chan->register_config[1],
++			       &vdce_conf_chan->register_config[0],
++			       sizeof(struct vdce_hw_config));
++			vdce_conf_chan->register_config[0].vdce_ctrl =
++			    BITRESET(vdce_conf_chan->register_config[0].
++				     vdce_ctrl, SET_CHROMA_ENABLE);
++			vdce_conf_chan->register_config[1].vdce_ctrl =
++			    BITRESET(vdce_conf_chan->register_config[1].
++				     vdce_ctrl, SET_LUMA_ENABLE);
++		}
++	}
++	/* Channel is busy */
++	vdce_conf_chan->status = VDCE_CHAN_PENDING;
++	/* function call to add the entry of application in array */
++	ret = add_to_array(vdce_conf_chan);
++
++	/* If non-blocking case than return */
++	if (ret == -1 && vdce_conf_chan->channel_mode == VDCE_MODE_NON_BLOCKING) {
++		return 0;
++	}
++	vdce_conf_chan->status = VDCE_CHAN_BUSY;
++	/* start the process */
++	vdce_conf_chan->vdce_complete = VDCE_PASS1_STARTED;
++	if (vdce_conf_chan->mode_state ==
++	    VDCE_OPERATION_CHROMINANCE_CONVERSION ||
++	    vdce_conf_chan->mode_state == VDCE_OPERATION_PRE_CODECMODE ||
++	    vdce_conf_chan->mode_state == VDCE_OPERATION_POST_CODECMODE ||
++	    vdce_conf_chan->mode_state == VDCE_OPERATION_TRANS_CODECMODE) {
++		edma_operation = 1;
++
++		luma_status = vdce_conf_chan->register_config[0].vdce_ctrl;
++		if ((luma_status & 0x6) == 0x6) {
++			edma_operation = 1;
++		} else {
++			edma_operation = 0;
++		}
++		if ((vdce_conf_chan->get_params.common_params.src_mode !=
++		     vdce_conf_chan->get_params.common_params.res_mode)) {
++			edma_operation = 0;
++		}
++		ccv_only = vdce_conf_chan->register_config[0].vdce_ctrl;
++		if (ccv_only & 0xb00) {
++			edma_operation = 0;
++		}
++		if (edma_operation == 1) {
++			vdce_conf_chan->register_config[0].vdce_ctrl =
++			    BITRESET(vdce_conf_chan->register_config[0].
++				     vdce_ctrl, SET_LUMA_ENABLE);
++		}
++	}
++	vdce_hw_setup(&vdce_conf_chan->register_config[0]);
++	enable_irq(VDCE_INTERRUPT);
++	/*function call to enable ge hardware */
++	ret = vdce_enable(&vdce_conf_chan->register_config[0]);
++
++	if (edma_operation == 1) {
++		dst_hsz_luma = vdce_conf_chan->
++		    get_params.common_params.dst_hsz_luminance;
++
++		dst_vsz_luma = vdce_conf_chan->
++		    get_params.common_params.dst_vsz_luminance;
++		if (vdce_conf_chan->get_params.common_params.src_mode ==
++		    VDCE_FIELD_MODE) {
++			ccnt = 2;
++			dst_vsz_luma = dst_vsz_luma / 2;
++		}
++		ret = edma3_memcpy(dst_hsz_luma, dst_vsz_luma,
++				   ccnt, vdce_start);
++		vdce_conf_chan->register_config[0].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[0].
++			   vdce_ctrl, SET_LUMA_ENABLE);
++	}
++
++	/* waiting for processing to be complete */
++	if (vdce_conf_chan->channel_mode != VDCE_MODE_NON_BLOCKING) {
++		wait_for_completion_interruptible(&(device_config.sem_isr));
++		vdce_conf_chan->status = VDCE_CHAN_FREE;
++
++	}
++	dev_dbg(vdce_device, "<fn> vdce_start L</fn>\n");
++	return ret;
++}
++
++/*
++ * add_to_array : Function to add the current channel configuration
++ * into array according to priority.
++ */
++int add_to_array(channel_config_t * vdce_conf_chan)
++{
++	int array_index, device_index;
++	dev_dbg(vdce_device, "<fn> add_to_array E</fn>\n");
++
++	/* locking the configuartion aaray */
++	down(&device_config.array_sem);
++	/* add configuration to the     queue according to its priority */
++	if (device_config.array_count == EMPTY) {
++		/* if array empty insert at top position */
++		dev_dbg(vdce_device, "First request for resizing \n");
++		device_config.channel_configuration[device_config.array_count]
++		    = vdce_conf_chan;
++	} else {
++		/* check the priority and insert according to the priority */
++		/* it will start from first     index */
++		for (array_index = SECONDENTRY;
++		     array_index < device_config.array_count; array_index++) {
++			if (device_config.
++			    channel_configuration[array_index]->priority <
++			    vdce_conf_chan->priority)
++				break;
++		}
++		/* shift all the elements one step down in array */
++		/* iF firstelement and second have same prioroty than insert */
++		/* below first */
++		for (device_index = device_config.array_count;
++		     device_index > array_index; device_index--) {
++			device_config.channel_configuration[device_index] =
++			    device_config.
++			    channel_configuration[device_index - 1];
++		}
++
++		device_config.channel_configuration[array_index] =
++		    vdce_conf_chan;
++	}
++	/* incrementing number of requests for VDCE */
++	device_config.array_count++;
++	dev_dbg(vdce_device, "The total request for resizing are %d",
++		device_config.array_count);
++	if (device_config.array_count != SECONDENTRY) {
++
++		up(&device_config.array_sem);
++		/* if non-blocking return than channel in use */
++		if (vdce_conf_chan->channel_mode == VDCE_MODE_NON_BLOCKING) {
++			return -1;
++		} else {
++			/* if the request is pending that lock the request */
++			wait_for_completion_interruptible
++			    (&(vdce_conf_chan->channel_sem));
++		}
++	} else {
++		up(&device_config.array_sem);
++	}
++	dev_dbg(vdce_device, "<fn> add_to_array L</fn>\n");
++	return 0;
++}
++
++/*
++ * delete_from_array : Function to delete the processed array entry
++ * form the array
++ */
++int delete_from_array()
++{
++	int array_index = FIRSTENTRY, device_index;
++	channel_config_t *vdce_conf_chan;
++
++	dev_dbg(vdce_device, "<fn> delete_from_array E</fn>\n");
++	/*shift the     entried in array */
++	if (device_config.array_count != SECONDENTRY) {
++		/* decrementing the     request count */
++		device_config.array_count--;
++		/* shift all the elements one step up in array */
++		for (device_index = array_index;
++		     device_index < device_config.array_count; device_index++) {
++
++			device_config.channel_configuration[device_index] =
++			    device_config.
++			    channel_configuration[device_index + 1];
++		}
++		/* making last entry NULL; */
++		device_config.channel_configuration[device_index + 1] = NULL;
++	} else {
++		/* remove the top entry */
++		dev_dbg(vdce_device, "\n Removing	the first request");
++		device_config.array_count--;
++		device_config.channel_configuration[FIRSTENTRY] = NULL;
++	}
++	if (device_config.array_count != FIRSTENTRY) {
++		/* get config having highest priority in array
++		   vdce_device.config
++		   and unlock config.sem of that config */
++		dev_dbg(vdce_device,
++			"Releasing array lock of the second entry\n");
++
++		vdce_conf_chan =
++		    (device_config.channel_configuration[FIRSTENTRY]);
++		/* non-blocking indicatind the first entry is nonblocking */
++		if ((vdce_conf_chan->channel_mode) == VDCE_MODE_NON_BLOCKING) {
++			return -1;
++		} else {
++			complete(&(device_config.channel_configuration
++				   [FIRSTENTRY]->channel_sem));
++		}
++	} else {
++		dev_dbg(vdce_device, "Releasing array lock \n");
++	}
++	dev_dbg(vdce_device, "<fn> delete_from_array L</fn>\n");
++	return 0;
++}
++
++/*
++ * vdce_check_global_params : Function to check the error conditions
++ */
++int vdce_check_common_params(vdce_params_t * params)
++{
++	int ret = 0;
++	int hrsz_mag = 0, vrsz_mag = 0;
++	int i = 0, prcs = 0;
++	dev_dbg(vdce_device, "<fn>vdce_check_global_params E</fn>\n");
++	/* Checking the validity of various enums */
++	ret = CHECK_MODE_RANGE(params->vdce_mode, VDCE_OPERATION_BLENDING);
++	if (ret) {
++		dev_err(vdce_device, "Invalid mode\n");
++		return -EINVAL;
++	}
++	/* checking validity for precodec params */
++	if (params->vdce_mode == VDCE_OPERATION_POST_CODECMODE ||
++	    params->vdce_mode == VDCE_OPERATION_TRANS_CODECMODE) {
++		/* checking validity for postcodec params */
++		if ((params->modes_control & RSZ_ENABLE_MASK) ==
++		    (RSZ_ENABLE_MASK)
++		    && (params->modes_control & BLEND_ENABLE_MASK) ==
++		    (BLEND_ENABLE_MASK)) {
++			dev_err(vdce_device,
++				"Cannot	enable due to Hardware limitation \n");
++			return -EINVAL;
++
++		}
++	}
++	/* if resizing than check for resize ratio */
++	if ((params->vdce_mode == VDCE_OPERATION_RESIZING) ||
++	    ((params->vdce_mode == VDCE_OPERATION_PRE_CODECMODE) &&
++	     ((params->modes_control & RSZ_ENABLE_MASK) == (RSZ_ENABLE_MASK)))
++	    || ((params->vdce_mode == VDCE_OPERATION_POST_CODECMODE)
++		&& ((params->modes_control & RSZ_ENABLE_MASK) ==
++		    (RSZ_ENABLE_MASK)))
++	    || ((params->vdce_mode == VDCE_OPERATION_TRANS_CODECMODE)
++		&& ((params->modes_control & RSZ_ENABLE_MASK) ==
++		    (RSZ_ENABLE_MASK)))) {
++		hrsz_mag =
++		    (params->common_params.src_hsz_luminance * 256) /
++		    (params->common_params.dst_hsz_luminance);
++		vrsz_mag =
++		    (params->common_params.src_vsz_luminance * 256) /
++		    (params->common_params.dst_vsz_luminance);
++		/* checking horizontal phase */
++		if ((hrsz_mag < MIN_RSZ_MAG_RATIO) ||
++		    (hrsz_mag > MAX_RSZ_MAG_RATIO)) {
++			dev_err(vdce_device, "Invalid Horizontal ratio \n");
++			ret = -EINVAL;
++		}
++		/* checking vertical phase */
++		if ((vrsz_mag < MIN_RSZ_MAG_RATIO)
++		    || (vrsz_mag > MAX_RSZ_MAG_RATIO)) {
++			dev_err(vdce_device, "Invalid Vertical ratio \n");
++			ret = -EINVAL;
++		}
++	}
++	if ((params->vdce_mode == VDCE_OPERATION_RESIZING) &&
++	    (params->vdce_mode_params.rsz_params.
++	     rsz_op_mode == VDCE_CODECMODE_MPEG1)) {
++		dev_err(vdce_device,
++			" This facility not supported due to hardware \n\n");
++	}
++	if (params->common_params.prcs_unit_value == 0) {
++		prcs = hrsz_mag / 256;
++		for (i = 4; i >= 0; i--) {
++			if ((prcs_array_value[i] * prcs + 9) <= 256) {
++				break;
++			}
++		}
++		if (i < 0) {
++			i = 0;
++		}
++		prcs = prcs_array_value[i];
++	} else {
++		prcs = params->common_params.prcs_unit_value;
++	}
++	if (prcs > 256) {
++		return -EINVAL;
++	}
++	if (params->vdce_mode == VDCE_OPERATION_EDGE_PADDING) {
++		if ((params->vdce_mode_params.epad_params.hext_luma > prcs)
++		    || (params->vdce_mode_params.epad_params.hext_chroma >
++			prcs))
++			return -EINVAL;
++	}
++	if (params->common_params.src_processing_mode == VDCE_PROGRESSIVE) {
++		if ((params->common_params.src_mode == VDCE_FIELD_MODE) ||
++		    (params->common_params.res_mode == VDCE_FIELD_MODE)) {
++			dev_err(vdce_device, "Invalid Mode ratio \n");
++			return -EINVAL;
++		}
++	}
++	if (ret) {
++		dev_dbg(vdce_device, "Inavlid return \n");
++		return -EINVAL;
++	} else {
++		return 0;
++	}
++	dev_dbg(vdce_device, "<fn>vdce_check_global_params L</fn>\n");
++}
++
++/*
++ * vdce_set_size_fmt : Setting resizing parameters .
++ */
++int vdce_set_size_fmt(vdce_common_params_t * params,
++		      channel_config_t * vdce_conf_chan, int num_pass)
++{
++	int ret = 0;
++	int mode;
++	int prcs_nvalue = 0, i = 0;
++	int prcs = 0;
++	vdce_image_fmt_t src_image_type, divider = 1;
++	dev_dbg(vdce_device, "<fn>vdce_set_size_fmt	E</fn>\n");
++	/* setting luminance processing enable bit */
++	if (params->proc_control == VDCE_LUMA_ENABLE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_LUMA_ENABLE);
++	} else if (params->proc_control == VDCE_CHROMA_ENABLE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_CHROMA_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_CHROMA_ENABLE);
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_LUMA_ENABLE);
++	}
++
++	/* setting input horizontal alf enable */
++	if (params->field_status == VDCE_TOP_ENABLE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_TOP_ENABLE);
++	} else if (params->field_status == VDCE_BOTTOM_ENABLE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_BOT_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_BOT_ENABLE);
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_TOP_ENABLE);
++	}
++	/* setting src i/o mode */
++	if (params->src_mode == VDCE_FRAME_MODE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_SRC_MODE);
++	} else {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[num_pass].
++			     vdce_ctrl, SET_SRC_MODE);
++	}
++	/* setting res i/o mode */
++	if (params->res_mode == VDCE_FRAME_MODE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_RES_MODE);
++	} else {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[num_pass].
++			     vdce_ctrl, SET_RES_MODE);
++	}
++	if (num_pass == 1 &&
++	    (vdce_conf_chan->mode_state != VDCE_OPERATION_RESIZING)) {
++		if (params->src_mode == VDCE_FRAME_MODE) {
++			vdce_conf_chan->register_config[0].vdce_ctrl =
++			    BITSET(vdce_conf_chan->register_config[0].
++				   vdce_ctrl, SET_RES_MODE);
++		} else {
++
++			vdce_conf_chan->register_config[0].vdce_ctrl =
++			    BITRESET(vdce_conf_chan->register_config[0].
++				     vdce_ctrl, SET_RES_MODE);
++		}
++	}
++	if (num_pass == 1 &&
++	    (vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING)) {
++		if (params->res_mode == VDCE_FRAME_MODE) {
++			vdce_conf_chan->register_config[1].vdce_ctrl =
++			    BITSET(vdce_conf_chan->register_config[1].
++				   vdce_ctrl, SET_SRC_MODE);
++		} else {
++
++			vdce_conf_chan->register_config[1].vdce_ctrl =
++			    BITRESET(vdce_conf_chan->register_config[1].
++				     vdce_ctrl, SET_SRC_MODE);
++		}
++	}
++	/* setting bmp i/o mode */
++	if (params->src_bmp_mode == VDCE_FRAME_MODE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_BMP_MODE);
++	} else {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[num_pass].
++			     vdce_ctrl, SET_BMP_MODE);
++	}
++	/* setting bmp i/o mode */
++	if (params->src_processing_mode == VDCE_PROGRESSIVE) {
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITSET(vdce_conf_chan->register_config[num_pass].
++			   vdce_ctrl, SET_PRO_MODE);
++	} else {
++		/* atleat top field or bottom field should be configured for
++		   interlaced */
++		vdce_conf_chan->register_config[num_pass].vdce_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[num_pass].
++			     vdce_ctrl, SET_PRO_MODE);
++	}
++	vdce_conf_chan->register_config[num_pass].vdce_req_sz =
++	    vdce_conf_chan->register_config[num_pass].
++	    vdce_req_sz & ~(VDCE_REQ_SZ_MASK);
++
++	vdce_conf_chan->register_config[num_pass].vdce_req_sz =
++	    (vdce_conf_chan->register_config[num_pass].vdce_req_sz |
++	     ((256) << VDCE_REQ_SZ_SHIFT));
++
++	if (params->prcs_unit_value == 0) {
++		prcs_nvalue =
++		    (params->src_hsz_luminance / (params->dst_hsz_luminance));
++		for (i = 4; i >= 0; i--) {
++			if ((prcs_array_value[i] * prcs_nvalue + 9) <= 256) {
++				break;
++			}
++		}
++		if (i < 0) {
++			i = 0;
++		}
++		prcs = prcs_array_value[i];
++	} else {
++		prcs = params->prcs_unit_value;
++	}
++	vdce_conf_chan->register_config[num_pass].vdce_prcs_unit_size =
++	    prcs & (VDCE_PRCS_UNIT_SIZE_MASK);
++
++	/* Configuration of luma size */
++	vdce_conf_chan->register_config[num_pass].src_Y_sz |=
++	    ((params->src_hsz_luminance << SRC_Y_HSZ_SHIFT) & (SRC_Y_HSZ_MASK));
++
++	if (params->src_processing_mode == VDCE_INTERLACED) {
++
++		vdce_conf_chan->register_config[num_pass].src_Y_sz |=
++		    ((params->
++		      src_vsz_luminance /
++		      2 << SRC_Y_VSZ_SHIFT) & (SRC_Y_VSZ_MASK));
++	} else {
++		vdce_conf_chan->register_config[num_pass].src_Y_sz |=
++		    ((params->
++		      src_vsz_luminance << SRC_Y_VSZ_SHIFT) & (SRC_Y_VSZ_MASK));
++	}
++
++	vdce_conf_chan->register_config[num_pass].res_Y_sz |=
++	    ((params->dst_hsz_luminance << RES_Y_HSZ_SHIFT) & (RES_Y_HSZ_MASK));
++
++	if (params->src_processing_mode == VDCE_INTERLACED) {
++		vdce_conf_chan->register_config[num_pass].res_Y_sz |=
++		    ((params->
++		      dst_vsz_luminance /
++		      2 << RES_Y_VSZ_SHIFT) & (RES_Y_VSZ_MASK));
++	} else {
++		vdce_conf_chan->register_config[num_pass].res_Y_sz |=
++		    ((params->
++		      dst_vsz_luminance << RES_Y_VSZ_SHIFT) & (RES_Y_VSZ_MASK));
++	}
++	/* Configuration of chroma size */
++	mode = ((vdce_conf_chan->register_config[num_pass].vdce_ctrl
++		 & VDCE_MODE_MASK) >> VDCE_MODE_SHIFT);
++
++	if ((vdce_conf_chan->mode_state == VDCE_OPERATION_PRE_CODECMODE) ||
++	    ((vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING) &&
++	     (mode == MODE_PRECODEC)) ||
++	    ((vdce_conf_chan->mode_state ==
++	      VDCE_OPERATION_CHROMINANCE_CONVERSION) &&
++	     (mode == MODE_PRECODEC)) || (mode == MODE_PRECODEC) ||
++	    (vdce_conf_chan->mode_state == VDCE_OPERATION_EDGE_PADDING)) {
++		src_image_type = VDCE_IMAGE_FMT_422;
++
++	} else {
++		src_image_type = VDCE_IMAGE_FMT_420;
++	}
++	/* mode is 420 so chroma value is reduced by 2 */
++	divider = (params->src_processing_mode == VDCE_INTERLACED) ? 4 : 2;
++	if (src_image_type == VDCE_IMAGE_FMT_420) {
++		divider = (params->
++			   src_processing_mode == VDCE_INTERLACED) ? 4 : 2;
++		vdce_conf_chan->register_config[num_pass].src_C_sz |=
++		    ((params->src_vsz_luminance / divider << SRC_C_VSZ_SHIFT)
++		     & (SRC_C_VSZ_MASK));
++	} else if (src_image_type == VDCE_IMAGE_FMT_422) {
++		divider = (params->
++			   src_processing_mode == VDCE_INTERLACED) ? 2 : 1;
++		vdce_conf_chan->register_config[num_pass].src_C_sz |=
++		    vdce_conf_chan->register_config[num_pass].src_C_sz |=
++		    ((params->src_vsz_luminance / divider << SRC_C_VSZ_SHIFT)
++		     & (SRC_C_VSZ_MASK));
++
++	} else {
++		return -EINVAL;
++	}
++
++	vdce_conf_chan->register_config[num_pass].src_C_sz |=
++	    ((params->src_hsz_luminance << SRC_C_HSZ_SHIFT) & (SRC_C_HSZ_MASK));
++
++	vdce_conf_chan->register_config[num_pass].res_C_sz |=
++	    ((params->dst_hsz_luminance << RES_C_HSZ_SHIFT) & (RES_C_HSZ_MASK));
++	if ((vdce_conf_chan->mode_state == VDCE_OPERATION_PRE_CODECMODE) ||
++	    (mode == MODE_TRANSCODEC) || (mode == MODE_PRECODEC)) {
++
++		divider = (params->
++			   src_processing_mode == VDCE_INTERLACED) ? 4 : 2;
++
++	} else {
++		divider = (params->
++			   src_processing_mode == VDCE_INTERLACED) ? 2 : 1;
++	}
++	vdce_conf_chan->register_config[num_pass].res_C_sz |=
++	    ((params->
++	      dst_vsz_luminance /
++	      divider << RES_C_VSZ_SHIFT) & (RES_C_VSZ_MASK));
++	/* Configuration of bitmap size */
++	divider = (params->src_processing_mode == VDCE_INTERLACED) ? 2 : 1;
++	vdce_conf_chan->register_config[num_pass].src_bmp_sz |=
++	    ((params->bmp_hsize << SRC_BMP_HSZ_SHIFT) & (SRC_BMP_HSZ_MASK));
++
++	vdce_conf_chan->register_config[num_pass].src_bmp_sz |=
++	    ((params->
++	      bmp_vsize / divider << SRC_BMP_VSZ_SHIFT) & (SRC_BMP_VSZ_MASK));
++
++	/* configuration for starting position */
++	vdce_conf_chan->register_config[num_pass].src_Y_strt_ps =
++	    params->src_hsp_luminance;
++	vdce_conf_chan->register_config[num_pass].src_C_strt_ps =
++	    params->src_hsp_luminance;
++	vdce_conf_chan->register_config[num_pass].res_Y_strt_ps =
++	    params->res_hsp_luminance;
++
++	vdce_conf_chan->register_config[num_pass].src_bmp_strt_ps |=
++	    ((params->bmp_hsp_bitmap) & (SRC_BMP_STRT_HPS_MASK));
++
++	vdce_conf_chan->register_config[num_pass].res_bmp_strt_ps |=
++	    ((params->res_hsp_bitmap) & (SRC_BMP_HSZ_MASK));
++
++	vdce_conf_chan->register_config[num_pass].res_bmp_strt_ps |=
++	    ((params->res_vsp_bitmap << RES_BMP_STRT_VPS_SHIFT)
++	     & (RES_BMP_STRT_VPS_MASK));
++	/* hardcoding the image format as raster scanning */
++	vdce_conf_chan->register_config[num_pass].vdce_sdr_fmt =
++	    VDCE_RASTER_SCANNING;
++
++	dev_dbg(vdce_device, "<fn>vdce_set_size_fmt	L\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_set_rmapparams : Setting range mapping parameters.
++ */
++int vdce_set_rmapparams(vdce_rmap_params_t * params,
++			channel_config_t * vdce_conf_chan, int index)
++{
++	int ret = 0;
++	dev_dbg(vdce_device, "<fn>vdce_set_rmmaparams E\n</fn>");
++	dev_dbg(vdce_device, "The	value s	%d\n", params->coeff_y);
++	if (params->rmap_yenable == VDCE_FEATURE_ENABLE) {
++		vdce_conf_chan->register_config[index].rgmp_ctrl =
++		    BITSET(vdce_conf_chan->register_config[index].
++			   rgmp_ctrl, SET_RMAP_YENABLE);
++
++		dev_dbg(vdce_device, "Entering and setting value \n");
++		vdce_conf_chan->register_config[index].rgmp_ctrl |=
++		    ((params->coeff_y) << RANGE_MAP_Y_SHIFT) & RANGE_MAP_Y_MASK;
++
++	} else {
++		vdce_conf_chan->register_config[index].rgmp_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rgmp_ctrl, SET_RMAP_YENABLE);
++	}
++	if (params->rmap_cenable == VDCE_FEATURE_ENABLE) {
++		vdce_conf_chan->register_config[index].rgmp_ctrl =
++		    BITSET(vdce_conf_chan->register_config[index].
++			   rgmp_ctrl, SET_RMAP_CENABLE);
++
++		vdce_conf_chan->register_config[index].rgmp_ctrl |=
++		    ((params->
++		      coeff_c) << (RANGE_MAP_C_SHIFT)) & RANGE_MAP_C_MASK;
++	} else {
++		vdce_conf_chan->register_config[index].rgmp_ctrl =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rgmp_ctrl, SET_RMAP_CENABLE);
++	}
++	vdce_conf_chan->register_config[index].vdce_ctrl =
++	    BITSET(vdce_conf_chan->register_config[index].vdce_ctrl,
++		   SET_RMAP_ENABLE);
++	dev_dbg(vdce_device, "<fn>vdce_set_rmapparams L\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_set_rszparams : Setting resizing parameters .
++ */
++int vdce_set_rszparams(vdce_params_t * params,
++		       channel_config_t * vdce_conf_chan,
++		       vdce_mode_operation_t mode, int index)
++{
++	int ret = 0;
++	vdce_rsz_params_t rsz_params;
++	int hrsz_mag, vrsz_mag;
++	if (mode == VDCE_OPERATION_PRE_CODECMODE) {
++		rsz_params =
++		    (params->vdce_mode_params.precodec_params.rsz_params);
++	} else if (mode == VDCE_OPERATION_POST_CODECMODE) {
++		rsz_params =
++		    (params->vdce_mode_params.postcodec_params.rsz_params);
++	} else if (mode == VDCE_OPERATION_TRANS_CODECMODE) {
++		rsz_params =
++		    (params->vdce_mode_params.transcodec_params.rsz_params);
++	} else if (mode == VDCE_OPERATION_RESIZING) {
++		rsz_params = (params->vdce_mode_params.rsz_params);
++	}
++
++	dev_dbg(vdce_device, "<fn>vdce_set_rszparams E\n</fn>");
++	/* setting input horizontal alf enable */
++	if (rsz_params.hrsz_alf_enable == VDCE_FEATURE_ENABLE) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_HRSZ_ALF_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_HRSZ_ALF_ENABLE);
++	}
++	/* setting input vertical alf format */
++	if (rsz_params.vrsz_alf_enable == VDCE_FEATURE_ENABLE) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_VRSZ_ALF_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_VRSZ_ALF_ENABLE);
++	}
++	/* setting H type */
++	if (rsz_params.vrsz_mode == VDCE_ALGO_TAP_4LINEAR_INTERPOLATION) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_RSZ_V_TYPE);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_RSZ_V_TYPE);
++	}
++	/* setting V type */
++	if (rsz_params.hrsz_mode == VDCE_ALGO_TAP_4LINEAR_INTERPOLATION) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_RSZ_H_TYPE);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_RSZ_H_TYPE);
++	}
++	/* setting V type */
++	if (rsz_params.hrsz_alf_mode == VDCE_ALFMODE_MANUAL) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_RSZ_H_ALF_mode);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_RSZ_H_ALF_mode);
++	}
++	/* setting intensity of resizer */
++	if ((rsz_params.hrsz_alf_mode == VDCE_ALFMODE_MANUAL)
++	    && (rsz_params.hrsz_alf_enable == VDCE_FEATURE_ENABLE)) {
++		if (rsz_params.hrsz_alf_intensity > MAX_RSZ_INTENSITY) {
++			rsz_params.hrsz_alf_intensity = MAX_RSZ_INTENSITY;
++		} else {
++			vdce_conf_chan->register_config[index].
++			    rsz_alf_intensity |=
++			    (((rsz_params.
++			       hrsz_alf_intensity) << RSZ_ALF_INTENSITY_SHIFT)
++			     & RSZ_ALF_INTENSITY_MASK);
++		}
++	} else {
++		vdce_conf_chan->register_config[index].rsz_alf_intensity = 0;
++	}
++	/* if resizer used check for the params */
++	hrsz_mag =
++	    (params->common_params.src_hsz_luminance *
++	     256) / (params->common_params.dst_hsz_luminance);
++	vdce_conf_chan->register_config[index].rsz_h_mag |=
++	    (((hrsz_mag) << RSZ_H_MAG_SHIFT) & (RSZ_H_MAG_MASK));
++	vrsz_mag =
++	    (params->common_params.src_vsz_luminance *
++	     256) / (params->common_params.dst_vsz_luminance);
++	vdce_conf_chan->register_config[index].rsz_v_mag |=
++	    (((vrsz_mag) << RSZ_V_MAG_SHIFT)) & (RSZ_V_MAG_MASK);
++
++	/* setting horizontal enable bit */
++	if (hrsz_mag >= 256) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_HRSZ_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_HRSZ_ENABLE);
++	}
++	/* setting vertical enable bit */
++	if (vrsz_mag >= 256) {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITSET(vdce_conf_chan->register_config[index].rsz_mode,
++			   SET_VRSZ_ENABLE);
++	} else {
++		vdce_conf_chan->register_config[index].rsz_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     rsz_mode, SET_VRSZ_ENABLE);
++	}
++	vdce_conf_chan->register_config[index].vdce_ctrl =
++	    BITSET(vdce_conf_chan->register_config[index].vdce_ctrl,
++		   SET_RSZ_ENABLE);
++	dev_dbg(vdce_device, "<fn>vdce_set_rszparams L\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_set_epadparams : Setting EPAD parameters.
++ */
++int vdce_set_epadparams(vdce_epad_params_t * params,
++			channel_config_t * vdce_conf_chan, int index)
++{
++	int ret = 0;
++	dev_dbg(vdce_device, "<fn>vdce_set_epadparams E \n</fn>");
++	/* configuring luma vertical extension value */
++	vdce_conf_chan->register_config[index].epd_luma_width |=
++	    (((params->vext_luma) << EPD_Y_VEXT_SHIFT) & EPD_Y_VEXT_MASK);
++
++	/* configuring luma horizontal extension value */
++	vdce_conf_chan->register_config[index].epd_luma_width |=
++	    ((params->hext_luma) << (EPD_Y_HEXT_SHIFT)) & (EPD_Y_HEXT_MASK);
++
++	/* configuring chroma vertical extension value */
++	vdce_conf_chan->register_config[index].epd_chroma_width |=
++	    ((params->vext_chroma) << (EPD_C_VEXT_SHIFT)) & EPD_C_VEXT_MASK;
++
++	/* configuring chroma horizontal extension value */
++	vdce_conf_chan->register_config[index].epd_chroma_width |=
++	    (((params->hext_chroma) << EPD_C_HEXT_SHIFT) & EPD_C_HEXT_MASK);
++	dev_dbg(vdce_device, "<fn>vdce_set_epadparams L\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_set_ccvparams : Setting CCV parameters.
++ */
++int vdce_set_ccvparams(vdce_ccv_params_t * params,
++		       channel_config_t * vdce_conf_chan, int mode, int index)
++{
++	int ret = 0;
++	dev_dbg(vdce_device, "<fn>vdce_set_ccvparams E\n</fn>");
++	/* setting output format */
++	if (mode == MODE_PRECODEC || mode == MODE_TRANSCODEC) {
++		if (params->codec_mode_out == VDCE_CODECMODE_MPEG1) {
++			vdce_conf_chan->register_config[index].ccv_mode =
++			    BITSET(vdce_conf_chan->register_config[index].
++				   ccv_mode, SET_CCV_OUT_MPEG1);
++
++			vdce_conf_chan->register_config[index].vdce_ctrl =
++			    BITSET(vdce_conf_chan->register_config[index].
++				   vdce_ctrl, SET_CCV_ENABLE);
++
++		} else {
++			vdce_conf_chan->register_config[index].ccv_mode =
++			    BITRESET(vdce_conf_chan->
++				     register_config[index].ccv_mode,
++				     SET_CCV_OUT_MPEG1);
++		}
++	}
++	if (mode == MODE_POSTCODEC || mode == MODE_TRANSCODEC) {
++		/* setting input format */
++		if (params->codec_mode_in == VDCE_CODECMODE_MPEG1) {
++			vdce_conf_chan->register_config[index].ccv_mode =
++			    BITSET(vdce_conf_chan->register_config[index].
++				   ccv_mode, SET_CCV_IN_MPEG1);
++			vdce_conf_chan->register_config[index].vdce_ctrl =
++			    BITSET(vdce_conf_chan->register_config[index].
++				   vdce_ctrl, SET_CCV_ENABLE);
++		} else {
++			vdce_conf_chan->register_config[index].ccv_mode =
++			    BITRESET(vdce_conf_chan->
++				     register_config[index].ccv_mode,
++				     SET_CCV_IN_MPEG1);
++		}
++	}
++	/* setting H type */
++	if (params->hccv_type == VDCE_ALGO_TAP_4LINEAR_INTERPOLATION) {
++		vdce_conf_chan->register_config[index].ccv_mode =
++		    BITSET(vdce_conf_chan->register_config[index].ccv_mode,
++			   SET_CCV_H_TYPE);
++	} else {
++		vdce_conf_chan->register_config[index].ccv_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     ccv_mode, SET_CCV_H_TYPE);
++	}
++	/* setting V type */
++	if (params->vccv_type == VDCE_ALGO_TAP_4LINEAR_INTERPOLATION) {
++		vdce_conf_chan->register_config[index].ccv_mode =
++		    BITSET(vdce_conf_chan->register_config[index].ccv_mode,
++			   SET_CCV_V_TYPE);
++	} else {
++		vdce_conf_chan->register_config[index].ccv_mode =
++		    BITRESET(vdce_conf_chan->register_config[index].
++			     ccv_mode, SET_CCV_V_TYPE);
++	}
++	vdce_conf_chan->register_config[index].vdce_ctrl |=
++	    ((mode << VDCE_MODE_SHIFT) & (VDCE_MODE_MASK));
++	dev_dbg(vdce_device, "<fn>vdce_get_ccvparams L\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_set_blendparams : Setting blending parameters.
++ */
++int vdce_set_blendparams(vdce_blend_params_t * params,
++			 channel_config_t * vdce_conf_chan, int mode, int index)
++{
++	int i = 0;
++	int ret = 0;
++	dev_dbg(vdce_device, "<fn>vdce_set_blendparams E\n</fn>");
++	for (i = 0; i < MAX_BLEND_TABLE; i++) {
++		/* configuring blend factor for zero blend value parameters */
++		vdce_conf_chan->register_config[index].bld_lut[i] |=
++		    ((params->bld_lut[i].
++		      blend_value) << BLD_LUT_FCT_SHIFT) & (BLD_LUT_FCT_MASK);
++
++		/* configuring Cr value for zero blend value parameters */
++		vdce_conf_chan->register_config[index].bld_lut[i] |=
++		    ((params->bld_lut[i].blend_cr) << BLD_LUT_CR_SHIFT) &
++		    (BLD_LUT_CR_MASK);
++
++		/* configuring cb value for zero blend value parameters */
++		vdce_conf_chan->register_config[index].bld_lut[i] |=
++		    ((params->bld_lut[i].blend_cb) << BLD_LUT_CB_SHIFT) &
++		    (BLD_LUT_CB_MASK);
++		/* configuring Y value for zero blend value parameters */
++		vdce_conf_chan->register_config[index].bld_lut[i] |=
++		    ((params->bld_lut[i].blend_y) << BLD_LUT_Y_SHIFT) &
++		    BLD_LUT_Y_MASK;
++	}
++	vdce_conf_chan->register_config[index].vdce_ctrl =
++	    BITSET(vdce_conf_chan->register_config[index].vdce_ctrl,
++		   SET_BLEND_ENABLE);
++	dev_dbg(vdce_device, "<fn>vdce_set_blendparams E\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_set_params : Function to set the ge parameters
++ */
++int vdce_set_params(vdce_params_t * params, channel_config_t * vdce_conf_chan)
++{
++	int ret = 0;
++	int pass_num = 0;
++	int mode;
++	vdce_ccv_params_t ccv_params;
++	dev_dbg(vdce_device, "<fn> vdce_set_params E\n</fn>");
++
++	memset(&(vdce_conf_chan->register_config[0]), 0,
++	       sizeof(vdce_hw_config_t));
++	memset(&(vdce_conf_chan->register_config[1]), 0,
++	       sizeof(vdce_hw_config_t));
++
++	vdce_conf_chan->status = VDCE_CHAN_UNINITIALISED;
++	vdce_conf_chan->mode_state = params->vdce_mode;
++	vdce_conf_chan->num_pass = VDCE_SINGLE_PASS;
++	/* configuration of Pre-codec mode */
++	if (params->vdce_mode == VDCE_OPERATION_PRE_CODECMODE) {
++		if (((params->modes_control & RSZ_ENABLE_MASK) ==
++		     (RSZ_ENABLE_MASK))) {
++			ret = vdce_set_rszparams(params, vdce_conf_chan,
++						 VDCE_OPERATION_PRE_CODECMODE,
++						 pass_num);
++		}
++		ret = vdce_set_ccvparams(&(params->vdce_mode_params.
++					   precodec_params.ccv_params),
++					 vdce_conf_chan, MODE_PRECODEC,
++					 pass_num);
++
++		vdce_conf_chan->register_config[pass_num].vdce_ctrl |=
++		    ((MODE_PRECODEC << VDCE_MODE_SHIFT) & (VDCE_MODE_MASK));
++
++	} else if (params->vdce_mode == VDCE_OPERATION_POST_CODECMODE) {
++		/* configuration of Post-codec mode */
++		/* setting resizing params and enabling it */
++		if (((params->modes_control & RSZ_ENABLE_MASK) ==
++		     (RSZ_ENABLE_MASK))) {
++			ret = vdce_set_rszparams(params, vdce_conf_chan,
++						 VDCE_OPERATION_POST_CODECMODE,
++						 pass_num);
++			if (params->vdce_mode_params.postcodec_params.
++			    ccv_params.codec_mode_in == VDCE_CODECMODE_MPEG1) {
++				vdce_conf_chan->luma_chroma_phased = 1;
++			}
++		}
++		ret =
++		    vdce_set_ccvparams(&
++				       (params->vdce_mode_params.
++					postcodec_params.ccv_params),
++				       vdce_conf_chan, MODE_POSTCODEC,
++				       pass_num);
++		/* setting range-mapping params and enabling it */
++		if (((params->modes_control & RMAP_ENABLE_MASK) ==
++		     (RMAP_ENABLE_MASK))) {
++			ret =
++			    vdce_set_rmapparams(&
++						(params->vdce_mode_params.
++						 postcodec_params.
++						 rmap_params),
++						vdce_conf_chan, pass_num);
++		}
++		/* setting blending params and enabling it */
++		if (((params->modes_control & BLEND_ENABLE_MASK) ==
++		     (BLEND_ENABLE_MASK))) {
++			ret =
++			    vdce_set_blendparams(&
++						 (params->vdce_mode_params.
++						  postcodec_params.
++						  blend_params),
++						 vdce_conf_chan,
++						 VDCE_OPERATION_POST_CODECMODE,
++						 pass_num);
++		}
++		vdce_conf_chan->register_config[pass_num].vdce_ctrl |=
++		    ((MODE_POSTCODEC << VDCE_MODE_SHIFT) & (VDCE_MODE_MASK));
++
++	} else if (params->vdce_mode == VDCE_OPERATION_TRANS_CODECMODE) {
++		/* Configuration of Trans-codec mode */
++		/* setting resizing params and enabling it */
++		if (((params->modes_control & RSZ_ENABLE_MASK) ==
++		     (RSZ_ENABLE_MASK))) {
++			ret = vdce_set_rszparams(params, vdce_conf_chan,
++						 VDCE_OPERATION_TRANS_CODECMODE,
++						 pass_num);
++			if (params->vdce_mode_params.transcodec_params.
++			    ccv_params.codec_mode_in == VDCE_CODECMODE_MPEG1) {
++				vdce_conf_chan->luma_chroma_phased = 1;
++			}
++		}
++		/* setting range-mapping params and enabling it */
++		if (((params->modes_control & RMAP_ENABLE_MASK) ==
++		     (RMAP_ENABLE_MASK))) {
++			ret =
++			    vdce_set_rmapparams(&
++						(params->vdce_mode_params.
++						 transcodec_params.
++						 rmap_params),
++						vdce_conf_chan, pass_num);
++		}
++		/* setting blend params and enabling it */
++		if (((params->modes_control & BLEND_ENABLE_MASK) ==
++		     (BLEND_ENABLE_MASK))) {
++			ret =
++			    vdce_set_blendparams(&
++						 (params->vdce_mode_params.
++						  transcodec_params.
++						  blend_params),
++						 vdce_conf_chan,
++						 VDCE_OPERATION_TRANS_CODECMODE,
++						 pass_num);
++		}
++		/* setting ccv params and enabling it */
++		if (((params->modes_control & CCV_ENABLE_MASK) ==
++		     (CCV_ENABLE_MASK))) {
++			ret =
++			    vdce_set_ccvparams(&
++					       (params->vdce_mode_params.
++						transcodec_params.
++						ccv_params),
++					       vdce_conf_chan,
++					       MODE_TRANSCODEC, pass_num);
++		}
++		vdce_conf_chan->register_config[pass_num].vdce_ctrl |=
++		    ((MODE_TRANSCODEC << VDCE_MODE_SHIFT) & (VDCE_MODE_MASK));
++
++	} else if (params->vdce_mode == VDCE_OPERATION_EDGE_PADDING) {
++		/* configuration of Edge-padding mode */
++		ret = vdce_set_epadparams(&(params->vdce_mode_params.
++					    epad_params)
++					  , vdce_conf_chan, pass_num);
++		vdce_conf_chan->register_config[pass_num].vdce_ctrl |=
++		    ((MODE_EPAD << VDCE_MODE_SHIFT) & (VDCE_MODE_MASK));
++	} else if (params->vdce_mode == VDCE_OPERATION_RESIZING) {
++		/* Configuration of Resizing mode */
++		if (params->vdce_mode_params.rsz_params.rsz_mode ==
++		    VDCE_MODE_422) {
++			memset(&ccv_params, 0, sizeof(vdce_ccv_params_t));
++			vdce_conf_chan->num_pass = VDCE_MULTIPASS;
++			/* set mode as pre-codec */
++			vdce_conf_chan->register_config[pass_num].
++			    vdce_ctrl |=
++			    ((MODE_PRECODEC << VDCE_MODE_SHIFT) &
++			     (VDCE_MODE_MASK));
++			ret =
++			    vdce_set_ccvparams(&ccv_params, vdce_conf_chan,
++					       MODE_PRECODEC, pass_num);
++			ret =
++			    vdce_set_rszparams(params, vdce_conf_chan,
++					       VDCE_OPERATION_RESIZING,
++					       pass_num);
++			pass_num = 1;
++			ret =
++			    vdce_set_ccvparams(&ccv_params, vdce_conf_chan,
++					       MODE_POSTCODEC, pass_num);
++
++			vdce_conf_chan->register_config[pass_num].
++			    vdce_ctrl |=
++			    ((MODE_POSTCODEC << VDCE_MODE_SHIFT) &
++			     (VDCE_MODE_MASK));
++		} else {
++			vdce_conf_chan->register_config[pass_num].
++			    vdce_ctrl |=
++			    ((MODE_TRANSCODEC << VDCE_MODE_SHIFT) &
++			     (VDCE_MODE_MASK));
++			ret = vdce_set_rszparams(params, vdce_conf_chan,
++						 VDCE_OPERATION_RESIZING,
++						 pass_num);
++			if (params->vdce_mode_params.rsz_params.
++			    rsz_op_mode == VDCE_CODECMODE_MPEG1) {
++				vdce_conf_chan->luma_chroma_phased = 1;
++			}
++		}
++	} else if (params->vdce_mode == VDCE_OPERATION_CHROMINANCE_CONVERSION) {
++		/* Configuration of CCV mode */
++		if (params->vdce_mode_params.ccv_params.conversion_type ==
++		    VDCE_CCV_MODE_420_422) {
++			ret =
++			    vdce_set_ccvparams(&
++					       (params->vdce_mode_params.
++						ccv_params),
++					       vdce_conf_chan,
++					       MODE_POSTCODEC, pass_num);
++		} else if (params->vdce_mode_params.ccv_params.
++			   conversion_type == VDCE_CCV_MODE_422_420) {
++			ret =
++			    vdce_set_ccvparams(&
++					       (params->vdce_mode_params.
++						ccv_params),
++					       vdce_conf_chan,
++					       MODE_PRECODEC, pass_num);
++		} else {
++			ret =
++			    vdce_set_ccvparams(&
++					       (params->vdce_mode_params.
++						ccv_params),
++					       vdce_conf_chan,
++					       MODE_TRANSCODEC, pass_num);
++		}
++	} else if (params->vdce_mode == VDCE_OPERATION_RANGE_MAPPING) {
++		/* Configuration of Range-mapping */
++		ret = vdce_set_rmapparams(&(params->vdce_mode_params.
++					    rmap_params), vdce_conf_chan,
++					  pass_num);
++		vdce_conf_chan->register_config[pass_num].vdce_ctrl |=
++		    ((MODE_TRANSCODEC << VDCE_MODE_SHIFT) & (VDCE_MODE_MASK));
++	} else if (params->vdce_mode == VDCE_OPERATION_BLENDING) {
++		/* Configuration of Blending mode */
++		if (params->vdce_mode_params.blend_params.blend_mode ==
++		    VDCE_MODE_422) {
++			memset(&ccv_params, 0, sizeof(vdce_ccv_params_t));
++			/* set mode as pre-codec */
++			vdce_conf_chan->num_pass = VDCE_MULTIPASS;
++			ret =
++			    vdce_set_ccvparams(&ccv_params, vdce_conf_chan,
++					       MODE_PRECODEC, pass_num);
++			vdce_conf_chan->register_config[pass_num].
++			    vdce_ctrl |=
++			    ((MODE_PRECODEC << VDCE_MODE_SHIFT) &
++			     (VDCE_MODE_MASK));
++			pass_num = 1;
++			ret =
++			    vdce_set_blendparams(&
++						 (params->vdce_mode_params.
++						  blend_params),
++						 vdce_conf_chan,
++						 MODE_POSTCODEC, 1);
++			ret =
++			    vdce_set_ccvparams(&ccv_params, vdce_conf_chan,
++					       MODE_POSTCODEC, pass_num);
++
++			vdce_conf_chan->register_config[pass_num].
++			    vdce_ctrl |=
++			    ((MODE_POSTCODEC << VDCE_MODE_SHIFT) &
++			     (VDCE_MODE_MASK));
++		} else {
++			vdce_conf_chan->register_config[pass_num].
++			    vdce_ctrl |=
++			    ((MODE_TRANSCODEC << VDCE_MODE_SHIFT) &
++			     (VDCE_MODE_MASK));
++
++			ret =
++			    vdce_set_blendparams(&
++						 (params->vdce_mode_params.
++						  blend_params),
++						 vdce_conf_chan,
++						 MODE_TRANSCODEC, 0);
++		}
++	} else {
++		/* error */
++		dev_err(vdce_device, "\n mode not supported ");
++		ret = -EINVAL;
++	}
++	if (pass_num == 0) {
++		vdce_set_size_fmt(&(params->common_params), vdce_conf_chan, 0);
++	} else {
++		vdce_set_size_fmt(&(params->common_params), vdce_conf_chan, 0);
++		vdce_set_size_fmt(&(params->common_params), vdce_conf_chan, 1);
++	}
++	mode = ((vdce_conf_chan->register_config[0].vdce_ctrl
++		 & VDCE_MODE_MASK) >> VDCE_MODE_SHIFT);
++
++	if ((vdce_conf_chan->mode_state == VDCE_OPERATION_PRE_CODECMODE) ||
++	    ((vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING) &&
++	     (vdce_conf_chan->num_pass == VDCE_MULTIPASS)) ||
++	    ((vdce_conf_chan->
++	      mode_state == VDCE_OPERATION_CHROMINANCE_CONVERSION) &&
++	     (vdce_conf_chan->num_pass == VDCE_MULTIPASS)) ||
++	    (mode == MODE_PRECODEC) ||
++	    (vdce_conf_chan->mode_state == VDCE_OPERATION_EDGE_PADDING)) {
++		vdce_conf_chan->image_type_in = VDCE_IMAGE_FMT_422;
++	} else {
++		vdce_conf_chan->image_type_in = VDCE_IMAGE_FMT_420;
++	}
++	if ((vdce_conf_chan->mode_state == VDCE_OPERATION_POST_CODECMODE)
++	    || ((vdce_conf_chan->mode_state == VDCE_OPERATION_RESIZING)
++		&& (vdce_conf_chan->num_pass == VDCE_MULTIPASS))
++	    ||
++	    ((vdce_conf_chan->mode_state ==
++	      VDCE_OPERATION_CHROMINANCE_CONVERSION)
++	     && (vdce_conf_chan->num_pass == VDCE_MULTIPASS))
++	    ||
++	    ((vdce_conf_chan->mode_state == VDCE_OPERATION_BLENDING
++	      && vdce_conf_chan->num_pass == VDCE_MULTIPASS)
++	     || mode == MODE_POSTCODEC)
++	    || (vdce_conf_chan->mode_state == VDCE_OPERATION_EDGE_PADDING)) {
++		vdce_conf_chan->image_type_out = VDCE_IMAGE_FMT_422;
++
++	} else {
++		vdce_conf_chan->image_type_out = VDCE_IMAGE_FMT_420;
++	}
++	if (vdce_conf_chan->luma_chroma_phased == 1) {
++		if (params->common_params.proc_control ==
++		    VDCE_LUMA_CHROMA_ENABLE) {
++			vdce_conf_chan->luma_chroma_phased = 1;
++			vdce_conf_chan->num_pass = VDCE_MULTIPASS;
++		} else {
++			vdce_conf_chan->luma_chroma_phased = 0;
++			vdce_conf_chan->num_pass = VDCE_SINGLE_PASS;
++		}
++
++	}
++	if (ret == 0) {
++		dev_dbg(vdce_device, "VDCE State configured \n");
++		memcpy(&vdce_conf_chan->get_params, params,
++		       sizeof(vdce_params_t));
++		vdce_conf_chan->status = VDCE_CHAN_PARAMS_INITIALISED;
++	}
++	dev_dbg(vdce_device, "<fn> vdce_set_params L\n</fn>");
++	return ret;
++}
++
++/*
++ * vdce_get_Params : Function to get the parameters values
++ */
++int vdce_get_params(vdce_params_t * params, channel_config_t * vdce_conf_chan)
++{
++	if (vdce_conf_chan->status == VDCE_CHAN_UNINITIALISED) {
++		dev_err(vdce_device, "State not configured \n");
++		return -EINVAL;
++	}
++	memcpy(params, &vdce_conf_chan->get_params, sizeof(vdce_params_t));
++	return 0;
++}
++
++/*
++ * vdce_set_priority : This function sets a priority of hardware and channel.
++ */
++int vdce_set_priority(int priority, channel_config_t * vdce_conf_chan)
++{
++	dev_dbg(vdce_device, "<fn> vdce_set_priority E\n</fn>");
++	/* check the prioroty range and assign the priority */
++	if (priority > VDCE_MAX_PRIORITY || priority < VDCE_MIN_PRIORITY) {
++		return -EINVAL;
++	} else {
++		vdce_conf_chan->priority = priority;
++		dev_dbg(vdce_device, "the channel prioroty is %d", priority);
++	}
++	dev_dbg(vdce_device, "<fn> vdce_set_priority L\n</fn>");
++	return 0;
++}
++
++/*
++ * vdce_get_priority : This function gets a priority of hardware and channel.
++ */
++int vdce_get_priority(int *priority, channel_config_t * vdce_conf_chan)
++{
++	dev_dbg(vdce_device, "<fn> vdce_Get_priority E\n</fn>");
++	/* get the priority from the channel */
++	*priority = vdce_conf_chan->priority;
++	dev_dbg(vdce_device, "the	value is %d", *priority);
++	dev_dbg(vdce_device, "<fn> vdce_Get_priority L\n</fn>");
++	return 0;
++}
++
++/*
++ * vdce_get_status : This function gets a status of hardware and channel.
++ */
++int vdce_get_status(vdce_hw_status_t * hw_status,
++		    channel_config_t * vdce_conf_chan)
++{
++	dev_dbg(vdce_device, "<fn> vdce_Get_status E\n</fn>");
++	hw_status->chan_status = vdce_conf_chan->status;
++	dev_dbg(vdce_device, "<fn>vdce_Get_status E\n</fn>");
++	return 0;
++}
++
++/*
++ * vdce_get_status : This function used to get default params
++*/
++int vdce_get_default(vdce_params_t * def_params)
++{
++	vdce_params_t *vdce_temp_params = NULL;
++	if (def_params->vdce_mode == VDCE_OPERATION_PRE_CODECMODE) {
++		vdce_temp_params = &precodec_default_params;
++	} else if (def_params->vdce_mode == VDCE_OPERATION_POST_CODECMODE) {
++		vdce_temp_params = &postcodec_default_params;
++	} else if (def_params->vdce_mode == VDCE_OPERATION_TRANS_CODECMODE) {
++		vdce_temp_params = &transcodec_default_params;
++	} else if (def_params->vdce_mode == VDCE_OPERATION_EDGE_PADDING) {
++		vdce_temp_params = &epad_default_params;
++	} else if (def_params->vdce_mode == VDCE_OPERATION_RESIZING) {
++		vdce_temp_params = &rsz_default_params;
++	} else if (def_params->vdce_mode == VDCE_OPERATION_BLENDING) {
++		vdce_temp_params = &blend_default_params;
++	} else if (def_params->vdce_mode == VDCE_OPERATION_RANGE_MAPPING) {
++		vdce_temp_params = &rmap_default_params;
++	} else if (def_params->
++		   vdce_mode == VDCE_OPERATION_CHROMINANCE_CONVERSION) {
++		vdce_temp_params = &ccv_default_params;
++	}
++	memcpy(def_params, vdce_temp_params, sizeof(vdce_params_t));
++	return 0;
++
++}
++
++/*
++ * vdce_open : This function creates a channels.
++ */
++static int vdce_open(struct inode *inode, struct file *filp)
++{
++	channel_config_t *vdce_conf_chan;
++
++	dev_dbg(vdce_device, "<fn> vdce_open E\n</fn>");
++	/* if usage counter is greater than maximum supported channels
++	   return error */
++	if (device_config.module_usage_count >= MAX_CHANNELS) {
++		dev_err(vdce_device,
++			"\n modules usage count	is greater than	supported ");
++		return -EBUSY;
++	}
++	if (device_config.module_usage_count == 0) {
++		device_config.sem_isr.done = 0;
++	}
++	/* allocate memory for a new configuration */
++	vdce_conf_chan = kmalloc(sizeof(channel_config_t), GFP_KERNEL);
++
++	if (vdce_conf_chan == NULL) {
++		dev_err(vdce_device,
++			"\n cannot allocate memory ro channel config");
++		return -ENOMEM;
++	}
++	dev_dbg(vdce_device,
++		"Malloc	Done for channel configuration structure\n");
++	if (filp->f_flags == (O_NONBLOCK | O_RDWR)) {
++		vdce_conf_chan->channel_mode = VDCE_MODE_NON_BLOCKING;
++	}
++	/* zeroing register config */
++	memset(vdce_conf_chan, 0, sizeof(channel_config_t));
++	if (filp->f_flags == (O_NONBLOCK | O_RDWR)) {
++		vdce_conf_chan->channel_mode = VDCE_MODE_NON_BLOCKING;
++	}
++
++	/* increment usage counter */
++	/* Lock the global variable and increment the counter */
++	down_interruptible(&device_config.device_mutex);
++	device_config.module_usage_count++;
++	up(&device_config.device_mutex);
++
++	/*sTATE_NOT_CONFIGURED and priority to zero */
++	vdce_conf_chan->priority = 0;
++	vdce_conf_chan->mode_state = VDCE_CHAN_UNINITIALISED;
++
++	dev_dbg(vdce_device, "Initializing of channel done \n");
++
++	/* initializing of application mutex */
++	init_completion(&(vdce_conf_chan->channel_sem));
++	vdce_conf_chan->channel_sem.done = 0;
++
++	init_MUTEX(&(vdce_conf_chan->chan_protection));
++	/* taking the configuartion     structure in private data */
++	filp->private_data = vdce_conf_chan;
++
++	dev_dbg(vdce_device, "<fn> vdce_open L\n</fn>");
++
++	return 0;
++}
++
++/*
++ * vdce_release : The Function is used to release the number of
++ * resources occupied by the channel
++*/
++static int vdce_release(struct inode *inode, struct file *filp)
++{
++
++	/* get the configuratin of this channel from private_date member of
++	   file */
++	int ret = 0;
++	channel_config_t *vdce_conf_chan =
++	    (channel_config_t *) filp->private_data;
++
++	dev_dbg(vdce_device, "<fn> vdce_release E\n</fn>");
++
++	ret = down_trylock(&(vdce_conf_chan->chan_protection));
++	if (ret != 0) {
++
++		dev_dbg(vdce_device, "Channel in use %d", ret);
++		return -EBUSY;
++	}
++	vdce_clear_status();
++	/* it will free all the input and output buffers */
++	free_buff(vdce_conf_chan);
++	/* decrements the module usage count; */
++	/* lock the global variable and decrement variable */
++	down_interruptible(&device_config.device_mutex);
++	device_config.module_usage_count--;
++	up(&device_config.device_mutex);
++	up(&(vdce_conf_chan->chan_protection));
++	kfree(vdce_conf_chan);
++	dev_dbg(vdce_device, "<fn> vdce_release L\n</fn>");
++
++	return 0;
++}
++
++/*
++ * vdce_mmap : Function to map device memory into user space
++ */
++static int vdce_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	/* get the configuratin of this channel from private_date
++	   member of file */
++	/* for looping purpuse */
++	int buffercounter = 0;
++	int i;
++	/* for checking purpose */
++	int flag = 0;
++	/* hold number of input and output buffer allocated */
++	int buffer_offset = 0;
++	unsigned int offset = vma->vm_pgoff << PAGE_SHIFT;
++
++	channel_config_t *vdce_conf_chan =
++	    (channel_config_t *) filp->private_data;
++
++	dev_dbg(vdce_device, "<fn> vdce_mmap E\n</fn>");
++
++	for (i = 0; i < 3; i++) {
++		/*find the input address which  is to be mapped */
++		for (buffercounter = 0; buffercounter <
++		     vdce_conf_chan->vdce_buffer[i].num_allocated;
++		     buffercounter++) {
++			buffer_offset =
++			    virt_to_phys(vdce_conf_chan->vdce_buffer[i].
++					 buffers[buffercounter]);
++			if (buffer_offset == offset) {
++				flag = 1;
++				break;
++			}
++		}
++		if (flag == 1) {
++			break;
++		}
++
++	}
++	/* the address to be mapped is not found so return error */
++	if (flag == 0)
++		return -EAGAIN;
++
++	dev_dbg(vdce_device, "The	address	mapped via mmap");
++	/* map the address from user space to kernel space */
++	if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
++			    vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
++		return -EAGAIN;
++	}
++	dev_dbg(vdce_device, "<fn> vdce_mmap L\n</fn>");
++
++	return 0;
++}
++
++/*
++ * vdce_ioctl : This function will process IOCTL commands sent by
++ * the application and control .
++ */
++static int vdce_ioctl(struct inode *inode, struct file *file,
++		      unsigned int cmd, unsigned long arg)
++{
++	int ret = 0;
++	vdce_address_start_t start;
++	vdce_params_t params;
++	vdce_buffer_t buffer;
++	vdce_reqbufs_t reqbuff;
++	/*get the configuratin of this channel from
++	   private_date member of file */
++	channel_config_t *vdce_conf_chan =
++	    (channel_config_t *) file->private_data;
++
++	dev_dbg(vdce_device, " vdce_ioctl E\n");
++	/* before decoding check for correctness of cmd */
++	if (_IOC_TYPE(cmd) != VDCE_IOC_BASE) {
++		dev_err(vdce_device, "Bad command Value \n");
++		return -1;
++	}
++	if (_IOC_NR(cmd) > VDCE_IOC_MAXNR) {
++		dev_err(vdce_device, "Bad Command Value\n");
++		return -1;
++	}
++	/*veryfying access permission of commands */
++	if (_IOC_DIR(cmd) & _IOC_READ) {
++
++		ret = !access_ok(VERIFY_WRITE, (void *)arg, _IOC_SIZE(cmd));
++	} else if (_IOC_DIR(cmd) & _IOC_WRITE) {
++
++		ret = !access_ok(VERIFY_READ, (void *)arg, _IOC_SIZE(cmd));
++	}
++	if (ret) {
++		dev_err(vdce_device, "access denied\n");
++		return -1;	/*error in access */
++	}
++	ret = down_trylock(&(vdce_conf_chan->chan_protection));
++	if (ret != 0) {
++
++		dev_dbg(vdce_device, "Channel in use %d", ret);
++		return -EBUSY;
++	}
++	/* switch according value of cmd */
++	switch (cmd) {
++		/*this ioctl is used to request frame buffers to be
++		   allocated by the ge module. The allocated buffers
++		   are channel  specific and can be     addressed
++		   by indexing */
++	case VDCE_REQBUF:
++		/* function to allocate the memory to input
++		   or output buffer. */
++		if (copy_from_user(&reqbuff, (vdce_reqbufs_t *) arg,
++				   sizeof(vdce_reqbufs_t))) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ret = malloc_buff(&reqbuff, vdce_conf_chan);
++
++		if (copy_to_user((vdce_reqbufs_t *) arg,
++				 &reqbuff, sizeof(vdce_reqbufs_t)))
++			ret = -EFAULT;
++		break;
++		/*this ioctl is used to query the physical address of a
++		   particular frame buffer. */
++	case VDCE_QUERYBUF:
++		if (copy_from_user(&buffer, (vdce_buffer_t *) arg,
++				   sizeof(vdce_buffer_t))) {
++			ret = -EFAULT;
++			break;
++		}
++		ret = get_buf_address(&buffer, vdce_conf_chan);
++
++		if (copy_to_user((vdce_buffer_t *) arg,
++				 &buffer, sizeof(vdce_buffer_t)))
++			ret = -EFAULT;
++		break;
++		/* this ioctl is used to set the priority of the current
++		   logical channel. If multiple GE tasks from multiple
++		   logical channels are currently *pending, the task
++		   associated with the  highest priority logical channel
++		   will be executed first */
++	case VDCE_SET_PRIORITY:
++		dev_dbg(vdce_device, "\n VDCE_Priority:start");
++		ret = vdce_set_priority((*(int *)arg), vdce_conf_chan);
++		dev_dbg(vdce_device, "\n VDCE_Priority:end");
++		break;
++		/* this ioctl is used to get the priority of
++		   the current logic channel */
++	case VDCE_GET_PRIORITY:
++		dev_dbg(vdce_device, "\n Get VDCE_Priority:start");
++		ret = vdce_get_priority((int *)arg, vdce_conf_chan);
++		dev_dbg(vdce_device, "\n Get VDCE_Priority:end");
++		break;
++		/* this ioctl is used to set the parameters
++		   of the GE hardware, parameters. */
++	case VDCE_SET_PARAMS:
++		/* function to set the hardware configuration */
++		if (copy_from_user(&params, (vdce_params_t *) arg,
++				   sizeof(vdce_params_t))) {
++			ret = -EFAULT;
++			break;
++		}
++		ret = vdce_check_common_params(&params);
++		if (0 == ret) {
++			ret = vdce_set_params(&params, vdce_conf_chan);
++		} else {
++			dev_err(vdce_device, "\n VDCE wrong parameters \n");
++		}
++		break;
++		/*this ioctl is used to get the GE hardware settings
++		   associated with the current logical channel represented
++		   by fd. */
++	case VDCE_GET_PARAMS:
++		/* function to get the hardware configuration */
++		ret = vdce_get_params((vdce_params_t *) arg, vdce_conf_chan);
++		break;
++		/* this ioctl is used to check the current status
++		   of the ge hardware */
++	case VDCE_GET_DEFAULT:
++		/* this ioctl is used to get the default parameters
++		   of the ge hardware */
++		ret = vdce_get_default((vdce_params_t *) arg);
++		break;
++	case VDCE_GET_STATUS:
++		ret = vdce_get_status((vdce_hw_status_t *) arg, vdce_conf_chan);
++		break;
++		/*this ioctl submits a VDCE task .The call can either be blocked
++		   until the task is completed or returned immediately based
++		   on the value of the blocking argument in the open
++		   structure. If  it is blocking, the     status of the task
++		   can be checked by calling ioctl   VDCE_GET_STATUS.
++		   Only one taskcan  be outstanding for each logical channel. */
++	case VDCE_START:
++		if (copy_from_user(&start, (vdce_address_start_t *) arg,
++				   sizeof(vdce_address_start_t))) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ret = vdce_start(&start, vdce_conf_chan);
++		break;
++	default:
++		dev_dbg(vdce_device, "VDCE_ioctl: Invalid Command Value");
++		ret = -EINVAL;
++	}
++
++	dev_dbg(vdce_device, " vdce_ioctl L\n");
++	up(&(vdce_conf_chan->chan_protection));
++
++	return ret;
++}
++static struct file_operations vdce_fops = {
++	.owner = THIS_MODULE,
++	.open = vdce_open,
++	.release = vdce_release,
++	.mmap = vdce_mmap,
++	.ioctl = vdce_ioctl,
++};
++
++/*
++ * vdce_isr : Function to register the ge character device driver
++ */
++irqreturn_t vdce_isr(int irq, void *dev_id, struct pt_regs *regs)
++{
++	int ret;
++	/* to suggest that resizing has been completed */
++	channel_config_t *vdce_conf_chan =
++	    device_config.channel_configuration[FIRSTENTRY];
++
++	dev_dbg(vdce_device, "<fn> vdce_isr E \n</fn>");
++	/* if the current call in blocking release the semaphore */
++	if (((vdce_conf_chan->num_pass == VDCE_MULTIPASS) &&
++	     (vdce_conf_chan->vdce_complete == VDCE_PASS1_STARTED))) {
++		vdce_conf_chan->vdce_complete = VDCE_PASS2_STARTED;
++
++		tasklet_schedule(&short_tasklet);
++
++	} else {
++		vdce_conf_chan->vdce_complete = VDCE_COMPLETED;
++
++	}
++	/* if process is completed than remove the entry from array */
++	if (vdce_conf_chan->vdce_complete == VDCE_COMPLETED) {
++		if (vdce_conf_chan->channel_mode != VDCE_MODE_NON_BLOCKING) {
++			complete(&(device_config.sem_isr));
++		}
++		disable_irq(VDCE_INTERRUPT);
++		ret = delete_from_array();
++		vdce_conf_chan->status = VDCE_CHAN_FREE;
++		if (ret == 0) {
++			return IRQ_HANDLED;
++		} else {
++			tasklet_schedule(&short_tasklet);
++		}
++	}
++	dev_dbg(vdce_device, "<fn> vdce_isr L\n</fn>");
++	return IRQ_HANDLED;
++}
++
++/*
++ * process_nonblock : Function to process_nonblocking call
++ */
++void process_bottomhalf(unsigned long ret)
++{
++	/* codec mode used */
++	channel_config_t *vdce_conf_chan =
++	    device_config.channel_configuration[FIRSTENTRY];
++	int pass_num;
++	if (vdce_conf_chan->vdce_complete == VDCE_PASS2_STARTED) {
++		/* set 2 pass register configuration */
++		pass_num = 1;
++	} else {
++		vdce_conf_chan->vdce_complete = VDCE_PASS1_STARTED;
++		/* set 1 pass register configuration */
++		pass_num = 0;
++	}
++	/*function call to set up the hardware */
++	vdce_hw_setup(&vdce_conf_chan->register_config[pass_num]);
++	/*function call to enable ge hardware */
++	if (pass_num == 0) {
++		enable_irq(VDCE_INTERRUPT);
++	}
++	ret = vdce_enable(&vdce_conf_chan->register_config[pass_num]);
++
++	dev_dbg(vdce_device, "<fn> process_nonblock L</fn>\n");
++}
++static void vdce_platform_release(struct device *device)
++{
++	/* this is called when the reference count goes to zero */
++}
++static int __init vdce_probe(struct device *device)
++{
++	vdce_device = device;
++	return 0;
++}
++static int vdce_remove(struct device *device)
++{
++	return 0;
++}
++static struct class_simple *vdce_class;
++
++static struct platform_device graphics_device = {
++	.name = DRIVERNAME,.id = 2,.dev = {
++					   .release = vdce_platform_release,}
++};
++static struct device_driver vdce_driver = {
++	.name = DRIVERNAME,
++	.bus = &platform_bus_type,
++	.probe = vdce_probe,
++	.remove = vdce_remove,
++};
++
++/*
++ * vdce_init : Function to register ge character driver
++ */
++static int __init vdce_init(void)
++{
++	int result;
++	int adr;
++	int size;
++	device_config.module_usage_count = 0;
++	device_config.array_count = 0;
++
++	/* register the driver in the kernel */
++	result = alloc_chrdev_region(&dev, 0, 1, DRIVER_NAME);
++	if (result < 0) {
++		printk(KERN_ERR "\nDaVincige: Module intialization failed.\
++		could not register character device");
++		return -ENODEV;
++	}
++	/* initialize of character device */
++	cdev_init(&c_dev, &vdce_fops);
++	c_dev.owner = THIS_MODULE;
++	c_dev.ops = &vdce_fops;
++	/* addding character device */
++	result = cdev_add(&c_dev, dev, 1);
++	if (result) {
++		printk(KERN_ERR "NOtICE \nDaVincige:Error %d adding DavinciVDCE\
++				 ..error no:", result);
++		result = -EINVAL;
++		goto label1;
++	}
++	/* registeration of character device */
++	register_chrdev(MAJOR(dev), DRIVER_NAME, &vdce_fops);
++
++	/* register driver as a platform driver */
++	if (driver_register(&vdce_driver) != 0) {
++		result = -EINVAL;
++		goto label2;
++	}
++	/* register the drive as a platform device */
++	if (platform_device_register(&graphics_device) != 0) {
++		result = -EINVAL;
++		goto label3;
++	}
++	vdce_class = class_simple_create(THIS_MODULE, DRIVERNAME);
++	if (!vdce_class) {
++		result = -EIO;
++		goto label4;
++	}
++	/* register simple device class */
++	class_simple_device_add(vdce_class, dev, NULL, DRIVERNAME);
++
++	init_completion(&(device_config.sem_isr));
++	init_completion(&(device_config.edma_sem));
++
++	device_config.sem_isr.done = 0;
++	device_config.edma_sem.done = 0;
++
++	/* initialize the device mutex */
++	init_MUTEX(&device_config.array_sem);
++	init_MUTEX(&device_config.device_mutex);
++
++	/* set up the Interrupt handler for     ge interrupt */
++	result =
++	    request_irq(VDCE_INTERRUPT, vdce_isr, SA_INTERRUPT,
++			"DavinciHD_VDCE", (void *)NULL);
++	disable_irq(VDCE_INTERRUPT);
++	if (result < 0) {
++		printk(KERN_ERR "Cannot initialize IRQ \n");
++		result = -EINVAL;
++		goto label5;
++
++	}
++	device_config.inter_size = inter_bufsize;
++	if (device_config.inter_size > 0) {
++		device_config.inter_buffer =
++		    (void *)(__get_free_pages(GFP_KERNEL | GFP_DMA,
++					      get_order((device_config.
++							 inter_size))));
++		if (!(device_config.inter_buffer)) {
++			goto label5;
++		}
++
++		adr = (unsigned int)device_config.inter_buffer;
++		size = PAGE_SIZE << (get_order((device_config.inter_size)));
++		while (size > 0) {
++			/* make  sure the frame buffers
++			   are never swapped out of memory */
++			SetPageReserved(virt_to_page(adr));
++			adr += PAGE_SIZE;
++			size -= PAGE_SIZE;
++		}
++	}
++	result = vdce_enable_int();
++	if (result < 0) {
++		printk(KERN_ERR "Cannot init register \n");
++		result = -EINVAL;
++		goto label5;
++
++	} else {
++		result = 0;
++		goto done;
++	}
++
++      label5:
++	class_simple_destroy(vdce_class);
++      label4:
++	platform_device_unregister(&graphics_device);
++      label3:
++	driver_unregister(&vdce_driver);
++      label2:
++	cdev_del(&c_dev);
++	unregister_chrdev(MAJOR(dev), DRIVER_NAME);
++      label1:
++	unregister_chrdev_region(dev, 1);
++
++      done:
++	return result;
++}
++
++/*
++ * vdce_cleanup : Function is called by the kernel. It unregister
++ * the device.
++ */
++void __exit vdce_cleanup(void)
++{
++	unregister_chrdev_region(dev, 1);
++	/* remove simple class device */
++	class_simple_device_remove(dev);
++
++	/* destroy simple class */
++	class_simple_destroy(vdce_class);
++	/* remove platform driver */
++	driver_unregister(&vdce_driver);
++	/* disable interrupt */
++	free_irq(VDCE_INTERRUPT, (void *)NULL);
++	/* remove platform device */
++	platform_device_unregister(&graphics_device);
++	cdev_del(&c_dev);
++	/* unregistering the driver from the kernel */
++	unregister_chrdev(MAJOR(dev), DRIVER_NAME);
++	if (device_config.inter_size > 0) {
++		vdce_free_pages((int)device_config.inter_buffer,
++				((device_config.inter_size)));
++	}
++}
++
++module_init(vdce_init)
++    module_exit(vdce_cleanup)
+Index: linux-2.6.10/drivers/char/davinci_vdce_hw.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/davinci_vdce_hw.c
+@@ -0,0 +1,319 @@
++/* *
++ * Copyright (C) 2007 Texas Instruments	Inc
++ *
++ * This	program	is free	software; you can redistribute it and/or modify
++ * it under the	terms of the GNU General Public	License	as published by
++ * the Free Software Foundation; either	version	2 of the License, or
++ * (at your option) any	later version.
++ *
++ * This	program	is distributed in the hope that	it will	be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A	PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59	Temple Place, Suite 330, Boston, MA 02111-1307	USA
++ */
++/* davinci_vdce_hw.c	file */
++
++/*Header files*/
++#include <asm/arch/davinci_vdce_hw.h>
++#include <linux/kernel.h>	/* printk()     */
++#include <linux/device.h>
++#include <asm/arch/davinci_vdce.h>
++
++extern struct device *vdce_device;
++/*
++ * vdce_hardware_setup :Function to set GE hardware configuration registers
++ */
++void vdce_hw_setup(vdce_hw_config_t * register_config)
++{
++	/* all devdbg will be removed after UT */
++	int status;
++	dev_dbg(vdce_device, " vdce_hw_setup E\n");
++
++	/* setting the hardware register GE ctrl */
++	regw(register_config->vdce_ctrl, VDCE_CTRL);
++	dev_dbg(vdce_device, "GE CTRL : %x	regr = %x \n",
++		register_config->vdce_ctrl, regr(VDCE_CTRL));
++
++	regw(register_config->vdce_emulation_ctrl, VDCE_EMULATION_CTRL);
++	dev_dbg(vdce_device, "VDCE_EMULATION_CTRL	%x regr	= %x\n",
++		register_config->vdce_emulation_ctrl,
++		regr(VDCE_EMULATION_CTRL));
++
++	/* setting the hardware register sdr_fmt */
++	regw(register_config->vdce_sdr_fmt, VDCE_SDR_FMT);
++	dev_dbg(vdce_device, "VDCE_SDR_FMT %x regr = %x\n",
++		register_config->vdce_sdr_fmt, regr(VDCE_SDR_FMT));
++
++	/* setting the hardware register req_sz */
++	regw(register_config->vdce_req_sz, VDCE_REQ_SZ);
++	dev_dbg(vdce_device, "VDCE_REQ_SZ %x	regr = %x\n",
++		register_config->vdce_req_sz, regr(VDCE_REQ_SZ));
++
++	regw(register_config->vdce_prcs_unit_size, VDCE_PRCS_UNIT_SIZE);
++	dev_dbg(vdce_device, "VDCE_PRCS_UNIT_SIZE :	%x	regr = %x \n",
++		register_config->vdce_prcs_unit_size,
++		regr(VDCE_PRCS_UNIT_SIZE));
++
++	regw(register_config->src_Y_strt_ps, SRC_Y_STRT_PS);
++	dev_dbg(vdce_device, "SRC_Y_STRT_PS : %x	regr = %x \n",
++		register_config->src_Y_strt_ps, regr(SRC_Y_STRT_PS));
++
++	regw(register_config->src_Y_sz, SRC_Y_SZ);
++	dev_dbg(vdce_device, "SRC_Y_SZ : %x	regr = %x \n",
++		register_config->src_Y_sz, regr(SRC_Y_SZ));
++
++	regw(register_config->src_C_strt_ps, SRC_C_STRT_PS);
++	dev_dbg(vdce_device, "SRC_C_STRT_PS : %x	regr = %x \n",
++		register_config->src_C_strt_ps, regr(SRC_C_STRT_PS));
++
++	regw(register_config->src_C_sz, SRC_C_SZ);
++	dev_dbg(vdce_device, "SRC_C_SZ : %x	regr = %x \n",
++		register_config->src_C_sz, regr(SRC_C_SZ));
++
++	regw(register_config->src_bmp_strt_ps, SRC_BMP_STRT_PS);
++	dev_dbg(vdce_device, "SRC_BMP_STRT_PS : %x	regr = %x \n",
++		register_config->src_bmp_strt_ps, regr(SRC_BMP_STRT_PS));
++
++	regw(register_config->src_bmp_sz, SRC_BMP_SZ);
++	dev_dbg(vdce_device, "SRC_BMP_SZ : %x	regr = %x \n",
++		register_config->src_bmp_sz, regr(SRC_BMP_SZ));
++
++	regw(register_config->res_Y_strt_ps, RES_Y_STRT_PS);
++	dev_dbg(vdce_device, "RES_Y_STRT_PS : %x	regr = %x \n",
++		register_config->res_Y_strt_ps, regr(RES_Y_STRT_PS));
++
++	regw(register_config->res_Y_sz, RES_Y_SZ);
++	dev_dbg(vdce_device, "RES_Y_SZ : %x	regr = %x \n",
++		register_config->res_Y_sz, regr(RES_Y_SZ));
++
++	regw(register_config->res_C_strt_ps, RES_C_STRT_PS);
++	dev_dbg(vdce_device, "RES_C_STRT_PS : %x	regr = %x \n",
++		register_config->res_C_strt_ps, regr(RES_C_STRT_PS));
++
++	regw(register_config->res_C_sz, RES_C_SZ);
++	dev_dbg(vdce_device, "RES_C_SZ : %x	regr = %x \n",
++		register_config->res_C_sz, regr(RES_C_SZ));
++
++	regw(register_config->res_bmp_strt_ps, RES_BMP_STRT_PS);
++	dev_dbg(vdce_device, "RES_BMP_STRT_PS : %x	regr = %x \n",
++		register_config->res_bmp_strt_ps, regr(RES_BMP_STRT_PS));
++
++	regw(register_config->rsz_mode, RSZ_MODE);
++	dev_dbg(vdce_device, "RSZ_MODE : %x	regr = %x \n",
++		register_config->rsz_mode, regr(RSZ_MODE));
++
++	regw(register_config->rsz_h_mag, RSZ_H_MAG);
++	dev_dbg(vdce_device, "RSZ_H_MAG :	%x	regr = %x \n",
++		register_config->rsz_h_mag, regr(RSZ_H_MAG));
++
++	regw(register_config->rsz_v_mag, RSZ_V_MAG);
++	dev_dbg(vdce_device, "RSZ_V_MAG :	%x	regr = %x \n",
++		register_config->rsz_v_mag, regr(RSZ_V_MAG));
++
++	regw(register_config->rsz_h_phase, RSZ_H_PHASE);
++	dev_dbg(vdce_device, "RSZ_H_PHASE	: %x	regr = %x \n",
++		register_config->rsz_h_phase, regr(RSZ_H_PHASE));
++
++	regw(register_config->rsz_v_phase, RSZ_V_PHASE);
++	dev_dbg(vdce_device, "RSZ_V_PHASE	: %x	regr = %x \n",
++		register_config->rsz_v_phase, regr(RSZ_V_PHASE));
++
++	regw(register_config->rsz_alf_intensity, RSZ_ALF_INTENSITY);
++	dev_dbg(vdce_device, "RSZ_ALF_INTENSITY :	%x	regr = %x \n",
++		register_config->rsz_alf_intensity, regr(RSZ_ALF_INTENSITY));
++
++	regw(register_config->ccv_mode, CCV_MODE);
++	dev_dbg(vdce_device, "CCV_MODE : %x	regr = %x \n",
++		register_config->ccv_mode, regr(CCV_MODE));
++
++	regw(register_config->bld_lut[0], BLD_LUT_00);
++	dev_dbg(vdce_device, "BLD_LUT_00 : %x	regr = %x \n",
++		register_config->bld_lut[0], regr(BLD_LUT_00));
++
++	regw(register_config->bld_lut[1], BLD_LUT_01);
++	dev_dbg(vdce_device, "BLD_LUT_01 : %x	regr = %x \n",
++		register_config->bld_lut[1], regr(BLD_LUT_01));
++
++	regw(register_config->bld_lut[2], BLD_LUT_02);
++	dev_dbg(vdce_device, "BLD_LUT_02 : %x	regr = %x \n",
++		register_config->bld_lut[2], regr(BLD_LUT_02));
++
++	regw(register_config->bld_lut[3], BLD_LUT_03);
++	dev_dbg(vdce_device, "BLD_LUT_03 : %x	regr = %x \n",
++		register_config->bld_lut[3], regr(BLD_LUT_03));
++
++	regw(register_config->rgmp_ctrl, RGMP_CTRL);
++	dev_dbg(vdce_device, "RGMP_CTRL :	%x	regr = %x \n",
++		register_config->rgmp_ctrl, regr(RGMP_CTRL));
++
++	regw(register_config->epd_luma_width, EPD_LUMA_WIDTH);
++	dev_dbg(vdce_device, "EPD_LUMA_WIDTH : %x	regr = %x \n",
++		register_config->epd_luma_width, regr(EPD_LUMA_WIDTH));
++
++	regw(register_config->epd_chroma_width, EPD_CHROMA_WIDTH);
++	dev_dbg(vdce_device, "EPD_CHROMA_WIDTH : %x	regr = %x \n",
++		register_config->epd_chroma_width, regr(EPD_CHROMA_WIDTH));
++
++	/* source addres for luma and chroma */
++	regw(register_config->vdce_src_strt_add_ytop, VDCE_SRC_STRT_ADD_YTOP);
++
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_ADD_YTOP %x	regr = %x\n",
++		register_config->vdce_src_strt_add_ytop,
++		regr(VDCE_SRC_STRT_ADD_YTOP));
++
++	regw(register_config->vdce_src_strt_add_ctop, VDCE_SRC_STRT_ADD_CTOP);
++
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_ADD_CTOP %x	regr = %x\n",
++		register_config->vdce_src_strt_add_ctop,
++		regr(VDCE_SRC_STRT_ADD_CTOP));
++
++	regw(register_config->vdce_src_strt_add_ybot, VDCE_SRC_STRT_ADD_YBOT);
++
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_ADD_YBOT %x	regr = %x\n",
++		register_config->vdce_src_strt_add_ybot,
++		regr(VDCE_SRC_STRT_ADD_YBOT));
++
++	regw(register_config->vdce_src_strt_add_cbot, VDCE_SRC_STRT_ADD_CBOT);
++
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_ADD_CBOT %x	regr = %x\n",
++		register_config->vdce_src_strt_add_cbot,
++		regr(VDCE_SRC_STRT_ADD_CBOT));
++
++	/* result address for luma and chroma */
++	regw(register_config->vdce_res_strt_add_ytop, VDCE_RES_STRT_ADD_YTOP);
++
++	dev_dbg(vdce_device, "VDCE_RES_STRT_ADD_YTOP %x	regr = %x\n",
++		register_config->vdce_res_strt_add_ytop,
++		regr(VDCE_RES_STRT_ADD_YTOP));
++
++	regw(register_config->vdce_res_strt_add_ctop, VDCE_RES_STRT_ADD_CTOP);
++	dev_dbg(vdce_device, "VDCE_RES_STRT_ADD_CTOP %x	regr = %x\n",
++		register_config->vdce_res_strt_add_ctop,
++		regr(VDCE_RES_STRT_ADD_CTOP));
++
++	regw(register_config->vdce_res_strt_add_ybot, VDCE_RES_STRT_ADD_YBOT);
++
++	dev_dbg(vdce_device, "VDCE_RES_STRT_ADD_YTOP %x	regr = %x\n",
++		register_config->vdce_res_strt_add_ybot,
++		regr(VDCE_RES_STRT_ADD_YBOT));
++
++	regw(register_config->vdce_res_strt_add_cbot, VDCE_RES_STRT_ADD_CBOT);
++	dev_dbg(vdce_device, "VDCE_RES_STRT_ADD_CBOT %x	regr = %x\n",
++		register_config->vdce_res_strt_add_cbot,
++		regr(VDCE_RES_STRT_ADD_CBOT));
++
++	/* source offset for luma and chroma */
++	regw(register_config->vdce_src_add_ofst_ytop, VDCE_SRC_STRT_OFF_YTOP);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_OFF_YTOP %x	regr = %x\n",
++		register_config->vdce_src_add_ofst_ytop,
++		regr(VDCE_SRC_STRT_OFF_YTOP));
++
++	regw(register_config->vdce_src_add_ofst_ctop, VDCE_SRC_STRT_OFF_CTOP);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_OFF_CTOP %x	regr = %x\n",
++		register_config->vdce_src_add_ofst_ctop,
++		regr(VDCE_SRC_STRT_OFF_CTOP));
++
++	regw(register_config->vdce_src_add_ofst_ybot, VDCE_SRC_STRT_OFF_YBOT);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_OFF_YBOT %x	regr = %x\n",
++		register_config->vdce_src_add_ofst_ybot,
++		regr(VDCE_SRC_STRT_OFF_YBOT));
++
++	regw(register_config->vdce_src_add_ofst_cbot, VDCE_SRC_STRT_OFF_CBOT);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_OFF_CBOT %x	regr = %x\n",
++		register_config->vdce_src_add_ofst_cbot,
++		regr(VDCE_SRC_STRT_OFF_CBOT));
++
++	/* result offset for luma and chroma */
++	regw(register_config->vdce_res_strt_off_ytop, VDCE_RES_STRT_OFF_YTOP);
++	dev_dbg(vdce_device, "VDCE_RES_STRT_OFF_YTOP %x	regr = %x\n",
++		register_config->vdce_res_strt_off_ytop,
++		regr(VDCE_RES_STRT_OFF_YTOP));
++
++	regw(register_config->vdce_res_strt_off_ctop, VDCE_RES_STRT_OFF_CTOP);
++	dev_dbg(vdce_device, "VDCE_RES_STRT_OFF_CTOP %x	regr = %x\n",
++		register_config->vdce_res_strt_off_ctop,
++		regr(VDCE_RES_STRT_OFF_CTOP));
++
++	regw(register_config->vdce_res_strt_off_ybot, VDCE_RES_STRT_OFF_YBOT);
++	dev_dbg(vdce_device, "VDCE_RES_STRT_OFF_YBOT %x	regr = %x\n",
++		register_config->vdce_res_strt_off_ybot,
++		regr(VDCE_RES_STRT_OFF_YBOT));
++
++	regw(register_config->vdce_res_strt_off_cbot, VDCE_RES_STRT_OFF_CBOT);
++	dev_dbg(vdce_device, "VDCE_RES_STRT_OFF_CBOT %x	regr = %x\n",
++		register_config->vdce_res_strt_off_cbot,
++		regr(VDCE_RES_STRT_OFF_CBOT));
++
++	/* bitmap address and offset for luma and chroma */
++	regw(register_config->vdce_src_strt_add_bmp_top,
++	     VDCE_SRC_STRT_ADD_BMP_TOP);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_ADD_BMP_TOP %x	regr = %x\n",
++		register_config->vdce_src_strt_add_bmp_top,
++		regr(VDCE_SRC_STRT_ADD_BMP_TOP));
++
++	regw(register_config->vdce_src_strt_add_bmp_bot,
++	     VDCE_SRC_STRT_ADD_BMP_BOT);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_ADD_BMP_BOT %x	regr = %x\n",
++		register_config->vdce_src_strt_add_bmp_bot,
++		regr(VDCE_SRC_STRT_ADD_BMP_BOT));
++
++	regw(register_config->vdce_src_strt_off_bmp_top,
++	     VDCE_SRC_STRT_OFF_BMP_TOP);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_OFF_BMP_TOP %x	regr = %x\n",
++		register_config->vdce_src_strt_off_bmp_top,
++		regr(VDCE_SRC_STRT_OFF_BMP_TOP));
++
++	regw(register_config->vdce_src_strt_off_bmp_bot,
++	     VDCE_SRC_STRT_OFF_BMP_BOT);
++
++	status = regr(VDCE_STATUS);
++	dev_dbg(vdce_device, "VDCE_SRC_STRT_OFF_BMP_BOT %x	regr = %x\n",
++		register_config->vdce_src_strt_off_bmp_bot,
++		regr(VDCE_SRC_STRT_OFF_BMP_BOT));
++	dev_dbg(vdce_device, "vdce_hw_setup L\n");
++}
++
++/*
++ * vdce_enable : Function to enable the	ge module
++ */
++int vdce_enable(vdce_hw_config_t * register_config)
++{
++	dev_dbg(vdce_device, " vdce_enable E\n");
++	/* enabling the resizer the setting enable bit */
++	register_config->vdce_ctrl =
++	    BITSET(register_config->vdce_ctrl, VDCE_ENABLE);
++
++	regw(register_config->vdce_ctrl, VDCE_CTRL);
++
++	register_config->vdce_ctrl =
++	    BITRESET(register_config->vdce_ctrl, VDCE_ENABLE);
++
++	dev_dbg(vdce_device, "vdce enable L\n");
++
++	return 0;
++}
++
++/*
++ * vdce_interrupt set : Function to set interrupt
++ */
++inline int vdce_enable_int(void)
++{
++	regw(1, VDCE_INTEN);
++	regw(1, VDCE_INTEN_SET);
++	/* Disable emulation control signal */
++	regw(1, VDCE_EMULATION_CTRL);
++	return 0;
++}
++
++/*
++ * vdce_clear_status : Function to clear the status
++ */
++inline int vdce_clear_status(void)
++{
++	regw(1, VDCE_STATUS_CLR);
++	return 0;
++}
+Index: linux-2.6.10/include/asm-arm/arch-davinci/davinci_vdce.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-davinci/davinci_vdce.h
+@@ -0,0 +1,460 @@
++/* *
++ * Copyright (C) 2007 Texas Instruments	Inc
++ *
++ * This	program	is free	software; you can redistribute it and/or modify
++ * it under the	terms of the GNU General Public	License	as published by
++ * the Free Software Foundation; either	version	2 of the License, or
++ * (at your option any)	later version.
++ * This	program	is distributed in the hope that	it will	be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not,write to the	Free Software
++ * Foundation, Inc., 59	Temple Place, Suite 330, Boston, MA  02111-1307	 USA
++ */
++/* davinci_vdce.h	file */
++
++#ifndef	DAVINCI_VDCE_H
++#define	DAVINCI_VDCE_H
++#ifdef __KERNEL__
++/* include Linux files */
++#include <linux/interrupt.h>
++#endif
++#include <asm/arch/davinci_vdce_hw.h>
++#define	  VDCE_IOC_BASE			   'G'
++#define	  VDCE_IOC_MAXNR			    9
++/* Ioctl options which are to be passed	while calling the ioctl	*/
++#define	VDCE_SET_PARAMS		 _IOWR(VDCE_IOC_BASE, 1, vdce_params_t)
++#define	VDCE_GET_PARAMS		 _IOR(VDCE_IOC_BASE, 2, vdce_params_t)
++#define	VDCE_GET_STATUS		 _IOR(VDCE_IOC_BASE, 3, vdce_hw_status_t)
++#define	VDCE_START		 _IOWR(VDCE_IOC_BASE, 4, vdce_address_start_t)
++#define	VDCE_REQBUF		 _IOWR(VDCE_IOC_BASE, 5, vdce_reqbufs_t)
++#define	VDCE_QUERYBUF		 _IOWR(VDCE_IOC_BASE, 6, vdce_buffer_t)
++#define VDCE_GET_DEFAULT	 _IOWR(VDCE_IOC_BASE, 7, vdce_params_t)
++#define	VDCE_SET_PRIORITY	 _IOWR(VDCE_IOC_BASE, 8, int)
++#define	VDCE_GET_PRIORITY	 _IOR(VDCE_IOC_BASE, 9, int)
++
++#define	VDCE_MAX_PRIORITY		  5
++#define	VDCE_MIN_PRIORITY		  0
++#define	VDCE_DEFAULT_PRIORITY		  0
++#define	MAX_BUFFERS			  8
++
++#ifdef __KERNEL__
++#define	MAX_RSZ_INTENSITY		  128
++#define	MIN_RSZ_MAG_RATIO		  256
++#define	MAX_RSZ_MAG_RATIO		  2048
++#define	DRIVER_NAME			  "VDCE"
++#define	MAX_CHANNELS			  16
++#define	FIRSTENTRY			  0
++#define	SECONDENTRY			  1
++#define	EMPTY				  0
++#define	FREE_BUFFER			  0
++#define CHECK_MODE_RANGE(mode, limit)    ((mode < 0 || mode > limit)?1:0)
++#define GET_DIVIDE_FACTOR(format)	 ((format == 0)?3:4)
++#define GET_CHROMA_DIVIDE_FACTOR(format) ((format == 0)?4:2)
++#define GET_VAL(reg, mask, shift)
++#define RSZ_ENABLE_MASK			0x1
++#define BLEND_ENABLE_MASK		0x2
++#define RMAP_ENABLE_MASK		0x4
++#define CCV_ENABLE_MASK			0x8
++#endif
++
++/* enum	for selected VDCE mode */
++typedef enum vdce_mode_operation {
++	VDCE_OPERATION_PRE_CODECMODE = 0,/* set pre codec mode */
++	VDCE_OPERATION_POST_CODECMODE,	/* set post codec mode */
++	VDCE_OPERATION_TRANS_CODECMODE,	/* set trans codec mode */
++	VDCE_OPERATION_EDGE_PADDING,	/* enable edge padding */
++	VDCE_OPERATION_RESIZING,	/* For doing chrominance conversion */
++	VDCE_OPERATION_CHROMINANCE_CONVERSION,	/* For doing resizing */
++	VDCE_OPERATION_RANGE_MAPPING,	/* For doing range mapping */
++	VDCE_OPERATION_BLENDING		/* for doing blending */
++} vdce_mode_operation_t;
++
++/* enum	for enable disable status */
++typedef enum vdce_status {
++	VDCE_FEATURE_DISABLE = 0,	/* Suggest  disable status */
++	VDCE_FEATURE_ENABLE		/* Suggest Enable status   */
++} vdce_status_t;
++
++/* enum	for image_type */
++typedef enum vdce_image_type {
++	VDCE_BUF_IN = 0,	/* Suggest  buffer is of output type */
++	VDCE_BUF_OUT,		/* Suggest  buffer is of input type */
++	VDCE_BUF_BMP		/* Suggest  buffer is of bitmap type */
++} vdce_image_type_t;
++
++/* enum	to enable disable luma/chroma processing */
++typedef enum vdce_proc_control {
++	VDCE_LUMA_ENABLE = 0,	/* suggest luma processing is enable  */
++	VDCE_CHROMA_ENABLE,	/* suggest chroma processing is enable  */
++	VDCE_LUMA_CHROMA_ENABLE	/* suggest both processing is enable  */
++} vdce_proc_control_t;
++
++/* enum	to enable disable field	status */
++typedef enum vdce_field_status {
++	VDCE_TOP_ENABLE = 0,/* suggest top field processing is enable  */
++	VDCE_BOTTOM_ENABLE,/* suggest bottom field processing is enable */
++	VDCE_TOP_BOT_ENABLE/* suggest both processing is enable  */
++} vdce_field_status_t;
++
++/* enum	for codec mode */
++typedef enum vdce_codec_mode {
++	VDCE_CODECMODE_MPEG2_MPEG4 = 0,	/* suggest mpeg2 is selected */
++	VDCE_CODECMODE_MPEG1		/* suggest mpeg1 is selected */
++} vdce_codec_mode_t;
++
++/* ALF mode for	resizing */
++typedef enum vdce_alfmode {
++	VDCE_ALFMODE_AUTOMATIC = 0,	/* tap-4 */
++	VDCE_ALFMODE_MANUAL		/* tap linear */
++} vdce_alfmode_t;
++
++/* type	of algo*/
++typedef enum vdce_algo_type {
++
++	VDCE_ALGO_TAP_4CUBIC_CONVOLUTION = 0,	/* cubic convolution */
++	VDCE_ALGO_TAP_4LINEAR_INTERPOLATION	/* linear interpolation */
++} vdce_algo_type_t;
++
++/* for mode */
++typedef enum vdce_io_mode {
++	VDCE_FIELD_MODE = 0,	/* Indicate that field mode */
++	VDCE_FRAME_MODE		/* Indicate that frame mode */
++} vdce_io_mode_t;
++
++/* hardware and	channel	status */
++typedef enum vdce_processing_status {
++	VDCE_CHAN_FREE = 0,		/* channel free */
++	VDCE_CHAN_BUSY,			/* channel busy */
++	VDCE_CHAN_PENDING,		/* Request pending */
++	VDCE_CHAN_UNINITIALISED,	/* Parameters uninitialised */
++	VDCE_CHAN_PARAMS_INITIALISED,	/* Parameters initialised */
++} vdce_processing_status_t;
++
++/* processing mode of image */
++typedef enum vdce_processing_mode {
++	VDCE_INTERLACED = 0,		/* interlaced mode */
++	VDCE_PROGRESSIVE		/* progressive mode */
++} vdce_processing_mode_t;
++
++/* image format	*/
++typedef enum vdce_image_fmt {
++	VDCE_IMAGE_FMT_420 = 0,	    /* 4:2:0 image format */
++	VDCE_IMAGE_FMT_422 = 1	    /* 4:2:2 image format */
++
++} vdce_image_fmt_t;
++/*CCV operation	mode */
++typedef enum vdce_ccv_mode {
++	VDCE_CCV_MODE_422_420 = 0,	/* 4:2:2 to 4:2:0 */
++	VDCE_CCV_MODE_420_422,		/* 4:2:0 to 4:2:2 */
++	VDCE_CCV_MODE_420_420		/* 4:2:0 to 4:2:0 */
++} vdce_ccv_mode_t;
++/*Resize operation mode	*/
++typedef enum vdce_rsz_mode {
++	VDCE_MODE_420 = 0,	/* 4:2:2  */
++	VDCE_MODE_422,		/* 4:2:0 */
++} vdce_rsz_blend_mode_t;
++
++/* ---------------Interface Data structures-----------------------------------*/
++/* Structure to	configure the resize parameters	*/
++typedef struct vdce_rsz_params {
++	vdce_rsz_blend_mode_t rsz_mode;	/* Value will not be used in native */
++	/*Mode. It will be used for stanalone */
++	/*resizing only */
++	vdce_codec_mode_t rsz_op_mode;
++	vdce_algo_type_t hrsz_mode;/* To suggest horizontal resizing mode */
++					/*   eg convolution */
++	vdce_algo_type_t vrsz_mode;	/* To suggest Vertical resizing mode */
++					/* eg convolution */
++	vdce_status_t hrsz_alf_enable;	/* Suggest horizontal anti alias */
++					/*  filter is on */
++	vdce_status_t vrsz_alf_enable;	/* Suggest vertical anti alias filter */
++					/* is on */
++	vdce_alfmode_t hrsz_alf_mode;	/* Suggest the anti alias filter mode */
++	unsigned char hrsz_alf_intensity;/* Intensity for coefficients calc */
++} vdce_rsz_params_t;
++
++/* Structure to	configure the chrominance conversion parameters	*/
++typedef struct vdce_ccv_params {
++	vdce_ccv_mode_t conversion_type; /* Value will not be used in native */
++					/*Mode. It will be used for stanalone */
++					/*CCV only */
++	/* Below both parameters will be used only in case for trans codec */
++	vdce_codec_mode_t codec_mode_in;/* Type of input of codec conversion */
++					/*eg mpeg1 or other */
++	vdce_codec_mode_t codec_mode_out;/*Type of output of codec conversion */
++					/*eg mpeg2 or other */
++	vdce_algo_type_t hccv_type;	/* Chrominance conversion functional */
++					/*type selection bit (for horz) */
++	vdce_algo_type_t vccv_type;	/* Chrominance conversion functional */
++					/* type selection bit(for vert) */
++} vdce_ccv_params_t;
++
++/* Structure to	configure the range maping parameters */
++typedef struct vdce_rmap_params {
++
++	unsigned char coeff_y;		/* coeffcients of range mapping */
++					/*for Y component */
++	vdce_status_t rmap_yenable;	/* Suggest that luminance range */
++					/*mapping is enable */
++	unsigned char coeff_c;		/* coeffcients of range mapping for */
++					/* chroma component */
++	vdce_status_t rmap_cenable;	/* Suggest that chrominace range */
++					/* mapping is enable */
++} vdce_rmap_params_t;
++
++/* Structure to	configure the blending parameters */
++typedef struct blend_table {
++
++	unsigned char blend_cr;	/* blend value for cr component */
++	unsigned char blend_cb;	/* blend value for cb component */
++	unsigned char blend_y;	/* blend value for y component */
++	unsigned char blend_value;	/* Blend factor */
++} blend_table_t;
++
++typedef struct vdce_blend_params {
++
++	vdce_rsz_blend_mode_t blend_mode;
++	blend_table_t bld_lut[MAX_BLEND_TABLE];	/* 4 bitmap defined for blend */
++} vdce_blend_params_t;
++
++/* Structure to	configure edge padding parameters */
++typedef struct vdce_epad_params {
++
++	unsigned char vext_chroma;	/* Vertical extension value for */
++					/* chroma component */
++	unsigned char hext_chroma;	/* horizontal extension value for */
++					/*chroma component */
++	unsigned char vext_luma;	/* Vertical extension value for */
++					/* luma component */
++	unsigned char hext_luma;	/* horizontal extension value for */
++					/*chroma component */
++} vdce_epad_params_t;
++
++/* Structure to	configure input	output format and sizes	*/
++typedef struct vdce_common_params {
++
++	vdce_processing_mode_t src_processing_mode;/* source processing mode */
++						/*interlaced or progressive */
++	vdce_io_mode_t src_mode;	/* src mode field or frame  */
++	vdce_io_mode_t res_mode;	/* res mode field or frame  */
++	vdce_io_mode_t src_bmp_mode;	/* bmp mode field or frame */
++	vdce_proc_control_t proc_control;	/* Luminace processing */
++						/*enable or not */
++	vdce_field_status_t field_status;	/* Top field enable or not */
++
++	unsigned short src_hsz_luminance;/* input horizontal size for */
++					/*luminance component */
++	unsigned short src_vsz_luminance;/* input vertical size for */
++					/*luminance component */
++	unsigned short bmp_vsize;	/* input vertical size for */
++					/*bitmap component */
++	unsigned short bmp_hsize;	/* input horizontal size for */
++					/* bitmap component */
++	unsigned char src_hsp_luminance;/*horizontal starting position */
++					/* for luminance */
++	unsigned char src_vsp_luminance;/* vertical starting position */
++					/* for luminance */
++	unsigned char bmp_hsp_bitmap;	/* hrz starting position for */
++					/* bitmap */
++	unsigned char res_hsp_luminance;/* Hrz starting position for */
++					/*luminance component for res */
++	unsigned char res_vsp_luminance;/* Vertical starting position for */
++					/*luminance component for res */
++	unsigned short dst_hsz_luminance;/* Hrz starting size for */
++					/*luminance component for res */
++	unsigned short dst_vsz_luminance;/* Vertical size for */
++					/*   luminance */
++					/*component for result */
++	unsigned short res_hsp_bitmap;	/* Horizontal starting pos */
++					/*for bitmap component */
++	unsigned short res_vsp_bitmap;	/* vertical starting position */
++					/* for bitmap component */
++	unsigned short prcs_unit_value;/* Hold the prcs value by app */
++} vdce_common_params_t;
++
++/* precodec parameters configuration structure */
++typedef struct vdce_precodec_params {
++	vdce_rsz_params_t rsz_params;
++	vdce_ccv_params_t ccv_params;
++} vdce_precodec_params_t;
++
++/* postcodec parameters	configuration structure	*/
++typedef struct vdce_postcodec_params {
++	vdce_rsz_params_t rsz_params;
++	vdce_rmap_params_t rmap_params;
++	vdce_blend_params_t blend_params;
++	vdce_ccv_params_t ccv_params;
++} vdce_postcodec_params_t;
++
++/* transcodec parameters configuration structure */
++typedef struct vdce_transcodec_params {
++	vdce_rsz_params_t rsz_params;
++	vdce_rmap_params_t rmap_params;
++	vdce_blend_params_t blend_params;
++	vdce_epad_params_t epad_params;
++	vdce_ccv_params_t ccv_params;
++} vdce_transcodec_params_t;
++
++/* Passed for setting VDCE parameters */
++typedef struct vdce_params {
++	vdce_mode_operation_t vdce_mode;
++	/* Bits position for enabling the various sub-modes */
++	/* 1 bit defienes resizing 2 blending 3 range mapping and 4 ccv */
++	unsigned char modes_control;
++	vdce_common_params_t common_params;
++	union {
++		vdce_precodec_params_t precodec_params;
++		vdce_postcodec_params_t postcodec_params;
++		vdce_transcodec_params_t transcodec_params;
++		vdce_epad_params_t epad_params;
++		vdce_rsz_params_t rsz_params;
++		vdce_rmap_params_t rmap_params;
++		vdce_blend_params_t blend_params;
++		vdce_ccv_params_t ccv_params;
++	} vdce_mode_params;
++} vdce_params_t;
++
++/* status parameters structure */
++typedef struct vdce_hw_status {
++	vdce_processing_status_t chan_status;	/* get channel status */
++} vdce_hw_status_t;
++
++/* to allocate the memory*/
++typedef struct vdce_reqbufs {
++
++	vdce_image_type_t buf_type;	/* typeof frame buffer */
++	int count;		/* number of frame buffers to be allocated */
++	int num_lines;		/* Number of lines i.e.vertical pitch for */
++				/* luma componenet */
++	int bytes_per_line;	/* Number of lines i.e.horizontal pitch for */
++				/* luma componenet */
++	vdce_image_fmt_t image_type;	/* Input image format */
++} vdce_reqbufs_t;
++
++/* assessed for	quering	the buffer to get physical address*/
++typedef struct vdce_buffer {
++
++	int index;		/* buffer index number, 0 -> N-1 */
++	vdce_image_type_t buf_type;/* buffer type, input or output */
++	union {
++	unsigned int offset;	/* physical     address of the buffer, */
++	unsigned int virt_ptr;
++	};/* used in the mmap() system call */
++	int size;		/* size */
++} vdce_buffer_t;
++
++/* structure to	be passed while	VDCE oparation */
++typedef struct vdce_address_start {
++	/* 0 is input buffer 1 is output and 2 in bitmap buffer */
++	vdce_buffer_t buffers[3];
++	/* Horizontal and vertical pitch */
++	unsigned int src_horz_pitch;
++	unsigned int res_horz_pitch;
++	unsigned int bmp_pitch;
++} vdce_address_start_t;
++
++#ifdef __KERNEL__
++/* ---------------Driver Structures-------------------------------------------*/
++/* enum for suggesting num of passes required */
++typedef enum vdce_num_pass {
++	VDCE_SINGLE_PASS = 1,	/* VDCE driver will operate in single pass */
++	VDCE_MULTIPASS	/* VDCE driver will operate in Multipass pass */
++} vdce_num_pass_t;
++/* enum for suggesting channel mode */
++typedef enum vdce_mode {
++	VDCE_MODE_BLOCKING = 0,	/* channel opeend in blocking mode */
++	VDCE_MODE_NON_BLOCKING	/* channel opened in non-blocking */
++} vdce_mode_t;
++typedef enum vdce_start_status {
++	VDCE_PASS1_STARTED = 0,
++	VDCE_PASS2_STARTED,
++	VDCE_COMPLETED
++} vdce_start_status_t;
++/* Global structure in driver */
++typedef struct device_params {
++	int module_usage_count;	/* Keeps track of number of open chan */
++	struct completion sem_isr;	/* sem to indicate the completion */
++					/*in case for blocking call */
++	struct semaphore array_sem;	/* sem to protect array entry */
++	struct semaphore device_mutex;	/* sem to protect global variables */
++	struct channel_config *channel_configuration[MAX_CHANNELS];
++	/* Poniter */
++	/* to be stored in Channel Queue */
++	int array_count;	/* Total number of entries in array */
++	void *inter_buffer;	/* Address for inter buffer */
++	unsigned int inter_size; /* Size of intermediate buffer */
++	struct completion edma_sem;
++} device_params_t;
++typedef struct vdce_buffer_info {
++	void *buffers[MAX_BUFFERS];
++	int size;
++	int num_allocated;
++} vdce_buffer_info_t;
++/* Channel specific device structure */
++typedef struct channel_config {
++	struct vdce_hw_config register_config[2];/* Instance of register */
++						/* mapping structure */
++	vdce_num_pass_t num_pass;		/* Single pass or multipass */
++	vdce_buffer_info_t vdce_buffer[3];
++	vdce_params_t get_params;	/*Instance for parameters send */
++						/* by application */
++	vdce_params_t get_params1;
++	int priority;				/* Hold priority of channel */
++	struct completion channel_sem;		/* Completion semaphore to be */
++						/* used for blocking call */
++	struct semaphore chan_protection;	/* Semaphore to protect the */
++						/* channel */
++	vdce_mode_operation_t mode_state;	/* VDCE channel mode */
++	vdce_mode_t channel_mode;		/* Indiacte the blocking or */
++						/* non blocking */
++	int luma_chroma_phased;		/* if 1 indicates luma is phased */
++	vdce_processing_status_t status;	/* Indiacte channel */
++						/*free/pending/busy */
++	vdce_start_status_t vdce_complete;	/* To keep track of isr */
++	vdce_image_fmt_t image_type_out;	/* Input image type */
++	vdce_image_fmt_t image_type_in;		/* Output image type */
++
++} channel_config_t;
++
++typedef struct vdce_debug_info {
++	/* keeps track of number of interrupts */
++	int vdce_interrupt_count;
++	/* keeps track of number of non-block calls */
++	int vdce_nonblock_count;
++	/* keeps track of number of blocking calls */
++	int vdce_block_count;
++} vdce_debug_info_t;
++
++/* ---------------Function definition-----------------------------------------*/
++int malloc_buff(vdce_reqbufs_t *, channel_config_t *);
++int get_buf_address(vdce_buffer_t *, channel_config_t *);
++int free_buff(channel_config_t *);
++int vdce_set_multipass_address(vdce_address_start_t *, channel_config_t *);
++int vdce_set_address(vdce_address_start_t *, channel_config_t *,
++						 int, u32, u32, u32);
++int vdce_start(vdce_address_start_t *, channel_config_t *);
++int add_to_array(channel_config_t *);
++int delete_from_array(void);
++void process_bottomhalf(unsigned long);
++int vdce_get_default(vdce_params_t *);
++int vdce_check_common_params(vdce_params_t *);
++int vdce_set_size_fmt(vdce_common_params_t *, channel_config_t *, int);
++int vdce_set_rszparams(vdce_params_t *, channel_config_t *,
++		     vdce_mode_operation_t, int);
++int vdce_set_epadparams(vdce_epad_params_t *, channel_config_t *, int);
++int vdce_set_ccvparams(vdce_ccv_params_t *, channel_config_t *, int, int);
++int vdce_set_blendparams(vdce_blend_params_t *, channel_config_t *, int, int);
++int vdce_set_rmapparams(vdce_rmap_params_t *, channel_config_t *, int);
++int vdce_set_params(vdce_params_t *, channel_config_t *);
++int vdce_get_params(vdce_params_t *, channel_config_t *);
++int vdce_set_priority(int, channel_config_t *);
++int vdce_get_priority(int *, channel_config_t *);
++int vdce_get_status(vdce_hw_status_t *, channel_config_t *);
++int free_num_buffers(int *, unsigned long, unsigned long);
++irqreturn_t vdce_isr(int, void *, struct pt_regs *);
++#endif
++#endif
+Index: linux-2.6.10/include/asm-arm/arch-davinci/davinci_vdce_hw.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-davinci/davinci_vdce_hw.h
+@@ -0,0 +1,254 @@
++/* *
++ * Copyright (C) 2007 Texas Instruments	Inc
++ *
++ * This	program	is free	software; you can redistribute it and/or modify
++ * it under the	terms of the GNU General Public	License	as published by
++ * the Free Software Foundation; either	version	2 of the License, or
++ * (at your option) any	later version.
++ *
++ * This	program	is distributed in the hope that	it will	be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A	PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59	Temple Place, Suite 330, Boston, MA 02111-1307	USA
++ */
++/* davinci_vdce_hw.h	file */
++#ifndef	DAVINCI_VDCE_HW_H
++#define	DAVINCI_VDCE_HW_H
++#ifdef __KERNEL__
++#include <asm/arch/hardware.h>
++#include <asm/io.h>
++#endif
++#define	MAX_BLEND_TABLE			  4
++/* Register	offset mapping*/
++#ifdef __KERNEL__
++#define	BITSET(variable,bit)		((variable)| (1<<bit))
++#define	BITRESET(variable,bit)		((variable)& (~(0x00000001<<(bit))))
++#define	BITGET(variable,bit)		(((variable)& (1<<bit))>>(bit))
++
++/* Bit position for various bits . Used in BITSET */
++#define	 SET_CCV_V_TYPE		(2)
++#define	 SET_CCV_H_TYPE		(3)
++#define	 SET_CCV_IN_MPEG1	(1)
++#define	 SET_CCV_OUT_MPEG1	(0)
++#define	 SET_CCV_ENABLE		(10)
++#define	 VDCE_RASTER_SCANNING	(0)
++/* Bits position number to be used in bitset for setting various registers */
++#define	SET_HRSZ_ENABLE		(0)
++#define	SET_VRSZ_ENABLE		(4)
++#define	SET_HRSZ_ALF_ENABLE	(8)
++#define	SET_VRSZ_ALF_ENABLE	(12)
++#define	SET_RSZ_H_TYPE		(1)
++#define	SET_RSZ_V_TYPE		(5)
++#define	SET_RSZ_H_ALF_mode	(9)
++#define	SET_LUMA_ENABLE		(1)
++#define	SET_CHROMA_ENABLE	(2)
++#define	SET_TOP_ENABLE		(7)
++#define	SET_BOT_ENABLE		(6)
++#define	SET_SRC_MODE		(14)
++#define	SET_RES_MODE		(13)
++#define	SET_BMP_MODE		(15)
++#define	SET_PRO_MODE		(12)
++/* various modes supported in hardware. The value generated by them */
++#define	MODE_PRECODEC		(2)
++#define	MODE_POSTCODEC		(3)
++#define	MODE_TRANSCODEC		(1)
++#define	MODE_EPAD		(0)
++
++#define	SET_RSZ_ENABLE		(8)
++#define	SET_RMAP_ENABLE		(9)
++#define	SET_BLEND_ENABLE	(11)
++#define	FOUR_TWO_TWO		(1)
++#define	SET_RMAP_YENABLE	(3)
++#define	SET_RMAP_CENABLE	(11)
++
++/* various shifts and masks of register */
++#define	LUMA_CHROMA_ENABLE_MASK	(0x6)
++#define	LUMA_CHROMA_ENABLE_SHIFT (0x1)
++#define	TOP_BOTTOM_ENABLE_MASK	(0xc0)
++#define	TOP_BOTTOM_ENABLE_SHIFT	(0x6)
++
++/* Mask and shift values for range mapping registers */
++#define	RANGE_MAP_Y_SHIFT	(0)
++#define	RANGE_MAP_Y_MASK	(0x7<<RANGE_MAP_Y_SHIFT)
++#define	RANGE_MAP_C_SHIFT	(8)
++#define	RANGE_MAP_C_MASK	(0x7<<RANGE_MAP_C_SHIFT)
++/* Mask and shift values for Blending registers */
++#define	BLD_LUT_Y_SHIFT		(16)
++#define	BLD_LUT_Y_MASK		(0xff<<BLD_LUT_Y_SHIFT)
++#define	BLD_LUT_CB_SHIFT	(0)
++#define	BLD_LUT_CB_MASK		(0xff<<BLD_LUT_CB_SHIFT)
++#define	BLD_LUT_CR_SHIFT	(8)
++#define	BLD_LUT_CR_MASK		(0xff<<BLD_LUT_CR_SHIFT)
++#define	BLD_LUT_FCT_SHIFT	(24)
++#define	BLD_LUT_FCT_MASK	(0xff<<BLD_LUT_FCT_SHIFT)
++/* Mask and shift values for Edgepadding registers */
++#define	EPD_C_HEXT_SHIFT	(0)
++#define	EPD_C_HEXT_MASK		(0x3f<<EPD_C_HEXT_SHIFT)
++#define	EPD_C_VEXT_SHIFT	(8)
++#define	EPD_C_VEXT_MASK		(0x3f<<EPD_C_VEXT_SHIFT	 )
++#define	EPD_Y_VEXT_SHIFT	(8)
++#define	EPD_Y_VEXT_MASK		(0x3f<<EPD_Y_VEXT_SHIFT)
++#define	EPD_Y_HEXT_SHIFT	(0)
++#define	EPD_Y_HEXT_MASK		(0x3f<<EPD_Y_HEXT_SHIFT	)
++/* Mask and shift values for Resizing registers */
++#define	RSZ_H_MAG_SHIFT		(0)
++#define	RSZ_H_MAG_MASK		(0xfff<<RSZ_H_MAG_SHIFT	)
++#define	RSZ_V_MAG_SHIFT		(0)
++#define	RSZ_V_MAG_MASK		(0xfff<<RSZ_V_MAG_SHIFT	)
++
++#define	VDCE_REQ_SZ_SHIFT		(0)
++#define	VDCE_REQ_SZ_MASK		(0x1ff<<VDCE_REQ_SZ_SHIFT	)
++#define	VDCE_PRCS_UNIT_SIZE_SHIFT	 (0)
++#define	VDCE_PRCS_UNIT_SIZE_MASK	 (0x1ff<<VDCE_PRCS_UNIT_SIZE_SHIFT )
++/* source and result image size shift and mask */
++#define	SRC_Y_HSZ_SHIFT		(0)
++#define	SRC_Y_HSZ_MASK		(0xfff<<SRC_Y_HSZ_SHIFT	)
++#define	SRC_Y_VSZ_SHIFT		(16)
++#define	SRC_Y_VSZ_MASK		(0xfff<<SRC_Y_VSZ_SHIFT	)
++#define	RES_Y_HSZ_SHIFT		(0)
++#define	RES_Y_HSZ_MASK		(0xfff<<SRC_Y_HSZ_SHIFT	)
++#define	RES_Y_VSZ_SHIFT		(16)
++#define	RES_Y_VSZ_MASK		(0xfff<<RES_Y_VSZ_SHIFT	)
++#define	SRC_C_HSZ_SHIFT		(0)
++#define	SRC_C_HSZ_MASK		(0xfff<<SRC_C_HSZ_SHIFT	)
++#define	SRC_C_VSZ_SHIFT		(16)
++#define	SRC_C_VSZ_MASK		(0xfff<<SRC_C_VSZ_SHIFT	 )
++#define	RES_C_HSZ_SHIFT		(0)
++#define	RES_C_HSZ_MASK		(0xfff<<RES_C_HSZ_SHIFT	)
++#define	RES_C_VSZ_SHIFT		(16)
++#define	RES_C_VSZ_MASK		(0xfff<<RES_C_VSZ_SHIFT)
++#define	SRC_BMP_HSZ_SHIFT	(0)
++#define	SRC_BMP_HSZ_MASK	(0xfff<<SRC_BMP_HSZ_SHIFT )
++#define	SRC_BMP_VSZ_SHIFT	(16)
++#define	SRC_BMP_VSZ_MASK	(0xfff<<SRC_BMP_VSZ_SHIFT )
++#define	SRC_BMP_STRT_HPS_SHIFT	  (0)
++#define	SRC_BMP_STRT_HPS_MASK	  (0xfff<<SRC_BMP_STRT_HPS_SHIFT)
++#define	RES_BMP_STRT_VPS_SHIFT	(16)
++#define	RES_BMP_STRT_VPS_MASK	(0xfff<<RES_BMP_STRT_VPS_SHIFT )
++
++#define	VDCE_MODE_SHIFT		(4)
++#define	VDCE_MODE_MASK		(0x3 <<VDCE_MODE_SHIFT )
++#define	RSZ_ALF_INTENSITY_SHIFT	(0)
++#define	RSZ_ALF_INTENSITY_MASK	(0xff)
++/* Base address and offset for various ge registers */
++#define	VDCE_IOBASE_VADDR	IO_ADDRESS(0x01c12800)
++#define	VDCE_ENABLE		(0x0)
++#define	VDCE_CTRL		(0x04)
++#define	VDCE_INTEN		(0x08)
++#define	VDCE_INTEN_SET		(0x0c)
++#define	VDCE_EMULATION_CTRL	(0x1c)
++#define	VDCE_STATUS		(0x14)
++#define	VDCE_STATUS_CLR		(0x18)
++#define	VDCE_SDR_FMT		(0x20)
++#define	VDCE_REQ_SZ		(0x24)
++#define	VDCE_PRCS_UNIT_SIZE	(0x28)
++#define	VDCE_SRC_STRT_ADD_YTOP	(0x40)
++#define	VDCE_SRC_STRT_OFF_YTOP	(0x48)
++#define	VDCE_SRC_STRT_ADD_YBOT	(0x4c)
++#define	VDCE_SRC_STRT_OFF_YBOT	(0x54)
++#define	VDCE_SRC_STRT_ADD_CTOP	(0x58)
++#define	VDCE_SRC_STRT_OFF_CTOP	(0x60)
++#define	VDCE_SRC_STRT_ADD_CBOT	(0x64)
++#define	VDCE_SRC_STRT_OFF_CBOT	(0x6c)
++#define	VDCE_SRC_STRT_ADD_BMP_TOP	(0x70)
++#define	VDCE_SRC_STRT_OFF_BMP_TOP	(0x74)
++#define	VDCE_SRC_STRT_ADD_BMP_BOT	(0x78)
++#define	VDCE_SRC_STRT_OFF_BMP_BOT	(0x7c)
++#define	VDCE_RES_STRT_ADD_YTOP	(0x80)
++#define	VDCE_RES_STRT_OFF_YTOP	(0x88)
++#define	VDCE_RES_STRT_ADD_YBOT	(0x8c)
++#define	VDCE_RES_STRT_OFF_YBOT	(0x94)
++#define	VDCE_RES_STRT_ADD_CTOP	(0x98)
++#define	VDCE_RES_STRT_OFF_CTOP	(0xa0)
++#define	VDCE_RES_STRT_ADD_CBOT	(0xa4)
++#define	VDCE_RES_STRT_OFF_CBOT	(0xac)
++#define	SRC_Y_STRT_PS		(0xc0)
++#define	SRC_Y_SZ		(0xc4)
++#define	SRC_C_STRT_PS		(0xc8)
++#define	SRC_C_SZ		(0xcc)
++#define	SRC_BMP_STRT_PS		(0xd0)
++#define	SRC_BMP_SZ		(0xd4)
++#define	RES_Y_STRT_PS		(0xe0)
++#define	RES_Y_SZ		(0xe4)
++#define	RES_C_STRT_PS		(0xe8)
++#define	RES_C_SZ		(0xec)
++#define	RES_BMP_STRT_PS		(0xf0)
++#define	RSZ_MODE		(0x100)
++#define	RSZ_H_MAG		(0x104)
++#define	RSZ_V_MAG		(0x108)
++#define	RSZ_H_PHASE		(0x10c)
++#define	RSZ_V_PHASE		(0x110)
++#define	RSZ_ALF_INTENSITY	(0x114)
++#define	CCV_MODE		(0x120)
++#define	BLD_LUT_00		(0x140)
++#define	BLD_LUT_01		(0x144)
++#define	BLD_LUT_02		(0x148)
++#define	BLD_LUT_03		(0x14c)
++#define	RGMP_CTRL		(0x160)
++#define	EPD_LUMA_WIDTH		(0x184)
++#define	EPD_CHROMA_WIDTH	(0x188)
++/* Register read/write */
++#define	regw(val,reg)		outl(val,((reg)+ VDCE_IOBASE_VADDR))
++#define	regr(reg)		inl((reg)+VDCE_IOBASE_VADDR)
++
++/* register mapping structure */
++typedef struct vdce_hw_config {
++	unsigned int vdce_ctrl;
++	unsigned int vdce_emulation_ctrl;
++	unsigned int vdce_sdr_fmt;
++	unsigned int vdce_req_sz;
++	unsigned int vdce_prcs_unit_size;
++	u32 src_Y_strt_ps;
++	u32 src_Y_sz;
++	u32 src_C_strt_ps;
++	u32 src_C_sz;
++	u32 src_bmp_strt_ps;
++	u32 src_bmp_sz;
++	u32 res_Y_strt_ps;
++	u32 res_Y_sz;
++	u32 res_C_strt_ps;
++	u32 res_C_sz;
++	u32 res_bmp_strt_ps;
++	unsigned int vdce_src_strt_add_ytop;
++	unsigned int vdce_src_strt_add_ctop;
++	unsigned int vdce_src_strt_add_ybot;
++	unsigned int vdce_src_strt_add_cbot;
++	unsigned int vdce_res_strt_add_ytop;
++	unsigned int vdce_res_strt_add_ctop;
++	unsigned int vdce_res_strt_add_ybot;
++	unsigned int vdce_res_strt_add_cbot;
++	unsigned int vdce_src_add_ofst_ytop;
++	unsigned int vdce_src_add_ofst_ctop;
++	unsigned int vdce_src_add_ofst_ybot;
++	unsigned int vdce_src_add_ofst_cbot;
++	unsigned int vdce_src_strt_add_bmp_top;
++	unsigned int vdce_src_strt_add_bmp_bot;
++	unsigned int vdce_src_strt_off_bmp_top;
++	unsigned int vdce_src_strt_off_bmp_bot;
++	unsigned int vdce_res_strt_off_ytop;
++	unsigned int vdce_res_strt_off_ctop;
++	unsigned int vdce_res_strt_off_ybot;
++	unsigned int vdce_res_strt_off_cbot;
++	u32 rsz_mode;
++	u32 rsz_h_mag;
++	u32 rsz_v_mag;
++	u32 rsz_h_phase;
++	u32 rsz_v_phase;
++	u32 rsz_alf_intensity;
++	u32 ccv_mode;
++	u32 bld_lut[MAX_BLEND_TABLE];
++	u32 rgmp_ctrl;
++	u32 epd_luma_width;
++	u32 epd_chroma_width;
++} vdce_hw_config_t;
++
++int vdce_enable_int(void);
++int vdce_clear_status(void);
++int vdce_enable(vdce_hw_config_t *);
++void vdce_hw_setup(vdce_hw_config_t *);
++#endif
++#endif
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -111,6 +111,9 @@ obj-$(CONFIG_RESIZER) += davinci_rsz_dri
+ obj-$(CONFIG_HANGCHECK_TIMER) += hangcheck-timer.o
+ obj-$(CONFIG_DAVINCI_RTC) += davinci-rtc.o
+ 
++davinci_vdce_driver-objs := davinci_vdce.o davinci_vdce_hw.o
++obj-$(CONFIG_VDCE) += davinci_vdce_driver.o
++
+ davinci_previewer_driver-objs := davinci_previewer_hw.o davinci_previewer.o
+ obj-$(CONFIG_PREVIEWER) += davinci_previewer_driver.o
+ 
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -1130,6 +1130,13 @@ config PREVIEWER
+ 	help
+ 		DaVinci Previewer Driver
+ 
++config VDCE
++	tristate "DaVinci VDCE Driver"
++	default n
++	depends on MACH_DAVINCI_HD_EVM
++	help
++		DaVinci VDCE Driver.
++
+ config DAVINCI_PWM
+ 	tristate "DaVinci PWM Driver Support"
+ 	default n
+Index: linux-2.6.10/mvl_patches/pro-1693.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1693.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1693);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

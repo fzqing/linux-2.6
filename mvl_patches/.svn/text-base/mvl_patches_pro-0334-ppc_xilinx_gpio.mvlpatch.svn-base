@@ -1,0 +1,763 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_gpio
+# Date: Mon Mar  6 15:02:31 2006
+# Source: MontaVista Software, Inc.
+# MR: 15265
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     Linux driver (aka "adapter") for GPIO IP.
+# 
+
+PATCHNUM=334
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15265
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    Linux driver (aka "adapter") for GPIO IP.
+
+ drivers/char/Kconfig                   |    7 
+ drivers/char/Makefile                  |    1 
+ drivers/char/xilinx_gpio/Makefile      |   13 +
+ drivers/char/xilinx_gpio/adapter.c     |  422 +++++++++++++++++++++++++++++++++
+ drivers/char/xilinx_gpio/xgpio_ioctl.h |   46 +++
+ mvl_patches/pro-0334.c                 |   16 +
+ 6 files changed, 505 insertions(+)
+
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -994,6 +994,13 @@ config SCx200_GPIO
+ 
+ 	  If compiled as a module, it will be called scx200_gpio.
+ 
++config XILINX_GPIO
++	tristate "Xilinx GPIO support"
++	depends on XILINX_VIRTEX
++	select XILINX_EDK
++	help
++	  This driver supports GPIO IP from Xilinx EDK
++
+ config RAW_DRIVER
+ 	tristate "RAW driver (/dev/raw/rawN) (OBSOLETE)"
+ 	help
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -89,6 +89,7 @@ obj-$(CONFIG_PPDEV) += ppdev.o
+ obj-$(CONFIG_NWBUTTON) += nwbutton.o
+ obj-$(CONFIG_NWFLASH) += nwflash.o
+ obj-$(CONFIG_SCx200_GPIO) += scx200_gpio.o
++obj-$(CONFIG_XILINX_GPIO) += xilinx_gpio/
+ 
+ obj-$(CONFIG_WATCHDOG)	+= watchdog/
+ obj-$(CONFIG_MWAVE) += mwave/
+Index: linux-2.6.10/drivers/char/xilinx_gpio/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_gpio/Makefile
+@@ -0,0 +1,13 @@
++#
++# Makefile for the Xilinx GPIO driver
++#
++
++EXTRA_CFLAGS		+= -Idrivers/xilinx_edk
++
++# The Linux adapter for the Xilinx driver code.
++xilinx_gpio-objs	:= adapter.o
++
++# The Xilinx OS independent code.
++xilinx_gpio-objs	+= xgpio.o
++
++obj-$(CONFIG_XILINX_GPIO) += xilinx_gpio.o
+Index: linux-2.6.10/drivers/char/xilinx_gpio/adapter.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_gpio/adapter.c
+@@ -0,0 +1,422 @@
++/*
++ * adapter.c
++ *
++ * Xilinx GPIO Adapter component to interface GPIO component to Linux
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2005 (c)MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++/*
++ * This driver is a bit unusual in that it is composed of two logical
++ * parts where one part is the OS independent code and the other part is
++ * the OS dependent code.  Xilinx provides their drivers split in this
++ * fashion.  This file represents the Linux OS dependent part known as
++ * the Linux adapter.  The other files in this directory are the OS
++ * independent files as provided by Xilinx with no changes made to them.
++ * The names exported by those files begin with XGpio_.  All functions
++ * in this file that are called by Linux have names that begin with
++ * xgpio_.  Any other functions are static helper functions.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/miscdevice.h>
++#include <linux/xilinx_devices.h>
++
++#include <asm/io.h>
++#include <asm/uaccess.h>
++
++#include "xgpio.h"
++#include "xgpio_ioctl.h"
++
++struct xgpio_instance {
++	struct list_head link;
++	unsigned long base_phys;	/* GPIO base address - physical */
++	u32 device_id;
++	/*
++	 * The underlying OS independent code needs space as well.  A
++	 * pointer to the following XGpio structure will be passed to
++	 * any XGpio_ function that requires it.  However, we try to treat the
++	 * data as an opaque object in this file (meaning that we never
++	 * reference any of the fields inside of the structure).
++	 */
++	XGpio		gpio;
++};
++
++/* SAATODO: This function will be moved into the Xilinx code. */
++/****************************************************************************/
++/**
++* Get the input/output direction of all discrete signals.
++*
++* @param InstancePtr is a pointer to an XGpio instance to be worked on.
++*
++* @return Current copy of the tristate (direction) register.
++*
++* @note
++*
++* None
++*
++*****************************************************************************/
++u32 XGpio_GetDataDirection(XGpio * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	return XGpio_mReadReg(InstancePtr->BaseAddress, XGPIO_TRI_OFFSET);
++}
++
++inline int XGpio_IsReady(XGpio * InstancePtr)
++{
++	return InstancePtr->IsReady == XCOMPONENT_IS_READY;
++}
++
++static LIST_HEAD(inst_list);
++static DECLARE_RWSEM(inst_list_sem);
++
++/*******************************************************************************
++ * This configuration stuff should become unnecessary after EDK version 8.x is
++ * released.
++ ******************************************************************************/
++
++static DECLARE_MUTEX(cfg_sem);
++static XGpio_Config * p_xgpio_cfg;
++
++/*
++ * Lookup the device configuration based on the unique device ID.
++ * Prototyped in xgpio.h.
++ * We rely on that p_xgpio_cfg is set properly right before XGpio_Initialize()
++ * calls XGpio_LookupConfig().
++ */
++XGpio_Config * XGpio_LookupConfig(u16 DeviceId)
++{
++	return p_xgpio_cfg;
++}
++
++static XStatus XGpio_CfgInitialize(XGpio * InstancePtr, XGpio_Config * CfgPtr)
++{
++	XStatus retval;
++
++	down(&cfg_sem);
++	p_xgpio_cfg = CfgPtr;
++	retval = XGpio_Initialize(InstancePtr, 0);
++	up(&cfg_sem);
++
++	return retval;
++}
++
++/*******************
++ * The misc device *
++ *******************/
++
++static int xgpio_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static int xgpio_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static int ioctl_setup(unsigned long arg,
++		       struct xgpio_ioctl_data *ioctl_data,
++		       struct xgpio_instance **match)
++{
++	struct list_head *entry;
++	struct xgpio_instance *inst;
++
++	if (copy_from_user(ioctl_data, (void *) arg, sizeof (*ioctl_data)))
++		return -EFAULT;
++
++	down_read(&inst_list_sem);
++
++	list_for_each(entry, &inst_list) {
++		inst = list_entry(entry, struct xgpio_instance, link);
++		if (ioctl_data->device == inst->device_id) {
++			up_read(&inst_list_sem);
++			if (XGpio_IsReady(&inst->gpio)) {
++				*match = inst;
++				return 0;
++			} else {
++				return -EAGAIN;
++			}
++		}
++	}
++
++	up_read(&inst_list_sem);
++	return -ENODEV;
++}
++
++static int xgpio_ioctl(struct inode *inode, struct file *file,
++		       unsigned int cmd, unsigned long arg)
++{
++	struct xgpio_ioctl_data ioctl_data;
++	struct xgpio_instance *inst;
++	int status;
++	u32 r;
++
++	switch (cmd) {
++	case XGPIO_IN:
++		status = ioctl_setup(arg, &ioctl_data, &inst);
++		if (status < 0)
++			return status;
++
++		/*
++		 * Ensure that the GPIO bits in the mask are tristated.
++		 * Unlike IBM OCP GPIO, one needs to set the bits in the
++		 * Tristate (direction) Register to make the corresponding
++		 * GPIOs to be inputs.
++		 */
++		r = XGpio_GetDataDirection(&inst->gpio);
++		XGpio_SetDataDirection(&inst->gpio, r | ioctl_data.mask);
++
++		ioctl_data.data = (XGpio_DiscreteRead(&inst->gpio)
++				   & ioctl_data.mask);
++		if (copy_to_user((struct xgpio_ioctl_data *) arg,
++				 &ioctl_data, sizeof (ioctl_data))) {
++			return -EFAULT;
++		}
++		break;
++
++	case XGPIO_OUT:
++		status = ioctl_setup(arg, &ioctl_data, &inst);
++		if (status < 0)
++			return status;
++
++		/* Get the prior value. */
++		r = XGpio_DiscreteRead(&inst->gpio);
++		/* Clear the bits that we're going to put in. */
++		r &= ~ioctl_data.mask;
++		/* Set the bits that were provided. */
++		r |= (ioctl_data.mask & ioctl_data.data);
++
++		XGpio_DiscreteWrite(&inst->gpio, r);
++
++		/*
++		 * Ensure that the GPIO bits in the mask are not tristated.
++		 * Unlike IBM OCP GPIO, one needs to clear the bits in the
++		 * Tristate (direction) Register to make the corresponding
++		 * GPIOs to be outputs.
++		 */
++		r = XGpio_GetDataDirection(&inst->gpio);
++		XGpio_SetDataDirection(&inst->gpio, r & ~ioctl_data.mask);
++
++		break;
++
++	case XGPIO_TRISTATE:
++		status = ioctl_setup(arg, &ioctl_data, &inst);
++		if (status < 0)
++			return status;
++
++		/* Get the prior value. */
++		r = XGpio_GetDataDirection(&inst->gpio);
++		/* Clear the bits that we're going to put in. */
++		r &= ~ioctl_data.mask;
++		/*
++		 * Set the bits that were provided.
++		 * Note that "1" makes the corresponding GPIO pin to tristate.
++		 * To keep the interface the same as for IBM OCP GPIO
++		 * we invert ioctl_data.data before writing them to the
++		 * Tristate Register.
++		 */
++		r |= (ioctl_data.mask & ~ioctl_data.data);
++
++		XGpio_SetDataDirection(&inst->gpio, r);
++		break;
++
++	case XGPIO_OPEN_DRAIN:
++		/* This can be implemented by configuring a pin as
++		 * output when it is "0", and tristating a pin when
++		 * it is "1". Now just fall trough. */
++
++	default:
++		return -ENOIOCTLCMD;
++
++	}
++	return 0;
++}
++
++/*
++ * We get to all of the GPIOs through one minor number.  Here's the
++ * miscdevice that gets registered for that minor number.
++ */
++
++static struct file_operations xgpio_fops = {
++	owner:THIS_MODULE,
++	ioctl:xgpio_ioctl,
++	open:xgpio_open,
++	release:xgpio_release
++};
++
++static struct miscdevice miscdev = {
++	minor:XGPIO_MINOR,
++	name:"xgpio",
++	fops:&xgpio_fops
++};
++
++/******************************
++ * The platform device driver *
++ ******************************/
++
++#define DRIVER_NAME "xilinx_gpio"
++
++static int xgpio_probe(struct device *dev)
++{
++	XGpio_Config xgpio_config;
++	struct xgpio_instance *xgpio_inst;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct resource *regs_res;
++	int retval;
++
++	if (!dev)
++		return -EINVAL;
++
++	xgpio_inst = kzalloc(sizeof(struct xgpio_instance), GFP_KERNEL);
++	if (!xgpio_inst) {
++		printk(KERN_ERR
++		       "%s #%d: Couldn't allocate device private record\n",
++		       miscdev.name, pdev->id);
++		return -ENOMEM;
++	}
++
++	/* Map the control registers in */
++	regs_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!regs_res || (regs_res->end - regs_res->start + 1 < 8)) {
++		printk(KERN_ERR "%s #%d: Couldn't get registers resource\n",
++		       miscdev.name, pdev->id);
++		retval = -EFAULT;
++		goto failed1;
++	}
++
++	if (!request_mem_region(regs_res->start, 8, DRIVER_NAME)) {
++		printk(KERN_ERR "Couldn't lock memory region at 0x%08lX\n",
++			regs_res->start);
++		retval = -EBUSY;
++		goto failed2;
++	}
++
++	xgpio_inst->base_phys = regs_res->start;
++	xgpio_inst->device_id = pdev->id;
++	xgpio_config.DeviceId = pdev->id;
++	xgpio_config.BaseAddress = (u32) ioremap(regs_res->start, 8);
++
++	/* Tell the Xilinx code to bring this GPIO interface up. */
++	if (XGpio_CfgInitialize(&xgpio_inst->gpio, &xgpio_config) != XST_SUCCESS) {
++		printk(KERN_ERR "%s #%d: Could not initialize instance.\n",
++		       miscdev.name, pdev->id);
++		retval = -ENODEV;
++		goto failed3;
++	}
++
++	/* Add XGpio instance to the list */
++	down_write(&inst_list_sem);
++	if (list_empty(&inst_list)) {
++		retval = misc_register(&miscdev);
++		if (retval != 0) {
++			up_write(&inst_list_sem);
++			printk(KERN_ERR "%s #%d: Could not register miscdev.\n",
++			miscdev.name, pdev->id);
++			goto failed3;
++		}
++	}
++	list_add_tail(&xgpio_inst->link, &inst_list);
++	up_write(&inst_list_sem);
++
++	printk(KERN_INFO "%s #%d at 0x%08lX mapped to 0x%08X\n",
++	       miscdev.name, xgpio_inst->device_id,
++	       xgpio_inst->base_phys, xgpio_inst->gpio.BaseAddress);
++
++	return 0; /* success */
++
++failed3:
++	iounmap((void *) (xgpio_config.BaseAddress));
++
++failed2:
++	release_mem_region(regs_res->start, 8);
++
++failed1:
++	kfree(xgpio_inst);
++
++	return retval;
++}
++
++static int xgpio_remove(struct device *dev)
++{
++	struct list_head *entry;
++	struct xgpio_instance *xgpio_inst = NULL;
++	struct platform_device *pdev = to_platform_device(dev);
++
++	if (!dev)
++		return -EINVAL;
++
++	/* Set xgpio_inst based on pdev->id match */
++
++	down_read(&inst_list_sem);
++	list_for_each(entry, &inst_list) {
++		xgpio_inst = list_entry(entry, struct xgpio_instance, link);
++		if(pdev->id == xgpio_inst->device_id) {
++			break;
++		} else {
++			xgpio_inst = NULL;
++		}
++	}
++	up_read(&inst_list_sem);
++
++	if(xgpio_inst == NULL)
++		return -ENODEV;
++
++	/* Remove the private data from the list */
++	down_write(&inst_list_sem);
++	list_del(&xgpio_inst->link);
++	if(list_empty(&inst_list)) {
++		misc_deregister(&miscdev);
++	}
++	up_write(&inst_list_sem);
++
++	iounmap((void *) (xgpio_inst->gpio.BaseAddress));
++
++	release_mem_region(xgpio_inst->base_phys, 8);
++
++	kfree(xgpio_inst);
++
++	return 0;	/* success */
++}
++
++
++static struct device_driver xgpio_driver = {
++	.name		= DRIVER_NAME,
++	.bus		= &platform_bus_type,
++
++	.probe		= xgpio_probe,
++	.remove		= xgpio_remove
++};
++
++static int __init xgpio_init(void)
++{
++	/*
++	 * No kernel boot options used,
++	 * so we just need to register the driver
++	 */
++	return driver_register(&xgpio_driver);
++}
++
++static void __exit xgpio_cleanup(void)
++{
++	driver_unregister(&xgpio_driver);
++}
++
++module_init(xgpio_init);
++module_exit(xgpio_cleanup);
++
++MODULE_AUTHOR("MontaVista Software, Inc. <source@mvista.com>");
++MODULE_DESCRIPTION(DRIVER_DESCRIPTION);
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/char/xilinx_gpio/xgpio_ioctl.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_gpio/xgpio_ioctl.h
+@@ -0,0 +1,46 @@
++/*
++ * xgpio_ioctl.h
++ *
++ * ioctl numbers and data structure for Xilinx GPIO driver.
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2005 (c)MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ *
++ * Copied from ibm_ocp_gpio.h written by
++ *
++ *  Armin Kuster akuster@pacbell.net
++ *  Sept, 2001
++ *
++ *  Orignial driver
++ *  Author: MontaVista Software, Inc.  <source@mvista.com>
++ *          Frank Rowand <frank_rowand@mvista.com>
++ *
++ * Copyright 2000 MontaVista Software Inc.
++ */
++
++#ifndef __XGPIO_IOCTL_H
++#define __XGPIO_IOCTL_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define XGPIO_IOCTL_BASE	'Z'
++
++struct xgpio_ioctl_data {
++	__u32 device;
++	__u32 mask;
++	__u32 data;
++};
++
++#define XGPIO_MINOR             185
++#define XGPIO_IN		_IOWR(XGPIO_IOCTL_BASE, 0, struct xgpio_ioctl_data)
++#define XGPIO_OUT		_IOW (XGPIO_IOCTL_BASE, 1, struct xgpio_ioctl_data)
++#define XGPIO_OPEN_DRAIN	_IOW (XGPIO_IOCTL_BASE, 2, struct xgpio_ioctl_data)
++#define XGPIO_TRISTATE		_IOW (XGPIO_IOCTL_BASE, 3, struct xgpio_ioctl_data)
++
++#endif /* __XGPIO_IOCTL_H */
+Index: linux-2.6.10/mvl_patches/pro-0334.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0334.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(334);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

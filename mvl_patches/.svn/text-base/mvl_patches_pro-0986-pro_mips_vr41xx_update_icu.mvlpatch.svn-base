@@ -1,0 +1,1065 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_vr41xx_update_icu
+# Date: Tue Nov 28 11:32:44 2006
+# MR: 18842
+# 
+# [PATCH] mips: update IRQ handling for vr41xx
+# 
+# This patch has updated IRQ handling for vr41xx.
+# o added common IRQ dispatch
+# o changed IRQ number in int-handler.S
+# o added resource management to icu.c
+# 
+# Signed-off-by: Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
+# Cc: Ralf Baechle <ralf@linux-mips.org>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# commit 979934da9e7a0005bd9c8b1d7d00febb59ff67f7
+# tree e42728186c3efaccfa9da1dd2103090846d0c9fc
+# parent 006cfb51ad12047497a2a5ad796fb8914a1bc487
+# author Yoichi Yuasa <yuasa@hh.iij4u.or.jp> Sat, 03 Sep 2005 15:56:04 -0700
+# committer Linus Torvalds <torvalds@evo.osdl.org> Mon, 05 Sep 2005 00:06:02 -0700
+# 
+#  arch/mips/vr41xx/common/Makefile      |    2 
+#  arch/mips/vr41xx/common/icu.c         |  269 +++++++++++++++-------------------
+#  arch/mips/vr41xx/common/int-handler.S |   10 -
+#  arch/mips/vr41xx/common/irq.c         |   94 +++++++++++
+#  include/asm-mips/vr41xx/vr41xx.h      |   16 +-
+#  5 files changed, 234 insertions(+), 157 deletions(-)
+# 
+
+PATCHNUM=986
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18842
+
+[PATCH] mips: update IRQ handling for vr41xx
+
+This patch has updated IRQ handling for vr41xx.
+o added common IRQ dispatch
+o changed IRQ number in int-handler.S
+o added resource management to icu.c
+
+Signed-off-by: Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+commit 979934da9e7a0005bd9c8b1d7d00febb59ff67f7
+tree e42728186c3efaccfa9da1dd2103090846d0c9fc
+parent 006cfb51ad12047497a2a5ad796fb8914a1bc487
+author Yoichi Yuasa <yuasa@hh.iij4u.or.jp> Sat, 03 Sep 2005 15:56:04 -0700
+committer Linus Torvalds <torvalds@evo.osdl.org> Mon, 05 Sep 2005 00:06:02 -0700
+
+ arch/mips/vr41xx/common/Makefile      |    2 
+ arch/mips/vr41xx/common/icu.c         |  269 +++++++++++++++-------------------
+ arch/mips/vr41xx/common/int-handler.S |   10 -
+ arch/mips/vr41xx/common/irq.c         |   94 +++++++++++
+ include/asm-mips/vr41xx/vr41xx.h      |   16 +-
+ mvl_patches/pro-0986.c                |   16 ++
+ 6 files changed, 250 insertions(+), 157 deletions(-)
+
+Index: linux-2.6.10/arch/mips/vr41xx/common/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/mips/vr41xx/common/Makefile
++++ linux-2.6.10/arch/mips/vr41xx/common/Makefile
+@@ -2,7 +2,7 @@
+ # Makefile for common code of the NEC VR4100 series.
+ #
+ 
+-obj-y				+= bcu.o cmu.o icu.o init.o int-handler.o pmu.o
++obj-y				+= bcu.o cmu.o icu.o init.o int-handler.o irq.o pmu.o
+ obj-$(CONFIG_SERIAL_8250)	+= serial.o
+ obj-$(CONFIG_VRC4171)		+= vrc4171.o
+ obj-$(CONFIG_VRC4173)		+= vrc4173.o
+Index: linux-2.6.10/arch/mips/vr41xx/common/icu.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/vr41xx/common/icu.c
++++ linux-2.6.10/arch/mips/vr41xx/common/icu.c
+@@ -3,7 +3,7 @@
+  *
+  *  Copyright (C) 2001-2002  MontaVista Software Inc.
+  *    Author: Yoichi Yuasa <yyuasa@mvista.com or source@mvista.com>
+- *  Copyright (C) 2003-2004  Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
++ *  Copyright (C) 2003-2005  Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -31,7 +31,7 @@
+ #include <linux/config.h>
+ #include <linux/errno.h>
+ #include <linux/init.h>
+-#include <linux/interrupt.h>
++#include <linux/ioport.h>
+ #include <linux/irq.h>
+ #include <linux/module.h>
+ #include <linux/smp.h>
+@@ -39,34 +39,24 @@
+ 
+ #include <asm/cpu.h>
+ #include <asm/io.h>
+-#include <asm/irq.h>
+-#include <asm/irq_cpu.h>
+ #include <asm/vr41xx/vr41xx.h>
+ 
+-extern asmlinkage void vr41xx_handle_interrupt(void);
+-
+-extern void init_vr41xx_giuint_irq(void);
+-extern void giuint_irq_dispatch(struct pt_regs *regs);
+-
+-static uint32_t icu1_base;
+-static uint32_t icu2_base;
+-
+-static struct irqaction icu_cascade = {
+-	.handler	= no_action,
+-	.mask		= CPU_MASK_NONE,
+-	.name		= "cascade",
+-};
++static void __iomem *icu1_base;
++static void __iomem *icu2_base;
+ 
+ static unsigned char sysint1_assign[16] = {
+ 	0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+ static unsigned char sysint2_assign[16] = {
+-	2, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++	2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+-#define SYSINT1REG_TYPE1	KSEG1ADDR(0x0b000080)
+-#define SYSINT2REG_TYPE1	KSEG1ADDR(0x0b000200)
++#define ICU1_TYPE1_BASE	0x0b000080UL
++#define ICU2_TYPE1_BASE	0x0b000200UL
+ 
+-#define SYSINT1REG_TYPE2	KSEG1ADDR(0x0f000080)
+-#define SYSINT2REG_TYPE2	KSEG1ADDR(0x0f0000a0)
++#define ICU1_TYPE2_BASE	0x0f000080UL
++#define ICU2_TYPE2_BASE	0x0f0000a0UL
++
++#define ICU1_SIZE	0x20
++#define ICU2_SIZE	0x1c
+ 
+ #define SYSINT1REG	0x00
+ #define PIUINTREG	0x02
+@@ -106,61 +96,61 @@ static unsigned char sysint2_assign[16] 
+ #define SYSINT1_IRQ_TO_PIN(x)	((x) - SYSINT1_IRQ_BASE)	/* Pin 0-15 */
+ #define SYSINT2_IRQ_TO_PIN(x)	((x) - SYSINT2_IRQ_BASE)	/* Pin 0-15 */
+ 
+-#define read_icu1(offset)	readw(icu1_base + (offset))
+-#define write_icu1(val, offset)	writew((val), icu1_base + (offset))
++#define INT_TO_IRQ(x)		((x) + 2)	/* Int0-4 -> IRQ2-6 */
++
++#define icu1_read(offset)		readw(icu1_base + (offset))
++#define icu1_write(offset, value)	writew((value), icu1_base + (offset))
+ 
+-#define read_icu2(offset)	readw(icu2_base + (offset))
+-#define write_icu2(val, offset)	writew((val), icu2_base + (offset))
++#define icu2_read(offset)		readw(icu2_base + (offset))
++#define icu2_write(offset, value)	writew((value), icu2_base + (offset))
+ 
+ #define INTASSIGN_MAX	4
+ #define INTASSIGN_MASK	0x0007
+ 
+-static inline uint16_t set_icu1(uint8_t offset, uint16_t set)
++static inline uint16_t icu1_set(uint8_t offset, uint16_t set)
+ {
+-	uint16_t res;
++	uint16_t data;
+ 
+-	res = read_icu1(offset);
+-	res |= set;
+-	write_icu1(res, offset);
++	data = icu1_read(offset);
++	data |= set;
++	icu1_write(offset, data);
+ 
+-	return res;
++	return data;
+ }
+ 
+-static inline uint16_t clear_icu1(uint8_t offset, uint16_t clear)
++static inline uint16_t icu1_clear(uint8_t offset, uint16_t clear)
+ {
+-	uint16_t res;
++	uint16_t data;
+ 
+-	res = read_icu1(offset);
+-	res &= ~clear;
+-	write_icu1(res, offset);
++	data = icu1_read(offset);
++	data &= ~clear;
++	icu1_write(offset, data);
+ 
+-	return res;
++	return data;
+ }
+ 
+-static inline uint16_t set_icu2(uint8_t offset, uint16_t set)
++static inline uint16_t icu2_set(uint8_t offset, uint16_t set)
+ {
+-	uint16_t res;
++	uint16_t data;
+ 
+-	res = read_icu2(offset);
+-	res |= set;
+-	write_icu2(res, offset);
++	data = icu2_read(offset);
++	data |= set;
++	icu2_write(offset, data);
+ 
+-	return res;
++	return data;
+ }
+ 
+-static inline uint16_t clear_icu2(uint8_t offset, uint16_t clear)
++static inline uint16_t icu2_clear(uint8_t offset, uint16_t clear)
+ {
+-	uint16_t res;
++	uint16_t data;
+ 
+-	res = read_icu2(offset);
+-	res &= ~clear;
+-	write_icu2(res, offset);
++	data = icu2_read(offset);
++	data &= ~clear;
++	icu2_write(offset, data);
+ 
+-	return res;
++	return data;
+ }
+ 
+-/*=======================================================================*/
+-
+ void vr41xx_enable_piuint(uint16_t mask)
+ {
+ 	irq_desc_t *desc = irq_desc + PIU_IRQ;
+@@ -169,7 +159,7 @@ void vr41xx_enable_piuint(uint16_t mask)
+ 	if (current_cpu_data.cputype == CPU_VR4111 ||
+ 	    current_cpu_data.cputype == CPU_VR4121) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		set_icu1(MPIUINTREG, mask);
++		icu1_set(MPIUINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -184,7 +174,7 @@ void vr41xx_disable_piuint(uint16_t mask
+ 	if (current_cpu_data.cputype == CPU_VR4111 ||
+ 	    current_cpu_data.cputype == CPU_VR4121) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		clear_icu1(MPIUINTREG, mask);
++		icu1_clear(MPIUINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -199,7 +189,7 @@ void vr41xx_enable_aiuint(uint16_t mask)
+ 	if (current_cpu_data.cputype == CPU_VR4111 ||
+ 	    current_cpu_data.cputype == CPU_VR4121) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		set_icu1(MAIUINTREG, mask);
++		icu1_set(MAIUINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -214,7 +204,7 @@ void vr41xx_disable_aiuint(uint16_t mask
+ 	if (current_cpu_data.cputype == CPU_VR4111 ||
+ 	    current_cpu_data.cputype == CPU_VR4121) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		clear_icu1(MAIUINTREG, mask);
++		icu1_clear(MAIUINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -229,7 +219,7 @@ void vr41xx_enable_kiuint(uint16_t mask)
+ 	if (current_cpu_data.cputype == CPU_VR4111 ||
+ 	    current_cpu_data.cputype == CPU_VR4121) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		set_icu1(MKIUINTREG, mask);
++		icu1_set(MKIUINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -244,7 +234,7 @@ void vr41xx_disable_kiuint(uint16_t mask
+ 	if (current_cpu_data.cputype == CPU_VR4111 ||
+ 	    current_cpu_data.cputype == CPU_VR4121) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		clear_icu1(MKIUINTREG, mask);
++		icu1_clear(MKIUINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -257,7 +247,7 @@ void vr41xx_enable_dsiuint(uint16_t mask
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&desc->lock, flags);
+-	set_icu1(MDSIUINTREG, mask);
++	icu1_set(MDSIUINTREG, mask);
+ 	spin_unlock_irqrestore(&desc->lock, flags);
+ }
+ 
+@@ -269,7 +259,7 @@ void vr41xx_disable_dsiuint(uint16_t mas
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&desc->lock, flags);
+-	clear_icu1(MDSIUINTREG, mask);
++	icu1_clear(MDSIUINTREG, mask);
+ 	spin_unlock_irqrestore(&desc->lock, flags);
+ }
+ 
+@@ -281,7 +271,7 @@ void vr41xx_enable_firint(uint16_t mask)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&desc->lock, flags);
+-	set_icu2(MFIRINTREG, mask);
++	icu2_set(MFIRINTREG, mask);
+ 	spin_unlock_irqrestore(&desc->lock, flags);
+ }
+ 
+@@ -293,7 +283,7 @@ void vr41xx_disable_firint(uint16_t mask
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&desc->lock, flags);
+-	clear_icu2(MFIRINTREG, mask);
++	icu2_clear(MFIRINTREG, mask);
+ 	spin_unlock_irqrestore(&desc->lock, flags);
+ }
+ 
+@@ -308,7 +298,7 @@ void vr41xx_enable_pciint(void)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		write_icu2(PCIINT0, MPCIINTREG);
++		icu2_write(MPCIINTREG, PCIINT0);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -324,7 +314,7 @@ void vr41xx_disable_pciint(void)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		write_icu2(0, MPCIINTREG);
++		icu2_write(MPCIINTREG, 0);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -340,7 +330,7 @@ void vr41xx_enable_scuint(void)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		write_icu2(SCUINT0, MSCUINTREG);
++		icu2_write(MSCUINTREG, SCUINT0);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -356,7 +346,7 @@ void vr41xx_disable_scuint(void)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		write_icu2(0, MSCUINTREG);
++		icu2_write(MSCUINTREG, 0);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -372,7 +362,7 @@ void vr41xx_enable_csiint(uint16_t mask)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		set_icu2(MCSIINTREG, mask);
++		icu2_set(MCSIINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -388,7 +378,7 @@ void vr41xx_disable_csiint(uint16_t mask
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		clear_icu2(MCSIINTREG, mask);
++		icu2_clear(MCSIINTREG, mask);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -404,7 +394,7 @@ void vr41xx_enable_bcuint(void)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		write_icu2(BCUINTR, MBCUINTREG);
++		icu2_write(MBCUINTREG, BCUINTR);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+@@ -420,30 +410,28 @@ void vr41xx_disable_bcuint(void)
+ 	    current_cpu_data.cputype == CPU_VR4131 ||
+ 	    current_cpu_data.cputype == CPU_VR4133) {
+ 		spin_lock_irqsave(&desc->lock, flags);
+-		write_icu2(0, MBCUINTREG);
++		icu2_write(MBCUINTREG, 0);
+ 		spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
+ }
+ 
+ EXPORT_SYMBOL(vr41xx_disable_bcuint);
+ 
+-/*=======================================================================*/
+-
+ static unsigned int startup_sysint1_irq(unsigned int irq)
+ {
+-	set_icu1(MSYSINT1REG, (uint16_t)1 << SYSINT1_IRQ_TO_PIN(irq));
++	icu1_set(MSYSINT1REG, 1 << SYSINT1_IRQ_TO_PIN(irq));
+ 
+ 	return 0; /* never anything pending */
+ }
+ 
+ static void shutdown_sysint1_irq(unsigned int irq)
+ {
+-	clear_icu1(MSYSINT1REG, (uint16_t)1 << SYSINT1_IRQ_TO_PIN(irq));
++	icu1_clear(MSYSINT1REG, 1 << SYSINT1_IRQ_TO_PIN(irq));
+ }
+ 
+ static void enable_sysint1_irq(unsigned int irq)
+ {
+-	set_icu1(MSYSINT1REG, (uint16_t)1 << SYSINT1_IRQ_TO_PIN(irq));
++	icu1_set(MSYSINT1REG, 1 << SYSINT1_IRQ_TO_PIN(irq));
+ }
+ 
+ #define disable_sysint1_irq	shutdown_sysint1_irq
+@@ -452,7 +440,7 @@ static void enable_sysint1_irq(unsigned 
+ static void end_sysint1_irq(unsigned int irq)
+ {
+ 	if (!(irq_desc[irq].status & (IRQ_DISABLED | IRQ_INPROGRESS)))
+-		set_icu1(MSYSINT1REG, (uint16_t)1 << SYSINT1_IRQ_TO_PIN(irq));
++		icu1_set(MSYSINT1REG, 1 << SYSINT1_IRQ_TO_PIN(irq));
+ }
+ 
+ static struct hw_interrupt_type sysint1_irq_type = {
+@@ -465,23 +453,21 @@ static struct hw_interrupt_type sysint1_
+ 	.end		= end_sysint1_irq,
+ };
+ 
+-/*=======================================================================*/
+-
+ static unsigned int startup_sysint2_irq(unsigned int irq)
+ {
+-	set_icu2(MSYSINT2REG, (uint16_t)1 << SYSINT2_IRQ_TO_PIN(irq));
++	icu2_set(MSYSINT2REG, 1 << SYSINT2_IRQ_TO_PIN(irq));
+ 
+ 	return 0; /* never anything pending */
+ }
+ 
+ static void shutdown_sysint2_irq(unsigned int irq)
+ {
+-	clear_icu2(MSYSINT2REG, (uint16_t)1 << SYSINT2_IRQ_TO_PIN(irq));
++	icu2_clear(MSYSINT2REG, 1 << SYSINT2_IRQ_TO_PIN(irq));
+ }
+ 
+ static void enable_sysint2_irq(unsigned int irq)
+ {
+-	set_icu2(MSYSINT2REG, (uint16_t)1 << SYSINT2_IRQ_TO_PIN(irq));
++	icu2_set(MSYSINT2REG, 1 << SYSINT2_IRQ_TO_PIN(irq));
+ }
+ 
+ #define disable_sysint2_irq	shutdown_sysint2_irq
+@@ -490,7 +476,7 @@ static void enable_sysint2_irq(unsigned 
+ static void end_sysint2_irq(unsigned int irq)
+ {
+ 	if (!(irq_desc[irq].status & (IRQ_DISABLED | IRQ_INPROGRESS)))
+-		set_icu2(MSYSINT2REG, (uint16_t)1 << SYSINT2_IRQ_TO_PIN(irq));
++		icu2_set(MSYSINT2REG, 1 << SYSINT2_IRQ_TO_PIN(irq));
+ }
+ 
+ static struct hw_interrupt_type sysint2_irq_type = {
+@@ -503,8 +489,6 @@ static struct hw_interrupt_type sysint2_
+ 	.end		= end_sysint2_irq,
+ };
+ 
+-/*=======================================================================*/
+-
+ static inline int set_sysint1_assign(unsigned int irq, unsigned char assign)
+ {
+ 	irq_desc_t *desc = irq_desc + irq;
+@@ -515,8 +499,8 @@ static inline int set_sysint1_assign(uns
+ 
+ 	spin_lock_irq(&desc->lock);
+ 
+-	intassign0 = read_icu1(INTASSIGN0);
+-	intassign1 = read_icu1(INTASSIGN1);
++	intassign0 = icu1_read(INTASSIGN0);
++	intassign1 = icu1_read(INTASSIGN1);
+ 
+ 	switch (pin) {
+ 	case 0:
+@@ -556,8 +540,8 @@ static inline int set_sysint1_assign(uns
+ 	}
+ 
+ 	sysint1_assign[pin] = assign;
+-	write_icu1(intassign0, INTASSIGN0);
+-	write_icu1(intassign1, INTASSIGN1);
++	icu1_write(INTASSIGN0, intassign0);
++	icu1_write(INTASSIGN1, intassign1);
+ 
+ 	spin_unlock_irq(&desc->lock);
+ 
+@@ -574,8 +558,8 @@ static inline int set_sysint2_assign(uns
+ 
+ 	spin_lock_irq(&desc->lock);
+ 
+-	intassign2 = read_icu1(INTASSIGN2);
+-	intassign3 = read_icu1(INTASSIGN3);
++	intassign2 = icu1_read(INTASSIGN2);
++	intassign3 = icu1_read(INTASSIGN3);
+ 
+ 	switch (pin) {
+ 	case 0:
+@@ -623,8 +607,8 @@ static inline int set_sysint2_assign(uns
+ 	}
+ 
+ 	sysint2_assign[pin] = assign;
+-	write_icu1(intassign2, INTASSIGN2);
+-	write_icu1(intassign3, INTASSIGN3);
++	icu1_write(INTASSIGN2, intassign2);
++	icu1_write(INTASSIGN3, intassign3);
+ 
+ 	spin_unlock_irq(&desc->lock);
+ 
+@@ -651,88 +635,92 @@ int vr41xx_set_intassign(unsigned int ir
+ 
+ EXPORT_SYMBOL(vr41xx_set_intassign);
+ 
+-/*=======================================================================*/
+-
+-asmlinkage void irq_dispatch(unsigned char intnum, struct pt_regs *regs)
++static int icu_get_irq(unsigned int irq, struct pt_regs *regs)
+ {
+ 	uint16_t pend1, pend2;
+ 	uint16_t mask1, mask2;
+ 	int i;
+ 
+-	pend1 = read_icu1(SYSINT1REG);
+-	mask1 = read_icu1(MSYSINT1REG);
++	pend1 = icu1_read(SYSINT1REG);
++	mask1 = icu1_read(MSYSINT1REG);
+ 
+-	pend2 = read_icu2(SYSINT2REG);
+-	mask2 = read_icu2(MSYSINT2REG);
++	pend2 = icu2_read(SYSINT2REG);
++	mask2 = icu2_read(MSYSINT2REG);
+ 
+ 	mask1 &= pend1;
+ 	mask2 &= pend2;
+ 
+ 	if (mask1) {
+ 		for (i = 0; i < 16; i++) {
+-			if (intnum == sysint1_assign[i] &&
+-			    (mask1 & ((uint16_t)1 << i))) {
+-				if (i == 8)
+-					giuint_irq_dispatch(regs);
+-				else
+-					do_IRQ(SYSINT1_IRQ(i), regs);
+-				return;
+-			}
++			if (irq == INT_TO_IRQ(sysint1_assign[i]) && (mask1 & (1 << i)))
++				return SYSINT1_IRQ(i);
+ 		}
+ 	}
+ 
+ 	if (mask2) {
+ 		for (i = 0; i < 16; i++) {
+-			if (intnum == sysint2_assign[i] &&
+-			    (mask2 & ((uint16_t)1 << i))) {
+-				do_IRQ(SYSINT2_IRQ(i), regs);
+-				return;
+-			}
++			if (irq == INT_TO_IRQ(sysint2_assign[i]) && (mask2 & (1 << i)))
++				return SYSINT2_IRQ(i);
+ 		}
+ 	}
+ 
+ 	printk(KERN_ERR "spurious ICU interrupt: %04x,%04x\n", pend1, pend2);
+ 
+ 	atomic_inc(&irq_err_count);
+-}
+ 
+-/*=======================================================================*/
++	return -1;
++}
+ 
+ static int __init vr41xx_icu_init(void)
+ {
++	unsigned long icu1_start, icu2_start;
++	int i;
++
+ 	switch (current_cpu_data.cputype) {
+ 	case CPU_VR4111:
+ 	case CPU_VR4121:
+-		icu1_base = SYSINT1REG_TYPE1;
+-		icu2_base = SYSINT2REG_TYPE1;
++		icu1_start = ICU1_TYPE1_BASE;
++		icu2_start = ICU2_TYPE1_BASE;
+ 		break;
+ 	case CPU_VR4122:
+ 	case CPU_VR4131:
+ 	case CPU_VR4133:
+-		icu1_base = SYSINT1REG_TYPE2;
+-		icu2_base = SYSINT2REG_TYPE2;
++		icu1_start = ICU1_TYPE2_BASE;
++		icu2_start = ICU2_TYPE2_BASE;
+ 		break;
+ 	default:
+ 		printk(KERN_ERR "ICU: Unexpected CPU of NEC VR4100 series\n");
+-		return -EINVAL;
++		return -ENODEV;
+ 	}
+ 
+-	write_icu1(0, MSYSINT1REG);
+-	write_icu1(0xffff, MGIUINTLREG);
++	if (request_mem_region(icu1_start, ICU1_SIZE, "ICU") == NULL)
++		return -EBUSY;
+ 
+-	write_icu2(0, MSYSINT2REG);
+-	write_icu2(0xffff, MGIUINTHREG);
++	if (request_mem_region(icu2_start, ICU2_SIZE, "ICU") == NULL) {
++		release_mem_region(icu1_start, ICU1_SIZE);
++		return -EBUSY;
++	}
+ 
+-	return 0;
+-}
++	icu1_base = ioremap(icu1_start, ICU1_SIZE);
++	if (icu1_base == NULL) {
++		release_mem_region(icu1_start, ICU1_SIZE);
++		release_mem_region(icu2_start, ICU2_SIZE);
++		return -ENOMEM;
++	}
+ 
+-early_initcall(vr41xx_icu_init);
++	icu2_base = ioremap(icu2_start, ICU2_SIZE);
++	if (icu2_base == NULL) {
++		iounmap(icu1_base);
++		release_mem_region(icu1_start, ICU1_SIZE);
++		release_mem_region(icu2_start, ICU2_SIZE);
++		return -ENOMEM;
++	}
+ 
+-/*=======================================================================*/
++	icu1_write(MSYSINT1REG, 0);
++	icu1_write(MGIUINTLREG, 0xffff);
+ 
+-static inline void init_vr41xx_icu_irq(void)
+-{
+-	int i;
++	icu2_write(MSYSINT2REG, 0);
++	icu2_write(MGIUINTHREG, 0xffff);
+ 
+ 	for (i = SYSINT1_IRQ_BASE; i <= SYSINT1_IRQ_LAST; i++)
+ 		irq_desc[i].handler = &sysint1_irq_type;
+@@ -740,18 +728,13 @@ static inline void init_vr41xx_icu_irq(v
+ 	for (i = SYSINT2_IRQ_BASE; i <= SYSINT2_IRQ_LAST; i++)
+ 		irq_desc[i].handler = &sysint2_irq_type;
+ 
+-	setup_irq(INT0_CASCADE_IRQ, &icu_cascade);
+-	setup_irq(INT1_CASCADE_IRQ, &icu_cascade);
+-	setup_irq(INT2_CASCADE_IRQ, &icu_cascade);
+-	setup_irq(INT3_CASCADE_IRQ, &icu_cascade);
+-	setup_irq(INT4_CASCADE_IRQ, &icu_cascade);
+-}
++	cascade_irq(INT0_IRQ, icu_get_irq);
++	cascade_irq(INT1_IRQ, icu_get_irq);
++	cascade_irq(INT2_IRQ, icu_get_irq);
++	cascade_irq(INT3_IRQ, icu_get_irq);
++	cascade_irq(INT4_IRQ, icu_get_irq);
+ 
+-void __init arch_init_irq(void)
+-{
+-	mips_cpu_irq_init(MIPS_CPU_IRQ_BASE);
+-	init_vr41xx_icu_irq();
+-	init_vr41xx_giuint_irq();
+-
+-	set_except_vector(0, vr41xx_handle_interrupt);
++	return 0;
+ }
++
++core_initcall(vr41xx_icu_init);
+Index: linux-2.6.10/arch/mips/vr41xx/common/int-handler.S
+===================================================================
+--- linux-2.6.10.orig/arch/mips/vr41xx/common/int-handler.S
++++ linux-2.6.10/arch/mips/vr41xx/common/int-handler.S
+@@ -71,24 +71,24 @@
+ 
+ 		andi	t1, t0, CAUSEF_IP3	# check for Int1
+ 		bnez	t1, handle_int
+-		li	a0, 1
++		li	a0, 3
+ 
+ 		andi	t1, t0, CAUSEF_IP4	# check for Int2
+ 		bnez	t1, handle_int
+-		li	a0, 2
++		li	a0, 4
+ 
+ 		andi	t1, t0, CAUSEF_IP5	# check for Int3
+ 		bnez	t1, handle_int
+-		li	a0, 3
++		li	a0, 5
+ 
+ 		andi	t1, t0, CAUSEF_IP6	# check for Int4
+ 		bnez	t1, handle_int
+-		li	a0, 4
++		li	a0, 6
+ 
+ 1:
+ 		andi	t1, t0, CAUSEF_IP2	# check for Int0
+ 		bnez	t1, handle_int
+-		li	a0, 0
++		li	a0, 2
+ 
+ 		andi	t1, t0, CAUSEF_IP0	# check for IP0
+ 		bnez	t1, handle_irq
+Index: linux-2.6.10/arch/mips/vr41xx/common/irq.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/vr41xx/common/irq.c
+@@ -0,0 +1,94 @@
++/*
++ *  Interrupt handing routines for NEC VR4100 series.
++ *
++ *  Copyright (C) 2005  Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++#include <linux/interrupt.h>
++#include <linux/module.h>
++
++#include <asm/irq_cpu.h>
++#include <asm/system.h>
++#include <asm/vr41xx/vr41xx.h>
++
++typedef struct irq_cascade {
++	int (*get_irq)(unsigned int, struct pt_regs *);
++} irq_cascade_t;
++
++static irq_cascade_t irq_cascade[NR_IRQS] __cacheline_aligned;
++
++static struct irqaction cascade_irqaction = {
++	.handler	= no_action,
++	.mask		= CPU_MASK_NONE,
++	.name		= "cascade",
++};
++
++int cascade_irq(unsigned int irq, int (*get_irq)(unsigned int, struct pt_regs *))
++{
++	int retval = 0;
++
++	if (irq >= NR_IRQS)
++		return -EINVAL;
++
++	if (irq_cascade[irq].get_irq != NULL)
++		free_irq(irq, NULL);
++
++	irq_cascade[irq].get_irq = get_irq;
++
++	if (get_irq != NULL) {
++		retval = setup_irq(irq, &cascade_irqaction);
++		if (retval < 0)
++			irq_cascade[irq].get_irq = NULL;
++	}
++
++	return retval;
++}
++
++EXPORT_SYMBOL_GPL(cascade_irq);
++
++asmlinkage void irq_dispatch(unsigned int irq, struct pt_regs *regs)
++{
++	irq_cascade_t *cascade;
++	irq_desc_t *desc;
++
++	if (irq >= NR_IRQS) {
++		atomic_inc(&irq_err_count);
++		return;
++	}
++
++	cascade = irq_cascade + irq;
++	if (cascade->get_irq != NULL) {
++		unsigned int source_irq = irq;
++		desc = irq_desc + source_irq;
++		desc->handler->ack(source_irq);
++		irq = cascade->get_irq(irq, regs);
++		if (irq < 0)
++			atomic_inc(&irq_err_count);
++		else
++			irq_dispatch(irq, regs);
++		desc->handler->end(source_irq);
++	} else
++		do_IRQ(irq, regs);
++}
++
++extern asmlinkage void vr41xx_handle_interrupt(void);
++
++void __init arch_init_irq(void)
++{
++	mips_cpu_irq_init(MIPS_CPU_IRQ_BASE);
++
++	set_except_vector(0, vr41xx_handle_interrupt);
++}
+Index: linux-2.6.10/include/asm-mips/vr41xx/vr41xx.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/vr41xx/vr41xx.h
++++ linux-2.6.10/include/asm-mips/vr41xx/vr41xx.h
+@@ -7,7 +7,7 @@
+  * Copyright (C) 2001, 2002 Paul Mundt
+  * Copyright (C) 2002 MontaVista Software, Inc.
+  * Copyright (C) 2002 TimeSys Corp.
+- * Copyright (C) 2003-2004 Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
++ * Copyright (C) 2003-2005 Yoichi Yuasa <yuasa@hh.iij4u.or.jp>
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -79,11 +79,11 @@ extern void vr41xx_mask_clock(vr41xx_clo
+ #define MIPS_CPU_IRQ(x)		(MIPS_CPU_IRQ_BASE + (x))
+ #define MIPS_SOFTINT0_IRQ	MIPS_CPU_IRQ(0)
+ #define MIPS_SOFTINT1_IRQ	MIPS_CPU_IRQ(1)
+-#define INT0_CASCADE_IRQ	MIPS_CPU_IRQ(2)
+-#define INT1_CASCADE_IRQ	MIPS_CPU_IRQ(3)
+-#define INT2_CASCADE_IRQ	MIPS_CPU_IRQ(4)
+-#define INT3_CASCADE_IRQ	MIPS_CPU_IRQ(5)
+-#define INT4_CASCADE_IRQ	MIPS_CPU_IRQ(6)
++#define INT0_IRQ		MIPS_CPU_IRQ(2)
++#define INT1_IRQ		MIPS_CPU_IRQ(3)
++#define INT2_IRQ		MIPS_CPU_IRQ(4)
++#define INT3_IRQ		MIPS_CPU_IRQ(5)
++#define INT4_IRQ		MIPS_CPU_IRQ(6)
+ #define TIMER_IRQ		MIPS_CPU_IRQ(7)
+ 
+ /* SYINT1 Interrupt Numbers */
+@@ -97,7 +97,7 @@ extern void vr41xx_mask_clock(vr41xx_clo
+ #define PIU_IRQ			SYSINT1_IRQ(5)
+ #define AIU_IRQ			SYSINT1_IRQ(6)
+ #define KIU_IRQ			SYSINT1_IRQ(7)
+-#define GIUINT_CASCADE_IRQ	SYSINT1_IRQ(8)
++#define GIUINT_IRQ		SYSINT1_IRQ(8)
+ #define SIU_IRQ			SYSINT1_IRQ(9)
+ #define BUSERR_IRQ		SYSINT1_IRQ(10)
+ #define SOFTINT_IRQ		SYSINT1_IRQ(11)
+@@ -128,7 +128,7 @@ extern void vr41xx_mask_clock(vr41xx_clo
+ #define GIU_IRQ_LAST		GIU_IRQ(31)
+ 
+ extern int vr41xx_set_intassign(unsigned int irq, unsigned char intassign);
+-extern int vr41xx_cascade_irq(unsigned int irq, int (*get_irq_number)(int irq));
++extern int cascade_irq(unsigned int irq, int (*get_irq)(unsigned int, struct pt_regs *));
+ 
+ #define PIUINT_COMMAND		0x0040
+ #define PIUINT_DATA		0x0020
+Index: linux-2.6.10/mvl_patches/pro-0986.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0986.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(986);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

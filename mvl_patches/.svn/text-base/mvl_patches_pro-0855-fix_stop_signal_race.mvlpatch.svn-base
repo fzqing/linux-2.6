@@ -1,0 +1,642 @@
+#! /usr/bin/env bash
+# Patch: -fix_stop_signal_race
+# Date: Tue Aug  8 21:00:18 2006
+# MR: 18602
+# 
+# commit 7dd666ec0ead16b41e774126bb2df035f5cb45f2
+# Author: roland <roland>
+# Date:   Wed Jan 5 05:37:48 2005 +0000
+# 
+#     [PATCH] fix stop signal race
+#     
+#     The `sig_avoid_stop_race' checks fail to catch a related race scenario that
+#     can happen.  I don't think this has been seen in nature, but it could
+#     happen in the same sorts of situations where the observed problems come up
+#     that those checks work around.  This patch takes a different approach to
+#     catching this race condition.  The new approach plugs the hole, and I think
+#     is also cleaner.
+#     
+#     The issue is a race between one CPU processing a stop signal while another
+#     CPU processes a SIGCONT or SIGKILL.  There is a window in stop-signal
+#     processing where the siglock must be released.  If a SIGCONT or SIGKILL
+#     comes along here on another CPU, then the stop signal in the midst of being
+#     processed needs to be discarded rather than having the stop take place
+#     after the SIGCONT or SIGKILL has been generated.  The existing workaround
+#     checks for this case explicitly by looking for a pending SIGCONT or SIGKILL
+#     after reacquiring the lock.
+#     
+#     However, there is another problem related to the same race issue.  In the
+#     window where the processing of the stop signal has released the siglock,
+#     the stop signal is not represented in the pending set any more, but it is
+#     still "pending" and not "delivered" in POSIX terms.  The SIGCONT coming in
+#     this window is required to clear all pending stop signals.  But, if a stop
+#     signal has been dequeued but not yet processed, the SIGCONT generation will
+#     fail to clear it (in handle_stop_signal).  Likewise, a SIGKILL coming here
+#     should prevent the stop processing and make the thread die immediately
+#     instead.  The `sig_avoid_stop_race' code checks for this by examining the
+#     pending set to see if SIGCONT or SIGKILL is in it.  But this fails to
+#     handle the case where another CPU running another thread in the same
+#     process has already dequeued the signal (so it no longer can be found in
+#     the pending set).  We must catch this as well, so that the same problems do
+#     not arise when another thread on another CPU acted real fast.
+#     
+#     I've fixed this dumping the `sig_avoid_stop_race' kludge in favor of a
+#     little explicit bookkeeping.  Now, dequeuing any stop signal sets a flag
+#     saying that a pending stop signal has been taken on by some CPU since the
+#     last time all pending stop signals were cleared due to SIGCONT/SIGKILL.
+#     The processing of stop signals checks the flag after the window where it
+#     released the lock, and abandons the signal the flag has been cleared.  The
+#     code that clears pending stop signals on SIGCONT generation also clears
+#     this flag.  The various places that are trying to ensure the process dies
+#     quickly (SIGKILL or other unhandled signals) also clear the flag.  I've
+#     made this a general flags word in signal_struct, and replaced the
+#     stop_state field with flag bits in this word.
+#     
+#     Signed-off-by: Roland McGrath <roland@redhat.com>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+#     
+#     BKrev: 41db7d2cBjKGtCZDlUmwwo2dgMZ6Wg
+# 
+
+PATCHNUM=855
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18602
+
+commit 7dd666ec0ead16b41e774126bb2df035f5cb45f2
+Author: roland <roland>
+Date:   Wed Jan 5 05:37:48 2005 +0000
+
+    [PATCH] fix stop signal race
+    
+    The `sig_avoid_stop_race' checks fail to catch a related race scenario that
+    can happen.  I don't think this has been seen in nature, but it could
+    happen in the same sorts of situations where the observed problems come up
+    that those checks work around.  This patch takes a different approach to
+    catching this race condition.  The new approach plugs the hole, and I think
+    is also cleaner.
+    
+    The issue is a race between one CPU processing a stop signal while another
+    CPU processes a SIGCONT or SIGKILL.  There is a window in stop-signal
+    processing where the siglock must be released.  If a SIGCONT or SIGKILL
+    comes along here on another CPU, then the stop signal in the midst of being
+    processed needs to be discarded rather than having the stop take place
+    after the SIGCONT or SIGKILL has been generated.  The existing workaround
+    checks for this case explicitly by looking for a pending SIGCONT or SIGKILL
+    after reacquiring the lock.
+    
+    However, there is another problem related to the same race issue.  In the
+    window where the processing of the stop signal has released the siglock,
+    the stop signal is not represented in the pending set any more, but it is
+    still "pending" and not "delivered" in POSIX terms.  The SIGCONT coming in
+    this window is required to clear all pending stop signals.  But, if a stop
+    signal has been dequeued but not yet processed, the SIGCONT generation will
+    fail to clear it (in handle_stop_signal).  Likewise, a SIGKILL coming here
+    should prevent the stop processing and make the thread die immediately
+    instead.  The `sig_avoid_stop_race' code checks for this by examining the
+    pending set to see if SIGCONT or SIGKILL is in it.  But this fails to
+    handle the case where another CPU running another thread in the same
+    process has already dequeued the signal (so it no longer can be found in
+    the pending set).  We must catch this as well, so that the same problems do
+    not arise when another thread on another CPU acted real fast.
+    
+    I've fixed this dumping the `sig_avoid_stop_race' kludge in favor of a
+    little explicit bookkeeping.  Now, dequeuing any stop signal sets a flag
+    saying that a pending stop signal has been taken on by some CPU since the
+    last time all pending stop signals were cleared due to SIGCONT/SIGKILL.
+    The processing of stop signals checks the flag after the window where it
+    released the lock, and abandons the signal the flag has been cleared.  The
+    code that clears pending stop signals on SIGCONT generation also clears
+    this flag.  The various places that are trying to ensure the process dies
+    quickly (SIGKILL or other unhandled signals) also clear the flag.  I've
+    made this a general flags word in signal_struct, and replaced the
+    stop_state field with flag bits in this word.
+    
+    Signed-off-by: Roland McGrath <roland@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+    
+    BKrev: 41db7d2cBjKGtCZDlUmwwo2dgMZ6Wg
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 574f879..eb87d91 100644
+Index: linux-2.6.10/include/linux/sched.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/sched.h
++++ linux-2.6.10/include/linux/sched.h
+@@ -428,8 +428,7 @@ struct signal_struct {
+ 
+ 	/* thread group stop support, overloads group_exit_code too */
+ 	int			group_stop_count;
+-	/* 1 if group stopped since last SIGCONT, -1 if SIGCONT since report */
+-  	int			stop_state;
++	unsigned int		flags; /* see SIGNAL_* flags below */
+ 
+ 	/* POSIX.1b Interval Timers */
+ 	struct list_head posix_timers;
+@@ -466,6 +465,14 @@ struct signal_struct {
+ };
+ 
+ /*
++ * Bits in flags field of signal_struct.
++ */
++#define SIGNAL_STOP_STOPPED	0x00000001 /* job control stop in effect */
++#define SIGNAL_STOP_DEQUEUED	0x00000002 /* stop signal dequeued */
++#define SIGNAL_STOP_CONTINUED	0x00000004 /* SIGCONT since WCONTINUED reap */
++
++
++/*
+  * Priority of a process goes from 0..MAX_PRIO-1, valid RT
+  * priority is 0..MAX_RT_PRIO-1, and SCHED_NORMAL tasks are
+  * in the range MAX_RT_PRIO..MAX_PRIO-1. Priority values
+Index: linux-2.6.10/kernel/exit.c
+===================================================================
+--- linux-2.6.10.orig/kernel/exit.c
++++ linux-2.6.10/kernel/exit.c
+@@ -1265,16 +1265,17 @@ static int wait_task_continued(task_t *p
+ 	if (unlikely(!p->signal))
+ 		return 0;
+ 
+-	if (p->signal->stop_state >= 0)
++	if (!(p->signal->flags & SIGNAL_STOP_CONTINUED))
+ 		return 0;
+ 
+ 	spin_lock_irq(&p->sighand->siglock);
+-	if (p->signal->stop_state >= 0) { /* Re-check with the lock held.  */
++	/* Re-check with the lock held.  */
++	if (!(p->signal->flags & SIGNAL_STOP_CONTINUED)) {
+ 		spin_unlock_irq(&p->sighand->siglock);
+ 		return 0;
+ 	}
+ 	if (!noreap)
+-		p->signal->stop_state = 0;
++		p->signal->flags &= ~SIGNAL_STOP_CONTINUED;
+ 	spin_unlock_irq(&p->sighand->siglock);
+ 
+ 	pid = p->pid;
+Index: linux-2.6.10/kernel/fork.c
+===================================================================
+--- linux-2.6.10.orig/kernel/fork.c
++++ linux-2.6.10/kernel/fork.c
+@@ -771,11 +771,11 @@ static inline int copy_signal(unsigned l
+ 		return -ENOMEM;
+ 	atomic_set(&sig->count, 1);
+ 	atomic_set(&sig->live, 1);
++	sig->flags = 0;
+ 	sig->group_exit = 0;
+ 	sig->group_exit_code = 0;
+ 	sig->group_exit_task = NULL;
+ 	sig->group_stop_count = 0;
+-	sig->stop_state = 0;
+ 	sig->curr_target = NULL;
+ 	init_sigpending(&sig->shared_pending);
+ 	INIT_LIST_HEAD(&sig->posix_timers);
+Index: linux-2.6.10/kernel/signal.c
+===================================================================
+--- linux-2.6.10.orig/kernel/signal.c
++++ linux-2.6.10/kernel/signal.c
+@@ -155,11 +155,6 @@ static kmem_cache_t *sigqueue_cachep;
+ 	(!T(signr, SIG_KERNEL_IGNORE_MASK|SIG_KERNEL_STOP_MASK) && \
+ 	 (t)->sighand->action[(signr)-1].sa.sa_handler == SIG_DFL)
+ 
+-#define sig_avoid_stop_race() \
+-	(sigtestsetmask(&current->pending.signal, M(SIGCONT) | M(SIGKILL)) || \
+-	 sigtestsetmask(&current->signal->shared_pending.signal, \
+-						  M(SIGCONT) | M(SIGKILL)))
+-
+ static int sig_ignored(struct task_struct *t, int sig)
+ {
+ 	void __user * handler;
+@@ -543,6 +538,21 @@ int dequeue_signal(struct task_struct *t
+ 	if (!signr)
+ 		signr = __dequeue_signal(&tsk->signal->shared_pending,
+ 					 mask, info);
++ 	if (signr && unlikely(sig_kernel_stop(signr))) {
++ 		/*
++ 		 * Set a marker that we have dequeued a stop signal.  Our
++ 		 * caller might release the siglock and then the pending
++ 		 * stop signal it is about to process is no longer in the
++ 		 * pending bitmasks, but must still be cleared by a SIGCONT
++ 		 * (and overruled by a SIGKILL).  So those cases clear this
++ 		 * shared flag after we've set it.  Note that this flag may
++ 		 * remain set after the signal we return is ignored or
++ 		 * handled.  That doesn't matter because its only purpose
++ 		 * is to alert stop-signal processing code when another
++ 		 * processor has come along and cleared the flag.
++ 		 */
++ 		tsk->signal->flags |= SIGNAL_STOP_DEQUEUED;
++ 	}
+ 	if ( signr &&
+ 	     ((info->si_code & __SI_MASK) == __SI_TIMER) &&
+ 	     info->si_sys_private){
+@@ -680,7 +690,7 @@ static void handle_stop_signal(int sig, 
+ 			 * the SIGCHLD was pending on entry to this kill.
+ 			 */
+ 			p->signal->group_stop_count = 0;
+-			p->signal->stop_state = 1;
++			p->signal->flags = SIGNAL_STOP_CONTINUED;
+ 			spin_unlock(&p->sighand->siglock);
+ 			if (p->ptrace & PT_PTRACED)
+ 				do_notify_parent_cldstop(p, p->parent,
+@@ -722,12 +732,12 @@ static void handle_stop_signal(int sig, 
+ 			t = next_thread(t);
+ 		} while (t != p);
+ 
+-		if (p->signal->stop_state > 0) {
++		if (p->signal->flags & SIGNAL_STOP_STOPPED) {
+ 			/*
+ 			 * We were in fact stopped, and are now continued.
+ 			 * Notify the parent with CLD_CONTINUED.
+ 			 */
+-			p->signal->stop_state = -1;
++			p->signal->flags = SIGNAL_STOP_CONTINUED;
+ 			p->signal->group_exit_code = 0;
+ 			spin_unlock(&p->sighand->siglock);
+ 			if (p->ptrace & PT_PTRACED)
+@@ -739,7 +749,20 @@ static void handle_stop_signal(int sig, 
+ 					p->group_leader->real_parent,
+ 							 CLD_CONTINUED);
+ 			spin_lock(&p->sighand->siglock);
++		} else {
++			/*
++			 * We are not stopped, but there could be a stop
++			 * signal in the middle of being processed after
++			 * being removed from the queue.  Clear that too.
++			 */
++			p->signal->flags = 0;
+ 		}
++	} else if (sig == SIGKILL) {
++		/*
++		 * Make sure that any pending stop signal already dequeued
++		 * is undone by the wakeup for SIGKILL.
++		 */
++		p->signal->flags = 0;
+ 	}
+ }
+ 
+@@ -971,6 +994,7 @@ __group_complete_signal(int sig, struct 
+ 			p->signal->group_exit = 1;
+ 			p->signal->group_exit_code = sig;
+ 			p->signal->group_stop_count = 0;
++			p->signal->flags = 0;
+ 			t = p;
+ 			do {
+ 				sigaddset(&t->pending.signal, SIGKILL);
+@@ -1058,6 +1082,7 @@ void zap_other_threads(struct task_struc
+ 	struct task_struct *t;
+ 
+ 	p->signal->group_stop_count = 0;
++	p->signal->flags = 0;
+ 
+ 	if (thread_group_empty(p))
+ 		return;
+@@ -1672,15 +1697,18 @@ finish_stop(int stop_count)
+ /*
+  * This performs the stopping for SIGSTOP and other stop signals.
+  * We have to stop all threads in the thread group.
++ * Returns nonzero if we've actually stopped and released the siglock.
++ * Returns zero if we didn't stop and still hold the siglock.
+  */
+-static void
++static int
+ do_signal_stop(int signr)
+ {
+ 	struct signal_struct *sig = current->signal;
+ 	struct sighand_struct *sighand = current->sighand;
+ 	int stop_count = -1;
+ 
+-	/* spin_lock_irq(&sighand->siglock) is now done in caller */
++	if (!likely(sig->flags & SIGNAL_STOP_DEQUEUED))
++		return 0;
+ 
+ 	if (sig->group_stop_count > 0) {
+ 		/*
+@@ -1692,7 +1720,7 @@ do_signal_stop(int signr)
+ 		current->exit_code = signr;
+ 		set_current_state(TASK_STOPPED);
+ 		if (stop_count == 0)
+-			sig->stop_state = 1;
++			sig->flags = SIGNAL_STOP_STOPPED;
+ 		spin_unlock_irq(&sighand->siglock);
+ 	}
+ 	else if (thread_group_empty(current)) {
+@@ -1701,7 +1729,7 @@ do_signal_stop(int signr)
+ 		 */
+ 		current->exit_code = current->signal->group_exit_code = signr;
+ 		set_current_state(TASK_STOPPED);
+-		sig->stop_state = 1;
++		sig->flags = SIGNAL_STOP_STOPPED;
+ 		spin_unlock_irq(&sighand->siglock);
+ 	}
+ 	else {
+@@ -1722,25 +1750,16 @@ do_signal_stop(int signr)
+ 		read_lock(&tasklist_lock);
+ 		spin_lock_irq(&sighand->siglock);
+ 
+-		if (unlikely(sig->group_exit)) {
++		if (!likely(sig->flags & SIGNAL_STOP_DEQUEUED)) {
+ 			/*
+-			 * There is a group exit in progress now.
+-			 * We'll just ignore the stop and process the
+-			 * associated fatal signal.
++			 * Another stop or continue happened while we
++			 * didn't have the lock.  We can just swallow this
++			 * signal now.  If we raced with a SIGCONT, that
++			 * should have just cleared it now.  If we raced
++			 * with another processor delivering a stop signal,
++			 * then the SIGCONT that wakes us up should clear it.
+ 			 */
+-			spin_unlock_irq(&sighand->siglock);
+-			read_unlock(&tasklist_lock);
+-			return;
+-		}
+-
+-		if (unlikely(sig_avoid_stop_race())) {
+-			/*
+-			 * Either a SIGCONT or a SIGKILL signal was
+-			 * posted in the siglock-not-held window.
+-			 */
+-			spin_unlock_irq(&sighand->siglock);
+-			read_unlock(&tasklist_lock);
+-			return;
++			return 0;
+ 		}
+ 
+ 		if (sig->group_stop_count == 0) {
+@@ -1768,13 +1787,14 @@ do_signal_stop(int signr)
+ 		current->exit_code = signr;
+ 		set_current_state(TASK_STOPPED);
+ 		if (stop_count == 0)
+-			sig->stop_state = 1;
++			sig->flags = SIGNAL_STOP_STOPPED;
+ 
+ 		spin_unlock_irq(&sighand->siglock);
+ 		read_unlock(&tasklist_lock);
+ 	}
+ 
+ 	finish_stop(stop_count);
++	return 1;
+ }
+ 
+ /*
+@@ -1810,7 +1830,7 @@ static inline int handle_group_stop(void
+ 	 */
+ 	stop_count = --current->signal->group_stop_count;
+ 	if (stop_count == 0)
+-		current->signal->stop_state = 1;
++		current->signal->flags = SIGNAL_STOP_STOPPED;
+ 	current->exit_code = current->signal->group_exit_code;
+ 	set_current_state(TASK_STOPPED);
+ 	spin_unlock_irq(&current->sighand->siglock);
+@@ -1907,28 +1927,27 @@ relock:
+ 			 * This allows an intervening SIGCONT to be posted.
+ 			 * We need to check for that and bail out if necessary.
+ 			 */
+-			if (signr == SIGSTOP) {
+-				do_signal_stop(signr); /* releases siglock */
+-				goto relock;
+-			}
+-			spin_unlock_irq(&current->sighand->siglock);
++			if (signr != SIGSTOP) {
++				spin_unlock_irq(&current->sighand->siglock);
+ 
+-			/* signals can be posted during this window */
++				/* signals can be posted during this window */
+ 
+-			if (is_orphaned_pgrp(process_group(current)))
+-				goto relock;
++				if (is_orphaned_pgrp(process_group(current)))
++					goto relock;
+ 
+-			spin_lock_irq(&current->sighand->siglock);
+-			if (unlikely(sig_avoid_stop_race())) {
+-				/*
+-				 * Either a SIGCONT or a SIGKILL signal was
+-				 * posted in the siglock-not-held window.
+-				 */
+-				continue;
++				spin_lock_irq(&current->sighand->siglock);
+ 			}
+ 
+-			do_signal_stop(signr); /* releases siglock */
+-			goto relock;
++			if (likely(do_signal_stop(signr))) {
++				/* It released the siglock.  */
++				goto relock;
++			}
++
++			/*
++			 * We didn't actually stop, due to a race
++			 * with SIGCONT or something like that.
++			 */
++			continue;
+ 		}
+ 
+ 		spin_unlock_irq(&current->sighand->siglock);
+Index: linux-2.6.10/mvl_patches/pro-0855.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0855.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(855);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

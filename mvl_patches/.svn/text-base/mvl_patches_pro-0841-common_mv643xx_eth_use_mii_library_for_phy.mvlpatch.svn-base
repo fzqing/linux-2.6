@@ -1,0 +1,391 @@
+#! /usr/bin/env bash
+# Patch: -common_mv643xx_eth_use_mii_library_for_phy
+# Date: Tue Aug  8 20:56:38 2006
+# Source: James Chapman <jchapman@katalix.com>
+# MR: 16579
+# Type: Enhancement
+# Disposition: Submitted to netdev@vger.kernel.org
+# Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+# Description:
+# mv643xx: use MII library for PHY management
+# 
+# Modify link up/down handling to use the functions from the MII
+# library.  Note that I track link state using the MII PHY registers
+# rather than the mv643xx chip's link state registers because I think
+# it's cleaner to use the MII library code rather than writing local
+# driver support code. It is also useful to make the actual MII
+# registers available to the user with maskable kernel printk messages
+# so the MII registers are being read anyway
+# 
+# Signed-off-by: James Chapman <jchapman@katalix.com>
+# Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+# 
+
+PATCHNUM=841
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: James Chapman <jchapman@katalix.com>
+MR: 16579
+Type: Enhancement
+Disposition: Submitted to netdev@vger.kernel.org
+Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+Description:
+mv643xx: use MII library for PHY management
+
+Modify link up/down handling to use the functions from the MII
+library.  Note that I track link state using the MII PHY registers
+rather than the mv643xx chip's link state registers because I think
+it's cleaner to use the MII library code rather than writing local
+driver support code. It is also useful to make the actual MII
+registers available to the user with maskable kernel printk messages
+so the MII registers are being read anyway
+
+Signed-off-by: James Chapman <jchapman@katalix.com>
+Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+
+Index: linux-2.6.10/drivers/net/mv643xx_eth.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.h
++++ linux-2.6.10/drivers/net/mv643xx_eth.h
+@@ -6,6 +6,7 @@
+ #include <linux/kernel.h>
+ #include <linux/spinlock.h>
+ #include <linux/workqueue.h>
++#include <linux/mii.h>
+ 
+ #include <linux/mv643xx.h>
+ 
+@@ -394,6 +395,7 @@ struct mv643xx_private {
+ 
+ 	u32 rx_int_coal;
+ 	u32 tx_int_coal;
++	struct mii_if_info mii;
+ };
+ 
+ /* ethernet.h API list */
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -77,7 +77,6 @@
+ #define PHY_WAIT_MICRO_SECONDS	10
+ 
+ /* Static function declarations */
+-static int eth_port_link_is_up(unsigned int eth_port_num);
+ static void eth_port_uc_addr_get(struct net_device *dev,
+ 						unsigned char *MacAddr);
+ static void eth_port_set_multicast_list(struct net_device *);
+@@ -95,8 +94,11 @@ static void eth_port_init_mac_tables(uns
+ #ifdef MV643XX_NAPI
+ static int mv643xx_poll(struct net_device *dev, int *budget);
+ #endif
++static int ethernet_phy_get(unsigned int eth_port_num);
+ static void ethernet_phy_set(unsigned int eth_port_num, int phy_addr);
+ static int ethernet_phy_detect(unsigned int eth_port_num);
++static int mv643xx_mdio_read(struct net_device *dev, int phy_id, int location);
++static void mv643xx_mdio_write(struct net_device *dev, int phy_id, int location, int val);
+ static struct ethtool_ops mv643xx_ethtool_ops;
+ 
+ static char mv643xx_driver_name[] = "mv643xx_eth";
+@@ -535,14 +537,17 @@ static irqreturn_t mv643xx_eth_int_handl
+ 	}
+ 	/* PHY status changed */
+ 	if (eth_int_cause_ext & (BIT16 | BIT20)) {
+-		if (eth_port_link_is_up(port_num)) {
+-			netif_carrier_on(dev);
+-			netif_wake_queue(dev);
+-			/* Start TX queue */
+-			mv643xx_eth_port_enable_tx(port_num, mp->port_tx_queue_command);
+-		} else {
+-			netif_carrier_off(dev);
++		if (mii_link_ok(&mp->mii)) {
++			if (!netif_carrier_ok(dev)) {
++				netif_carrier_on(dev);
++				netif_wake_queue(dev);
++				/* Start TX queue */
++				mv643xx_eth_port_enable_tx(port_num,
++						mp->port_tx_queue_command);
++			}
++		} else if (netif_carrier_ok(dev)) {
+ 			netif_stop_queue(dev);
++			netif_carrier_off(dev);
+ 		}
+ 	}
+ 
+@@ -1433,6 +1438,14 @@ static int mv643xx_eth_probe(struct devi
+ 		}
+ 	}
+ 
++	/* Hook up MII support for ethtool */
++	mp->mii.dev = dev;
++	mp->mii.mdio_read = mv643xx_mdio_read;
++	mp->mii.mdio_write = mv643xx_mdio_write;
++	mp->mii.phy_id = ethernet_phy_get(port_num);
++	mp->mii.phy_id_mask = 0x3f;
++	mp->mii.reg_num_mask = 0x1f;
++
+ 	err = ethernet_phy_detect(port_num);
+ 	if (err) {
+ 		pr_debug("MV643xx ethernet port %d: "
+@@ -1441,6 +1454,8 @@ static int mv643xx_eth_probe(struct devi
+ 		return err;
+ 	}
+ 
++	mp->mii.supports_gmii = mii_check_gmii_support(&mp->mii);
++
+ 	err = register_netdev(dev);
+ 	if (err)
+ 		goto out;
+@@ -2414,21 +2429,6 @@ static int eth_port_autoneg_supported(un
+ 	return phy_reg_data0 & 0x1000;
+ }
+ 
+-static int eth_port_link_is_up(unsigned int eth_port_num)
+-{
+-	unsigned int phy_reg_data1;
+-
+-	eth_port_read_smi_reg(eth_port_num, 1, &phy_reg_data1);
+-
+-	if (eth_port_autoneg_supported(eth_port_num)) {
+-		if (phy_reg_data1 & 0x20)	/* auto-neg complete */
+-			return 1;
+-	} else if (phy_reg_data1 & 0x4)		/* link up */
+-		return 1;
+-
+-	return 0;
+-}
+-
+ /*
+  * eth_port_read_smi_reg - Read PHY registers
+  *
+@@ -2534,6 +2534,24 @@ out:
+ }
+ 
+ /*
++ * Wrappers for MII support library.
++ */
++static int mv643xx_mdio_read(struct net_device *dev, int phy_id, int location)
++{
++	int val;
++	struct mv643xx_private *mp = netdev_priv(dev);
++
++	eth_port_read_smi_reg(mp->port_num, location, &val);
++	return val;
++}
++
++static void mv643xx_mdio_write(struct net_device *dev, int phy_id, int location, int val)
++{
++	struct mv643xx_private *mp = netdev_priv(dev);
++	eth_port_write_smi_reg(mp->port_num, location, val);
++}
++
++/*
+  * eth_port_send - Send an Ethernet packet
+  *
+  * DESCRIPTION:
+Index: linux-2.6.10/mvl_patches/pro-0841.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0841.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(841);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

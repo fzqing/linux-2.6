@@ -1,0 +1,500 @@
+#! /usr/bin/env bash
+# Patch: -Manage_jbd_allocations_from_its_own_slabs
+# Date: Sun Apr  8 23:15:16 2007
+# MR: 22232, 22366
+# 
+# From ea817398e68dfa25612229fda7fc74580cf915fb Mon Sep 17 00:00:00 2001
+# From: Badari Pulavarty <pbadari@us.ibm.com>
+# Date: Sun, 27 Aug 2006 01:23:52 -0700
+# Subject: [PATCH] [PATCH] Manage jbd allocations from its own slabs
+# 
+# JBD currently allocates commit and frozen buffers from slabs.  With
+# CONFIG_SLAB_DEBUG, its possible for an allocation to cross the page
+# boundary causing IO problems.
+# 
+# https://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=200127
+# 
+# So, instead of allocating these from regular slabs - manage allocation from
+# its own slabs and disable slab debug for these slabs.
+# 
+# [akpm@osdl.org: cleanups]
+# Signed-off-by: Badari Pulavarty <pbadari@us.ibm.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1295
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 22232, 22366
+
+From ea817398e68dfa25612229fda7fc74580cf915fb Mon Sep 17 00:00:00 2001
+From: Badari Pulavarty <pbadari@us.ibm.com>
+Date: Sun, 27 Aug 2006 01:23:52 -0700
+Subject: [PATCH] [PATCH] Manage jbd allocations from its own slabs
+
+JBD currently allocates commit and frozen buffers from slabs.  With
+CONFIG_SLAB_DEBUG, its possible for an allocation to cross the page
+boundary causing IO problems.
+
+https://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=200127
+
+So, instead of allocating these from regular slabs - manage allocation from
+its own slabs and disable slab debug for these slabs.
+
+[akpm@osdl.org: cleanups]
+Signed-off-by: Badari Pulavarty <pbadari@us.ibm.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/fs/jbd/commit.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/commit.c
++++ linux-2.6.10/fs/jbd/commit.c
+@@ -261,10 +261,8 @@ void journal_commit_transaction(journal_
+ 			struct buffer_head *bh = jh2bh(jh);
+ 
+ 			jbd_lock_bh_state(bh);
+-			if (jh->b_committed_data) {
+-				kfree(jh->b_committed_data);
+-				jh->b_committed_data = NULL;
+-			}
++			jbd_slab_free(jh->b_committed_data, bh->b_size);
++			jh->b_committed_data = NULL;
+ 			jbd_unlock_bh_state(bh);
+ 		}
+ 		journal_refile_buffer(journal, jh);
+@@ -747,14 +745,14 @@ restart_loop:
+ 		 * Otherwise, we can just throw away the frozen data now.
+ 		 */
+ 		if (jh->b_committed_data) {
+-			kfree(jh->b_committed_data);
++			jbd_slab_free(jh->b_committed_data, bh->b_size);
+ 			jh->b_committed_data = NULL;
+ 			if (jh->b_frozen_data) {
+ 				jh->b_committed_data = jh->b_frozen_data;
+ 				jh->b_frozen_data = NULL;
+ 			}
+ 		} else if (jh->b_frozen_data) {
+-			kfree(jh->b_frozen_data);
++			jbd_slab_free(jh->b_frozen_data, bh->b_size);
+ 			jh->b_frozen_data = NULL;
+ 		}
+ 
+Index: linux-2.6.10/fs/jbd/journal.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/journal.c
++++ linux-2.6.10/fs/jbd/journal.c
+@@ -83,6 +83,7 @@ EXPORT_SYMBOL(journal_try_to_free_buffer
+ EXPORT_SYMBOL(journal_force_commit);
+ 
+ static int journal_convert_superblock_v1(journal_t *, journal_superblock_t *);
++static int journal_create_jbd_slab(size_t slab_size);
+ 
+ /*
+  * Helper function used to manage commit timeouts
+@@ -339,10 +340,10 @@ repeat:
+ 		char *tmp;
+ 
+ 		jbd_unlock_bh_state(bh_in);
+-		tmp = jbd_rep_kmalloc(bh_in->b_size, GFP_NOFS);
++		tmp = jbd_slab_alloc(bh_in->b_size, GFP_NOFS);
+ 		jbd_lock_bh_state(bh_in);
+ 		if (jh_in->b_frozen_data) {
+-			kfree(tmp);
++			jbd_slab_free(tmp, bh_in->b_size);
+ 			goto repeat;
+ 		}
+ 
+@@ -1080,17 +1081,17 @@ static int load_superblock(journal_t *jo
+ int journal_load(journal_t *journal)
+ {
+ 	int err;
++	journal_superblock_t *sb;
+ 
+ 	err = load_superblock(journal);
+ 	if (err)
+ 		return err;
+ 
++	sb = journal->j_superblock;
+ 	/* If this is a V2 superblock, then we have to check the
+ 	 * features flags on it. */
+ 
+ 	if (journal->j_format_version >= 2) {
+-		journal_superblock_t *sb = journal->j_superblock;
+-
+ 		if ((sb->s_feature_ro_compat &
+ 		     ~cpu_to_be32(JFS_KNOWN_ROCOMPAT_FEATURES)) ||
+ 		    (sb->s_feature_incompat &
+@@ -1101,6 +1102,13 @@ int journal_load(journal_t *journal)
+ 		}
+ 	}
+ 
++	/*
++	 * Create a slab for this blocksize
++	 */
++	err = journal_create_jbd_slab(cpu_to_be32(sb->s_blocksize));
++	if (err)
++		return err;
++
+ 	/* Let the recovery code check whether it needs to recover any
+ 	 * data from the journal. */
+ 	if (journal_recover(journal))
+@@ -1612,6 +1620,77 @@ void * __jbd_kmalloc (const char *where,
+ }
+ 
+ /*
++ * jbd slab management: create 1k, 2k, 4k, 8k slabs as needed
++ * and allocate frozen and commit buffers from these slabs.
++ *
++ * Reason for doing this is to avoid, SLAB_DEBUG - since it could
++ * cause bh to cross page boundary.
++ */
++
++#define JBD_MAX_SLABS 5
++#define JBD_SLAB_INDEX(size)  (size >> 11)
++
++static kmem_cache_t *jbd_slab[JBD_MAX_SLABS];
++static const char *jbd_slab_names[JBD_MAX_SLABS] = {
++	"jbd_1k", "jbd_2k", "jbd_4k", NULL, "jbd_8k"
++};
++
++static void journal_destroy_jbd_slabs(void)
++{
++	int i;
++
++	for (i = 0; i < JBD_MAX_SLABS; i++) {
++		if (jbd_slab[i])
++			kmem_cache_destroy(jbd_slab[i]);
++		jbd_slab[i] = NULL;
++	}
++}
++
++static int journal_create_jbd_slab(size_t slab_size)
++{
++	int i = JBD_SLAB_INDEX(slab_size);
++
++	BUG_ON(i >= JBD_MAX_SLABS);
++
++	/*
++	 * Check if we already have a slab created for this size
++	 */
++	if (jbd_slab[i])
++		return 0;
++
++	/*
++	 * Create a slab and force alignment to be same as slabsize -
++	 * this will make sure that allocations won't cross the page
++	 * boundary.
++	 */
++	jbd_slab[i] = kmem_cache_create(jbd_slab_names[i],
++				slab_size, slab_size, 0, NULL, NULL);
++	if (!jbd_slab[i]) {
++		printk(KERN_EMERG "JBD: no memory for jbd_slab cache\n");
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++void * jbd_slab_alloc(size_t size, int flags)
++{
++	int idx;
++
++	idx = JBD_SLAB_INDEX(size);
++	BUG_ON(jbd_slab[idx] == NULL);
++	return kmem_cache_alloc(jbd_slab[idx], flags | __GFP_NOFAIL);
++}
++
++void jbd_slab_free(void *ptr,  size_t size)
++{
++	int idx;
++
++	idx = JBD_SLAB_INDEX(size);
++	BUG_ON(jbd_slab[idx] == NULL);
++	kmem_cache_free(jbd_slab[idx], ptr);
++}
++
++/*
+  * Journal_head storage management
+  */
+ static kmem_cache_t *journal_head_cache;
+@@ -1799,13 +1878,13 @@ static void __journal_remove_journal_hea
+ 				printk(KERN_WARNING "%s: freeing "
+ 						"b_frozen_data\n",
+ 						__FUNCTION__);
+-				kfree(jh->b_frozen_data);
++				jbd_slab_free(jh->b_frozen_data, bh->b_size);
+ 			}
+ 			if (jh->b_committed_data) {
+ 				printk(KERN_WARNING "%s: freeing "
+ 						"b_committed_data\n",
+ 						__FUNCTION__);
+-				kfree(jh->b_committed_data);
++				jbd_slab_free(jh->b_committed_data, bh->b_size);
+ 			}
+ 			bh->b_private = NULL;
+ 			jh->b_bh = NULL;	/* debug, really */
+@@ -1961,6 +2040,7 @@ static void journal_destroy_caches(void)
+ 	journal_destroy_revoke_caches();
+ 	journal_destroy_journal_head_cache();
+ 	journal_destroy_handle_cache();
++	journal_destroy_jbd_slabs();
+ }
+ 
+ static int __init journal_init(void)
+Index: linux-2.6.10/fs/jbd/transaction.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/transaction.c
++++ linux-2.6.10/fs/jbd/transaction.c
+@@ -666,8 +666,9 @@ repeat:
+ 			if (!frozen_buffer) {
+ 				JBUFFER_TRACE(jh, "allocate memory for buffer");
+ 				jbd_unlock_bh_state(bh);
+-				frozen_buffer = jbd_kmalloc(jh2bh(jh)->b_size,
+-							    GFP_NOFS);
++				frozen_buffer =
++					jbd_slab_alloc(jh2bh(jh)->b_size,
++							 GFP_NOFS);
+ 				if (!frozen_buffer) {
+ 					printk(KERN_EMERG
+ 					       "%s: OOM for frozen_buffer\n",
+@@ -878,7 +879,7 @@ int journal_get_undo_access(handle_t *ha
+ 
+ repeat:
+ 	if (!jh->b_committed_data) {
+-		committed_data = jbd_kmalloc(jh2bh(jh)->b_size, GFP_NOFS);
++		committed_data = jbd_slab_alloc(jh2bh(jh)->b_size, GFP_NOFS);
+ 		if (!committed_data) {
+ 			printk(KERN_EMERG "%s: No memory for committed data\n",
+ 				__FUNCTION__);
+@@ -904,8 +905,8 @@ repeat:
+ 	jbd_unlock_bh_state(bh);
+ out:
+ 	journal_put_journal_head(jh);
+-	if (committed_data)
+-		kfree(committed_data);
++	if (unlikely(committed_data))
++		jbd_slab_free(committed_data, bh->b_size);
+ 	return err;
+ }
+ 
+Index: linux-2.6.10/include/linux/jbd.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/jbd.h
++++ linux-2.6.10/include/linux/jbd.h
+@@ -72,6 +72,9 @@ extern int journal_enable_debug;
+ #endif
+ 
+ extern void * __jbd_kmalloc (const char *where, size_t size, int flags, int retry);
++extern void * jbd_slab_alloc(size_t size, int flags);
++extern void jbd_slab_free(void *ptr, size_t size);
++
+ #define jbd_kmalloc(size, flags) \
+ 	__jbd_kmalloc(__FUNCTION__, (size), (flags), journal_oom_retry)
+ #define jbd_rep_kmalloc(size, flags) \
+Index: linux-2.6.10/mvl_patches/pro-1295.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1295.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1295);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

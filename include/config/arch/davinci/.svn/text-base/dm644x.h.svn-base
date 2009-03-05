@@ -1,0 +1,1 @@
+#define CONFIG_ARCH_DAVINCI_DM644x 1

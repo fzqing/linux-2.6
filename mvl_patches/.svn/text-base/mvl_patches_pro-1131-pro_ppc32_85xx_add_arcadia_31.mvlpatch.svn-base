@@ -1,0 +1,1337 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc32_85xx_add_arcadia_31
+# Date: Mon Mar  5 07:37:16 2007
+# Source: MontaVista Software, Inc.
+# MR: 19020
+# Type: Enhancement
+# Disposition: Local
+# Signed-off-by: Randy Vinson <rvinson@mvista.com>
+# Description:
+# Add support for Rev 3.1 of the Arcadia base board.
+# 
+# The Arcadia is the "base board" for the MPC8555CDS and the MPC8548CDS. A new
+# version has been released that has different PCI interrupt mappings. This patch
+# also corrects the interrupt mappings for the 2nd PCI bus on the MPC8555CDS and
+# properly handles the presence of a PCI-to-PCI bridge in any of the PCI slots.
+# 
+
+PATCHNUM=1131
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 19020
+Type: Enhancement
+Disposition: Local
+Signed-off-by: Randy Vinson <rvinson@mvista.com>
+Description:
+Add support for Rev 3.1 of the Arcadia base board.
+
+The Arcadia is the "base board" for the MPC8555CDS and the MPC8548CDS. A new
+version has been released that has different PCI interrupt mappings. This patch
+also corrects the interrupt mappings for the 2nd PCI bus on the MPC8555CDS and
+properly handles the presence of a PCI-to-PCI bridge in any of the PCI slots.
+
+Index: linux-2.6.10/arch/ppc/platforms/85xx/mpc85xx_cds_common.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/85xx/mpc85xx_cds_common.c
++++ linux-2.6.10/arch/ppc/platforms/85xx/mpc85xx_cds_common.c
+@@ -24,6 +24,7 @@
+ #include <linux/major.h>
+ #include <linux/console.h>
+ #include <linux/delay.h>
++#include <linux/ide.h>
+ #include <linux/irq.h>
+ #include <linux/seq_file.h>
+ #include <linux/serial.h>
+@@ -49,7 +50,7 @@
+ #include <asm/mpc85xx.h>
+ #include <asm/irq.h>
+ #include <asm/immap_85xx.h>
+-#include <asm/cpm2.h>
++#include <asm/immap_cpm2.h>
+ #include <asm/ppc_sys.h>
+ #include <asm/kgdb.h>
+ 
+@@ -105,11 +106,36 @@ extern void cpm2_reset(void);
+ 
+ extern unsigned long total_memory;      /* in mm/init */
+ 
++extern int pci_remove_device_safe(struct pci_dev *dev);
++
++extern void abort(void);
++
+ unsigned char __res[sizeof (bd_t)];
+ 
+ static int cds_pci_slot = 2;
+ static volatile u8 * cadmus;
+ 
++#ifdef CONFIG_PCI
++static int Tundra_found = 0;
++static int Tundra_bus = 0;
++static int Tundra_devfn = 0;
++
++/* We can determine which Rev of the Arcadia we are on by looking at the
++ * type of PCI-to-PCI bridge we have and the rev of the ARC chip. However,
++ * the PCI-to-PCI bridge can be disabled and the ARC chip is behind the bridge.
++ * So, when the PCI-to-PCI bridge is disabled, we need a little help.
++ */
++#if defined(CONFIG_ARCADIA_X2)
++static int arcadia_rev = 0x20; /* Assume 2 */
++#elif defined(CONFIG_ARCADIA_X30)
++static int arcadia_rev = 0x30; /* Assume 3.0 */
++#elif defined(CONFIG_ARCADIA_X31)
++static int arcadia_rev = 0x31; /* Assume 3.1 */
++#else
++#error Missing Arcadia revision definition
++#endif
++#endif /* CONFIG_PCI */
++
+ /* Internal interrupts are all Level Sensitive, and Positive Polarity */
+ static u_char mpc85xx_cds_openpic_initsenses[] __initdata = {
+ 	MPC85XX_INTERNAL_IRQ_SENSES,
+@@ -186,12 +212,41 @@ static irqreturn_t cpm2_cascade(int irq,
+ 
+ static struct irqaction cpm2_irqaction = {
+ 	.handler = cpm2_cascade,
+-	.flags = SA_INTERRUPT,
++	.flags = SA_INTERRUPT|SA_SHIRQ,
+ 	.mask = CPU_MASK_NONE,
+ 	.name = "cpm2_cascade",
+ };
+ #endif /* CONFIG_CPM2 */
+ 
++#if defined(CONFIG_PCI) && !defined(CONFIG_PEX)
++static irqreturn_t i8259_cascade(int irq, void *dev_id, struct pt_regs *regs)
++{
++	while((irq = i8259_irq(regs)) >= 0)
++		__do_IRQ(irq, regs);
++	return IRQ_HANDLED;
++}
++
++static struct irqaction i8259_irqaction = {
++	.handler = i8259_cascade,
++	.flags = SA_INTERRUPT|SA_SHIRQ,
++	.mask = CPU_MASK_NONE,
++	.name = "i8259_cascade",
++};
++
++static __init void
++mpc85xx_cds_config_i8259(void)
++{
++ 	int i;
++
++ 	for (i = 0; i < NUM_8259_INTERRUPTS; i++)
++ 		irq_desc[i].handler = &i8259_pic;
++
++ 	i8259_init(0);
++
++	setup_irq(PIRQ0A, &i8259_irqaction);
++}
++#endif /* CONFIG_PCI && !CONFIG_PEX */
++
+ void __init
+ mpc85xx_cds_init_IRQ(void)
+ {
+@@ -217,19 +272,6 @@ mpc85xx_cds_init_IRQ(void)
+          */
+         openpic_init(MPC85xx_OPENPIC_IRQ_OFFSET);
+ 
+-#ifdef via686found	/* BSP cond */
+-#ifdef CONFIG_PCI
+-#ifndef CONFIG_PEX
+- 	openpic_hookup_cascade(PIRQ0A, "82c59 cascade", i8259_irq);
+- 
+- 	for (i = 0; i < NUM_8259_INTERRUPTS; i++)
+- 		irq_desc[i].handler = &i8259_pic;
+- 
+- 	i8259_init(0);
+-#endif
+-#endif
+-#endif
+- 
+ #ifdef CONFIG_CPM2
+ 	/* Setup CPM2 PIC */
+ 	cpm2_init_IRQ();
+@@ -265,58 +307,96 @@ mpc85xx_map_irq(struct pci_dev *dev, uns
+ 	return PCI_IRQ_TABLE_LOOKUP;
+ #else
+ 	struct pci_controller *hose = pci_bus_to_hose(dev->bus->number);
+-
+ 	if (!hose->index)
+ 	{
+-		/* Handle PCI1 interrupts */
+-		char pci_irq_table[][4] =
+-			/*
+-			 *      PCI IDSEL/INTPIN->INTLINE
+-			 *        A      B      C      D
+-			 */
+-
+-			/* Note IRQ assignment for slots is based on which slot the elysium is
+-			 * in -- in this setup elysium is in slot #2 (this PIRQA as first
+-			 * interrupt on slot */
+-#ifdef CONFIG_MPC8548_CDS
+-		{
+-			{ 0, 1, 2, 3 }, /* 18 - Tsi310 */
++               /* Handle PCI1 interrupts */
++                       /*
++                        *      PCI IDSEL/INTPIN->INTLINE
++                        *        A      B      C      D
++                        */
++
++                       /* Note IRQ assignment for slots is based on which slotthe elysium is
++                        * in -- in this setup elysium is in slot #2 (this PIRQA as first
++                        * interrupt on slot */
++
++		char (*pci_irq_table)[4];
++
++		char pci_irq_table_x31 [][4] = {
++			{ 0, 0, 0, 0 }, /* 16 - */
++			{ 0, 0, 0, 0 }, /* 17 - */
++			{ 0, 0, 0, 0 }, /* 18 - */
++			{ 0, 0, 0, 0 }, /* 19 - */
++			{ 0, 1, 2, 3 }, /* 20 - Slot 1 */
++			{ 1, 2, 3, 0 }, /* 21 - Slot 2 */
++			{ 2, 3, 0, 1 }, /* 22 - slot 3 */
++			{ 0, 0, 0, 0 }, /* 23-- */
++			{ 0, 1, 2, 3 }, /* 24 - slot 4 */
++			{ 0, 0, 0, 0 }, /* 25-- */
++			{ 0, 0, 0, 0 }, /* 26-- */
++			{ 0, 0, 0, 0 }, /* 27-- */
++			{ 0, 1, 2, 3 }, /* 28 - Tsi310 bridge */
++		};
++
++		char pci_irq_table_x30[][4] = {
++			{ 0, 0, 0, 0 }, /* 16 - */
++			{ 0, 0, 0, 0 }, /* 17 - */
++			{ 0, 1, 2, 3 }, /* 18 - Tsi310 Bridge */
+ 			{ 0, 1, 2, 3 }, /* 19 - Slot 2 */
+ 			{ 0, 1, 2, 3 }, /* 20 - Slot 3 */
+ 			{ 0, 1, 2, 3 }, /* 21 - Slot 4 */
+-			{ 0, 1, 2, 3 }, /* 22 - Slot 5 */
++			{ 0, 1, 2, 3 }, /* 22 - slot 5 */
++			{ 0, 0, 0, 0 }, /* 23 - */
++			{ 0, 0, 0, 0 }, /* 24 - */
++			{ 0, 0, 0, 0 }, /* 25 - */
++			{ 0, 0, 0, 0 }, /* 26 - */
++			{ 0, 0, 0, 0 }, /* 27 - */
++			{ 0, 0, 0, 0 }, /* 28 - */
+ 		};
+ 
+-		const long min_idsel = 17, max_idsel = 22, irqs_per_slot = 4;
+-#else
+-		{
++		char pci_irq_table_x2[][4] = {
+ 			{ 0, 1, 2, 3 }, /* 16 - PMC */
+ 			{ 0, 1, 2, 3 }, /* 17 P2P (Tsi320) */
+ 			{ 0, 1, 2, 3 }, /* 18 - Slot 1 */
+ 			{ 1, 2, 3, 0 }, /* 19 - Slot 2 */
+ 			{ 2, 3, 0, 1 }, /* 20 - Slot 3 */
+ 			{ 3, 0, 1, 2 }, /* 21 - Slot 4 */
++			{ 0, 0, 0, 0 }, /* 22 - */
++			{ 0, 0, 0, 0 }, /* 23 - */
++			{ 0, 0, 0, 0 }, /* 24 - */
++			{ 0, 0, 0, 0 }, /* 25 - */
++			{ 0, 0, 0, 0 }, /* 26 - */
++			{ 0, 0, 0, 0 }, /* 27 - */
++			{ 0, 0, 0, 0 }, /* 28 - */
+ 		};
+ 
+-		const long min_idsel = 16, max_idsel = 21, irqs_per_slot = 4;
+-#endif
++		const long min_idsel = 16 , max_idsel = 28 , irqs_per_slot = 4;
+ 		int i, j;
+ 
+-		for (i = 0; i < 6; i++)
+-			for (j = 0; j < 4; j++)
+-				pci_irq_table[i][j] =
+-					((pci_irq_table[i][j] + 5 -
+-					  cds_pci_slot) & 0x3) + PIRQ0A;
+-
++		if (arcadia_rev == 0x20) {
++			pci_irq_table = pci_irq_table_x2;
++			for (i = 0; i <= (max_idsel - min_idsel); i++)
++				for (j = 0; j < 4; j++)
++					pci_irq_table[i][j] =
++						((pci_irq_table[i][j] + 5 -
++						  cds_pci_slot) & 0x3) + PIRQ0A;
++
++		} else {
++			pci_irq_table = (arcadia_rev == 0x30) ?
++				pci_irq_table_x30 : pci_irq_table_x31;
++
++			for (i = 0; i <= (max_idsel - min_idsel); i++)
++				for (j = 0; j < 4; j++)
++					pci_irq_table[i][j] =
++						pci_irq_table[i][j] + PIRQ0A;
++		}
+ 		return PCI_IRQ_TABLE_LOOKUP;
+ 	} else {
+ 		/* Handle PCI2 interrupts (if we have one) */
+ 		char pci_irq_table[][4] =
+ 		{
+ 			/*
+-			 * We only have one slot and one interrupt
+-			 * going to PIRQA - PIRQD */
+-			{ PIRQ1A, PIRQ1A, PIRQ1A, PIRQ1A }, /* 21 - slot 0 */
++			 * We only have one slot */
++			{ PIRQ1A, PIRQ0B, PIRQ0C, PIRQ0D }, /* 21 - slot 0 */
+ 		};
+ 
+ 		const long min_idsel = 21, max_idsel = 21, irqs_per_slot = 4;
+@@ -326,132 +406,307 @@ mpc85xx_map_irq(struct pci_dev *dev, uns
+ #endif
+ }
+ 
+-#define ARCADIA_HOST_BRIDGE_IDSEL     17
+-#define ARCADIA_2ND_BRIDGE_IDSEL     3
++#define ARCADIA_X2_BRIDGE_IDSEL		17
++#define ARCADIA_X3_BRIDGE_IDSEL		18
++#define ARCADIA_X31_BRIDGE_IDSEL	28
++#define ARCADIA_X2_2ND_BRIDGE_IDSEL	3
++#define ARCADIA_X3_2ND_BRIDGE_IDSEL	1
++
++#ifdef CONFIG_PPC_INDIRECT_PCI_BE
++#define PCI_CFG_OUT out_be32
++#else
++#define PCI_CFG_OUT out_le32
++#endif
++
++static void
++mpc85xx_private_read_config_word(struct pci_controller *hose, u8 bus,
++			     u8 devfn, int offset, u16 *val)
++{
++	u8 cfg_type = 0;
++	volatile unsigned char *cfg_data;
++
++	if (bus == hose->first_busno)
++		bus = 0;
+ 
+-extern int mpc85xx_pci1_last_busno;
++	PCI_CFG_OUT(hose->cfg_addr,
++		 (0x80000000 | (bus << 16)
++		  | (devfn << 8) | ((offset & 0xfc) | cfg_type)));
++
++	cfg_data = hose->cfg_data + (offset & 3);
++	*val = in_le16((u16 *)cfg_data);
++}
+ 
+ int
+ mpc85xx_exclude_device(u_char bus, u_char devfn)
+ {
+ #ifdef CONFIG_PEX
+ 	return PCIBIOS_SUCCESSFUL;
+-#endif
+-
+-if (bus == 0 && PCI_SLOT(devfn) == 0)
+-	return PCIBIOS_DEVICE_NOT_FOUND;
++#else
++	struct pci_controller *hose;
+ 
+-#ifdef CONFIG_85xx_PCI2
+-	if (mpc85xx_pci1_last_busno) 
+-		if (bus == (mpc85xx_pci1_last_busno + 1) && PCI_SLOT(devfn) == 0)
+-			return PCIBIOS_DEVICE_NOT_FOUND;
+-#endif
+-	/* We explicitly do not go past the Tundra 320 Bridge */
+-	if ((bus == 1) && (PCI_SLOT(devfn) == ARCADIA_2ND_BRIDGE_IDSEL))
++	hose = pci_bus_to_hose(bus);
++	if (hose == NULL) {
++		printk("Unable to locate hose\n");
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+-	if ((bus == 0) && (PCI_SLOT(devfn) == ARCADIA_2ND_BRIDGE_IDSEL))
++	}
++
++	/* Skip the host bridge on both hoses. */
++	if (hose->first_busno == bus && PCI_SLOT(devfn) == 0)
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+-	else
+-		return PCIBIOS_SUCCESSFUL;
++
++	/* Skip the seconday IDSEL for the Tundra P2P bridge. */
++	if (Tundra_found && hose->index == 0 && bus != hose->first_busno &&
++	    (PCI_SLOT(devfn) == ARCADIA_X2_2ND_BRIDGE_IDSEL ||
++	     PCI_SLOT(devfn) == ARCADIA_X3_2ND_BRIDGE_IDSEL)) {
++		u16 bus2;
++
++		mpc85xx_private_read_config_word(hose, Tundra_bus,
++				Tundra_devfn, PCI_PRIMARY_BUS,
++				&bus2);
++		bus2 = (bus2 >> 8) & 0xff;
++		if (bus == bus2)
++			return PCIBIOS_DEVICE_NOT_FOUND;
++	}
++
++	/*
++	 * If the Tundra Bridge has not been found, see if it is this device.
++	 * We know it is on the root bus of hose A, but it can be at any of
++	 * 3 different IDSEL values and some of those IDSELs are valid slots
++	 * on some of the Arcadia Revs.
++	 */
++	if (!Tundra_found && hose->index == 0 && hose->first_busno == bus &&
++	    (PCI_SLOT(devfn) == ARCADIA_X2_BRIDGE_IDSEL ||
++	     PCI_SLOT(devfn) == ARCADIA_X3_BRIDGE_IDSEL ||
++	     PCI_SLOT(devfn) == ARCADIA_X31_BRIDGE_IDSEL)) {
++		u16 venid, devid;
++
++		mpc85xx_private_read_config_word(hose, bus, devfn,
++				PCI_VENDOR_ID, &venid);
++		mpc85xx_private_read_config_word(hose, bus, devfn,
++				PCI_DEVICE_ID, &devid);
++		/*
++		 * To confuse everything, the Tsi320 is a Tundra design,
++		 * but the Tsi310 is an IBM design, hence the odd check.
++		 */
++		if ((venid == PCI_VENDOR_ID_IBM &&
++			devid == PCI_DEVICE_ID_IBM_TSI310) ||
++		    (venid == PCI_VENDOR_ID_TUNDRA &&
++		     	devid == PCI_DEVICE_ID_TUNDRA_TSI320)) {
++			Tundra_bus = bus;
++			Tundra_devfn = devfn;
++			Tundra_found = 1;
++		}
++	}
++	return PCIBIOS_SUCCESSFUL;
++#endif /* CONFIG_PEX */
+ }
+ 
+-void __init
+-mpc85xx_cds_enable_via(struct pci_controller *hose)
++static void __init
++mpc85xx_cds_fixup_arc(struct pci_dev *dev)
+ {
+-	u32 pci_class;
+-	u16 vid, did;
++	u32 rev;
+ 
+-	early_read_config_dword(hose, 0, 0x88, PCI_CLASS_REVISION, &pci_class);
+-	if ((pci_class >> 16) != PCI_CLASS_BRIDGE_PCI)
+-		return;
++	pci_read_config_dword(dev, PCI_CLASS_REVISION, &rev);
++	rev &= 0xff;
++	arcadia_rev = (rev == 0x04) ? 0x30 : rev;
++	printk(KERN_DEBUG "Found Arcadia Rev %01d.%01d\n",
++		(arcadia_rev >> 4) & 0xf, (arcadia_rev & 0xf));
+ 
+-	/* Configure P2P so that we can reach bus 1 */
+-	early_write_config_byte(hose, 0, 0x88, PCI_PRIMARY_BUS, 0);
+-	early_write_config_byte(hose, 0, 0x88, PCI_SECONDARY_BUS, 1);
+-	early_write_config_byte(hose, 0, 0x88, PCI_SUBORDINATE_BUS, 0xff);
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_FREESCALE, PCI_DEVICE_ID_ARCADIA_ARC,
++		mpc85xx_cds_fixup_arc);
+ 
+-	early_read_config_word(hose, 1, 0x10, PCI_VENDOR_ID, &vid);
+-	early_read_config_word(hose, 1, 0x10, PCI_DEVICE_ID, &did);
++static void __init
++mpc85xx_cds_fixup_tundra(struct pci_dev *dev)
++{
++	struct pci_controller *hose;
++	u16 cmd;
++	unsigned long start, end;
+ 
+-	if ((vid != PCI_VENDOR_ID_VIA) ||
+-			(did != PCI_DEVICE_ID_VIA_82C686))
++	hose = dev->sysdata;
++
++	if (!hose) {
++		printk("%s: No Hose?\n", __FUNCTION__);
+ 		return;
++	}
++
++	start = hose->io_resource.start;
++	end = start + 0x10000 - 1;
++
++	pci_read_config_word(dev, PCI_COMMAND, &cmd);
++	pci_write_config_word(dev, PCI_COMMAND,
++			      cmd & ~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY));
++
++	pci_write_config_byte(dev, PCI_IO_LIMIT,
++			(end >> 8) & PCI_IO_RANGE_MASK);
++	pci_write_config_word(dev, PCI_IO_LIMIT_UPPER16,
++			end >> 16);
++
++	pci_write_config_byte(dev, PCI_IO_BASE,
++			(start >> 8) & PCI_IO_RANGE_MASK);
++	pci_write_config_word(dev, PCI_IO_BASE_UPPER16,
++			start >> 16);
++	pci_write_config_word(dev, PCI_COMMAND, cmd);
++
++	/* If we found a Tundra chip, we're on a rev 2.x board. */
++	if (dev->vendor == PCI_VENDOR_ID_TUNDRA) {
++		arcadia_rev = 0x20;
++		printk(KERN_DEBUG "Found Arcadia Rev 2\n");
++	}
+ 
+-	/* Enable USB and IDE functions */
+-	early_write_config_byte(hose, 1, 0x10, 0x48, 0x08);
+ }
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_TUNDRA, PCI_DEVICE_ID_TUNDRA_TSI320,
++			mpc85xx_cds_fixup_tundra);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_IBM, PCI_DEVICE_ID_IBM_TSI310,
++			mpc85xx_cds_fixup_tundra);
++
++#define IDE_BASE_0 0xfff8
++#define IDE_BASE_1 0xfff4
++#define IDE_BASE_2 0xffe8
++#define IDE_BASE_3 0xffe4
++#define IDE_BASE_4 0xffd0
+ 
+-void __init
+-mpc85xx_cds_fixup_via(struct pci_controller *hose)
++#if defined(CONFIG_BLK_DEV_IDE) || defined(CONFIG_BLK_DEV_IDE_MODULE)
++/*
++ * IDE stuff.
++ */
++static int mpc85xx_cds_ide_default_irq(unsigned long base)
+ {
+-	u32 pci_class;
+-	u16 vid, did;
++	switch (base) {
++	case IDE_BASE_0:
++		return 14;
++	case IDE_BASE_1:
++		return 15;
++	default:
++		return 0;
++	}
++}
+ 
+-	early_read_config_dword(hose, 0, 0x88, PCI_CLASS_REVISION, &pci_class);
+-	if ((pci_class >> 16) != PCI_CLASS_BRIDGE_PCI)
+-		return;
++static unsigned long mpc85xx_cds_ide_default_io_base(int index)
++{
++	switch (index) {
++	case 0:
++		return IDE_BASE_0;
++	case 1:
++		return IDE_BASE_1;
++	default:
++		return 0;
++	}
++}
+ 
+-	/*
+-	 * Force the backplane P2P bridge to have a window
+-	 * open from 0x00000000-0x00001fff in PCI I/O space.
+-	 * This allows legacy I/O (i8259, etc) on the VIA
+-	 * southbridge to be accessed.
+-	 */
+-	early_write_config_byte(hose, 0, 0x88, PCI_IO_BASE, 0x00);
+-	early_write_config_word(hose, 0, 0x88, PCI_IO_BASE_UPPER16, 0x0000);
+-	early_write_config_byte(hose, 0, 0x88, PCI_IO_LIMIT, 0x10);
+-	early_write_config_word(hose, 0, 0x88, PCI_IO_LIMIT_UPPER16, 0x0000);
+-
+-	early_read_config_word(hose, 1, 0x10, PCI_VENDOR_ID, &vid);
+-	early_read_config_word(hose, 1, 0x10, PCI_DEVICE_ID, &did);
+-	if ((vid != PCI_VENDOR_ID_VIA) ||
+-			(did != PCI_DEVICE_ID_VIA_82C686))
+-		return;
++static void __init
++mpc85xx_cds_ide_init_hwif_ports(hw_regs_t * hw, unsigned long data_port,
++			  unsigned long ctrl_port, int *irq)
++{
++	unsigned long reg = data_port;
++	int i;
++
++	for (i = IDE_DATA_OFFSET; i <= IDE_STATUS_OFFSET; i++) {
++		hw->io_ports[i] = reg;
++		reg += 1;
++	}
++
++	if (ctrl_port)
++		hw->io_ports[IDE_CONTROL_OFFSET] = ctrl_port;
++	else
++		switch (data_port) {
++			case IDE_BASE_0:
++				hw->io_ports[IDE_CONTROL_OFFSET] =
++					IDE_BASE_2 + 2;
++				break;
++			case IDE_BASE_2:
++				hw->io_ports[IDE_CONTROL_OFFSET] =
++					IDE_BASE_3 + 2;
++				break;
++			default:
++				break;
++		}
++	if (irq != NULL)
++		*irq = mpc85xx_cds_ide_default_irq(data_port);
++}
++#endif /* defined(CONFIG_BLK_DEV_IDE) || defined(CONFIG_BLK_DEV_IDE_MODULE) */
++
++static void __init
++mpc85xx_cds_enable_via(struct pci_dev *dev)
++{
++	/* Enable USB and IDE functions */
++	pci_write_config_byte(dev, 0x48, 0x08);
++
++	/* Connect up the i8259 IRQ handler */
++	mpc85xx_cds_config_i8259();
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C686,
++			mpc85xx_cds_enable_via);
++
++static void __init
++mpc85xx_cds_fixup_via_ide(struct pci_dev *dev)
++{
++	u_char		c;
+ 
+ 	/*
+-	 * Since the P2P window was forced to cover the fixed
+-	 * legacy I/O addresses, it is necessary to manually
+-	 * place the base addresses for the IDE and USB functions
+-	 * within this window.
++	 * U-Boot does not set the enable bits
++	 * for the IDE device. Force them on here.
+ 	 */
+-	/* Function 1, IDE */
+-	early_write_config_dword(hose, 1, 0x11, PCI_BASE_ADDRESS_0, 0x1ff8);
+-	early_write_config_dword(hose, 1, 0x11, PCI_BASE_ADDRESS_1, 0x1ff4);
+-	early_write_config_dword(hose, 1, 0x11, PCI_BASE_ADDRESS_2, 0x1fe8);
+-	early_write_config_dword(hose, 1, 0x11, PCI_BASE_ADDRESS_3, 0x1fe4);
+-	early_write_config_dword(hose, 1, 0x11, PCI_BASE_ADDRESS_4, 0x1fd0);
+-
+-	/* Function 2, USB ports 0-1 */
+-	early_write_config_dword(hose, 1, 0x12, PCI_BASE_ADDRESS_4, 0x1fa0);
+-
+-	/* Function 3, USB ports 2-3 */
+-	early_write_config_dword(hose, 1, 0x13, PCI_BASE_ADDRESS_4, 0x1f80);
+-
+-	/* Function 5, Power Management */
+-	early_write_config_dword(hose, 1, 0x15, PCI_BASE_ADDRESS_0, 0x1e00);
+-	early_write_config_dword(hose, 1, 0x15, PCI_BASE_ADDRESS_1, 0x1dfc);
+-	early_write_config_dword(hose, 1, 0x15, PCI_BASE_ADDRESS_2, 0x1df8);
++	pci_read_config_byte(dev, 0x40, &c);
++	c |= 0x03; /* IDE: Chip Enable Bits */
++	pci_write_config_byte(dev, 0x40, c);
++
++	pci_write_config_byte(dev, PCI_INTERRUPT_LINE, 14);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_0, IDE_BASE_0);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_1, IDE_BASE_1);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_2, IDE_BASE_2);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_3, IDE_BASE_3);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_4, IDE_BASE_4);
++
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C586_1,
++			mpc85xx_cds_fixup_via_ide);
++
++static void __init
++mpc85xx_cds_fixup_via_usb(struct pci_dev *dev)
++{
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_4,
++			(PCI_FUNC(dev->devfn) == 2) ? 0xffa0 : 0xff80);
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C586_2,
++			mpc85xx_cds_fixup_via_usb);
++
++static void __init
++mpc85xx_cds_fixup_via_pwr(struct pci_dev *dev)
++{
++	/* Function 5, Power Management  (actually AC97 sound */
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_0, 0xfe00);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_1, 0xfdfc);
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_2, 0xfdf8);
++
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C686_5,
++			mpc85xx_cds_fixup_via_pwr);
++
++static void __init
++mpc85xx_cds_fixup_via_ac97(struct pci_dev *dev)
++{
++	/* Function 6, AC97 Interface (actually modem) */
++	pci_write_config_dword(dev, PCI_BASE_ADDRESS_0, 0xfc00);
+ 
+-	/* Function 6, AC97 Interface */
+-	early_write_config_dword(hose, 1, 0x16, PCI_BASE_ADDRESS_0, 0x1c00);
+ }
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C686_6,
++			mpc85xx_cds_fixup_via_ac97);
+ 
+ void __init
+ mpc85xx_cds_pcibios_fixup(void)
+ {
+         struct pci_dev *dev = NULL;
+-	u_char		c;
++
++	if ((dev = pci_find_device(PCI_VENDOR_ID_FREESCALE,
++				   PCI_DEVICE_ID_ARCADIA_ARC, NULL))) {
++		printk(KERN_DEBUG "%s: Found ARC\n", __FUNCTION__);
++		if (pci_remove_device_safe(dev) == 0)
++			printk(KERN_DEBUG "%s: Removed ARC\n", __FUNCTION__);
++	}
+ 
+         if ((dev = pci_find_device(PCI_VENDOR_ID_VIA,
+                                         PCI_DEVICE_ID_VIA_82C586_1, NULL))) {
+-                /*
+-                 * U-Boot does not set the enable bits
+-                 * for the IDE device. Force them on here.
+-                 */
+-                pci_read_config_byte(dev, 0x40, &c);
+-                c |= 0x03; /* IDE: Chip Enable Bits */
+-                pci_write_config_byte(dev, 0x40, c);
+-
+ 		/*
+ 		 * Since only primary interface works, force the
+ 		 * IDE function to standard primary IDE interrupt
+@@ -478,6 +733,54 @@ mpc85xx_cds_pcibios_fixup(void)
+ }
+ #endif /* CONFIG_PCI */
+ 
++void
++mpc85xx_cds_restart(char *cmd)
++{
++	struct pci_dev *dev;
++	unsigned long i = 0x2000000;
++	u_char tmp;
++	u32 __iomem *rst;
++
++	local_irq_disable();
++
++	if ((dev = pci_find_device(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C686,
++					NULL))) {
++
++		/* make sure bit 0 (reset) is a 0 */
++		outb(inb(0x92) & ~1L, 0x92);
++
++		/* Set port 92 reset enable bit in VIA header */
++		pci_read_config_byte(dev, 0x41, &tmp);
++		pci_write_config_byte(dev, 0x41, tmp | (1<<5));
++
++		/* signal a reset to system control port A - soft reset */
++		outb(inb(0x92) | 1, 0x92);
++
++		while (i != 0)
++			i--;
++		printk("Port A restart failed. Trying PCI restart.\n");
++
++		/* Hmmm, Port A reset failed, try a PCI reset */
++		pci_read_config_byte(dev, 0x47, &tmp);
++		pci_write_config_byte(dev, 0x47, tmp | 1);
++
++		i = 0x2000000;
++		while (i != 0)
++			i--;
++		/* fall through into 85xx processor-based reset code. */
++	}
++
++#ifdef CONFIG_PCI
++	printk("Unable to perform PCI reset. Using processor reset.\n");
++	printk("NOTE: Processor reset does not reset PCI devices.\n");
++#endif
++
++	rst = ioremap((BOARD_CCSRBAR + 0xe00b0),0x100);
++	out_be32(rst, 0x2); /* Set HRESET_REQ flag */
++
++	abort();
++}
++
+ TODC_ALLOC();
+ 
+ /* ************************************************************************
+@@ -503,7 +806,7 @@ mpc85xx_cds_setup_arch(void)
+ 	/*
+ 	 * The Abatron BDI JTAG debugger does not tolerate others
+ 	 * mucking with the debug registers.
+-	 */ 
++	 */
+ 	mtspr(SPRN_DBCR0, (DBCR0_IDM));
+ 	mtspr(SPRN_DBSR, 0xffffffff);
+ #endif
+@@ -530,7 +833,7 @@ mpc85xx_cds_setup_arch(void)
+ #ifdef CONFIG_PCI
+  	/* VIA IDE configuration */
+          ppc_md.pcibios_fixup = mpc85xx_cds_pcibios_fixup;
+- 
++
+         /* setup PCI host bridges */
+         mpc85xx_setup_hose();
+ #endif
+@@ -611,6 +914,7 @@ mpc85xx_cds_setup_arch(void)
+ #endif
+ }
+ 
++
+ /* ************************************************************************ */
+ void __init
+ platform_init(unsigned long r3, unsigned long r4, unsigned long r5,
+@@ -680,7 +984,7 @@ platform_init(unsigned long r3, unsigned
+         ppc_md.init_IRQ = mpc85xx_cds_init_IRQ;
+         ppc_md.get_irq = openpic_get_irq;
+ 
+-        ppc_md.restart = mpc85xx_restart;
++        ppc_md.restart = mpc85xx_cds_restart;
+         ppc_md.power_off = mpc85xx_power_off;
+         ppc_md.halt = mpc85xx_halt;
+ 
+@@ -695,6 +999,14 @@ platform_init(unsigned long r3, unsigned
+ 	ppc_md.nvram_read_val = todc_direct_read_val;
+ 	ppc_md.nvram_write_val = todc_direct_write_val;
+ 
++#ifdef CONFIG_PCI
++#if defined(CONFIG_BLK_DEV_IDE) || defined(CONFIG_BLK_DEV_IDE_MODULE)
++	ppc_ide_md.default_irq = mpc85xx_cds_ide_default_irq;
++	ppc_ide_md.default_io_base = mpc85xx_cds_ide_default_io_base;
++	ppc_ide_md.ide_init_hwif = mpc85xx_cds_ide_init_hwif_ports;
++#endif
++#endif
++
+ #if defined(CONFIG_SERIAL_8250) && defined(CONFIG_SERIAL_TEXT_DEBUG)
+         ppc_md.progress = gen550_progress;
+ #endif /* CONFIG_SERIAL_8250 && CONFIG_SERIAL_TEXT_DEBUG */
+Index: linux-2.6.10/arch/ppc/syslib/open_pic.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/open_pic.c
++++ linux-2.6.10/arch/ppc/syslib/open_pic.c
+@@ -687,7 +687,7 @@ openpic_init_nmi_irq(u_int irq)
+ 
+ static struct irqaction openpic_cascade_irqaction = {
+ 	.handler = no_action,
+-	.flags = SA_INTERRUPT,
++	.flags = SA_INTERRUPT|SA_SHIRQ,
+ 	.mask = CPU_MASK_NONE,
+ };
+ 
+Index: linux-2.6.10/arch/ppc/syslib/pci_auto.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/pci_auto.c
++++ linux-2.6.10/arch/ppc/syslib/pci_auto.c
+@@ -88,6 +88,18 @@ void __init pciauto_setup_bars(struct pc
+ 		/* Calculate requested size */
+ 		bar_size = ~(bar_response & addr_mask) + 1;
+ 
++		/* If the BAR size is not a power of 2, zero it and move on. */
++		if (bar_size & (bar_size - 1)) {
++			early_write_config_dword(hose,
++					current_bus,
++					pci_devfn,
++					bar,
++					0);
++			DBG("size (%08x) not a power of 2, skipping\n",
++			     bar_size);
++			continue;
++		}
++
+ 		/* Allocate a base address */
+ 		bar_value = (*upper_limit - bar_size) & ~(bar_size - 1);
+ 
+@@ -423,7 +435,8 @@ int __init pciauto_bus_scan(struct pci_c
+ 					current_bus,
+ 					pci_devfn,
+ 					PCI_CLASS_REVISION, &pci_class);
+-			if ( (pci_class >> 16) == PCI_CLASS_BRIDGE_PCI ) {
++			if ( (pci_class >> 16) == PCI_CLASS_BRIDGE_PCI &&
++			     (header_type & 1)) {
+ 				int iosave, memsave;
+ 
+ 				DBG("PCI Autoconfig: Found P2P bridge, device %d\n", PCI_SLOT(pci_devfn));
+Index: linux-2.6.10/arch/ppc/syslib/ppc85xx_setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc85xx_setup.c
++++ linux-2.6.10/arch/ppc/syslib/ppc85xx_setup.c
+@@ -239,10 +239,10 @@ mpc85xx_setup_pci2(struct pci_controller
+ 	pci = ioremap(binfo->bi_immr_base + MPC85xx_PCI2_OFFSET,
+ 		    MPC85xx_PCI2_SIZE);
+ 
+-	early_read_config_word(hose, hose->bus_offset, 0, PCI_COMMAND, &temps);
++	early_read_config_word(hose, hose->first_busno, 0, PCI_COMMAND, &temps);
+ 	temps |= PCI_COMMAND_SERR | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
+-	early_write_config_word(hose, hose->bus_offset, 0, PCI_COMMAND, temps);
+-	early_write_config_byte(hose, hose->bus_offset, 0, PCI_LATENCY_TIMER, 0x80);
++	early_write_config_word(hose, hose->first_busno, 0, PCI_COMMAND, temps);
++	early_write_config_byte(hose, hose->first_busno, 0, PCI_LATENCY_TIMER, 0x80);
+ 
+ 	/* Disable all windows (except powar0 since its ignored) */
+ 	pci->powar1 = 0;
+@@ -277,7 +277,6 @@ mpc85xx_setup_pci2(struct pci_controller
+ #endif /* CONFIG_85xx_PCI2 */
+ #endif
+ 
+-#ifdef CONFIG_PEX
+ struct local_window {
+ 	int number;
+ 	int target;
+@@ -358,7 +357,7 @@ mpc85xx_pci_law_fixup(void)
+ 			number = empty++;
+ 
+ 		out_be32(lawbase + 0x2 + (number * 0x8), (lwp->base)>>12);
+-		out_be32(lawbase + 0x4 + (number * 0x8), 
++		out_be32(lawbase + 0x4 + (number * 0x8),
+ 			 0x80000000 | (lwp->target)<<20 | (lwp->size));
+ 	}
+ 
+@@ -366,6 +365,7 @@ mpc85xx_pci_law_fixup(void)
+ 	return;
+ }
+ 
++#ifdef CONFIG_PEX
+ static void __init
+ mpc85xx_setup_pex(struct pci_controller *hose)
+ {
+@@ -416,7 +416,99 @@ mpc85xx_setup_pex(struct pci_controller 
+ }
+ #endif
+ 
+-int mpc85xx_pci1_last_busno = 0;
++#ifdef CONFIG_PPC_INDIRECT_PCI_BE
++#define PCI_CFG_OUT out_be32
++#else
++#define PCI_CFG_OUT out_le32
++#endif
++
++static int
++mpc85xx_cds_indirect_read_config(struct pci_bus *bus, unsigned int devfn,
++				int offset, int len, u32 *val)
++{
++	struct pci_controller *hose = bus->sysdata;
++	volatile unsigned char *cfg_data;
++	u8 cfg_type = 0;
++	u8 bus_num;
++
++	if (ppc_md.pci_exclude_device)
++		if (ppc_md.pci_exclude_device(bus->number, devfn))
++			return PCIBIOS_DEVICE_NOT_FOUND;
++
++	if (bus->number == hose->first_busno)
++		bus_num = 0;
++	else
++		bus_num = bus->number;
++
++	PCI_CFG_OUT(hose->cfg_addr,
++		 (0x80000000 | (bus_num << 16)
++		  | (devfn << 8) | ((offset & 0xfc) | cfg_type)));
++
++	/*
++	 * Note: the caller has already checked that offset is
++	 * suitably aligned and that len is 1, 2 or 4.
++	 */
++	cfg_data = hose->cfg_data + (offset & 3);
++	switch (len) {
++	case 1:
++		*val = in_8((u8 *)cfg_data);
++		break;
++	case 2:
++		*val = in_le16((u16 *)cfg_data);
++		break;
++	default:
++		*val = in_le32((u32 *)cfg_data);
++		break;
++	}
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static int
++mpc85xx_cds_indirect_write_config(struct pci_bus *bus, unsigned int devfn,
++				  int offset, int len, u32 val)
++{
++	struct pci_controller *hose = bus->sysdata;
++	volatile unsigned char *cfg_data;
++	u8 cfg_type = 0;
++	u8 bus_num;
++
++	if (ppc_md.pci_exclude_device)
++		if (ppc_md.pci_exclude_device(bus->number, devfn))
++			return PCIBIOS_DEVICE_NOT_FOUND;
++
++	if (bus->number == hose->first_busno)
++		bus_num = 0;
++	else
++		bus_num = bus->number;
++
++	PCI_CFG_OUT(hose->cfg_addr,
++		 (0x80000000 | (bus_num << 16)
++		  | (devfn << 8) | ((offset & 0xfc) | cfg_type)));
++
++	/*
++	 * Note: the caller has already checked that offset is
++	 * suitably aligned and that len is 1, 2 or 4.
++	 */
++	cfg_data = hose->cfg_data + (offset & 3);
++	switch (len) {
++	case 1:
++		out_8((u8 *)cfg_data, val);
++		break;
++	case 2:
++		out_le16((u16 *)cfg_data, val);
++		break;
++	default:
++		out_le32((u32 *)cfg_data, val);
++		break;
++	}
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static struct pci_ops mpc85xx_cds_indirect_pci_ops =
++{
++	mpc85xx_cds_indirect_read_config,
++	mpc85xx_cds_indirect_write_config
++};
+ 
+ void __init
+ mpc85xx_setup_hose(void)
+@@ -477,6 +569,8 @@ mpc85xx_setup_hose(void)
+ #endif
+ 	bd_t *binfo = (bd_t *) __res;
+ 
++	mpc85xx_pci_law_fixup();
++
+ 	hose_a = pcibios_alloc_controller();
+ 
+ 	if (!hose_a)
+@@ -486,12 +580,11 @@ mpc85xx_setup_hose(void)
+ 	ppc_md.pci_map_irq = mpc85xx_map_irq;
+ 
+ 	hose_a->first_busno = 0;
+-	hose_a->bus_offset = 0;
+ 	hose_a->last_busno = 0xff;
+ 
+ 	setup_indirect_pci(hose_a, binfo->bi_immr_base + PCI1_CFG_ADDR_OFFSET,
+ 			   binfo->bi_immr_base + PCI1_CFG_DATA_OFFSET);
+-	hose_a->set_cfg_type = 1;
++	hose_a->ops = &mpc85xx_cds_indirect_pci_ops;
+ 
+ 	mpc85xx_setup_pci1(hose_a);
+ 
+@@ -526,32 +619,23 @@ mpc85xx_setup_hose(void)
+ 			IORESOURCE_IO, "PCI1 host bridge");
+ 
+ 	ppc_md.pci_exclude_device = mpc85xx_exclude_device;
+-
+-#if defined(CONFIG_MPC8555_CDS) || defined(CONFIG_MPC8548_CDS)
+-	/* Pre pciauto_bus_scan VIA init */
+-	mpc85xx_cds_enable_via(hose_a);
+-#endif
+-
+ 	hose_a->last_busno = pciauto_bus_scan(hose_a, hose_a->first_busno);
+ 
+-#if defined(CONFIG_MPC8555_CDS) || defined(CONFIG_MPC8548_CDS)
+-	/* Post pciauto_bus_scan VIA fixup */
+-	mpc85xx_cds_fixup_via(hose_a);
+-#endif
+-
+ #ifdef CONFIG_85xx_PCI2
+ 	hose_b = pcibios_alloc_controller();
+ 
+ 	if (!hose_b)
+ 		return;
+ 
+-	hose_b->bus_offset = hose_a->last_busno + 1;
+ 	hose_b->first_busno = hose_a->last_busno + 1;
+ 	hose_b->last_busno = 0xff;
+ 
+ 	setup_indirect_pci(hose_b, binfo->bi_immr_base + PCI2_CFG_ADDR_OFFSET,
+ 			   binfo->bi_immr_base + PCI2_CFG_DATA_OFFSET);
+-	hose_b->set_cfg_type = 1;
++	hose_b->ops = &mpc85xx_cds_indirect_pci_ops;
++
++	/* allow access to the host bridge again. */
++	ppc_md.pci_exclude_device = NULL;
+ 
+ 	mpc85xx_setup_pci2(hose_b);
+ 
+@@ -575,10 +659,9 @@ mpc85xx_setup_hose(void)
+ 			MPC85XX_PCI2_UPPER_IO,
+ 			IORESOURCE_IO, "PCI2 host bridge");
+ 
+-	hose_b->last_busno = pciauto_bus_scan(hose_b, hose_b->first_busno);
++	ppc_md.pci_exclude_device = mpc85xx_exclude_device;
+ 
+-	/* let board code know what the last bus number was on PCI1 */
+-	mpc85xx_pci1_last_busno = hose_a->last_busno;
++	hose_b->last_busno = pciauto_bus_scan(hose_b, hose_b->first_busno);
+ #endif
+ #endif
+ 	return;
+Index: linux-2.6.10/include/asm-ppc/irq.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/irq.h
++++ linux-2.6.10/include/asm-ppc/irq.h
+@@ -221,7 +221,7 @@ static __inline__ int irq_canonicalize(i
+ #ifdef CONFIG_CPM2
+ #define MPC85xx_OPENPIC_IRQ_OFFSET	(CPM_IRQ_OFFSET + NR_CPM_INTS)
+ #else
+-#define MPC85xx_OPENPIC_IRQ_OFFSET	0
++#define MPC85xx_OPENPIC_IRQ_OFFSET	NR_8259_INTS
+ #endif
+ #endif
+ 
+Index: linux-2.6.10/include/linux/pci_ids.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/pci_ids.h
++++ linux-2.6.10/include/linux/pci_ids.h
+@@ -438,6 +438,7 @@
+ #define PCI_DEVICE_ID_IBM_CPC710_PCI32	0x0105
+ #define	PCI_DEVICE_ID_IBM_405GP		0x0156
+ #define PCI_DEVICE_ID_IBM_SNIPE		0x0180
++#define PCI_DEVICE_ID_IBM_TSI310	0x01a7	/* Tundra TSi310 */
+ #define PCI_DEVICE_ID_IBM_SERVERAIDI960	0x01bd
+ #define PCI_DEVICE_ID_IBM_CITRINE		0x028C
+ #define PCI_DEVICE_ID_IBM_GEMSTONE		0xB166
+@@ -1164,6 +1165,7 @@
+ #define PCI_DEVICE_ID_TUNDRA_CA91C042	0x0000
+ #define PCI_DEVICE_ID_TUNDRA_TSI108	0x0108
+ #define PCI_DEVICE_ID_TUNDRA_TSI109	0xA108
++#define PCI_DEVICE_ID_TUNDRA_TSI320	0x0513
+ 
+ #define PCI_VENDOR_ID_AMCC		0x10e8
+ #define PCI_DEVICE_ID_AMCC_MYRINET	0x8043
+@@ -2031,6 +2033,9 @@
+ #define PCI_VENDOR_ID_ARC               0x192E
+ #define PCI_DEVICE_ID_ARC_EHCI          0x0101
+ 
++#define PCI_VENDOR_ID_FREESCALE		0x1957
++#define PCI_DEVICE_ID_ARCADIA_ARC	0x3fff
++
+ #define PCI_VENDOR_ID_SYMPHONY		0x1c1c
+ #define PCI_DEVICE_ID_SYMPHONY_101	0x0001
+ 
+Index: linux-2.6.10/arch/ppc/platforms/85xx/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/85xx/Kconfig
++++ linux-2.6.10/arch/ppc/platforms/85xx/Kconfig
+@@ -78,6 +78,38 @@ config 85xx_PCI2
+ 	depends on MPC8555_CDS
+ 	default y
+ 
++choice
++	prompt "Default Arcadia Rev"
++	depends on PCI && (MPC8555_CDS || MPC8548_CDS)
++	default ARCADIA_X31
++	help
++	  The interrupt routings differ among the various revisions of the
++	  Arcadia. Normally, the proper Arcadia revision can be determined at
++	  runtime and this item is not required. However, if the PCI-to-PCI
++	  bridge on the Arcadia is disabled, runtime determination of the
++	  Arcadia is not possible and this item will be used to set the
++	  default Arcadia revision.
++
++config ARCADIA_X2
++	bool "Arcadia Rev 2"
++	help
++	  The Rev 2 Arcadia has 4 64-bit PCI slots with a HIP connector at
++	  each slot and a PrPMC connector.
++
++config ARCADIA_X30
++	bool "Arcadia Rev 3.0"
++	help
++	  The Rev 3.0 Arcadia has 4 64-bit PCI slots with HIP connectors at
++	  the 2 outermost slots, a PrPMC connector and 2 32-bit PCI slots.
++
++config ARCADIA_X31
++	bool "Arcadia Rev 3.1"
++	help
++	  The Rev 3.1 Arcadia has 4 64-bit PCI slots with HIP connectors at
++	  the 2 outermost slots, a PrPMC connector, 2 32-bit PCI slots and
++	  "Arcadia V3.1" silk screened adjacent to the 32-bit PCI connectors.
++endchoice
++
+ config PEX
+ 	bool "PCI Express support"
+ 	depends on PCI && MPC8548
+Index: linux-2.6.10/mvl_patches/pro-1131.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1131.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1131);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

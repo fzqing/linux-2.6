@@ -1,0 +1,513 @@
+#! /usr/bin/env bash
+# Patch: -sd_descriptor_sense_support
+# Date: Fri Jan  4 18:39:26 2008
+# Source: Kernel.org git
+# MR: 23373
+# Type: Defect Fix
+# Disposition: Backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# 
+# From ff8f440f41c390843ade3eaccd1b6ca959fbfb7b Mon Sep 17 00:00:00 2001
+# From: James Bottomley <jejb@mulgrave.(none)>
+# Date: Sat, 22 Jan 2005 21:26:01 -0600
+# Subject: [PATCH] sd descriptor sense support
+# 
+# From: 	Douglas Gilbert <dougg@torque.net>
+# 
+#    - make all sd driver sense data handling able to use
+#      both fixed and descriptor format
+#    - permit 64 bit lbas associated with medium (or
+#      hardware) errors to be conveyed back to the block
+#      layer
+# 
+# Signed-off-by: James Bottomley <James.Bottomley@SteelEye.com>
+# 
+
+PATCHNUM=1517
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Kernel.org git
+MR: 23373
+Type: Defect Fix
+Disposition: Backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+
+From ff8f440f41c390843ade3eaccd1b6ca959fbfb7b Mon Sep 17 00:00:00 2001
+From: James Bottomley <jejb@mulgrave.(none)>
+Date: Sat, 22 Jan 2005 21:26:01 -0600
+Subject: [PATCH] sd descriptor sense support
+
+From: 	Douglas Gilbert <dougg@torque.net>
+
+   - make all sd driver sense data handling able to use
+     both fixed and descriptor format
+   - permit 64 bit lbas associated with medium (or
+     hardware) errors to be conveyed back to the block
+     layer
+
+Signed-off-by: James Bottomley <James.Bottomley@SteelEye.com>
+
+Index: linux-2.6.10/drivers/scsi/sd.c
+===================================================================
+--- linux-2.6.10.orig/drivers/scsi/sd.c
++++ linux-2.6.10/drivers/scsi/sd.c
+@@ -762,15 +762,26 @@ static void sd_rw_intr(struct scsi_cmnd 
+ 	int this_count = SCpnt->bufflen;
+ 	int good_bytes = (result == 0 ? this_count : 0);
+ 	sector_t block_sectors = 1;
++	u64 first_err_block;
+ 	sector_t error_sector;
++	struct scsi_sense_hdr sshdr;
++	int sense_valid = 0;
++	int sense_deferred = 0;
++	int info_valid;
++
++	if (result) {
++		sense_valid = scsi_command_normalize_sense(SCpnt, &sshdr);
++		if (sense_valid)
++			sense_deferred = scsi_sense_is_deferred(&sshdr);
++	}
++
+ #ifdef CONFIG_SCSI_LOGGING
+ 	SCSI_LOG_HLCOMPLETE(1, printk("sd_rw_intr: %s: res=0x%x\n", 
+ 				SCpnt->request->rq_disk->disk_name, result));
+-	if (0 != result) {
+-		SCSI_LOG_HLCOMPLETE(1, printk("sd_rw_intr: sb[0,2,asc,ascq]"
+-				"=%x,%x,%x,%x\n", SCpnt->sense_buffer[0],
+-			SCpnt->sense_buffer[2], SCpnt->sense_buffer[12],
+-			SCpnt->sense_buffer[13]));
++	if (sense_valid) {
++		SCSI_LOG_HLCOMPLETE(1, printk("sd_rw_intr: sb[respc,sk,asc,"
++				"ascq]=%x,%x,%x,%x\n", sshdr.response_code,
++				sshdr.sense_key, sshdr.asc, sshdr.ascq));
+ 	}
+ #endif
+ 	/*
+@@ -781,17 +792,20 @@ static void sd_rw_intr(struct scsi_cmnd 
+ 
+ 	/* An error occurred */
+ 	if (driver_byte(result) != 0 && 	/* An error occurred */
+-	    (SCpnt->sense_buffer[0] & 0x7f) == 0x70) { /* Sense current */
+-		switch (SCpnt->sense_buffer[2]) {
++		sense_valid && !sense_deferred) {
++		switch (sshdr.sense_key) {
+ 		case MEDIUM_ERROR:
+-			if (!(SCpnt->sense_buffer[0] & 0x80))
+-				break;
+ 			if (!blk_fs_request(SCpnt->request))
+ 				break;
+-			error_sector = (SCpnt->sense_buffer[3] << 24) |
+-			(SCpnt->sense_buffer[4] << 16) |
+-			(SCpnt->sense_buffer[5] << 8) |
+-			SCpnt->sense_buffer[6];
++			info_valid = scsi_get_sense_info_fld(
++				SCpnt->sense_buffer, SCSI_SENSE_BUFFERSIZE,
++				&first_err_block);
++			/*
++			* May want to warn and skip if following cast results
++			* in actual truncation (if sector_t < 64 bits)
++			*/
++			error_sector = (sector_t)first_err_block;
++
+ 			if (SCpnt->request->bio != NULL)
+ 				block_sectors = bio_sectors(SCpnt->request->bio);
+ 			switch (SCpnt->device->sector_size) {
+@@ -831,7 +845,7 @@ static void sd_rw_intr(struct scsi_cmnd 
+ 			 */
+ 			scsi_print_sense("sd", SCpnt);
+ 			SCpnt->result = 0;
+-			SCpnt->sense_buffer[0] = 0x0;
++			memset(SCpnt->sense_buffer, 0, SCSI_SENSE_BUFFERSIZE);
+ 			good_bytes = this_count;
+ 			break;
+ 
+@@ -860,16 +874,20 @@ static void sd_rw_intr(struct scsi_cmnd 
+ 
+ static int media_not_present(struct scsi_disk *sdkp, struct scsi_request *srp)
+ {
++	struct scsi_sense_hdr sshdr;
++
+ 	if (!srp->sr_result)
+ 		return 0;
+ 	if (!(driver_byte(srp->sr_result) & DRIVER_SENSE))
+ 		return 0;
+-	if (srp->sr_sense_buffer[2] != NOT_READY &&
+-	    srp->sr_sense_buffer[2] != UNIT_ATTENTION)
+-	    	return 0;
+-	if (srp->sr_sense_buffer[12] != 0x3A) /* medium not present */
+-		return 0;
+-
++	/* not invoked for commands that could return deferred errors */
++	if (scsi_request_normalize_sense(srp, &sshdr)) {
++		if (sshdr.sense_key != NOT_READY &&
++		    sshdr.sense_key != UNIT_ATTENTION)
++			return 0;
++		if (sshdr.asc != 0x3A) /* medium not present */
++			return 0;
++	}
+ 	set_media_not_present(sdkp);
+ 	return 1;
+ }
+@@ -884,6 +902,8 @@ sd_spinup_disk(struct scsi_disk *sdkp, c
+ 	unsigned long spintime_value = 0;
+ 	int retries, spintime;
+ 	unsigned int the_result;
++	struct scsi_sense_hdr sshdr;
++	int sense_valid = 0;
+ 
+ 	spintime = 0;
+ 
+@@ -897,19 +917,22 @@ sd_spinup_disk(struct scsi_disk *sdkp, c
+ 			memset((void *) &cmd[1], 0, 9);
+ 
+ 			SRpnt->sr_cmd_len = 0;
+-			SRpnt->sr_sense_buffer[0] = 0;
+-			SRpnt->sr_sense_buffer[2] = 0;
++			memset(SRpnt->sr_sense_buffer, 0,
++			       SCSI_SENSE_BUFFERSIZE);
+ 			SRpnt->sr_data_direction = DMA_NONE;
+ 
+ 			scsi_wait_req (SRpnt, (void *) cmd, (void *) buffer,
+ 				       0/*512*/, SD_TIMEOUT, SD_MAX_RETRIES);
+ 
+ 			the_result = SRpnt->sr_result;
++			if (the_result)
++				sense_valid = scsi_request_normalize_sense(
++							SRpnt, &sshdr);
+ 			retries++;
+ 		} while (retries < 3 && 
+ 			 (!scsi_status_is_good(the_result) ||
+ 			  ((driver_byte(the_result) & DRIVER_SENSE) &&
+-			   SRpnt->sr_sense_buffer[2] == UNIT_ATTENTION)));
++			  sense_valid && sshdr.sense_key == UNIT_ATTENTION)));
+ 
+ 		/*
+ 		 * If the drive has indicated to us that it doesn't have
+@@ -923,7 +946,8 @@ sd_spinup_disk(struct scsi_disk *sdkp, c
+ 			/* no sense, TUR either succeeded or failed
+ 			 * with a status error */
+ 			if(!spintime && !scsi_status_is_good(the_result))
+-				printk(KERN_NOTICE "%s: Unit Not Ready, error = 0x%x\n", diskname, the_result);
++				printk(KERN_NOTICE "%s: Unit Not Ready, "
++				       "error = 0x%x\n", diskname, the_result);
+ 			break;
+ 		}
+ 					
+@@ -938,15 +962,15 @@ sd_spinup_disk(struct scsi_disk *sdkp, c
+ 		 * If manual intervention is required, or this is an
+ 		 * absent USB storage device, a spinup is meaningless.
+ 		 */
+-		if (SRpnt->sr_sense_buffer[2] == NOT_READY &&
+-		    SRpnt->sr_sense_buffer[12] == 4 /* not ready */ &&
+-		    SRpnt->sr_sense_buffer[13] == 3) {
++		if (sense_valid &&
++		    sshdr.sense_key == NOT_READY &&
++		    sshdr.asc == 4 && sshdr.ascq == 3) {
+ 			break;		/* manual intervention required */
+ 
+ 		/*
+ 		 * Issue command to spin up drive when not ready
+ 		 */
+-		} else if (SRpnt->sr_sense_buffer[2] == NOT_READY) {
++		} else if (sense_valid && sshdr.sense_key == NOT_READY) {
+ 			if (!spintime) {
+ 				printk(KERN_NOTICE "%s: Spinning up disk...",
+ 				       diskname);
+@@ -955,8 +979,8 @@ sd_spinup_disk(struct scsi_disk *sdkp, c
+ 				memset((void *) &cmd[2], 0, 8);
+ 				cmd[4] = 1;	/* Start spin cycle */
+ 				SRpnt->sr_cmd_len = 0;
+-				SRpnt->sr_sense_buffer[0] = 0;
+-				SRpnt->sr_sense_buffer[2] = 0;
++				memset(SRpnt->sr_sense_buffer, 0,
++					SCSI_SENSE_BUFFERSIZE);
+ 
+ 				SRpnt->sr_data_direction = DMA_NONE;
+ 				scsi_wait_req(SRpnt, (void *)cmd, 
+@@ -972,7 +996,8 @@ sd_spinup_disk(struct scsi_disk *sdkp, c
+ 			/* we don't understand the sense code, so it's
+ 			 * probably pointless to loop */
+ 			if(!spintime) {
+-				printk(KERN_NOTICE "%s: Unit Not Ready, sense:\n", diskname);
++				printk(KERN_NOTICE "%s: Unit Not Ready, "
++					"sense:\n", diskname);
+ 				scsi_print_req_sense("", SRpnt);
+ 			}
+ 			break;
+@@ -1000,6 +1025,8 @@ sd_read_capacity(struct scsi_disk *sdkp,
+ 	int the_result, retries;
+ 	int sector_size = 0;
+ 	int longrc = 0;
++	struct scsi_sense_hdr sshdr;
++	int sense_valid = 0;
+ 
+ repeat:
+ 	retries = 3;
+@@ -1017,8 +1044,7 @@ repeat:
+ 		}
+ 		
+ 		SRpnt->sr_cmd_len = 0;
+-		SRpnt->sr_sense_buffer[0] = 0;
+-		SRpnt->sr_sense_buffer[2] = 0;
++		memset(SRpnt->sr_sense_buffer, 0, SCSI_SENSE_BUFFERSIZE);
+ 		SRpnt->sr_data_direction = DMA_FROM_DEVICE;
+ 
+ 		scsi_wait_req(SRpnt, (void *) cmd, (void *) buffer,
+@@ -1028,6 +1054,9 @@ repeat:
+ 			return;
+ 
+ 		the_result = SRpnt->sr_result;
++		if (the_result)
++			sense_valid = scsi_request_normalize_sense(SRpnt,
++								   &sshdr);
+ 		retries--;
+ 
+ 	} while (the_result && retries);
+@@ -1049,7 +1078,7 @@ repeat:
+ 		/* Set dirty bit for removable devices if not ready -
+ 		 * sometimes drives will not report this properly. */
+ 		if (sdp->removable &&
+-		    SRpnt->sr_sense_buffer[2] == NOT_READY)
++		    sense_valid && sshdr.sense_key == NOT_READY)
+ 			sdp->changed = 1;
+ 
+ 		/* Either no media are present but the drive didn't tell us,
+@@ -1254,6 +1283,7 @@ sd_read_cache_type(struct scsi_disk *sdk
+ 	const int dbd = 0;	   /* DBD */
+ 	const int modepage = 0x08; /* current values, cache page */
+ 	struct scsi_mode_data data;
++	struct scsi_sense_hdr sshdr;
+ 
+ 	if (sdkp->device->skip_ms_page_8)
+ 		goto defaults;
+@@ -1303,17 +1333,14 @@ sd_read_cache_type(struct scsi_disk *sdk
+ 	}
+ 
+ bad_sense:
+-	if ((SRpnt->sr_sense_buffer[0] & 0x70) == 0x70
+-	     && (SRpnt->sr_sense_buffer[2] & 0x0f) == ILLEGAL_REQUEST
+-	     /* ASC 0x24 ASCQ 0x00: Invalid field in CDB */
+-	     && SRpnt->sr_sense_buffer[12] == 0x24
+-	     && SRpnt->sr_sense_buffer[13] == 0x00) {
++	if (scsi_request_normalize_sense(SRpnt, &sshdr) &&
++	    sshdr.sense_key == ILLEGAL_REQUEST &&
++	    sshdr.asc == 0x24 && sshdr.ascq == 0x0)
+ 		printk(KERN_NOTICE "%s: cache data unavailable\n",
+-		       diskname);
+-	} else {
++		       diskname);	/* Invalid field in CDB */
++	else
+ 		printk(KERN_ERR "%s: asking for cache data failed\n",
+ 		       diskname);
+-	}
+ 
+ defaults:
+ 	printk(KERN_ERR "%s: assuming drive cache: write through\n",
+Index: linux-2.6.10/mvl_patches/pro-1517.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1517.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1517);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

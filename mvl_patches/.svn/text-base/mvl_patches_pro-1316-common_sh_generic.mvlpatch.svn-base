@@ -1,0 +1,1230 @@
+#! /usr/bin/env bash
+# Patch: -common_sh_generic
+# Date: Fri May  4 10:06:26 2007
+# Source: MontaVista Software, Inc. 
+# MR: 20464
+# Type: Enhancement 
+# Disposition: MontaVista
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	In order to get our kernel to be compiled for (generic) SH
+# 	architecture, some patches are needed. The resulting patch is 
+# 	combined from sources provided by Renessans and local changes.
+# 
+
+PATCHNUM=1316
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 20464
+Type: Enhancement 
+Disposition: MontaVista
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	In order to get our kernel to be compiled for (generic) SH
+	architecture, some patches are needed. The resulting patch is 
+	combined from sources provided by Renessans and local changes.
+
+Index: linux-2.6.10/arch/sh/kernel/semaphore.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/semaphore.c
++++ linux-2.6.10/arch/sh/kernel/semaphore.c
+@@ -10,6 +10,7 @@
+ #include <linux/errno.h>
+ #include <linux/sched.h>
+ #include <linux/wait.h>
++#include <linux/module.h>
+ #include <linux/init.h>
+ #include <asm/semaphore.h>
+ #include <asm/semaphore-helper.h>
+@@ -46,7 +47,7 @@ spinlock_t semaphore_wake_lock;
+  * critical part is the inline stuff in <asm/semaphore.h>
+  * where we want to avoid any extra jumps and calls.
+  */
+-void __up(struct semaphore *sem)
++void __compat_up(struct semaphore *sem)
+ {
+ 	wake_one_more(sem);
+ 	wake_up(&sem->wait);
+@@ -104,7 +105,7 @@ void __up(struct semaphore *sem)
+ 	tsk->state = TASK_RUNNING;		\
+ 	remove_wait_queue(&sem->wait, &wait);
+ 
+-void __sched __down(struct semaphore * sem)
++void __sched __compat_down(struct semaphore * sem)
+ {
+ 	DOWN_VAR
+ 	DOWN_HEAD(TASK_UNINTERRUPTIBLE)
+@@ -114,7 +115,7 @@ void __sched __down(struct semaphore * s
+ 	DOWN_TAIL(TASK_UNINTERRUPTIBLE)
+ }
+ 
+-int __sched __down_interruptible(struct semaphore * sem)
++int __sched __compat_down_interruptible(struct semaphore * sem)
+ {
+ 	int ret = 0;
+ 	DOWN_VAR
+@@ -133,7 +134,19 @@ int __sched __down_interruptible(struct 
+ 	return ret;
+ }
+ 
+-int __down_trylock(struct semaphore * sem)
++int __compat_down_trylock(struct semaphore * sem)
+ {
+ 	return waking_non_zero_trylock(sem);
+ }
++
++fastcall int compat_sem_is_locked(struct compat_semaphore *sem)
++{
++	return (int) atomic_read(&sem->count) < 0;
++}
++
++EXPORT_SYMBOL(compat_sem_is_locked);
++EXPORT_SYMBOL(__compat_up);
++EXPORT_SYMBOL(__compat_down);
++EXPORT_SYMBOL(__compat_down_interruptible);
++EXPORT_SYMBOL(__compat_down_trylock);
++
+Index: linux-2.6.10/include/asm-sh/semaphore.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/semaphore.h
++++ linux-2.6.10/include/asm-sh/semaphore.h
+@@ -13,6 +13,13 @@
+  *  (Currently no asm implementation but generic C code...)
+  */
+ 
++/*
++ * On !PREEMPT_RT all semaphores are compat:
++ */
++#ifndef CONFIG_PREEMPT_RT
++# define compat_semaphore semaphore
++#endif
++
+ #include <linux/spinlock.h>
+ #include <linux/rwsem.h>
+ #include <linux/wait.h>
+@@ -20,32 +27,32 @@
+ #include <asm/system.h>
+ #include <asm/atomic.h>
+ 
+-struct semaphore {
++struct compat_semaphore {
+ 	atomic_t count;
+ 	int sleepers;
+ 	wait_queue_head_t wait;
+ };
+ 
+-#define __SEMAPHORE_INITIALIZER(name, n)				\
++#define __COMPAT_SEMAPHORE_INIT(name, n)				\
+ {									\
+ 	.count		= ATOMIC_INIT(n),				\
+ 	.sleepers	= 0,						\
+ 	.wait		= __WAIT_QUEUE_HEAD_INITIALIZER((name).wait)	\
+ }
+ 
+-#define __MUTEX_INITIALIZER(name) \
+-	__SEMAPHORE_INITIALIZER(name,1)
++#define __COMPAT_MUTEX_INITIALIZER(name) \
++	__COMPAT_SEMAPHORE_INIT(name,1)
+ 
+-#define __DECLARE_SEMAPHORE_GENERIC(name,count) \
+-	struct semaphore name = __SEMAPHORE_INITIALIZER(name,count)
++#define __COMPAT_DECLARE_SEMAPHORE_GENERIC(name,count) \
++	struct semaphore name = __COMPAT_SEMAPHORE_INIT(name,count)
+ 
+-#define DECLARE_MUTEX(name) __DECLARE_SEMAPHORE_GENERIC(name,1)
+-#define DECLARE_MUTEX_LOCKED(name) __DECLARE_SEMAPHORE_GENERIC(name,0)
++#define COMPAT_DECLARE_MUTEX(name) __COMPAT_DECLARE_SEMAPHORE_GENERIC(name,1)
++#define COMPAT_DECLARE_MUTEX_LOCKED(name) __COMPAT_DECLARE_SEMAPHORE_GENERIC(name,0)
+ 
+-static inline void sema_init (struct semaphore *sem, int val)
++static inline void compat_sema_init (struct compat_semaphore *sem, int val)
+ {
+ /*
+- *	*sem = (struct semaphore)__SEMAPHORE_INITIALIZER((*sem),val);
++ *	*sem = (struct semaphore)__COMPAT_SEMAPHORE_INIT((*sem),val);
+  *
+  * i'd rather use the more flexible initialization above, but sadly
+  * GCC 2.7.2.3 emits a bogus warning. EGCS doesn't. Oh well.
+@@ -55,14 +62,14 @@ static inline void sema_init (struct sem
+ 	init_waitqueue_head(&sem->wait);
+ }
+ 
+-static inline void init_MUTEX (struct semaphore *sem)
++static inline void compat_init_MUTEX (struct compat_semaphore *sem)
+ {
+-	sema_init(sem, 1);
++	compat_sema_init(sem, 1);
+ }
+ 
+-static inline void init_MUTEX_LOCKED (struct semaphore *sem)
++static inline void compat_init_MUTEX_LOCKED (struct compat_semaphore *sem)
+ {
+-	sema_init(sem, 0);
++	compat_sema_init(sem, 0);
+ }
+ 
+ #if 0
+@@ -72,36 +79,37 @@ asmlinkage int  __down_failed_trylock(vo
+ asmlinkage void __up_wakeup(void /* special register calling convention */);
+ #endif
+ 
+-asmlinkage void __down(struct semaphore * sem);
+-asmlinkage int  __down_interruptible(struct semaphore * sem);
+-asmlinkage int  __down_trylock(struct semaphore * sem);
+-asmlinkage void __up(struct semaphore * sem);
++asmlinkage void __compat_down(struct semaphore * sem);
++asmlinkage int  __compat_down_interruptible(struct semaphore * sem);
++asmlinkage int  __compat_down_trylock(struct semaphore * sem);
++asmlinkage void __compat_up(struct semaphore * sem);
++extern int compat_sem_is_locked(struct compat_semaphore *sem);
+ 
+ extern spinlock_t semaphore_wake_lock;
+ 
+-static inline void down(struct semaphore * sem)
++static inline void compat_down(struct semaphore * sem)
+ {
+ 	might_sleep();
+ 	if (atomic_dec_return(&sem->count) < 0)
+-		__down(sem);
++		__compat_down(sem);
+ }
+ 
+-static inline int down_interruptible(struct semaphore * sem)
++static inline int compat_down_interruptible(struct semaphore * sem)
+ {
+ 	int ret = 0;
+ 
+ 	might_sleep();
+ 	if (atomic_dec_return(&sem->count) < 0)
+-		ret = __down_interruptible(sem);
++		ret = __compat_down_interruptible(sem);
+ 	return ret;
+ }
+ 
+-static inline int down_trylock(struct semaphore * sem)
++static inline int compat_down_trylock(struct semaphore * sem)
+ {
+ 	int ret = 0;
+ 
+ 	if (atomic_dec_return(&sem->count) < 0)
+-		ret = __down_trylock(sem);
++		ret = __compat_down_trylock(sem);
+ 	return ret;
+ }
+ 
+@@ -109,11 +117,15 @@ static inline int down_trylock(struct se
+  * Note! This is subtle. We jump to wake people up only if
+  * the semaphore was negative (== somebody was waiting on it).
+  */
+-static inline void up(struct semaphore * sem)
++static inline void compat_up(struct semaphore * sem)
+ {
+ 	if (atomic_inc_return(&sem->count) <= 0)
+-		__up(sem);
++		__compat_up(sem);
+ }
+ 
+ #endif
++
++#define compat_sema_count(sem) atomic_read (& (sem)->count)
++#include <linux/semaphore.h>
++
+ #endif /* __ASM_SH_SEMAPHORE_H */
+Index: linux-2.6.10/arch/sh/kernel/cpu/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/cpu/Makefile
++++ linux-2.6.10/arch/sh/kernel/cpu/Makefile
+@@ -2,7 +2,7 @@
+ # Makefile for the Linux/SuperH CPU-specifc backends.
+ #
+ 
+-obj-y	:= irq_ipr.o irq_imask.o init.o bus.o
++obj-y	:= irq_ipr.o irq_imask.o init.o bus.o irq_init.o
+ 
+ obj-$(CONFIG_CPU_SH2)		+= sh2/
+ obj-$(CONFIG_CPU_SH3)		+= sh3/
+Index: linux-2.6.10/arch/sh/kernel/cpu/init.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/cpu/init.c
++++ linux-2.6.10/arch/sh/kernel/cpu/init.c
+@@ -94,6 +94,9 @@ static void __init cache_init(void)
+ 	 */
+ 	flags = CCR_CACHE_ENABLE | CCR_CACHE_INVALIDATE;
+ 
++#ifdef CONFIG_SH_CACHE_DISABLE
++	flags &= ~CCR_CACHE_ENABLE;
++#endif
+ #ifdef CCR_CACHE_EMODE
+ 	/* Force EMODE if possible */
+ 	if (cpu_data->dcache.ways > 1)
+Index: linux-2.6.10/arch/sh/kernel/cpu/irq_init.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/sh/kernel/cpu/irq_init.c
+@@ -0,0 +1,59 @@
++/*
++ * linux/arch/sh/kernel/cpu/irq_init.c
++ *
++ * Copyright (C) 2004 Takashi Kusuda
++ *
++ * Initialize SuperH internal IRQs.
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/irq.h>
++
++#include <asm/machvec.h>
++
++
++extern void init_sh4a_intc2_IRQ(void);
++extern void init_ipr_IRQ(void);
++extern void init_intmsk_IRQ(void);
++extern void init_IRQ_intc2(void);
++
++void __init init_IRQ(void)
++{
++
++#if defined(CONFIG_CPU_SH4A)
++	/*
++	 *  SH4A INTC consist of INTC and INTC2 modules.
++	 *  Peripheral module interrupt use INTC2.
++	 */
++	init_sh4a_intc2_IRQ();
++#else
++/*
++ * Pins(IRQ4/IRQ5 and PINT0-15 are multiplexed. These initializing
++ * (make_xxx_irq()) are done at platform depend IRQ setup section
++ * (at sh_mv.mv_init_irq()). So below init_ipr_IRQ and init_pint_IRQ
++ * don't initialize IRQ4/IRQ5 and PINT0-15.
++ *
++ * If you need these IRQ initialiation, add make_xxx_irq() at
++ * sh_mv.mv_init_irq() function.
++ */
++
++	/* Initialize IPR-IRQ */
++	init_ipr_IRQ();
++
++#if defined(SH_INTMSK_INIT_TABLE)
++	/* Initialize INTMSK-IRQ(SH7760) */
++	init_intmsk_IRQ();
++#endif /* SH_INTMSK_INIT_TABLE */
++
++#ifdef CONFIG_CPU_SUBTYPE_ST40
++	init_IRQ_intc2();
++#endif
++
++#endif
++
++	/* Perform the machine specific initialisation */
++	if (sh_mv.mv_init_irq != NULL) {
++		sh_mv.mv_init_irq();
++	}
++}
+Index: linux-2.6.10/arch/sh/kernel/cpu/irq_ipr.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/cpu/irq_ipr.c
++++ linux-2.6.10/arch/sh/kernel/cpu/irq_ipr.c
+@@ -5,14 +5,15 @@
+  * Copyright (C) 1999  Niibe Yutaka & Takeshi Yaegashi
+  * Copyright (C) 2000  Kazumoto Kojima
+  * Copyright (C) 2003 Takashi Kusuda <kusuda-takashi@hitachi-ul.co.jp>
++ * Copyright (C) 2004 Takashi Kusuda
++ * Copyright (C) 2005 Nobuhiro Iwamatsu
+  *
+  * Interrupt handling for IPR-based IRQ.
+  *
+  * Supported system:
+  *	On-chip supporting modules (TMU, RTC, etc.).
+- *	On-chip supporting modules for SH7709/SH7709A/SH7729/SH7300.
+- *	Hitachi SolutionEngine external I/O:
+- *		MS7709SE01, MS7709ASE01, and MS7750SE01
++ *	On-chip supporting modules for SH7300/SH7705/SH7706/SH7709/SH7709A/
++ *                                     SH7709S/SH7710/SH7720/SH7727/SH7729.
+  *
+  */
+ 
+@@ -90,8 +91,7 @@ static void mask_and_ack_ipr(unsigned in
+ {
+ 	disable_ipr_irq(irq);
+ 
+-#if defined(CONFIG_CPU_SUBTYPE_SH7707) || defined(CONFIG_CPU_SUBTYPE_SH7709) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7300) || defined(CONFIG_CPU_SUBTYPE_SH7705)
++#if defined(IRQ0_IRQ)
+ 	/* This is needed when we use edge triggered setting */
+ 	/* XXX: Is it really needed? */
+ 	if (IRQ0_IRQ <= irq && irq <= IRQ5_IRQ) {
+@@ -120,170 +120,22 @@ void make_ipr_irq(unsigned int irq, unsi
+ 	disable_ipr_irq(irq);
+ }
+ 
+-#if defined(CONFIG_CPU_SUBTYPE_SH7705) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7707) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7709)
+-static unsigned char pint_map[256];
+-static unsigned long portcr_mask = 0;
+-
+-static void enable_pint_irq(unsigned int irq);
+-static void disable_pint_irq(unsigned int irq);
+-
+-/* shutdown is same as "disable" */
+-#define shutdown_pint_irq disable_pint_irq
+-
+-static void mask_and_ack_pint(unsigned int);
+-static void end_pint_irq(unsigned int irq);
+-
+-static unsigned int startup_pint_irq(unsigned int irq)
+-{
+-	enable_pint_irq(irq);
+-	return 0; /* never anything pending */
+-}
+-
+-static struct hw_interrupt_type pint_irq_type = {
+-	"PINT-IRQ",
+-	startup_pint_irq,
+-	shutdown_pint_irq,
+-	enable_pint_irq,
+-	disable_pint_irq,
+-	mask_and_ack_pint,
+-	end_pint_irq
+-};
+-
+-static void disable_pint_irq(unsigned int irq)
+-{
+-	unsigned long val, flags;
+-
+-	local_irq_save(flags);
+-	val = ctrl_inw(INTC_INTER);
+-	val &= ~(1 << (irq - PINT_IRQ_BASE));
+-	ctrl_outw(val, INTC_INTER);	/* disable PINTn */
+-	portcr_mask &= ~(3 << (irq - PINT_IRQ_BASE)*2);
+-	local_irq_restore(flags);
+-}
+-
+-static void enable_pint_irq(unsigned int irq)
+-{
+-	unsigned long val, flags;
+-
+-	local_irq_save(flags);
+-	val = ctrl_inw(INTC_INTER);
+-	val |= 1 << (irq - PINT_IRQ_BASE);
+-	ctrl_outw(val, INTC_INTER);	/* enable PINTn */
+-	portcr_mask |= 3 << (irq - PINT_IRQ_BASE)*2;
+-	local_irq_restore(flags);
+-}
+-
+-static void mask_and_ack_pint(unsigned int irq)
+-{
+-	disable_pint_irq(irq);
+-}
+-
+-static void end_pint_irq(unsigned int irq)
+-{
+-	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
+-		enable_pint_irq(irq);
+-}
+-
+-void make_pint_irq(unsigned int irq)
+-{
+-	disable_irq_nosync(irq);
+-	irq_desc[irq].handler = &pint_irq_type;
+-	disable_pint_irq(irq);
+-}
++#if defined(SH_IPR_INIT_TABLE)
++	static struct sh_ipr_irq_info sh_ipr_regs_init[] __initdata = SH_IPR_INIT_TABLE;
+ #endif
+ 
+-void __init init_IRQ(void)
++void __init init_ipr_IRQ(void)
+ {
+-#if defined(CONFIG_CPU_SUBTYPE_SH7705) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7707) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7709)
++#if defined(SH_IPR_INIT_TABLE)
+ 	int i;
+-#endif
+-
+-	make_ipr_irq(TIMER_IRQ, TIMER_IPR_ADDR, TIMER_IPR_POS, TIMER_PRIORITY);
+-	make_ipr_irq(TIMER1_IRQ, TIMER1_IPR_ADDR, TIMER1_IPR_POS, TIMER1_PRIORITY);
+-#if defined(CONFIG_SH_RTC)
+-	make_ipr_irq(RTC_IRQ, RTC_IPR_ADDR, RTC_IPR_POS, RTC_PRIORITY);
+-#endif
+-
+-#ifdef SCI_ERI_IRQ
+-	make_ipr_irq(SCI_ERI_IRQ, SCI_IPR_ADDR, SCI_IPR_POS, SCI_PRIORITY);
+-	make_ipr_irq(SCI_RXI_IRQ, SCI_IPR_ADDR, SCI_IPR_POS, SCI_PRIORITY);
+-	make_ipr_irq(SCI_TXI_IRQ, SCI_IPR_ADDR, SCI_IPR_POS, SCI_PRIORITY);
+-#endif
+-
+-#ifdef SCIF1_ERI_IRQ
+-	make_ipr_irq(SCIF1_ERI_IRQ, SCIF1_IPR_ADDR, SCIF1_IPR_POS, SCIF1_PRIORITY);
+-	make_ipr_irq(SCIF1_RXI_IRQ, SCIF1_IPR_ADDR, SCIF1_IPR_POS, SCIF1_PRIORITY);
+-	make_ipr_irq(SCIF1_BRI_IRQ, SCIF1_IPR_ADDR, SCIF1_IPR_POS, SCIF1_PRIORITY);
+-	make_ipr_irq(SCIF1_TXI_IRQ, SCIF1_IPR_ADDR, SCIF1_IPR_POS, SCIF1_PRIORITY);
+-#endif
+-
+-#if defined(CONFIG_CPU_SUBTYPE_SH7300)
+-	make_ipr_irq(SCIF0_IRQ, SCIF0_IPR_ADDR, SCIF0_IPR_POS, SCIF0_PRIORITY);
+-	make_ipr_irq(DMTE2_IRQ, DMA1_IPR_ADDR, DMA1_IPR_POS, DMA1_PRIORITY);
+-	make_ipr_irq(DMTE3_IRQ, DMA1_IPR_ADDR, DMA1_IPR_POS, DMA1_PRIORITY);
+-	make_ipr_irq(VIO_IRQ, VIO_IPR_ADDR, VIO_IPR_POS, VIO_PRIORITY);
+-#endif
+-
+-#ifdef SCIF_ERI_IRQ
+-	make_ipr_irq(SCIF_ERI_IRQ, SCIF_IPR_ADDR, SCIF_IPR_POS, SCIF_PRIORITY);
+-	make_ipr_irq(SCIF_RXI_IRQ, SCIF_IPR_ADDR, SCIF_IPR_POS, SCIF_PRIORITY);
+-	make_ipr_irq(SCIF_BRI_IRQ, SCIF_IPR_ADDR, SCIF_IPR_POS, SCIF_PRIORITY);
+-	make_ipr_irq(SCIF_TXI_IRQ, SCIF_IPR_ADDR, SCIF_IPR_POS, SCIF_PRIORITY);
+-#endif
+-
+-#ifdef IRDA_ERI_IRQ
+-	make_ipr_irq(IRDA_ERI_IRQ, IRDA_IPR_ADDR, IRDA_IPR_POS, IRDA_PRIORITY);
+-	make_ipr_irq(IRDA_RXI_IRQ, IRDA_IPR_ADDR, IRDA_IPR_POS, IRDA_PRIORITY);
+-	make_ipr_irq(IRDA_BRI_IRQ, IRDA_IPR_ADDR, IRDA_IPR_POS, IRDA_PRIORITY);
+-	make_ipr_irq(IRDA_TXI_IRQ, IRDA_IPR_ADDR, IRDA_IPR_POS, IRDA_PRIORITY);
+-#endif
+ 
+-#if defined(CONFIG_CPU_SUBTYPE_SH7707) || defined(CONFIG_CPU_SUBTYPE_SH7709) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7300) || defined(CONFIG_CPU_SUBTYPE_SH7705)
+-	/*
+-	 * Initialize the Interrupt Controller (INTC)
+-	 * registers to their power on values
+-	 */
+-
+-	/*
+-	 * Enable external irq (INTC IRQ mode).
+-	 * You should set corresponding bits of PFC to "00"
+-	 * to enable these interrupts.
+-	 */
+-	make_ipr_irq(IRQ0_IRQ, IRQ0_IPR_ADDR, IRQ0_IPR_POS, IRQ0_PRIORITY);
+-	make_ipr_irq(IRQ1_IRQ, IRQ1_IPR_ADDR, IRQ1_IPR_POS, IRQ1_PRIORITY);
+-	make_ipr_irq(IRQ2_IRQ, IRQ2_IPR_ADDR, IRQ2_IPR_POS, IRQ2_PRIORITY);
+-	make_ipr_irq(IRQ3_IRQ, IRQ3_IPR_ADDR, IRQ3_IPR_POS, IRQ3_PRIORITY);
+-	make_ipr_irq(IRQ4_IRQ, IRQ4_IPR_ADDR, IRQ4_IPR_POS, IRQ4_PRIORITY);
+-	make_ipr_irq(IRQ5_IRQ, IRQ5_IPR_ADDR, IRQ5_IPR_POS, IRQ5_PRIORITY);
+-#if !defined(CONFIG_CPU_SUBTYPE_SH7300)
+-	make_ipr_irq(PINT0_IRQ, PINT0_IPR_ADDR, PINT0_IPR_POS, PINT0_PRIORITY);
+-	make_ipr_irq(PINT8_IRQ, PINT8_IPR_ADDR, PINT8_IPR_POS, PINT8_PRIORITY);
+-	enable_ipr_irq(PINT0_IRQ);
+-	enable_ipr_irq(PINT8_IRQ);
+-
+-	for(i = 0; i < 16; i++)
+-		make_pint_irq(PINT_IRQ_BASE + i);
+-	for(i = 0; i < 256; i++)
++	for(i = 0; sh_ipr_regs_init[i].irq != 0; i++)
+ 	{
+-		if(i & 1) pint_map[i] = 0;
+-		else if(i & 2) pint_map[i] = 1;
+-		else if(i & 4) pint_map[i] = 2;
+-		else if(i & 8) pint_map[i] = 3;
+-		else if(i & 0x10) pint_map[i] = 4;
+-		else if(i & 0x20) pint_map[i] = 5;
+-		else if(i & 0x40) pint_map[i] = 6;
+-		else if(i & 0x80) pint_map[i] = 7;
++		make_ipr_irq(sh_ipr_regs_init[i].irq,
++		sh_ipr_regs_init[i].addr,
++		sh_ipr_regs_init[i].pos,
++		sh_ipr_regs_init[i].priority);
+ 	}
+-#endif /* !CONFIG_CPU_SUBTYPE_SH7300 */
+-#endif /* CONFIG_CPU_SUBTYPE_SH7707 || CONFIG_CPU_SUBTYPE_SH7709  || CONFIG_CPU_SUBTYPE_SH7300*/
+-
+-#ifdef CONFIG_CPU_SUBTYPE_ST40
+-	init_IRQ_intc2();
+ #endif
+ 
+ 	/* Perform the machine specific initialisation */
+@@ -291,49 +143,6 @@ void __init init_IRQ(void)
+ 		sh_mv.mv_init_irq();
+ 	}
+ }
+-#if defined(CONFIG_CPU_SUBTYPE_SH7707) || defined(CONFIG_CPU_SUBTYPE_SH7709) || \
+-    defined(CONFIG_CPU_SUBTYPE_SH7300) || defined(CONFIG_CPU_SUBTYPE_SH7705)
+-int ipr_irq_demux(int irq)
+-{
+-#if !defined(CONFIG_CPU_SUBTYPE_SH7300)
+-	unsigned long creg, dreg, d, sav;
+-
+-	if(irq == PINT0_IRQ)
+-	{
+-#if defined(CONFIG_CPU_SUBTYPE_SH7707)
+-		creg = PORT_PACR;
+-		dreg = PORT_PADR;
+-#else
+-		creg = PORT_PCCR;
+-		dreg = PORT_PCDR;
+-#endif
+-		sav = ctrl_inw(creg);
+-		ctrl_outw(sav | portcr_mask, creg);
+-		d = (~ctrl_inb(dreg) ^ ctrl_inw(INTC_ICR2)) & ctrl_inw(INTC_INTER) & 0xff;
+-		ctrl_outw(sav, creg);
+-		if(d == 0) return irq;
+-		return PINT_IRQ_BASE + pint_map[d];
+-	}
+-	else if(irq == PINT8_IRQ)
+-	{
+-#if defined(CONFIG_CPU_SUBTYPE_SH7707)
+-		creg = PORT_PBCR;
+-		dreg = PORT_PBDR;
+-#else
+-		creg = PORT_PFCR;
+-		dreg = PORT_PFDR;
+-#endif
+-		sav = ctrl_inw(creg);
+-		ctrl_outw(sav | (portcr_mask >> 16), creg);
+-		d = (~ctrl_inb(dreg) ^ (ctrl_inw(INTC_ICR2) >> 8)) & (ctrl_inw(INTC_INTER) >> 8) & 0xff;
+-		ctrl_outw(sav, creg);
+-		if(d == 0) return irq;
+-		return PINT_IRQ_BASE + 8 + pint_map[d];
+-	}
+-#endif
+-	return irq;
+-}
+-#endif
+ 
+ EXPORT_SYMBOL(make_ipr_irq);
+ 
+Index: linux-2.6.10/arch/sh/kernel/cpu/irq_pint.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/sh/kernel/cpu/irq_pint.c
+@@ -0,0 +1,171 @@
++/*
++ * linux/arch/sh/kernel/cpu/irq_pint.c
++ *
++ * Copyright (C) 2004 Takashi Kusuda
++ *
++ * Interrupt handling for PINT IRQ.
++ * move PINT interrupt hander from irq_ipr.c, and add SH7727 pint code.
++ *
++ */
++
++#include <linux/config.h>
++#include <linux/init.h>
++#include <linux/irq.h>
++
++#include <asm/system.h>
++#include <asm/io.h>
++#include <asm/machvec.h>
++
++static unsigned char pint_map[256];
++static unsigned long portcr_mask = 0;
++
++static void enable_pint_irq(unsigned int irq);
++static void disable_pint_irq(unsigned int irq);
++
++/* shutdown is same as "disable" */
++#define shutdown_pint_irq disable_pint_irq
++
++static void mask_and_ack_pint(unsigned int);
++static void end_pint_irq(unsigned int irq);
++
++static unsigned int startup_pint_irq(unsigned int irq)
++{
++	enable_pint_irq(irq);
++	return 0; /* never anything pending */
++}
++
++static struct hw_interrupt_type pint_irq_type = {
++	"PINT-IRQ",
++	startup_pint_irq,
++	shutdown_pint_irq,
++	enable_pint_irq,
++	disable_pint_irq,
++	mask_and_ack_pint,
++	end_pint_irq
++};
++
++static void disable_pint_irq(unsigned int irq)
++{
++	unsigned long val, flags;
++
++	local_irq_save(flags);
++	val = ctrl_inw(INTC_INTER);
++	val &= ~(1 << (irq - PINT_IRQ_BASE));
++	ctrl_outw(val, INTC_INTER);	/* disable PINTn */
++	portcr_mask &= ~(3 << (irq - PINT_IRQ_BASE)*2);
++	local_irq_restore(flags);
++}
++
++static void enable_pint_irq(unsigned int irq)
++{
++	unsigned long val, flags;
++
++	local_irq_save(flags);
++	val = ctrl_inw(INTC_INTER);
++	val |= 1 << (irq - PINT_IRQ_BASE);
++	ctrl_outw(val, INTC_INTER);	/* enable PINTn */
++	portcr_mask |= 3 << (irq - PINT_IRQ_BASE)*2;
++	local_irq_restore(flags);
++}
++
++static void mask_and_ack_pint(unsigned int irq)
++{
++	disable_pint_irq(irq);
++}
++
++static void end_pint_irq(unsigned int irq)
++{
++	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
++		enable_pint_irq(irq);
++}
++
++void make_pint_irq(unsigned int irq)
++{
++	disable_irq_nosync(irq);
++	irq_desc[irq].handler = &pint_irq_type;
++	disable_pint_irq(irq);
++}
++
++void __init init_pint_IRQ(void)
++{
++	int i;
++
++	for(i = 0; i < 16; i++)
++		make_pint_irq(PINT_IRQ_BASE + i);
++	for(i = 0; i < 256; i++)
++	{
++		if(i & 1) pint_map[i] = 0;
++		else if(i & 2) pint_map[i] = 1;
++		else if(i & 4) pint_map[i] = 2;
++		else if(i & 8) pint_map[i] = 3;
++		else if(i & 0x10) pint_map[i] = 4;
++		else if(i & 0x20) pint_map[i] = 5;
++		else if(i & 0x40) pint_map[i] = 6;
++		else if(i & 0x80) pint_map[i] = 7;
++	}
++}
++
++int pint_irq_demux(int irq)
++{
++#if defined(CONFIG_CPU_SUBTYPE_SH7727)
++	unsigned long d, sav1, sav2;
++#else
++	unsigned long d, creg, dreg;
++#endif
++
++	if(irq == PINT0_IRQ) {
++#if defined(CONFIG_CPU_SUBTYPE_SH7727)
++		sav1 = ctrl_inw(PORT_PCCR); /* PINT3:0 */
++		sav2 = ctrl_inw(PORT_PMCR); /* PINT7:4 */
++		ctrl_outw(sav1 | ((portcr_mask&0x000000ff)<<8), PORT_PCCR); /* PINT3:0 */
++		ctrl_outw(sav2 | (portcr_mask&0x0000ff00), PORT_PMCR); /* PINT7:4 */
++
++		d = ((~((ctrl_inb(PORT_PCDR)>>4) || (ctrl_inb(PORT_PMDR)&0xf0))) ^ ctrl_inw(INTC_ICR2)) & ctrl_inw(INTC_INTER) & 0xff;
++
++		ctrl_outw(sav1, PORT_PCCR);
++		ctrl_outw(sav2, PORT_PMCR);
++#else
++#if defined(CONFIG_CPU_SUBTYPE_SH7705) || defined(CONFIG_CPU_SUBTYPE_SH7707)
++		creg = PORT_PACR;
++		dreg = PORT_PADR;
++#else
++		creg = PORT_PCCR;
++		dreg = PORT_PCDR;
++#endif
++		sav1 = ctrl_inw(creg);
++		ctrl_outw(sav1 | portcr_mask, creg);
++		d = (~ctrl_inb(dreg) ^ ctrl_inw(INTC_ICR2)) & ctrl_inw(INTC_INTER) & 0xff;
++		ctrl_outw(sav1, creg);
++#endif
++		if(d == 0) return irq;
++		return PINT_IRQ_BASE + pint_map[d];
++        } else if(irq == PINT8_IRQ) {
++#if defined(CONFIG_CPU_SUBTYPE_SH7727)
++		sav1 = ctrl_inw(PORT_PMCR); /* PINT10:8 */
++		sav2 = ctrl_inw(PORT_PFCR); /* PINT15:11 */
++		ctrl_outw(sav1 | ((portcr_mask&0x003f0000)>>14), PORT_PMCR); /* PINT10:8 */
++		ctrl_outw(sav2 | ((portcr_mask&0xffc00000)>>16), PORT_PFCR); /* PINT15:11 */
++
++		d = ((~(((ctrl_inb(PORT_PMDR)&0x0e)>>1) || (ctrl_inb(PORT_PFDR)&0xf8))) ^ (ctrl_inw(INTC_ICR2)>>8)) & (ctrl_inw(INTC_INTER)>>8) & 0xff;
++
++		ctrl_outw(sav1, PORT_PMCR);
++		ctrl_outw(sav2, PORT_PFCR);
++#else
++#if defined(CONFIG_CPU_SUBTYPE_SH7705) || defined(CONFIG_CPU_SUBTYPE_SH7707)
++		creg = PORT_PBCR;
++		dreg = PORT_PBDR;
++#else
++		creg = PORT_PFCR;
++		dreg = PORT_PFDR;
++#endif
++		sav1 = ctrl_inw(creg);
++		ctrl_outw(sav1 | (portcr_mask >> 16), creg);
++		d = (~ctrl_inb(dreg) ^ (ctrl_inw(INTC_ICR2) >> 8)) & (ctrl_inw(INTC_INTER) >> 8) & 0xff;
++		ctrl_outw(sav1, creg);
++#endif
++		if(d == 0) return irq;
++		return PINT_IRQ_BASE + 8 + pint_map[d];
++	}
++	return irq;
++}
++
+Index: linux-2.6.10/arch/sh/kernel/sh_ksyms.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/sh_ksyms.c
++++ linux-2.6.10/arch/sh/kernel/sh_ksyms.c
+@@ -78,11 +78,6 @@ EXPORT_SYMBOL(boot_cpu_data);
+ EXPORT_SYMBOL(get_vm_area);
+ #endif
+ 
+-/* semaphore exports */
+-EXPORT_SYMBOL(__up);
+-EXPORT_SYMBOL(__down);
+-EXPORT_SYMBOL(__down_interruptible);
+-
+ EXPORT_SYMBOL(__udelay);
+ EXPORT_SYMBOL(__ndelay);
+ EXPORT_SYMBOL(__const_udelay);
+@@ -122,7 +117,6 @@ EXPORT_SYMBOL(__flush_purge_region);
+ #endif
+ 
+ EXPORT_SYMBOL(flush_tlb_page);
+-EXPORT_SYMBOL(__down_trylock);
+ 
+ #ifdef CONFIG_SMP
+ EXPORT_SYMBOL(synchronize_irq);
+Index: linux-2.6.10/include/linux/compiler-gcc3.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/compiler-gcc3.h
++++ linux-2.6.10/include/linux/compiler-gcc3.h
+@@ -3,7 +3,7 @@
+ /* These definitions are for GCC v3.x.  */
+ #include <linux/compiler-gcc.h>
+ 
+-#if __GNUC_MINOR__ >= 1
++#if __GNUC_MINOR__ >= 1 && __GNUC_MINOR < 4
+ # define inline		inline		__attribute__((always_inline))
+ # define __inline__	__inline__	__attribute__((always_inline))
+ # define __inline	__inline	__attribute__((always_inline))
+@@ -29,6 +29,8 @@
+ #define __must_check __attribute__((warn_unused_result))
+ #endif
+ 
++#if !defined(CONFIG_SUPERH)
+ #if __GNUC_MINOR__ >= 5
+ #define __compiler_offsetof(a,b) __builtin_offsetof(a,b)
+ #endif
++#endif
+Index: linux-2.6.10/arch/sh/drivers/dma/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/sh/drivers/dma/Kconfig
++++ linux-2.6.10/arch/sh/drivers/dma/Kconfig
+@@ -13,9 +13,8 @@ config NR_ONCHIP_DMA_CHANNELS
+ 	int "Number of on-chip DMAC channels"
+ 	default "4"
+ 	help
+-	  This allows you to specify the number of channels that the on-chip
+-	  DMAC supports. This will be 4 for SH7750/SH7751 and 8 for the
+-	  SH7750R/SH7751R.
++          DMAC supports. This will be 6 for SH7300/SH7710/SH7720, 8 for
++          SH7750R/SH7751R, 12 for SH7780/SH7781, and 4 for other SuperH CPUs.
+ 
+ config NR_DMA_CHANNELS_BOOL
+ 	depends on SH_DMA
+Index: linux-2.6.10/arch/sh/drivers/dma/dma-sh.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/drivers/dma/dma-sh.c
++++ linux-2.6.10/arch/sh/drivers/dma/dma-sh.c
+@@ -59,8 +59,14 @@ static inline unsigned int get_dmte_irq(
+ 
+ 	if (chan < 4) {
+ 		irq = DMTE0_IRQ + chan;
+-	} else {
++#if CONFIG_NR_ONCHIP_DMA_CHANNELS > 4
++	} else if (chan < 8) {
+ 		irq = DMTE4_IRQ + chan - 4;
++#if CONFIG_NR_ONCHIP_DMA_CHANNELS > 8
++	} else {
++               irq = DMTE8_IRQ + chan - 8;
++#endif
++#endif
+ 	}
+ 
+ 	return irq;
+@@ -201,13 +207,7 @@ static int sh_dmac_get_dma_residue(struc
+ #if defined(CONFIG_CPU_SH4)
+ static irqreturn_t dma_err(int irq, void *dev_id, struct pt_regs *regs)
+ {
+-	unsigned long dmaor = ctrl_inl(DMAOR);
+-
+-	printk("DMAE: DMAOR=%lx\n", dmaor);
+-
+-	ctrl_outl(ctrl_inl(DMAOR)&~DMAOR_NMIF, DMAOR);
+-	ctrl_outl(ctrl_inl(DMAOR)&~DMAOR_AE, DMAOR);
+-	ctrl_outl(ctrl_inl(DMAOR)|DMAOR_DME, DMAOR);
++	DMAOR_ERR_CLEAR;
+ 
+ 	disable_irq(irq);
+ 
+@@ -225,7 +225,7 @@ static struct dma_ops sh_dmac_ops = {
+ 
+ static struct dma_info sh_dmac_info = {
+ 	.name		= "SuperH DMAC",
+-	.nr_channels	= 4,
++	.nr_channels	= MAX_DMAC_CHANNELS,
+ 	.ops		= &sh_dmac_ops,
+ 	.flags		= DMAC_CHANNELS_TEI_CAPABLE,
+ };
+@@ -233,22 +233,24 @@ static struct dma_info sh_dmac_info = {
+ static int __init sh_dmac_init(void)
+ {
+ 	struct dma_info *info = &sh_dmac_info;
+-	int i;
+ 
+ #ifdef CONFIG_CPU_SH4
+-	make_ipr_irq(DMAE_IRQ, DMA_IPR_ADDR, DMA_IPR_POS, DMA_PRIORITY);
++	int i = 0;
++
++	/*
++	 * IPR-IRQs are initialized on init_ipr_IRQ().
++	 * So, make_ipr_irq() is removed here.
++	 */
++
+ 	i = request_irq(DMAE_IRQ, dma_err, SA_INTERRUPT, "DMAC Address Error", 0);
+ 	if (i < 0)
+ 		return i;
+ #endif
+-
+-	for (i = 0; i < info->nr_channels; i++) {
+-		int irq = get_dmte_irq(i);
+-
+-		make_ipr_irq(irq, DMA_IPR_ADDR, DMA_IPR_POS, DMA_PRIORITY);
+-	}
+-
+-	ctrl_outl(0x8000 | DMAOR_DME, DMAOR);
++	/*
++	 * DMAOR register access method is different each CPUs.
++	 * So, use macro (include/cpu/dma.h).
++	 */
++	DMAOR_INIT;
+ 
+ 	return register_dmac(info);
+ }
+Index: linux-2.6.10/arch/sh/drivers/dma/dma-sh.h
+===================================================================
+--- linux-2.6.10.orig/arch/sh/drivers/dma/dma-sh.h
++++ linux-2.6.10/arch/sh/drivers/dma/dma-sh.h
+@@ -12,26 +12,12 @@
+ #define __DMA_SH_H
+ 
+ /* Definitions for the SuperH DMAC */
+-#define REQ_L	0x00000000
+-#define REQ_E	0x00080000
+-#define RACK_H	0x00000000
+-#define RACK_L	0x00040000
+-#define ACK_R	0x00000000
+-#define ACK_W	0x00020000
+-#define ACK_H	0x00000000
+-#define ACK_L	0x00010000
+ #define DM_INC	0x00004000
+ #define DM_DEC	0x00008000
+ #define SM_INC	0x00001000
+ #define SM_DEC	0x00002000
+ #define RS_IN	0x00000200
+ #define RS_OUT	0x00000300
+-#define TM_BURST 0x0000080
+-#define TS_8	0x00000010
+-#define TS_16	0x00000020
+-#define TS_32	0x00000030
+-#define TS_64	0x00000000
+-#define TS_BLK	0x00000040
+ #define CHCR_DE 0x00000001
+ #define CHCR_TE 0x00000002
+ #define CHCR_IE 0x00000004
+@@ -41,7 +27,6 @@
+  */
+ #define RS_DUAL	(DM_INC | SM_INC | 0x400 | TS_32)
+ 
+-#define DMAOR_COD	0x00000008
+ #define DMAOR_AE	0x00000004
+ #define DMAOR_NMIF	0x00000002
+ #define DMAOR_DME	0x00000001
+Index: linux-2.6.10/arch/sh/mm/consistent.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/mm/consistent.c
++++ linux-2.6.10/arch/sh/mm/consistent.c
+@@ -65,11 +65,11 @@ void consistent_sync(void *vaddr, size_t
+ 	void * p1addr = (void*) P1SEGADDR((unsigned long)vaddr);
+ 
+ 	switch (direction) {
+-	case DMA_FROM_DEVICE:		/* invalidate only */
+-		dma_cache_inv(p1addr, size);
++	case DMA_FROM_DEVICE:           /* writeback and invalidate */
++		dma_cache_wback_inv(p1addr, size);
+ 		break;
+-	case DMA_TO_DEVICE:		/* writeback only */
+-		dma_cache_wback(p1addr, size);
++	case DMA_TO_DEVICE:             /* writeback and invalidate */
++		dma_cache_wback_inv(p1addr, size);
+ 		break;
+ 	case DMA_BIDIRECTIONAL:		/* writeback and invalidate */
+ 		dma_cache_wback_inv(p1addr, size);
+Index: linux-2.6.10/include/asm-sh/page.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/page.h
++++ linux-2.6.10/include/asm-sh/page.h
+@@ -106,6 +106,7 @@ typedef struct { unsigned long pgprot; }
+ 
+ #ifndef CONFIG_DISCONTIGMEM
+ #define phys_to_page(phys)	(mem_map + (((phys)-__MEMORY_START) >> PAGE_SHIFT))
++#define VALID_PAGE(page)        ((page - mem_map) < max_mapnr)
+ #define page_to_phys(page)	(((page - mem_map) << PAGE_SHIFT) + __MEMORY_START)
+ #endif
+ 
+Index: linux-2.6.10/include/asm-sh/mrshpc.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-sh/mrshpc.h
+@@ -0,0 +1,44 @@
++#ifndef __ASM_SH_MRSHPC_H
++#define __ASM_SH_MRSHPC_H
++
++/*
++ * linux/include/asm-sh/mrshpc.h
++ *
++ * Copyright (C) 2004  Takashi Kusuda
++ *
++ *  MRSHPC Register list.
++ *  Mostly copy from asm/se/se.h
++ */
++
++#if defined(CONFIG_CF_BASE_ADDR)
++#define PA_MRSHPC_BASE	CONFIG_CF_BASE_ADDR
++#else
++#define PA_MRSHPC_BASE	P2SEGADDR(0x18000000)
++#endif
++
++#define PA_MRSHPC	(PA_MRSHPC_BASE + 0x003fffe0) /* MR-SHPC-01 PCMCIA controller */
++#if defined(CONFIG_SH_SOLUTION_ENGINE_PLUS)
++#define PA_MRSHPC_MW1	(PA_MRSHPC_BASE	+ 0x00000000) /* MR-SHPC-01 memory window base */
++#define PA_MRSHPC_MW2	(PA_MRSHPC_BASE + 0x00100000) /* MR-SHPC-01 attribute window base */
++#define PA_MRSHPC_IO	(PA_MRSHPC_BASE + 0x00200000) /* MR-SHPC-01 I/O window base */
++#else
++#define PA_MRSHPC_MW1	(PA_MRSHPC_BASE + 0x00400000) /* MR-SHPC-01 memory window base */
++#define PA_MRSHPC_MW2	(PA_MRSHPC_BASE + 0x00500000) /* MR-SHPC-01 attribute window base */
++#define PA_MRSHPC_IO	(PA_MRSHPC_BASE + 0x00600000) /* MR-SHPC-01 I/O window base */
++#endif
++#define MRSHPC_MODE	(PA_MRSHPC + 4)
++#define MRSHPC_OPTION   (PA_MRSHPC + 6)
++#define MRSHPC_CSR      (PA_MRSHPC + 8)
++#define MRSHPC_ISR      (PA_MRSHPC + 10)
++#define MRSHPC_ICR      (PA_MRSHPC + 12)
++#define MRSHPC_CPWCR    (PA_MRSHPC + 14)
++#define MRSHPC_MW0CR1   (PA_MRSHPC + 16)
++#define MRSHPC_MW1CR1   (PA_MRSHPC + 18)
++#define MRSHPC_IOWCR1   (PA_MRSHPC + 20)
++#define MRSHPC_MW0CR2   (PA_MRSHPC + 22)
++#define MRSHPC_MW1CR2   (PA_MRSHPC + 24)
++#define MRSHPC_IOWCR2   (PA_MRSHPC + 26)
++#define MRSHPC_CDCR     (PA_MRSHPC + 28)
++#define MRSHPC_PCIC_INFO (PA_MRSHPC + 30)
++
++#endif  /* __ASM_SH_MRSHPC_H */
+Index: linux-2.6.10/mvl_patches/pro-1316.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1316.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1316);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

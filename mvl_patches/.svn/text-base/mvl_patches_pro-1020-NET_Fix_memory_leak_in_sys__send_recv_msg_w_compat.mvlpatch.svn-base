@@ -1,0 +1,554 @@
+#! /usr/bin/env bash
+# Patch: -NET_Fix_memory_leak_in_sys__send_recv_msg_w_compat
+# Date: Mon Jan 22 08:18:31 2007
+# Source: K.O
+# MR: 21684
+# Type: Defect fix
+# Disposition: backported from 2.6.13-rc7
+# Signed-off-by: Armin Kuster <Akuster@mvista.com>
+# Description:
+# 
+# From d64d3873721cfe870d49d73c3744f06260779ce7 Mon Sep 17 00:00:00 2001
+# From: Andrew Morton <akpm@osdl.org>
+# Date: Tue, 9 Aug 2005 15:29:19 -0700
+# Subject: [PATCH 1/1] [NET]: Fix memory leak in sys_{send,recv}msg() w/compat
+# 
+# From: Dave Johnson <djohnson+linux-kernel@sw.starentnetworks.com>
+# 
+# sendmsg()/recvmsg() syscalls from o32/n32 apps to a 64bit kernel will
+# cause a kernel memory leak if iov_len > UIO_FASTIOV for each syscall!
+# 
+# This is because both sys_sendmsg() and verify_compat_iovec() kmalloc a
+# new iovec structure.  Only the one from sys_sendmsg() is free'ed.
+# 
+# I wrote a simple test program to confirm this after identifying the
+# problem:
+# 
+# http://davej.org/programs/testsendmsg.c
+# 
+# Note that the below fix will break solaris_sendmsg()/solaris_recvmsg() as
+# it also calls verify_compat_iovec() but expects it to malloc internally.
+# 
+# [ I fixed that. -DaveM ]
+# 
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1020
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: K.O
+MR: 21684
+Type: Defect fix
+Disposition: backported from 2.6.13-rc7
+Signed-off-by: Armin Kuster <Akuster@mvista.com>
+Description:
+
+From d64d3873721cfe870d49d73c3744f06260779ce7 Mon Sep 17 00:00:00 2001
+From: Andrew Morton <akpm@osdl.org>
+Date: Tue, 9 Aug 2005 15:29:19 -0700
+Subject: [PATCH 1/1] [NET]: Fix memory leak in sys_{send,recv}msg() w/compat
+
+From: Dave Johnson <djohnson+linux-kernel@sw.starentnetworks.com>
+
+sendmsg()/recvmsg() syscalls from o32/n32 apps to a 64bit kernel will
+cause a kernel memory leak if iov_len > UIO_FASTIOV for each syscall!
+
+This is because both sys_sendmsg() and verify_compat_iovec() kmalloc a
+new iovec structure.  Only the one from sys_sendmsg() is free'ed.
+
+I wrote a simple test program to confirm this after identifying the
+problem:
+
+http://davej.org/programs/testsendmsg.c
+
+Note that the below fix will break solaris_sendmsg()/solaris_recvmsg() as
+it also calls verify_compat_iovec() but expects it to malloc internally.
+
+[ I fixed that. -DaveM ]
+
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Index: linux-2.6.10/arch/sparc64/solaris/socket.c
+===================================================================
+--- linux-2.6.10.orig/arch/sparc64/solaris/socket.c
++++ linux-2.6.10/arch/sparc64/solaris/socket.c
+@@ -16,6 +16,7 @@
+ #include <linux/net.h>
+ #include <linux/compat.h>
+ #include <net/compat.h>
++#include <net/sock.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/string.h>
+@@ -297,119 +298,165 @@ asmlinkage int solaris_sendmsg(int fd, s
+ {
+ 	struct socket *sock;
+ 	char address[MAX_SOCK_ADDR];
+-	struct iovec iov[UIO_FASTIOV];
++	struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
+ 	unsigned char ctl[sizeof(struct cmsghdr) + 20];
+ 	unsigned char *ctl_buf = ctl;
+-	struct msghdr kern_msg;
+-	int err, total_len;
++	struct msghdr msg_sys;
++	int err, ctl_len, iov_size, total_len;
+ 
+-	if(msghdr_from_user32_to_kern(&kern_msg, user_msg))
+-		return -EFAULT;
+-	if(kern_msg.msg_iovlen > UIO_MAXIOV)
+-		return -EINVAL;
+-	err = verify_compat_iovec(&kern_msg, iov, address, VERIFY_READ);
+-	if (err < 0)
++	err = -EFAULT;
++	if (msghdr_from_user32_to_kern(&msg_sys, user_msg))
+ 		goto out;
+-	total_len = err;
+ 
+-	if(kern_msg.msg_controllen) {
+-		struct sol_cmsghdr __user *ucmsg = kern_msg.msg_control;
++	sock = sockfd_lookup(fd, &err);
++	if (!sock)
++		goto out;
++
++	/* do not move before msg_sys is valid */
++	err = -EMSGSIZE;
++	if (msg_sys.msg_iovlen > UIO_MAXIOV)
++		goto out_put;
++
++	/* Check whether to allocate the iovec area*/
++	err = -ENOMEM;
++	iov_size = msg_sys.msg_iovlen * sizeof(struct iovec);
++	if (msg_sys.msg_iovlen > UIO_FASTIOV) {
++		iov = sock_kmalloc(sock->sk, iov_size, GFP_KERNEL);
++		if (!iov)
++			goto out_put;
++	}
++
++	err = verify_compat_iovec(&msg_sys, iov, address, VERIFY_READ);
++	if (err < 0)
++		goto out_freeiov;
++	total_len = err;
++	err = -ENOBUFS;
++	if (msg_sys.msg_controllen > INT_MAX)
++		goto out_freeiov;
++
++	ctl_len = msg_sys.msg_controllen;
++	if (ctl_len) {
++		struct sol_cmsghdr __user *ucmsg = msg_sys.msg_control;
+ 		unsigned long *kcmsg;
+ 		compat_size_t cmlen;
+ 
+-		if(kern_msg.msg_controllen > sizeof(ctl) &&
+-		   kern_msg.msg_controllen <= 256) {
++		err = -EINVAL;
++		if (ctl_len <= sizeof(compat_size_t))
++			goto out_freeiov;
++
++		if (ctl_len > sizeof(ctl)) {
+ 			err = -ENOBUFS;
+-			ctl_buf = kmalloc(kern_msg.msg_controllen, GFP_KERNEL);
+-			if(!ctl_buf)
++			ctl_buf = kmalloc(ctl_len, GFP_KERNEL);
++			if (!ctl_buf)
+ 				goto out_freeiov;
+ 		}
+ 		__get_user(cmlen, &ucmsg->cmsg_len);
+ 		kcmsg = (unsigned long *) ctl_buf;
+ 		*kcmsg++ = (unsigned long)cmlen;
+ 		err = -EFAULT;
+-		if(copy_from_user(kcmsg, &ucmsg->cmsg_level,
+-				  kern_msg.msg_controllen - sizeof(compat_size_t)))
++		if (copy_from_user(kcmsg, &ucmsg->cmsg_level,
++			ctl_len - sizeof(compat_size_t)))
+ 			goto out_freectl;
+-		kern_msg.msg_control = ctl_buf;
++			msg_sys.msg_control = ctl_buf;
+ 	}
+-	kern_msg.msg_flags = solaris_to_linux_msgflags(user_flags);
++	msg_sys.msg_flags = solaris_to_linux_msgflags(user_flags);
+ 
+-	lock_kernel();
+-	sock = sockfd_lookup(fd, &err);
+-	if (sock != NULL) {
+-		if (sock->file->f_flags & O_NONBLOCK)
+-			kern_msg.msg_flags |= MSG_DONTWAIT;
+-		err = sock_sendmsg(sock, &kern_msg, total_len);
+-		sockfd_put(sock);
+-	}
+-	unlock_kernel();
++	if (sock->file->f_flags & O_NONBLOCK)
++		msg_sys.msg_flags |= MSG_DONTWAIT;
++	err = sock_sendmsg(sock, &msg_sys, total_len);
+ 
+ out_freectl:
+-	/* N.B. Use kfree here, as kern_msg.msg_controllen might change? */
+-	if(ctl_buf != ctl)
+-		kfree(ctl_buf);
++	if (ctl_buf != ctl)
++		sock_kfree_s(sock->sk, ctl_buf, ctl_len);
+ out_freeiov:
+-	if(kern_msg.msg_iov != iov)
+-		kfree(kern_msg.msg_iov);
++	if (iov != iovstack)
++		sock_kfree_s(sock->sk, iov, iov_size);
++out_put:
++	sockfd_put(sock);
+ out:
++
+ 	return err;
+ }
+ 
+ asmlinkage int solaris_recvmsg(int fd, struct sol_nmsghdr __user *user_msg, unsigned int user_flags)
+ {
+-	struct iovec iovstack[UIO_FASTIOV];
+-	struct msghdr kern_msg;
+-	char addr[MAX_SOCK_ADDR];
+ 	struct socket *sock;
++	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov = iovstack;
++	struct msghdr msg_sys;
++	unsigned long cmsg_ptr;
++	int err, iov_size, total_len, len;
++
++	/* kernel mode address */
++	char addr[MAX_SOCK_ADDR];
++
++	/* user mode address pointers */
+ 	struct sockaddr __user *uaddr;
+ 	int __user *uaddr_len;
+-	unsigned long cmsg_ptr;
+-	int err, total_len, len = 0;
+ 
+-	if(msghdr_from_user32_to_kern(&kern_msg, user_msg))
++	if (msghdr_from_user32_to_kern(&msg_sys, user_msg))
+ 		return -EFAULT;
+-	if(kern_msg.msg_iovlen > UIO_MAXIOV)
+-		return -EINVAL;
+ 
+-	uaddr = kern_msg.msg_name;
++	sock = sockfd_lookup(fd, &err);
++	if (!sock)
++		goto out;
++
++	err = -EMSGSIZE;
++	if (msg_sys.msg_iovlen > UIO_MAXIOV)
++		goto out_put;
++
++	/* Check whether to allocate the iovec area*/
++	err = -ENOMEM;
++	iov_size = msg_sys.msg_iovlen * sizeof(struct iovec);
++	if (msg_sys.msg_iovlen > UIO_FASTIOV) {
++		iov = sock_kmalloc(sock->sk, iov_size, GFP_KERNEL);
++		if (!iov)
++		goto out_put;
++	}
++
++	/*
++	 *      Save the user-mode address (verify_iovec will change the
++	 *      kernel msghdr to use the kernel address space)
++	 */
++
++	uaddr = (void __user *) msg_sys.msg_name;
+ 	uaddr_len = &user_msg->msg_namelen;
+-	err = verify_compat_iovec(&kern_msg, iov, addr, VERIFY_WRITE);
++	err = verify_compat_iovec(&msg_sys, iov, addr, VERIFY_WRITE);
+ 	if (err < 0)
+-		goto out;
++		goto out_freeiov;
+ 	total_len = err;
++	cmsg_ptr = (unsigned long) msg_sys.msg_control;
++	msg_sys.msg_flags = MSG_CMSG_COMPAT;
+ 
+-	cmsg_ptr = (unsigned long) kern_msg.msg_control;
+-	kern_msg.msg_flags = 0;
++	if (sock->file->f_flags & O_NONBLOCK)
++		user_flags |= MSG_DONTWAIT;
+ 
+-	lock_kernel();
+-	sock = sockfd_lookup(fd, &err);
+-	if (sock != NULL) {
+-		if (sock->file->f_flags & O_NONBLOCK)
+-			user_flags |= MSG_DONTWAIT;
+-		err = sock_recvmsg(sock, &kern_msg, total_len, user_flags);
+-		if(err >= 0)
+-			len = err;
+-		sockfd_put(sock);
+-	}
+-	unlock_kernel();
++	err = sock_recvmsg(sock, &msg_sys, total_len, user_flags);
++	if(err < 0)
++		goto out_freeiov;
+ 
+-	if(uaddr != NULL && err >= 0)
+-		err = move_addr_to_user(addr, kern_msg.msg_namelen, uaddr, uaddr_len);
+-	if(err >= 0) {
+-		err = __put_user(linux_to_solaris_msgflags(kern_msg.msg_flags), &user_msg->msg_flags);
+-		if(!err) {
+-			/* XXX Convert cmsg back into userspace 32-bit format... */
+-			err = __put_user((unsigned long)kern_msg.msg_control - cmsg_ptr,
+-					 &user_msg->msg_controllen);
+-		}
++	len = err;
++
++	if (uaddr != NULL) {
++		err = move_addr_to_user(addr, msg_sys.msg_namelen, uaddr,
++		uaddr_len);
++		if (err < 0)
++			goto out_freeiov;
+ 	}
++	err = __put_user(linux_to_solaris_msgflags(msg_sys.msg_flags), &user_msg->msg_flags);
++	if (err)
++		goto out_freeiov;
++	err = __put_user((unsigned long)msg_sys.msg_control - cmsg_ptr,
++			&user_msg->msg_controllen);
++	if (err)
++		goto out_freeiov;
++	err = len;
+ 
+-	if(kern_msg.msg_iov != iov)
+-		kfree(kern_msg.msg_iov);
++out_freeiov:
++	if (iov != iovstack)
++		sock_kfree_s(sock->sk, iov, iov_size);
++out_put:
++	sockfd_put(sock);
+ out:
+-	if(err < 0)
+-		return err;
+-	return len;
++	return err;
+ }
+Index: linux-2.6.10/net/compat.c
+===================================================================
+--- linux-2.6.10.orig/net/compat.c
++++ linux-2.6.10/net/compat.c
+@@ -91,20 +91,11 @@ int verify_compat_iovec(struct msghdr *k
+ 	} else
+ 		kern_msg->msg_name = NULL;
+ 
+-	if(kern_msg->msg_iovlen > UIO_FASTIOV) {
+-		kern_iov = kmalloc(kern_msg->msg_iovlen * sizeof(struct iovec),
+-				   GFP_KERNEL);
+-		if(!kern_iov)
+-			return -ENOMEM;
+-	}
+-
+ 	tot_len = iov_from_user_compat_to_kern(kern_iov,
+ 					  (struct compat_iovec __user *)kern_msg->msg_iov,
+ 					  kern_msg->msg_iovlen);
+ 	if(tot_len >= 0)
+ 		kern_msg->msg_iov = kern_iov;
+-	else if(kern_msg->msg_iovlen > UIO_FASTIOV)
+-		kfree(kern_iov);
+ 
+ 	return tot_len;
+ }
+Index: linux-2.6.10/mvl_patches/pro-1020.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1020.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1020);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1179 @@
+#! /usr/bin/env bash
+# Patch: -common_mtd_amd_xip
+# Date: Wed Dec 28 14:55:04 2005
+# Source: MontaVista Software, Inc.
+# MR: 9383
+# Type: Enhancement
+# Disposition: merged to linux-mtd http://lists.infradead.org/pipermail/linux-mtd-cvs/2005-June/004837.html
+# Signed-off-by: Todd Poynor <tpoynor@mvista.com>
+# Description:
+# 
+# 	Add MTD XIP support for AMD CFI flash.
+# 
+
+PATCHNUM=22
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 9383
+Type: Enhancement
+Disposition: merged to linux-mtd http://lists.infradead.org/pipermail/linux-mtd-cvs/2005-June/004837.html
+Signed-off-by: Todd Poynor <tpoynor@mvista.com>
+Description:
+
+	Add MTD XIP support for AMD CFI flash.
+
+Index: linux-2.6.10/drivers/mtd/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/chips/Kconfig
++++ linux-2.6.10/drivers/mtd/chips/Kconfig
+@@ -300,7 +300,7 @@ config MTD_JEDEC
+ 
+ config MTD_XIP
+ 	bool "XIP aware MTD support"
+-	depends on !SMP && MTD_CFI_INTELEXT && EXPERIMENTAL
++	depends on !SMP && (MTD_CFI_INTELEXT || MTD_CFI_AMDSTD) && EXPERIMENTAL
+ 	default y if XIP_KERNEL
+ 	help
+ 	  This allows MTD support to work with flash memory which is also
+Index: linux-2.6.10/drivers/mtd/chips/cfi_cmdset_0002.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/chips/cfi_cmdset_0002.c
++++ linux-2.6.10/drivers/mtd/chips/cfi_cmdset_0002.c
+@@ -4,11 +4,15 @@
+  *
+  * Copyright (C) 2000 Crossnet Co. <info@crossnet.co.jp>
+  * Copyright (C) 2004 Arcom Control Systems Ltd <linux@arcom.com>
++ * Copyright (C) 2005 MontaVista Software Inc. <source@mvista.com>
+  *
+  * 2_by_8 routines added by Simon Munton
+  *
+  * 4_by_16 work by Carolyn J. Smith
+  *
++ * XIP support hooks by Vitaly Wool (based on code for Intel flash 
++ * by Nicolas Pitre)
++ * 
+  * Occasionally maintained by Thayne Harbaugh tharbaugh at lnxi dot com
+  *
+  * This code is GPL
+@@ -34,6 +38,7 @@
+ #include <linux/mtd/map.h>
+ #include <linux/mtd/mtd.h>
+ #include <linux/mtd/cfi.h>
++#include <linux/mtd/xip.h>
+ 
+ #define AMD_BOOTLOC_BUG
+ #define FORCE_WORD_WRITE 0
+@@ -73,7 +78,6 @@ static struct mtd_chip_driver cfi_amdstd
+ 
+ /* #define DEBUG_CFI_FEATURES */
+ 
+-
+ #ifdef DEBUG_CFI_FEATURES
+ static void cfi_tell_features(struct cfi_pri_amdstd *extp)
+ {
+@@ -391,7 +395,7 @@ static struct mtd_info *cfi_amdstd_setup
+  * correctly and is therefore not done	(particulary with interleaved chips
+  * as each chip must be checked independantly of the others).
+  */
+-static int chip_ready(struct map_info *map, unsigned long addr)
++static int __xipram chip_ready(struct map_info *map, unsigned long addr)
+ {
+ 	map_word d, t;
+ 
+@@ -420,12 +424,12 @@ static int get_chip(struct map_info *map
+ 
+ 			if (time_after(jiffies, timeo)) {
+ 				printk(KERN_ERR "Waiting for chip to be ready timed out.\n");
+-				cfi_spin_unlock(chip->mutex);
++				spin_unlock(chip->mutex);
+ 				return -EIO;
+ 			}
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			cfi_udelay(1);
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 			/* Someone else might have been playing with it. */
+ 			goto retry;
+ 		}
+@@ -473,15 +477,23 @@ static int get_chip(struct map_info *map
+ 				return -EIO;
+ 			}
+ 			
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			cfi_udelay(1);
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 			/* Nobody will touch it while it's in state FL_ERASE_SUSPENDING.
+ 			   So we can just loop here. */
+ 		}
+ 		chip->state = FL_READY;
+ 		return 0;
+ 
++	case FL_XIP_WHILE_ERASING:
++		if (mode != FL_READY && mode != FL_POINT &&
++		    (!cfip || !(cfip->EraseSuspend&2)))
++			goto sleep;
++		chip->oldstate = chip->state;
++		chip->state = FL_READY;
++		return 0;
++
+ 	case FL_POINT:
+ 		/* Only if there's no operation suspended... */
+ 		if (mode == FL_READY && chip->oldstate == FL_READY)
+@@ -491,10 +503,10 @@ static int get_chip(struct map_info *map
+ 	sleep:
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+ 		add_wait_queue(&chip->wq, &wait);
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		schedule();
+ 		remove_wait_queue(&chip->wq, &wait);
+-		cfi_spin_lock(chip->mutex);
++		spin_lock(chip->mutex);
+ 		goto resettime;
+ 	}
+ }
+@@ -512,6 +524,11 @@ static void put_chip(struct map_info *ma
+ 		chip->state = FL_ERASING;
+ 		break;
+ 
++	case FL_XIP_WHILE_ERASING:
++		chip->state = chip->oldstate;
++		chip->oldstate = FL_READY;
++		break;
++
+ 	case FL_READY:
+ 	case FL_STATUS:
+ 		/* We should really make set_vpp() count, rather than doing this */
+@@ -523,6 +540,203 @@ static void put_chip(struct map_info *ma
+ 	wake_up(&chip->wq);
+ }
+ 
++#ifdef CONFIG_MTD_XIP
++
++/*
++ * No interrupt what so ever can be serviced while the flash isn't in array
++ * mode.  This is ensured by the xip_disable() and xip_enable() functions
++ * enclosing any code path where the flash is known not to be in array mode.
++ * And within a XIP disabled code path, only functions marked with __xipram
++ * may be called and nothing else (it's a good thing to inspect generated
++ * assembly to make sure inline functions were actually inlined and that gcc
++ * didn't emit calls to its own support functions). Also configuring MTD CFI
++ * support to a single buswidth and a single interleave is also recommended.
++ */
++#include <asm/hardware.h>
++static void xip_disable(struct map_info *map, struct flchip *chip,
++			unsigned long adr)
++{
++	/* TODO: chips with no XIP use should ignore and return */
++	(void) map_read(map, adr); /* ensure mmu mapping is up to date */
++	local_irq_disable();
++}
++
++static void __xipram xip_enable(struct map_info *map, struct flchip *chip,
++				unsigned long adr)
++{
++	struct cfi_private *cfi = map->fldrv_priv;
++
++	if (chip->state != FL_POINT && chip->state != FL_READY) {
++		map_write(map, CMD(0xf0), adr);
++		chip->state = FL_READY;
++	}
++	(void) map_read(map, adr);
++	asm volatile (".rep 8; nop; .endr"); /* fill instruction prefetch */
++	local_irq_enable();
++}
++
++/*
++ * When a delay is required for the flash operation to complete, the
++ * xip_udelay() function is polling for both the given timeout and pending
++ * (but still masked) hardware interrupts.  Whenever there is an interrupt
++ * pending then the flash erase operation is suspended, array mode restored 
++ * and interrupts unmasked.  Task scheduling might also happen at that
++ * point.  The CPU eventually returns from the interrupt or the call to
++ * schedule() and the suspended flash operation is resumed for the remaining
++ * of the delay period.
++ *
++ * Warning: this function _will_ fool interrupt latency tracing tools.
++ */
++
++static void __xipram xip_udelay(struct map_info *map, struct flchip *chip,
++				unsigned long adr, int usec)
++{
++	struct cfi_private *cfi = map->fldrv_priv;
++	struct cfi_pri_amdstd *extp = cfi->cmdset_priv;
++	map_word status, OK = CMD(0x80);
++	unsigned long suspended, start = xip_currtime();
++	flstate_t oldstate, newstate;
++
++	do {
++		cpu_relax();
++		if (xip_irqpending() && extp &&
++		    ((chip->state == FL_ERASING && (extp->EraseSuspend & 2))) &&
++		    (cfi_interleave_is_1(cfi) || chip->oldstate == FL_READY)) {
++			/*
++			 * Let's suspend the erase operation when supported.  
++			 * Note that we currently don't try to suspend 
++			 * interleaved chips if there is already another 
++			 * operation suspended (imagine what happens
++			 * when one chip was already done with the current
++			 * operation while another chip suspended it, then
++			 * we resume the whole thing at once).  Yes, it
++			 * can happen!
++			 * Write-suspend seems to be broken, so no write-
++			 * suspend support here.
++			 */
++			map_write(map, CMD(0xb0), adr);
++			usec -= xip_elapsed_since(start);
++			suspended = xip_currtime();
++			do {
++				if (xip_elapsed_since(suspended) > 100000) {
++					/*
++					 * The chip doesn't want to suspend
++					 * after waiting for 100 msecs.
++					 * This is a critical error but there
++					 * is not much we can do here.
++					 */
++					return;
++				}
++				status = map_read(map, adr);
++			} while (!map_word_andequal(map, status, OK, OK));
++
++			/* Suspend succeeded */
++			oldstate = chip->state;
++			if (oldstate == FL_ERASING) {
++				if (!map_word_bitsset(map, status, CMD(0x40)))
++					break;
++				newstate = FL_XIP_WHILE_ERASING;
++				chip->erase_suspended = 1;
++			}
++			chip->state = newstate;
++			map_write(map, CMD(0xf0), adr);
++			(void) map_read(map, adr);
++			asm volatile (".rep 8; nop; .endr");
++			local_irq_enable();
++			spin_unlock(chip->mutex);
++			asm volatile (".rep 8; nop; .endr");
++			cond_resched();
++
++			/*
++			 * We're back.  However someone else might have
++			 * decided to go write to the chip if we are in
++			 * a suspended erase state.  If so let's wait
++			 * until it's done.
++			 */
++			spin_lock(chip->mutex);
++			while (chip->state != newstate) {
++				DECLARE_WAITQUEUE(wait, current);
++				set_current_state(TASK_UNINTERRUPTIBLE);
++				add_wait_queue(&chip->wq, &wait);
++				spin_unlock(chip->mutex);
++				schedule();
++				remove_wait_queue(&chip->wq, &wait);
++				spin_lock(chip->mutex);
++			}
++			/* Disallow XIP again */
++			local_irq_disable();
++
++			/* Resume the write or erase operation */
++			map_write(map, CMD(0x30), adr);
++			chip->state = oldstate;
++			start = xip_currtime();
++		} else if (usec >= 1000000/HZ) {
++			/*
++			 * Try to save on CPU power when waiting delay
++			 * is at least a system timer tick period.
++			 * No need to be extremely accurate here.
++			 */
++			xip_cpu_idle();
++		}
++		status = map_read(map, adr);
++	} while (!map_word_andequal(map, status, OK, OK)
++		 && xip_elapsed_since(start) < usec);
++}
++
++#define UDELAY(map, chip, adr, usec)  xip_udelay(map, chip, adr, usec)
++
++/*
++ * The INVALIDATE_CACHED_RANGE() macro is normally used in parallel while
++ * the flash is actively programming or erasing since we have to poll for
++ * the operation to complete anyway.  We can't do that in a generic way with
++ * a XIP setup so do it before the actual flash operation in this case
++ * and stub it out from INVALIDATE_CACHE_UDELAY.
++ */
++#define XIP_INVAL_CACHED_RANGE(map, from, size)  \
++	INVALIDATE_CACHED_RANGE(map, from, size)
++
++#define INVALIDATE_CACHE_UDELAY(map, chip, adr, len, usec)  \
++	UDELAY(map, chip, adr, usec)
++
++/*
++ * Extra notes:
++ *
++ * Activating this XIP support changes the way the code works a bit.  For
++ * example the code to suspend the current process when concurrent access
++ * happens is never executed because xip_udelay() will always return with the
++ * same chip state as it was entered with.  This is why there is no care for
++ * the presence of add_wait_queue() or schedule() calls from within a couple
++ * xip_disable()'d  areas of code, like in do_erase_oneblock for example.
++ * The queueing and scheduling are always happening within xip_udelay().
++ *
++ * Similarly, get_chip() and put_chip() just happen to always be executed
++ * with chip->state set to FL_READY (or FL_XIP_WHILE_*) where flash state
++ * is in array mode, therefore never executing many cases therein and not
++ * causing any problem with XIP.
++ */
++
++#else
++
++#define xip_disable(map, chip, adr)
++#define xip_enable(map, chip, adr)
++#define XIP_INVAL_CACHED_RANGE(x...)
++
++#define UDELAY(map, chip, adr, usec)  \
++do {  \
++	spin_unlock(chip->mutex);  \
++	cfi_udelay(usec);  \
++	spin_lock(chip->mutex);  \
++} while (0)
++
++#define INVALIDATE_CACHE_UDELAY(map, chip, adr, len, usec)  \
++do {  \
++	spin_unlock(chip->mutex);  \
++	INVALIDATE_CACHED_RANGE(map, adr, len);  \
++	cfi_udelay(usec);  \
++	spin_lock(chip->mutex);  \
++} while (0)
++
++#endif
+ 
+ static inline int do_read_onechip(struct map_info *map, struct flchip *chip, loff_t adr, size_t len, u_char *buf)
+ {
+@@ -535,10 +749,10 @@ static inline int do_read_onechip(struct
+ 	/* Ensure cmd read/writes are aligned. */ 
+ 	cmd_addr = adr & ~(map_bankwidth(map)-1); 
+ 
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 	ret = get_chip(map, chip, cmd_addr, FL_READY);
+ 	if (ret) {
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		return ret;
+ 	}
+ 
+@@ -551,7 +765,7 @@ static inline int do_read_onechip(struct
+ 
+ 	put_chip(map, chip, cmd_addr);
+ 
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 	return 0;
+ }
+ 
+@@ -605,7 +819,7 @@ static inline int do_read_secsi_onechip(
+ 	struct cfi_private *cfi = map->fldrv_priv;
+ 
+  retry:
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 
+ 	if (chip->state != FL_READY){
+ #if 0
+@@ -614,7 +828,7 @@ static inline int do_read_secsi_onechip(
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+ 		add_wait_queue(&chip->wq, &wait);
+ 		
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 
+ 		schedule();
+ 		remove_wait_queue(&chip->wq, &wait);
+@@ -643,7 +857,7 @@ static inline int do_read_secsi_onechip(
+ 	cfi_send_gen_cmd(0x00, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+ 	
+ 	wake_up(&chip->wq);
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 
+ 	return 0;
+ }
+@@ -692,7 +906,7 @@ static int cfi_amdstd_secsi_read (struct
+ }
+ 
+ 
+-static int do_write_oneword(struct map_info *map, struct flchip *chip, unsigned long adr, map_word datum)
++static int __xipram do_write_oneword(struct map_info *map, struct flchip *chip, unsigned long adr, map_word datum)
+ {
+ 	struct cfi_private *cfi = map->fldrv_priv;
+ 	unsigned long timeo = jiffies + HZ;
+@@ -712,10 +926,10 @@ static int do_write_oneword(struct map_i
+ 
+ 	adr += chip->start;
+ 
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 	ret = get_chip(map, chip, adr, FL_WRITING);
+ 	if (ret) {
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		return ret;
+ 	}
+ 
+@@ -735,7 +949,9 @@ static int do_write_oneword(struct map_i
+ 		goto op_done;
+ 	}
+ 
++	XIP_INVAL_CACHED_RANGE(map, adr, map_bankwidth(map));
+ 	ENABLE_VPP(map);
++	xip_disable(map, chip, adr);
+  retry:
+ 	cfi_send_gen_cmd(0xAA, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+ 	cfi_send_gen_cmd(0x55, cfi->addr_unlock2, chip->start, map, cfi, cfi->device_type, NULL);
+@@ -743,9 +959,9 @@ static int do_write_oneword(struct map_i
+ 	map_write(map, datum, adr);
+ 	chip->state = FL_WRITING;
+ 
+-	cfi_spin_unlock(chip->mutex);
+-	cfi_udelay(chip->word_write_time);
+-	cfi_spin_lock(chip->mutex);
++	INVALIDATE_CACHE_UDELAY(map, chip,
++				adr, map_bankwidth(map),
++				chip->word_write_time);
+ 
+ 	/* See comment above for timeout value. */
+ 	timeo = jiffies + uWriteTimeout; 
+@@ -756,11 +972,11 @@ static int do_write_oneword(struct map_i
+ 
+ 			set_current_state(TASK_UNINTERRUPTIBLE);
+ 			add_wait_queue(&chip->wq, &wait);
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			schedule();
+ 			remove_wait_queue(&chip->wq, &wait);
+ 			timeo = jiffies + (HZ / 2); /* FIXME */
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 			continue;
+ 		}
+ 
+@@ -771,9 +987,7 @@ static int do_write_oneword(struct map_i
+                         break;
+ 
+ 		/* Latency issues. Drop the lock, wait a while and retry */
+-		cfi_spin_unlock(chip->mutex);
+-		cfi_udelay(1);
+-		cfi_spin_lock(chip->mutex);
++		UDELAY(map, chip, adr, 1);
+ 	}
+ 
+ 	printk(KERN_WARNING "MTD %s(): software timeout\n", __func__);
+@@ -787,8 +1001,9 @@ static int do_write_oneword(struct map_i
+ 	ret = -EIO;
+  op_done:
+ 	chip->state = FL_READY;
++	xip_enable(map, chip, adr);
+ 	put_chip(map, chip, adr);
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 
+ 	return ret;
+ }
+@@ -820,7 +1035,7 @@ static int cfi_amdstd_write_words(struct
+ 		map_word tmp_buf;
+ 
+  retry:
+-		cfi_spin_lock(cfi->chips[chipnum].mutex);
++		spin_lock(cfi->chips[chipnum].mutex);
+ 
+ 		if (cfi->chips[chipnum].state != FL_READY) {
+ #if 0
+@@ -829,7 +1044,7 @@ static int cfi_amdstd_write_words(struct
+ 			set_current_state(TASK_UNINTERRUPTIBLE);
+ 			add_wait_queue(&cfi->chips[chipnum].wq, &wait);
+ 
+-			cfi_spin_unlock(cfi->chips[chipnum].mutex);
++			spin_unlock(cfi->chips[chipnum].mutex);
+ 
+ 			schedule();
+ 			remove_wait_queue(&cfi->chips[chipnum].wq, &wait);
+@@ -843,7 +1058,7 @@ static int cfi_amdstd_write_words(struct
+ 		/* Load 'tmp_buf' with old contents of flash */
+ 		tmp_buf = map_read(map, bus_ofs+chipstart);
+ 
+-		cfi_spin_unlock(cfi->chips[chipnum].mutex);
++		spin_unlock(cfi->chips[chipnum].mutex);
+ 
+ 		/* Number of bytes to copy from buffer */
+ 		n = min_t(int, len, map_bankwidth(map)-i);
+@@ -898,7 +1113,7 @@ static int cfi_amdstd_write_words(struct
+ 		map_word tmp_buf;
+ 
+  retry1:
+-		cfi_spin_lock(cfi->chips[chipnum].mutex);
++		spin_lock(cfi->chips[chipnum].mutex);
+ 
+ 		if (cfi->chips[chipnum].state != FL_READY) {
+ #if 0
+@@ -907,7 +1122,7 @@ static int cfi_amdstd_write_words(struct
+ 			set_current_state(TASK_UNINTERRUPTIBLE);
+ 			add_wait_queue(&cfi->chips[chipnum].wq, &wait);
+ 
+-			cfi_spin_unlock(cfi->chips[chipnum].mutex);
++			spin_unlock(cfi->chips[chipnum].mutex);
+ 
+ 			schedule();
+ 			remove_wait_queue(&cfi->chips[chipnum].wq, &wait);
+@@ -920,7 +1135,7 @@ static int cfi_amdstd_write_words(struct
+ 
+ 		tmp_buf = map_read(map, ofs + chipstart);
+ 
+-		cfi_spin_unlock(cfi->chips[chipnum].mutex);
++		spin_unlock(cfi->chips[chipnum].mutex);
+ 
+ 		tmp_buf = map_word_load_partial(map, tmp_buf, buf, 0, len);
+ 	
+@@ -939,7 +1154,7 @@ static int cfi_amdstd_write_words(struct
+ /*
+  * FIXME: interleaved mode not tested, and probably not supported!
+  */
+-static inline int do_write_buffer(struct map_info *map, struct flchip *chip, 
++static int __xipram do_write_buffer(struct map_info *map, struct flchip *chip, 
+ 				  unsigned long adr, const u_char *buf, int len)
+ {
+ 	struct cfi_private *cfi = map->fldrv_priv;
+@@ -954,10 +1169,10 @@ static inline int do_write_buffer(struct
+ 	adr += chip->start;
+ 	cmd_adr = adr;
+ 
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 	ret = get_chip(map, chip, adr, FL_WRITING);
+ 	if (ret) {
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		return ret;
+ 	}
+ 
+@@ -966,7 +1181,10 @@ static inline int do_write_buffer(struct
+ 	DEBUG( MTD_DEBUG_LEVEL3, "MTD %s(): WRITE 0x%.8lx(0x%.8lx)\n",
+ 	       __func__, adr, datum.x[0] );
+ 
++	XIP_INVAL_CACHED_RANGE(map, adr, len);
+ 	ENABLE_VPP(map);
++	xip_disable(map, chip, cmd_adr);
++
+ 	cfi_send_gen_cmd(0xAA, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+ 	cfi_send_gen_cmd(0x55, cfi->addr_unlock2, chip->start, map, cfi, cfi->device_type, NULL);
+ 	//cfi_send_gen_cmd(0xA0, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+@@ -996,9 +1214,9 @@ static inline int do_write_buffer(struct
+ 	map_write(map, CMD(0x29), cmd_adr);
+ 	chip->state = FL_WRITING;
+ 
+-	cfi_spin_unlock(chip->mutex);
+-	cfi_udelay(chip->buffer_write_time);
+-	cfi_spin_lock(chip->mutex);
++	INVALIDATE_CACHE_UDELAY(map, chip,
++				adr, map_bankwidth(map),
++				chip->word_write_time);
+ 
+ 	timeo = jiffies + uWriteTimeout; 
+ 		
+@@ -1009,11 +1227,11 @@ static inline int do_write_buffer(struct
+ 
+ 			set_current_state(TASK_UNINTERRUPTIBLE);
+ 			add_wait_queue(&chip->wq, &wait);
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			schedule();
+ 			remove_wait_queue(&chip->wq, &wait);
+ 			timeo = jiffies + (HZ / 2); /* FIXME */
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 			continue;
+ 		}
+ 
+@@ -1024,9 +1242,7 @@ static inline int do_write_buffer(struct
+ 			break;
+ 
+ 		/* Latency issues. Drop the lock, wait a while and retry */
+-		cfi_spin_unlock(chip->mutex);
+-		cfi_udelay(1);
+-		cfi_spin_lock(chip->mutex);
++		UDELAY(map, chip, cmd_adr, 1);
+ 	}
+ 
+ 	printk(KERN_WARNING "MTD %s(): software timeout\n",
+@@ -1039,8 +1255,9 @@ static inline int do_write_buffer(struct
+ 	ret = -EIO;
+  op_done:
+ 	chip->state = FL_READY;
++	xip_enable(map, chip, cmd_adr);
+ 	put_chip(map, chip, adr);
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 
+ 	return ret;
+ }
+@@ -1130,7 +1347,7 @@ static int cfi_amdstd_write_buffers(stru
+  * Handle devices with one erase region, that only implement
+  * the chip erase command.
+  */
+-static inline int do_erase_chip(struct map_info *map, struct flchip *chip)
++static int __xipram do_erase_chip(struct map_info *map, struct flchip *chip)
+ {
+ 	struct cfi_private *cfi = map->fldrv_priv;
+ 	unsigned long timeo = jiffies + HZ;
+@@ -1140,17 +1357,20 @@ static inline int do_erase_chip(struct m
+ 
+ 	adr = cfi->addr_unlock1;
+ 
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 	ret = get_chip(map, chip, adr, FL_WRITING);
+ 	if (ret) {
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		return ret;
+ 	}
+ 
+ 	DEBUG( MTD_DEBUG_LEVEL3, "MTD %s(): ERASE 0x%.8lx\n",
+ 	       __func__, chip->start );
+ 
++	XIP_INVAL_CACHED_RANGE(map, adr, map->size);
+ 	ENABLE_VPP(map);
++	xip_disable(map, chip, adr);
++
+ 	cfi_send_gen_cmd(0xAA, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+ 	cfi_send_gen_cmd(0x55, cfi->addr_unlock2, chip->start, map, cfi, cfi->device_type, NULL);
+ 	cfi_send_gen_cmd(0x80, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+@@ -1162,9 +1382,9 @@ static inline int do_erase_chip(struct m
+ 	chip->erase_suspended = 0;
+ 	chip->in_progress_block_addr = adr;
+ 
+-	cfi_spin_unlock(chip->mutex);
+-	msleep(chip->erase_time/2);
+-	cfi_spin_lock(chip->mutex);
++	INVALIDATE_CACHE_UDELAY(map, chip,
++				adr, map->size,
++				chip->erase_time*500);
+ 
+ 	timeo = jiffies + (HZ*20);
+ 
+@@ -1173,10 +1393,10 @@ static inline int do_erase_chip(struct m
+ 			/* Someone's suspended the erase. Sleep */
+ 			set_current_state(TASK_UNINTERRUPTIBLE);
+ 			add_wait_queue(&chip->wq, &wait);
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			schedule();
+ 			remove_wait_queue(&chip->wq, &wait);
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 			continue;
+ 		}
+ 		if (chip->erase_suspended) {
+@@ -1193,30 +1413,28 @@ static inline int do_erase_chip(struct m
+ 			break;
+ 
+ 		/* Latency issues. Drop the lock, wait a while and retry */
+-		cfi_spin_unlock(chip->mutex);
+-		set_current_state(TASK_UNINTERRUPTIBLE);
+-		schedule_timeout(1);
+-		cfi_spin_lock(chip->mutex);
++		UDELAY(map, chip, adr, 1000);
+ 	}
+ 
+-	printk(KERN_WARNING "MTD %s(): software timeout\n",
+-	       __func__ );
+-
+ 	/* reset on all failures. */
+ 	map_write( map, CMD(0xF0), chip->start );
+ 	/* FIXME - should have reset delay before continuing */
+ 
++	printk(KERN_WARNING "MTD %s(): software timeout\n",
++	       __func__ );
++
+ 	ret = -EIO;
+  op_done:
+ 	chip->state = FL_READY;
++	xip_enable(map, chip, adr);
+ 	put_chip(map, chip, adr);
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 
+ 	return ret;
+ }
+ 
+ 
+-static inline int do_erase_oneblock(struct map_info *map, struct flchip *chip, unsigned long adr, int len, void *thunk)
++static int __xipram do_erase_oneblock(struct map_info *map, struct flchip *chip, unsigned long adr, int len, void *thunk)
+ {
+ 	struct cfi_private *cfi = map->fldrv_priv;
+ 	unsigned long timeo = jiffies + HZ;
+@@ -1225,17 +1443,20 @@ static inline int do_erase_oneblock(stru
+ 
+ 	adr += chip->start;
+ 
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 	ret = get_chip(map, chip, adr, FL_ERASING);
+ 	if (ret) {
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		return ret;
+ 	}
+ 
+ 	DEBUG( MTD_DEBUG_LEVEL3, "MTD %s(): ERASE 0x%.8lx\n",
+ 	       __func__, adr );
+ 
++	XIP_INVAL_CACHED_RANGE(map, adr, len);
+ 	ENABLE_VPP(map);
++	xip_disable(map, chip, adr);
++
+ 	cfi_send_gen_cmd(0xAA, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+ 	cfi_send_gen_cmd(0x55, cfi->addr_unlock2, chip->start, map, cfi, cfi->device_type, NULL);
+ 	cfi_send_gen_cmd(0x80, cfi->addr_unlock1, chip->start, map, cfi, cfi->device_type, NULL);
+@@ -1246,10 +1467,10 @@ static inline int do_erase_oneblock(stru
+ 	chip->state = FL_ERASING;
+ 	chip->erase_suspended = 0;
+ 	chip->in_progress_block_addr = adr;
+-	
+-	cfi_spin_unlock(chip->mutex);
+-	msleep(chip->erase_time/2);
+-	cfi_spin_lock(chip->mutex);
++
++	INVALIDATE_CACHE_UDELAY(map, chip,
++				adr, len,
++				chip->erase_time*500);
+ 
+ 	timeo = jiffies + (HZ*20);
+ 
+@@ -1258,10 +1479,10 @@ static inline int do_erase_oneblock(stru
+ 			/* Someone's suspended the erase. Sleep */
+ 			set_current_state(TASK_UNINTERRUPTIBLE);
+ 			add_wait_queue(&chip->wq, &wait);
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			schedule();
+ 			remove_wait_queue(&chip->wq, &wait);
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 			continue;
+ 		}
+ 		if (chip->erase_suspended) {
+@@ -1278,24 +1499,22 @@ static inline int do_erase_oneblock(stru
+ 			break;
+ 
+ 		/* Latency issues. Drop the lock, wait a while and retry */
+-		cfi_spin_unlock(chip->mutex);
+-		set_current_state(TASK_UNINTERRUPTIBLE);
+-		schedule_timeout(1);
+-		cfi_spin_lock(chip->mutex);
++		UDELAY(map, chip, adr, 1000000/HZ);
+ 	}
+-	
+-	printk(KERN_WARNING "MTD %s(): software timeout\n",
+-	       __func__ );
+-	
++
+ 	/* reset on all failures. */
+ 	map_write( map, CMD(0xF0), chip->start );
+ 	/* FIXME - should have reset delay before continuing */
+ 
++	printk(KERN_WARNING "MTD %s(): software timeout\n",
++	       __func__ );
++	
+ 	ret = -EIO;
+  op_done:
+ 	chip->state = FL_READY;
++	xip_enable(map, chip, adr);
+ 	put_chip(map, chip, adr);
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 	return ret;
+ }
+ 
+@@ -1355,7 +1574,7 @@ static void cfi_amdstd_sync (struct mtd_
+ 		chip = &cfi->chips[i];
+ 
+ 	retry:
+-		cfi_spin_lock(chip->mutex);
++		spin_lock(chip->mutex);
+ 
+ 		switch(chip->state) {
+ 		case FL_READY:
+@@ -1369,14 +1588,14 @@ static void cfi_amdstd_sync (struct mtd_
+ 			 * with the chip now anyway.
+ 			 */
+ 		case FL_SYNCING:
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 			break;
+ 
+ 		default:
+ 			/* Not an idle state */
+ 			add_wait_queue(&chip->wq, &wait);
+ 			
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 
+ 			schedule();
+ 
+@@ -1391,13 +1610,13 @@ static void cfi_amdstd_sync (struct mtd_
+ 	for (i--; i >=0; i--) {
+ 		chip = &cfi->chips[i];
+ 
+-		cfi_spin_lock(chip->mutex);
++		spin_lock(chip->mutex);
+ 		
+ 		if (chip->state == FL_SYNCING) {
+ 			chip->state = chip->oldstate;
+ 			wake_up(&chip->wq);
+ 		}
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 	}
+ }
+ 
+@@ -1413,7 +1632,7 @@ static int cfi_amdstd_suspend(struct mtd
+ 	for (i=0; !ret && i<cfi->numchips; i++) {
+ 		chip = &cfi->chips[i];
+ 
+-		cfi_spin_lock(chip->mutex);
++		spin_lock(chip->mutex);
+ 
+ 		switch(chip->state) {
+ 		case FL_READY:
+@@ -1433,7 +1652,7 @@ static int cfi_amdstd_suspend(struct mtd
+ 			ret = -EAGAIN;
+ 			break;
+ 		}
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 	}
+ 
+ 	/* Unlock the chips again */
+@@ -1442,13 +1661,13 @@ static int cfi_amdstd_suspend(struct mtd
+ 		for (i--; i >=0; i--) {
+ 			chip = &cfi->chips[i];
+ 
+-			cfi_spin_lock(chip->mutex);
++			spin_lock(chip->mutex);
+ 		
+ 			if (chip->state == FL_PM_SUSPENDED) {
+ 				chip->state = chip->oldstate;
+ 				wake_up(&chip->wq);
+ 			}
+-			cfi_spin_unlock(chip->mutex);
++			spin_unlock(chip->mutex);
+ 		}
+ 	}
+ 	
+@@ -1467,7 +1686,7 @@ static void cfi_amdstd_resume(struct mtd
+ 	
+ 		chip = &cfi->chips[i];
+ 
+-		cfi_spin_lock(chip->mutex);
++		spin_lock(chip->mutex);
+ 		
+ 		if (chip->state == FL_PM_SUSPENDED) {
+ 			chip->state = FL_READY;
+@@ -1477,7 +1696,7 @@ static void cfi_amdstd_resume(struct mtd
+ 		else
+ 			printk(KERN_ERR "Argh. Chip not in PM_SUSPENDED state upon resume()\n");
+ 
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 	}
+ }
+ 
+Index: linux-2.6.10/drivers/mtd/chips/fwh_lock.h
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/chips/fwh_lock.h
++++ linux-2.6.10/drivers/mtd/chips/fwh_lock.h
+@@ -58,10 +58,10 @@ static int fwh_xxlock_oneblock(struct ma
+ 	 * to flash memory - that means that we don't have to check status
+ 	 * and timeout.
+ 	 */
+-	cfi_spin_lock(chip->mutex);
++	spin_lock(chip->mutex);
+ 	ret = get_chip(map, chip, adr, FL_LOCKING);
+ 	if (ret) {
+-		cfi_spin_unlock(chip->mutex);
++		spin_unlock(chip->mutex);
+ 		return ret;
+ 	}
+ 
+@@ -71,7 +71,7 @@ static int fwh_xxlock_oneblock(struct ma
+ 	/* Done and happy. */
+ 	chip->state = FL_READY;
+ 	put_chip(map, chip, adr);
+-	cfi_spin_unlock(chip->mutex);
++	spin_unlock(chip->mutex);
+ 	return 0;
+ }
+ 
+Index: linux-2.6.10/drivers/mtd/maps/map_funcs.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/map_funcs.c
++++ linux-2.6.10/drivers/mtd/maps/map_funcs.c
+@@ -9,23 +9,24 @@
+ #include <linux/module.h>
+ 
+ #include <linux/mtd/map.h>
++#include <linux/mtd/xip.h>
+ 
+-static map_word simple_map_read(struct map_info *map, unsigned long ofs)
++static map_word __xipram simple_map_read(struct map_info *map, unsigned long ofs)
+ {
+ 	return inline_map_read(map, ofs);
+ }
+ 
+-static void simple_map_write(struct map_info *map, const map_word datum, unsigned long ofs)
++static void __xipram simple_map_write(struct map_info *map, const map_word datum, unsigned long ofs)
+ {
+ 	inline_map_write(map, datum, ofs);
+ }
+ 
+-static void simple_map_copy_from(struct map_info *map, void *to, unsigned long from, ssize_t len)
++static void __xipram simple_map_copy_from(struct map_info *map, void *to, unsigned long from, ssize_t len)
+ {
+ 	inline_map_copy_from(map, to, from, len);
+ }
+ 
+-static void simple_map_copy_to(struct map_info *map, unsigned long to, const void *from, ssize_t len)
++static void __xipram simple_map_copy_to(struct map_info *map, unsigned long to, const void *from, ssize_t len)
+ {
+ 	inline_map_copy_to(map, to, from, len);
+ }
+Index: linux-2.6.10/include/linux/mtd/cfi.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mtd/cfi.h
++++ linux-2.6.10/include/linux/mtd/cfi.h
+@@ -365,16 +365,6 @@ static inline void cfi_udelay(int us)
+ 	}
+ }
+ 
+-static inline void cfi_spin_lock(spinlock_t *mutex)
+-{
+-	spin_lock_bh(mutex);
+-}
+-
+-static inline void cfi_spin_unlock(spinlock_t *mutex)
+-{
+-	spin_unlock_bh(mutex);
+-}
+-
+ struct cfi_extquery *cfi_read_pri(struct map_info *map, uint16_t adr, uint16_t size,
+ 			     const char* name);
+ struct cfi_fixup {
+Index: linux-2.6.10/mvl_patches/pro-0022.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0022.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(22);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

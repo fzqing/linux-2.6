@@ -1,0 +1,422 @@
+#! /usr/bin/env bash
+# Patch: -mips_pnx8550_mmu_bug_fix
+# Date: Mon Mar  6 10:22:31 2006
+# Source: MontaVista Software, Inc.
+# MR: 16987
+# Type: Defect Fix
+# Disposition: needs submitting to
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+# 	This patch is a workaround to the h/w bug in the MIPS PR4450 CPU core (used in PNX8550).
+# 	This implements BAC (branch address cache) reset after every code TLBWR.
+# 	
+# 	The Philips's explanation of the symptoms and description of the bug:
+# 	1) Link operation produces incorrect output files:
+# 	   - traced to PR4450 pipeline bug associated with branch prediction in combination with the MMU
+# 	2) llegal instruction:
+# 	   - root cause not known but it's assumed that it's unaligned access exception => kernel tries to resolve
+# 	   - kernel checks instruction that caused exception 
+# 	   - not load or store
+# 	   - kernel signals as illegal instruction (since can also be instruction fetch problem)
+# 	   - at point of debug then registers have the correct content, so could be transient problem
+# 	3) Segmentation failure
+# 	   - root cause not yet proven
+# 	   - theory: bug kills instruction, causing incorrect values in registers, 
+# 	     affecting subsequent memory access and causing invalid address
+# 	4) Bus error
+# 	   - root cause not known
+# 	   - only seen once to-date.
+# 	   - could be similar to segmentation failure, but in a different address space.
+# 	   - theory: bug kills instruction, causing incorrect values in registers, 
+# 	     affecting subsequent memory access and causing invalid address
+# 	
+# 
+
+PATCHNUM=319
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16987
+Type: Defect Fix
+Disposition: needs submitting to
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+	This patch is a workaround to the h/w bug in the MIPS PR4450 CPU core (used in PNX8550).
+	This implements BAC (branch address cache) reset after every code TLBWR.
+	
+	The Philips's explanation of the symptoms and description of the bug:
+	1) Link operation produces incorrect output files:
+	   - traced to PR4450 pipeline bug associated with branch prediction in combination with the MMU
+	2) llegal instruction:
+	   - root cause not known but it's assumed that it's unaligned access exception => kernel tries to resolve
+	   - kernel checks instruction that caused exception 
+	   - not load or store
+	   - kernel signals as illegal instruction (since can also be instruction fetch problem)
+	   - at point of debug then registers have the correct content, so could be transient problem
+	3) Segmentation failure
+	   - root cause not yet proven
+	   - theory: bug kills instruction, causing incorrect values in registers, 
+	     affecting subsequent memory access and causing invalid address
+	4) Bus error
+	   - root cause not known
+	   - only seen once to-date.
+	   - could be similar to segmentation failure, but in a different address space.
+	   - theory: bug kills instruction, causing incorrect values in registers, 
+	     affecting subsequent memory access and causing invalid address
+	
+
+ arch/mips/mm/tlb-r4k.c |    4 ++
+ arch/mips/mm/tlbex.c   |   75 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ mvl_patches/pro-0319.c |   16 ++++++++++
+ 3 files changed, 94 insertions(+), 1 deletion(-)
+
+Index: linux-2.6.10/arch/mips/mm/tlb-r4k.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/tlb-r4k.c
++++ linux-2.6.10/arch/mips/mm/tlb-r4k.c
+@@ -416,7 +416,11 @@ void __init tlb_init(void)
+ 	 */
+ 	probe_tlb(config);
+ 	write_c0_pagemask(PM_DEFAULT_MASK);
++#ifdef CONFIG_PNX8550
++       write_c0_wired(11);
++#else
+ 	write_c0_wired(0);
++#endif
+ 	temp_tlb_entry = current_cpu_data.tlbsize - 1;
+ 	local_flush_tlb_all();
+ 
+Index: linux-2.6.10/arch/mips/mm/tlbex.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/tlbex.c
++++ linux-2.6.10/arch/mips/mm/tlbex.c
+@@ -410,7 +410,10 @@ enum label_id {
+ 	label_nopage_tlbm,
+ 	label_smp_pgtable_change,
+ 	label_r3000_write_probe_fail,
+-	label_r3000_write_probe_ok
++	label_r3000_write_probe_ok,
++#ifdef CONFIG_PNX8550
++	label_pnx8550_bac_reset,
++#endif
+ };
+ 
+ struct label {
+@@ -444,6 +447,10 @@ L_LA(_nopage_tlbm)
+ L_LA(_smp_pgtable_change)
+ L_LA(_r3000_write_probe_fail)
+ L_LA(_r3000_write_probe_ok)
++#ifdef CONFIG_PNX8550
++L_LA(_pnx8550_bac_reset)
++#endif
++
+ 
+ /* convenience macros for instructions */
+ #ifdef CONFIG_MIPS64
+@@ -666,18 +673,29 @@ static void il_bgezl(u32 **p, struct rel
+ 	i_bgezl(p, reg, 0);
+ }
+ 
++#ifdef CONFIG_PNX8550
++static void il_beq(u32 **p, struct reloc **r, unsigned int reg1,
++		   unsigned int reg2, enum label_id l)
++{
++	r_mips_pc16(r, *p, l);
++	i_beq(p, reg1, reg2, 0);
++}
++#endif
++
+ /* The only general purpose registers allowed in TLB handlers. */
+ #define K0		26
+ #define K1		27
+ 
+ /* Some CP0 registers */
+ #define C0_INDEX	0
++#define C0_RANDOM   	1
+ #define C0_ENTRYLO0	2
+ #define C0_ENTRYLO1	3
+ #define C0_CONTEXT	4
+ #define C0_BADVADDR	8
+ #define C0_ENTRYHI	10
+ #define C0_EPC		14
++#define C0_CONFIG     16
+ #define C0_XCONTEXT	20
+ 
+ #ifdef CONFIG_MIPS64
+@@ -700,6 +718,57 @@ static __initdata u32 tlb_handler[128];
+ static __initdata struct label labels[128];
+ static __initdata struct reloc relocs[128];
+ 
++#ifdef CONFIG_PNX8550
++static void __init build_pnx8550_bug_fix(u32 **p, struct label **l, struct reloc **r)
++{
++#define MFC0(_reg, _cp, _sel)		\
++		((cop0_op) << OP_SH	\
++		| (mfc_op) << RS_SH	\
++		| (_reg)   << RT_SH	\
++		| (_cp)    << RD_SH	\
++		| (_sel))
++
++#define MTC0(_reg, _cp, _sel)		\
++		((cop0_op) << OP_SH	\
++		| (mtc_op) << RS_SH	\
++		| (_reg)   << RT_SH	\
++		| (_cp)    << RD_SH	\
++		| (_sel))
++
++	/* load epc and badvaddr to k0 and k1 */
++	i_MFC0(p, K0, C0_EPC);
++	i_MFC0(p, K1, C0_BADVADDR);
++
++	/* branch if code entry  */
++	il_beq(p, r, K0, K1, label_pnx8550_bac_reset);
++	i_addiu(p, K0, K0, 4);
++
++	/* branch if code entry in BDS */
++	il_beq(p, r, K0, K1, label_pnx8550_bac_reset);
++	i_nop(p);
++	/* Write data tlb entry 11..31 */
++	i_tlbwr(p);
++	i_eret(p);
++	/* BAC Reset */
++	l_pnx8550_bac_reset(l, *p);
++	**p = MFC0(K0, C0_CONFIG, 7);
++	(*p)++;
++	i_ori(p, K0, K0, (1<<14));
++
++	**p = MTC0(K0, C0_CONFIG, 7);
++	(*p)++;
++
++	/* read random reg, sub 11, div by 2 */
++	i_MFC0(p, K1, C0_RANDOM);
++	i_addiu(p, K1, K1, -11);
++	i_srl(p, K1, K1, 1);
++
++	/* use as index for tlbwi */
++	i_MTC0(p, K1, C0_INDEX);
++	i_tlbwi(p);
++}
++#endif
++
+ /*
+  * The R3000 TLB handler is simple.
+  */
+@@ -1163,8 +1232,12 @@ static void __init build_r4000_tlb_refil
+ 
+ 	build_get_ptep(&p, K0, K1);
+ 	build_update_entries(&p, K0, K1);
++#ifdef CONFIG_PNX8550
++	build_pnx8550_bug_fix(&p, &l, &r);
++#else
+ 	build_tlb_write_entry(&p, &l, &r, tlb_random);
+ 	l_leave(&l, p);
++#endif
+ 	i_eret(&p); /* return from trap */
+ 
+ #ifdef CONFIG_MIPS64
+Index: linux-2.6.10/mvl_patches/pro-0319.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0319.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(319);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

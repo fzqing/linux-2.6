@@ -1,0 +1,621 @@
+#! /usr/bin/env bash
+# Patch: -USB_Storage_make_usb_storage_structures_refcounte
+# Date: Mon Jul 30 15:47:16 2007
+# Source: Kernel.org
+# MR: 23987
+# Type: Bugfix
+# Disposition: backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# minor fixups to make it patch with our sources.
+# 
+# From bb1e0019f28eca66b118a60135926edfc75907cf Mon Sep 17 00:00:00 2001
+# From: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+# Date: Wed, 23 Mar 2005 23:13:02 -0800
+# Subject: [PATCH 1/1] [PATCH] USB Storage: make usb-storage structures refcounted by SCSI
+# 
+# This patch started life as as474 from Alan Stern.  It's been rediffed
+# against the tip, tho that is now several days old.
+# 
+# This patch changes the way our private struct us_data is allocated; now it
+# gets stored at the end of the Scsi_Host rather than separately.  That's
+# what the hostdata field is intended for, and this is how other low-level
+# host drivers operate.  In order to convert between us_data and the
+# corresponding Scsi_Host I added two new inline routines: us_to_host and
+# host_to_us.  (The conversion actually should be quicker than before by a
+# microscopic amount, because now it only involves adding an offset whereas
+# before it involved dereferencing a pointer.)
+# 
+# The main advantage is that the host is refcounted, so now our us_data
+# automatically is too.  Although that doesn't matter at the moment, it will
+# matter later on when the control thread may need to outlive the disconnect
+# callback.
+# 
+# 
+# Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+# Signed-off-by: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+# Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+#  drivers/block/ub.c              |   85 ++++++++++++++++++++--------------------
+#  drivers/usb/storage/scsiglue.c  |   41 +++++++++----------
+#  drivers/usb/storage/transport.c |    4 -
+#  drivers/usb/storage/usb.c       |   55 ++++++++++---------------
+#  drivers/usb/storage/usb.h       |    9 +++-
+#  5 files changed, 97 insertions(+), 97 deletions(-)
+# 
+
+PATCHNUM=1352
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Kernel.org
+MR: 23987
+Type: Bugfix
+Disposition: backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+minor fixups to make it patch with our sources.
+
+From bb1e0019f28eca66b118a60135926edfc75907cf Mon Sep 17 00:00:00 2001
+From: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Date: Wed, 23 Mar 2005 23:13:02 -0800
+Subject: [PATCH 1/1] [PATCH] USB Storage: make usb-storage structures refcounted by SCSI
+
+This patch started life as as474 from Alan Stern.  It's been rediffed
+against the tip, tho that is now several days old.
+
+This patch changes the way our private struct us_data is allocated; now it
+gets stored at the end of the Scsi_Host rather than separately.  That's
+what the hostdata field is intended for, and this is how other low-level
+host drivers operate.  In order to convert between us_data and the
+corresponding Scsi_Host I added two new inline routines: us_to_host and
+host_to_us.  (The conversion actually should be quicker than before by a
+microscopic amount, because now it only involves adding an offset whereas
+before it involved dereferencing a pointer.)
+
+The main advantage is that the host is refcounted, so now our us_data
+automatically is too.  Although that doesn't matter at the moment, it will
+matter later on when the control thread may need to outlive the disconnect
+callback.
+
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+ drivers/usb/storage/scsiglue.c  |   41 ++++++++++++++---------------
+ drivers/usb/storage/transport.c |    4 +-
+ drivers/usb/storage/usb.c       |   55 ++++++++++++++++------------------------
+ drivers/usb/storage/usb.h       |    9 +++++-
+ mvl_patches/pro-1352.c          |   16 +++++++++++
+ 5 files changed, 69 insertions(+), 56 deletions(-)
+
+Index: linux-2.6.10/drivers/usb/storage/scsiglue.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/storage/scsiglue.c
++++ linux-2.6.10/drivers/usb/storage/scsiglue.c
+@@ -82,7 +82,7 @@ static int slave_alloc (struct scsi_devi
+ 
+ static int slave_configure(struct scsi_device *sdev)
+ {
+-	struct us_data *us = (struct us_data *) sdev->host->hostdata[0];
++	struct us_data *us = host_to_us(sdev->host);
+ 
+ 	/* Scatter-gather buffers (all but the last) must have a length
+ 	 * divisible by the bulk maxpacket size.  Otherwise a data packet
+@@ -162,14 +162,13 @@ static int slave_configure(struct scsi_d
+ }
+ 
+ /* queue a command */
+-/* This is always called with scsi_lock(srb->host) held */
++/* This is always called with scsi_lock(host) held */
+ static int queuecommand(struct scsi_cmnd *srb,
+ 			void (*done)(struct scsi_cmnd *))
+ {
+-	struct us_data *us = (struct us_data *)srb->device->host->hostdata[0];
++	struct us_data *us = host_to_us(srb->device->host);
+ 
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+-	srb->host_scribble = (unsigned char *)us;
+ 
+ 	/* check for state-transition errors */
+ 	if (us->srb != NULL) {
+@@ -199,11 +198,10 @@ static int queuecommand(struct scsi_cmnd
+  ***********************************************************************/
+ 
+ /* Command timeout and abort */
+-/* This is always called with scsi_lock(srb->host) held */
+-static int command_abort(struct scsi_cmnd *srb )
++/* This is always called with scsi_lock(host) held */
++static int command_abort(struct scsi_cmnd *srb)
+ {
+-	struct Scsi_Host *host = srb->device->host;
+-	struct us_data *us = (struct us_data *) host->hostdata[0];
++	struct us_data *us = host_to_us(srb->device->host);
+ 
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+ 
+@@ -223,13 +221,13 @@ static int command_abort(struct scsi_cmn
+ 		set_bit(US_FLIDX_ABORTING, &us->flags);
+ 		usb_stor_stop_transport(us);
+ 	}
+-	scsi_unlock(host);
++	scsi_unlock(us_to_host(us));
+ 
+ 	/* Wait for the aborted command to finish */
+ 	wait_for_completion(&us->notify);
+ 
+ 	/* Reacquire the lock and allow USB transfers to resume */
+-	scsi_lock(host);
++	scsi_lock(us_to_host(us));
+ 	clear_bit(US_FLIDX_ABORTING, &us->flags);
+ 	clear_bit(US_FLIDX_TIMED_OUT, &us->flags);
+ 	return SUCCESS;
+@@ -237,15 +235,15 @@ static int command_abort(struct scsi_cmn
+ 
+ /* This invokes the transport reset mechanism to reset the state of the
+  * device */
+-/* This is always called with scsi_lock(srb->host) held */
++/* This is always called with scsi_lock(host) held */
+ static int device_reset(struct scsi_cmnd *srb)
+ {
+-	struct us_data *us = (struct us_data *)srb->device->host->hostdata[0];
++	struct us_data *us = host_to_us(srb->device->host);
+ 	int result;
+ 
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+ 
+-	scsi_unlock(srb->device->host);
++	scsi_unlock(us_to_host(us));
+ 
+ 	/* lock the device pointers and do the reset */
+ 	down(&(us->dev_semaphore));
+@@ -257,22 +255,22 @@ static int device_reset(struct scsi_cmnd
+ 	up(&(us->dev_semaphore));
+ 
+ 	/* lock the host for the return */
+-	scsi_lock(srb->device->host);
++	scsi_lock(us_to_host(us));
+ 	return result;
+ }
+ 
+ /* This resets the device's USB port. */
+ /* It refuses to work if there's more than one interface in
+  * the device, so that other users are not affected. */
+-/* This is always called with scsi_lock(srb->host) held */
++/* This is always called with scsi_lock(host) held */
+ static int bus_reset(struct scsi_cmnd *srb)
+ {
+-	struct us_data *us = (struct us_data *)srb->device->host->hostdata[0];
++	struct us_data *us = host_to_us(srb->device->host);
+ 	int result, rc;
+ 
+ 	US_DEBUGP("%s called\n", __FUNCTION__);
+ 
+-	scsi_unlock(srb->device->host);
++	scsi_unlock(us_to_host(us));
+ 
+ 	/* The USB subsystem doesn't handle synchronisation between
+ 	 * a device's several drivers. Therefore we reset only devices
+@@ -300,7 +298,7 @@ static int bus_reset(struct scsi_cmnd *s
+ 	up(&(us->dev_semaphore));
+ 
+ 	/* lock the host for the return */
+-	scsi_lock(srb->device->host);
++	scsi_lock(us_to_host(us));
+ 	return result < 0 ? FAILED : SUCCESS;
+ }
+ 
+@@ -310,11 +308,12 @@ static int bus_reset(struct scsi_cmnd *s
+ void usb_stor_report_device_reset(struct us_data *us)
+ {
+ 	int i;
++	struct Scsi_Host *host = us_to_host(us);
+ 
+-	scsi_report_device_reset(us->host, 0, 0);
++	scsi_report_device_reset(host, 0, 0);
+ 	if (us->flags & US_FL_SCM_MULT_TARG) {
+-		for (i = 1; i < us->host->max_id; ++i)
+-			scsi_report_device_reset(us->host, 0, i);
++		for (i = 1; i < host->max_id; ++i)
++			scsi_report_device_reset(host, 0, i);
+ 	}
+ }
+ 
+Index: linux-2.6.10/drivers/usb/storage/transport.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/storage/transport.c
++++ linux-2.6.10/drivers/usb/storage/transport.c
+@@ -1118,11 +1118,11 @@ static int usb_stor_reset_common(struct 
+ 	 * RESETTING bit, and clear the ABORTING bit so that the reset
+ 	 * may proceed.
+ 	 */
+-	scsi_lock(us->host);
++	scsi_lock(us_to_host(us));
+ 	usb_stor_report_device_reset(us);
+ 	set_bit(US_FLIDX_RESETTING, &us->flags);
+ 	clear_bit(US_FLIDX_ABORTING, &us->flags);
+-	scsi_unlock(us->host);
++	scsi_unlock(us_to_host(us));
+ 
+ 	/* A 20-second timeout may seem rather long, but a LaCie
+ 	 * StudioDrive USB2 device takes 16+ seconds to get going
+Index: linux-2.6.10/drivers/usb/storage/usb.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/storage/usb.c
++++ linux-2.6.10/drivers/usb/storage/usb.c
+@@ -280,7 +280,7 @@ void fill_inquiry_response(struct us_dat
+ static int usb_stor_control_thread(void * __us)
+ {
+ 	struct us_data *us = (struct us_data *)__us;
+-	struct Scsi_Host *host = us->host;
++	struct Scsi_Host *host = us_to_host(us);
+ 
+ 	lock_kernel();
+ 
+@@ -782,20 +782,6 @@ static int usb_stor_acquire_resources(st
+ 
+ 	up(&us->dev_semaphore);
+ 
+-	/*
+-	 * Since this is a new device, we need to register a SCSI
+-	 * host definition with the higher SCSI layers.
+-	 */
+-	us->host = scsi_host_alloc(&usb_stor_host_template, sizeof(us));
+-	if (!us->host) {
+-		printk(KERN_WARNING USB_STORAGE
+-			"Unable to allocate the scsi host\n");
+-		return -EBUSY;
+-	}
+-
+-	/* Set the hostdata to prepare for scanning */
+-	us->host->hostdata[0] = (unsigned long) us;
+-
+ 	/* Start up our control thread */
+ 	p = kernel_thread(usb_stor_control_thread, us, CLONE_VM);
+ 	if (p < 0) {
+@@ -835,9 +821,9 @@ void usb_stor_release_resources(struct u
+ 		 * Enqueue the command, wake up the thread, and wait for 
+ 		 * notification that it has exited.
+ 		 */
+-		scsi_lock(us->host);
++		scsi_lock(us_to_host(us));
+ 		us->srb = NULL;
+-		scsi_unlock(us->host);
++		scsi_unlock(us_to_host(us));
+ 		up(&us->dev_semaphore);
+ 
+ 		up(&us->sema);
+@@ -850,10 +836,6 @@ void usb_stor_release_resources(struct u
+ 		us->extra_destructor(us->extra);
+ 	}
+ 
+-	/* Finish the host removal sequence */
+-	if (us->host)
+-		scsi_host_put(us->host);
+-
+ 	/* Free the extra data and the URB */
+ 	kfree(us->extra);
+ 	usb_free_urb(us->current_urb);
+@@ -874,9 +856,6 @@ static void dissociate_dev(struct us_dat
+ 
+ 	/* Remove our private data from the interface */
+ 	usb_set_intfdata(us->pusb_intf, NULL);
+-
+-	/* Free the structure itself */
+-	kfree(us);
+ }
+ 
+ /* Thread to carry out delayed SCSI-device scanning */
+@@ -911,7 +890,7 @@ retry:
+ 
+ 	/* If the device is still connected, perform the scanning */
+ 	if (!test_bit(US_FLIDX_DISCONNECTING, &us->flags)) {
+-		scsi_scan_host(us->host);
++		scsi_scan_host(us_to_host(us));
+ 		printk(KERN_DEBUG "usb-storage: device scan complete\n");
+ 	}
+ 
+@@ -923,18 +902,25 @@ retry:
+ static int storage_probe(struct usb_interface *intf,
+ 			 const struct usb_device_id *id)
+ {
++	struct Scsi_Host *host;
+ 	struct us_data *us;
+ 	const int id_index = id - storage_usb_ids; 
+ 	int result;
+ 
+ 	US_DEBUGP("USB Mass Storage device detected\n");
+ 
+-	/* Allocate the us_data structure and initialize the mutexes */
+-	us = (struct us_data *) kmalloc(sizeof(*us), GFP_KERNEL);
+-	if (!us) {
+-		printk(KERN_WARNING USB_STORAGE "Out of memory\n");
++	/*
++	 * Ask the SCSI layer to allocate a host structure, with extra
++	 * space at the end for our private us_data structure.
++	 */
++	host = scsi_host_alloc(&usb_stor_host_template, sizeof(*us));
++	if (!host) {
++		printk(KERN_WARNING USB_STORAGE
++			"Unable to allocate the scsi host\n");
+ 		return -ENOMEM;
+ 	}
++
++	us = host_to_us(host);
+ 	memset(us, 0, sizeof(struct us_data));
+ 	init_MUTEX(&(us->dev_semaphore));
+ 	init_MUTEX_LOCKED(&(us->sema));
+@@ -994,7 +980,7 @@ static int storage_probe(struct usb_inte
+ 	result = usb_stor_acquire_resources(us);
+ 	if (result)
+ 		goto BadDevice;
+-	result = scsi_add_host(us->host, &intf->dev);
++	result = scsi_add_host(host, &intf->dev);
+ 	if (result) {
+ 		printk(KERN_WARNING USB_STORAGE
+ 			"Unable to add the scsi host\n");
+@@ -1006,7 +992,7 @@ static int storage_probe(struct usb_inte
+ 	if (result < 0) {
+ 		printk(KERN_WARNING USB_STORAGE 
+ 		       "Unable to start the device-scanning thread\n");
+-		scsi_remove_host(us->host);
++		scsi_remove_host(host);
+ 		goto BadDevice;
+ 	}
+ 
+@@ -1017,6 +1003,7 @@ BadDevice:
+ 	US_DEBUGP("storage_probe() failed\n");
+ 	usb_stor_release_resources(us);
+ 	dissociate_dev(us);
++	scsi_host_put(host);
+ 	return result;
+ }
+ 
+@@ -1041,11 +1028,15 @@ static void storage_disconnect(struct us
+ 	/* Wait for the current command to finish, then remove the host */
+ 	down(&us->dev_semaphore);
+ 	up(&us->dev_semaphore);
+-	scsi_remove_host(us->host);
++	scsi_remove_host(us_to_host(us));
+ 
+ 	/* Wait for everything to become idle and release all our resources */
+ 	usb_stor_release_resources(us);
+ 	dissociate_dev(us);
++
++	/* Drop our reference to the host; the SCSI core will free it
++	 * (and "us" along with it) when the refcount becomes 0. */
++	scsi_host_put(us_to_host(us));
+ }
+ 
+ /***********************************************************************
+Index: linux-2.6.10/drivers/usb/storage/usb.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/storage/usb.h
++++ linux-2.6.10/drivers/usb/storage/usb.h
+@@ -139,7 +139,6 @@ struct us_data {
+ 	proto_cmnd		proto_handler;	 /* protocol handler	   */
+ 
+ 	/* SCSI interfaces */
+-	struct Scsi_Host	*host;		 /* our dummy host data */
+ 	struct scsi_cmnd	*srb;		 /* current srb		*/
+ 
+ 	/* thread information */
+@@ -165,6 +164,14 @@ struct us_data {
+ 	extra_data_destructor	extra_destructor;/* extra data destructor   */
+ };
+ 
++/* Convert between us_data and the corresponding Scsi_Host */
++static struct Scsi_Host inline *us_to_host(struct us_data *us) {
++	return container_of((void *) us, struct Scsi_Host, hostdata);
++}
++static struct us_data inline *host_to_us(struct Scsi_Host *host) {
++	return (struct us_data *) host->hostdata;
++}
++
+ /* The structure which defines our driver */
+ extern struct usb_driver usb_storage_driver;
+ 
+Index: linux-2.6.10/mvl_patches/pro-1352.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1352.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1352);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

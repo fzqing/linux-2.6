@@ -1,0 +1,539 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc32_440sp_mtd_map
+# Date: Mon Aug 21 08:34:29 2006
+# Source: MontaVista Software, Inc.
+# MR: 17368
+# Type: Enhancement
+# Disposition: needs submitting to linux-mtd
+# Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+# Description:
+# 	Adds MTD map file for the AMCC 440SP Eval.  The 440SP has 2 NOR flashes,
+# 	an SRAM chip, and an FRAM chip.
+# 
+
+PATCHNUM=891
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 17368
+Type: Enhancement
+Disposition: needs submitting to linux-mtd
+Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+Description:
+	Adds MTD map file for the AMCC 440SP Eval.  The 440SP has 2 NOR flashes,
+	an SRAM chip, and an FRAM chip.
+
+Index: linux-2.6.10/drivers/mtd/maps/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Kconfig
++++ linux-2.6.10/drivers/mtd/maps/Kconfig
+@@ -476,6 +476,7 @@ config MTD_OCOTEA
+ 	  This enables access routines for the flash chips on the IBM 440GX
+ 	  Ocotea board. If you have one of these boards and would like to
+ 	  use the flash chips on it, say 'Y'.
++
+ config MTD_BAMBOO
+ 	tristate "Flash devices mapped on IBM 440EP Bamboo"
+ 	depends on MTD_CFI && PPC32 && 44x && BAMBOO
+@@ -484,6 +485,14 @@ config MTD_BAMBOO
+ 	  Bamboo board.  If you have one of these boards and would like to
+ 	  use the flash chips on it, say 'Y'.
+ 
++config MTD_LUAN
++	tristate "Flash devices mapped on IBM 440SP Luan"
++	depends on MTD_CFI && LUAN
++	help
++	  This enables access routines for the flash chips on the IBM 440SP
++	  Luan board. If you have one of these boards and would like to
++	  use the flash chips on it, say 'Y'.
++
+ config MTD_REDWOOD
+ 	tristate "CFI Flash devices mapped on IBM Redwood"
+ 	depends on MTD_CFI && PPC32 && 4xx && 40x && ( REDWOOD_4 || REDWOOD_5 || REDWOOD_6 )
+Index: linux-2.6.10/drivers/mtd/maps/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Makefile
++++ linux-2.6.10/drivers/mtd/maps/Makefile
+@@ -60,6 +60,7 @@ obj-$(CONFIG_MTD_SCB2_FLASH)	+= scb2_fla
+ obj-$(CONFIG_MTD_EBONY)		+= ebony.o
+ obj-$(CONFIG_MTD_OCOTEA)	+= ocotea.o
+ obj-$(CONFIG_MTD_BAMBOO)	+= bamboo.o
++obj-$(CONFIG_MTD_LUAN)		+= luan.o
+ obj-$(CONFIG_MTD_BEECH)		+= beech-mtd.o
+ obj-$(CONFIG_MTD_ARCTIC)	+= arctic-mtd.o
+ obj-$(CONFIG_MTD_WALNUT)        += walnut.o
+Index: linux-2.6.10/drivers/mtd/maps/luan.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/maps/luan.c
+@@ -0,0 +1,264 @@
++/*
++ * Mapping for Luan user flash
++ *
++ * This was dirived from the ocotea.c
++ *
++ * Matt Porter <mporter@mvista.com>
++ *
++ * Copyright 2002-2003 MontaVista Software Inc.
++ * (C) Copyright IBM Corp. 2004
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ * Changes by IBM Corp.
++ * $00 03/04/2004 MN creation for the Luan board
++ * $BU 04/09/04   FM  Large Flash partionning changes
++ *                    (Linux Bring Up)
++ *
++ * 24/03/2005 Added SRAM and FRAM MTD support
++ */
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/map.h>
++#include <linux/mtd/partitions.h>
++#include <linux/config.h>
++#include <linux/version.h>
++#include <asm/io.h>
++
++static struct mtd_info *flash;
++
++static struct map_info luan_sram_map = {
++	.name = "Luan SRAM",
++	.size = LUAN_SRAM_SIZE,
++	.bankwidth = 1,
++};
++
++static struct map_info luan_fram_map = {
++	.name = "Luan FRAM",
++	.size = LUAN_FRAM_SIZE,
++	.bankwidth = 1,
++};
++
++static struct map_info luan_small_map = {
++	.name = "Luan small flash",
++	.size = LUAN_SMALL_FLASH_SIZE,
++	.bankwidth = 1,
++};
++
++static struct map_info luan_large_map = {
++	.name = "Luan large flash",
++	.size = LUAN_LARGE_FLASH_SIZE,
++	.bankwidth = 1,
++};
++
++static struct mtd_partition luan_sram_partitions[] = {
++	{
++	 .name = "SRAM",
++	 .offset = 0x0,
++	 .size = 0x100000,
++	 }
++};
++
++static struct mtd_partition luan_fram_partitions[] = {
++	{
++	 .name = "FRAM",
++	 .offset = 0x0,
++	 .size = 0x8000,
++	 }
++};
++
++static struct mtd_partition luan_small_partitions[] = {
++	{
++	 .name = "Pibs",
++	 .offset = 0x0,
++	 .size = 0x100000,
++	 }
++};
++
++static struct mtd_partition luan_large_partitions[] = {
++	{
++	 .name = "Linux Kernel",
++	 .offset = 0,
++	 .size = 0x100000,	/* new size:    change from 0x300000 to 0x100000 */
++	 },
++	{
++	 .name = "Free Area",
++	 .offset = 0x100000,	/* new offset:  change from 0x300000 to 0x100000 */
++	 .size = 0x300000,	/* new size:    change from 0x100000 to 0x300000 */
++	 }
++};
++
++#define NB_OF(x)  (sizeof(x)/sizeof(x[0]))
++
++int __init init_luan(void)
++{
++	u8 fpga0_reg;
++	u8 *fpga0_adr;
++	unsigned long long small_flash_base, large_flash_base;
++	unsigned long long sram_base;
++
++	fpga0_adr = ioremap64(LUAN_FPGA_REG_0, 16);
++	if (!fpga0_adr)
++		return -ENOMEM;
++
++	fpga0_reg = readb((unsigned long)fpga0_adr);
++	iounmap(fpga0_adr);
++
++	if (LUAN_BOOT_LARGE_FLASH(fpga0_reg)) {
++
++		large_flash_base = LUAN_LARGE_FLASH_LOW;
++
++		if ((fpga0_reg & LUAN_CONFIG_MASK) == LUAN_CONFIG_1) {
++			small_flash_base = LUAN_SMALL_FLASH_HIGH;
++			sram_base = LUAN_SRAM_HIGH;
++		} else if ((fpga0_reg & LUAN_CONFIG_MASK) == LUAN_CONFIG_2) {
++			small_flash_base = LUAN_SMALL_FLASH_HIGH2;
++			sram_base = LUAN_SRAM_HIGH2;
++		} else {
++			printk("invalid board config: fpga0_reg= %x\n",
++			       fpga0_reg);
++			return -EIO;
++		}
++	} else {
++		large_flash_base = LUAN_LARGE_FLASH_HIGH;
++
++		if ((fpga0_reg & LUAN_CONFIG_MASK) == LUAN_CONFIG_3) {
++			small_flash_base = LUAN_SMALL_FLASH_LOW;
++			sram_base = LUAN_SRAM_LOW;
++		} else if ((fpga0_reg & LUAN_CONFIG_MASK) == LUAN_CONFIG_4) {
++			small_flash_base = LUAN_SMALL_FLASH_LOW4;
++			sram_base = LUAN_SRAM_LOW4;
++		} else {
++			printk("invalid board config: fpga0_reg= %x\n",
++			       fpga0_reg);
++			return -EIO;
++		}
++	}
++
++	luan_small_map.phys = small_flash_base;
++	luan_small_map.virt =
++	    (unsigned long)ioremap64(small_flash_base, luan_small_map.size);
++
++	if (!luan_small_map.virt) {
++		printk("Failed to ioremap small flash\n");
++		return -EIO;
++	}
++
++	simple_map_init(&luan_small_map);
++
++	flash = do_map_probe("map_rom", &luan_small_map);
++	if (flash) {
++		flash->owner = THIS_MODULE;
++		add_mtd_partitions(flash, luan_small_partitions,
++				   NB_OF(luan_small_partitions));
++	} else {
++		printk("map probe failed for small flash\n");
++		return -ENXIO;
++	}
++
++	luan_large_map.phys = large_flash_base;
++	luan_large_map.virt =
++	    (unsigned long)ioremap64(large_flash_base, luan_large_map.size);
++
++	if (!luan_large_map.virt) {
++		printk("Failed to ioremap large flash\n");
++		return -EIO;
++	}
++
++	simple_map_init(&luan_large_map);
++
++	flash = do_map_probe("cfi_probe", &luan_large_map);
++	if (flash) {
++		flash->owner = THIS_MODULE;
++		add_mtd_partitions(flash, luan_large_partitions,
++				   NB_OF(luan_large_partitions));
++	} else {
++		printk("map probe failed for large flash\n");
++		return -ENXIO;
++	}
++
++	luan_sram_map.phys = sram_base;
++	luan_sram_map.virt =
++	    (unsigned long)ioremap64(sram_base, luan_sram_map.size);
++
++	if (!luan_sram_map.virt) {
++		printk("Failed to ioremap SRAM\n");
++		return -EIO;
++	}
++
++	simple_map_init(&luan_sram_map);
++
++	flash = do_map_probe("map_ram", &luan_sram_map);
++	if (flash) {
++		flash->owner = THIS_MODULE;
++		add_mtd_partitions(flash, luan_sram_partitions,
++				   NB_OF(luan_sram_partitions));
++	} else {
++		printk("map probe failed for SRAM\n");
++		return -ENXIO;
++	}
++
++	luan_fram_map.phys = LUAN_FRAM_ADDR;
++	luan_fram_map.virt =
++	    (unsigned long)ioremap64(LUAN_FRAM_ADDR, luan_fram_map.size);
++
++	if (!luan_fram_map.virt) {
++		printk("Failed to ioremap FRAM\n");
++		return -EIO;
++	}
++
++	simple_map_init(&luan_fram_map);
++
++	flash = do_map_probe("map_ram", &luan_fram_map);
++	if (flash) {
++		flash->owner = THIS_MODULE;
++		add_mtd_partitions(flash, luan_fram_partitions,
++				   NB_OF(luan_fram_partitions));
++	} else {
++		printk("map probe failed for FRAM\n");
++		return -ENXIO;
++	}
++	return 0;
++}
++
++static void __exit cleanup_luan(void)
++{
++	if (flash) {
++		del_mtd_partitions(flash);
++		map_destroy(flash);
++	}
++
++	if (luan_small_map.virt) {
++		iounmap((void *)luan_small_map.virt);
++		luan_small_map.virt = 0;
++	}
++
++	if (luan_large_map.virt) {
++		iounmap((void *)luan_large_map.virt);
++		luan_large_map.virt = 0;
++	}
++
++	if (luan_fram_map.virt) {
++		iounmap((void *)luan_fram_map.virt);
++		luan_fram_map.virt = 0;
++	}
++
++	if (luan_sram_map.virt) {
++		iounmap((void *)luan_sram_map.virt);
++		luan_sram_map.virt = 0;
++	}
++}
++
++module_init(init_luan);
++module_exit(cleanup_luan);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Matt Porter <mporter@mvista.com>");
++MODULE_DESCRIPTION("MTD map and partitions for IBM 440SP Luan boards");
+Index: linux-2.6.10/mvl_patches/pro-0891.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0891.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(891);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

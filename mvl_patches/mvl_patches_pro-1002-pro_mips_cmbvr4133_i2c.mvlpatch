@@ -1,0 +1,502 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_cmbvr4133_i2c
+# Date: Tue Nov 28 11:33:26 2006
+# Source: MontaVista Software, Inc.
+# MR: 18842
+# Type: Enhancement
+# Disposition: needs submitting to i2c@lm-sensors.org
+# Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+# Description:
+#     This adds support for a GPIO-based I2C interface on the NEC CMB-VR4133.
+# 
+
+PATCHNUM=1002
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18842
+Type: Enhancement
+Disposition: needs submitting to i2c@lm-sensors.org
+Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+Description:
+    This adds support for a GPIO-based I2C interface on the NEC CMB-VR4133.
+
+Index: linux-2.6.10/arch/mips/vr41xx/nec-cmbvr4133/setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/vr41xx/nec-cmbvr4133/setup.c
++++ linux-2.6.10/arch/mips/vr41xx/nec-cmbvr4133/setup.c
+@@ -119,6 +119,24 @@ static struct platform_device nec_candy1
+ };
+ #endif
+ 
++#ifdef CONFIG_I2C_VR41XX
++#include <asm/vr41xx/giu.h>
++
++static struct vr41xx_i2c_pins cmbvr4133_i2c_gpio_pins = {
++	.sda_pin	= CMBVR4133_SDA_PIN,
++	.scl_pin	= CMBVR4133_SCL_PIN,
++};
++
++static struct platform_device cmbvr4133_i2c_controller = {
++	.name		= "VR41XX-I2C",
++	.id		= 0,
++	.dev		= {
++		.platform_data = &cmbvr4133_i2c_gpio_pins,
++	},
++	.num_resources	= 0,
++};
++#endif
++
+ static int __init nec_cmbvr4133_arch_setup(void)
+ {
+ #ifdef CONFIG_NEC_CANDY
+@@ -132,6 +150,10 @@ static int __init nec_cmbvr4133_arch_set
+ 	memcpy(nec_candy1_pdata.mac_addr, (void *) CMBVR4133_MAC1_FLASH, 6);
+ 	platform_device_register(&nec_candy1_device);
+ #endif
++
++#ifdef CONFIG_I2C_VR41XX
++	platform_device_register(&cmbvr4133_i2c_controller);
++#endif
+ 	return 0;
+ }
+ arch_initcall(nec_cmbvr4133_arch_setup);
+Index: linux-2.6.10/drivers/i2c/busses/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Kconfig
++++ linux-2.6.10/drivers/i2c/busses/Kconfig
+@@ -523,4 +523,15 @@ config I2C_EMMA2RH
+ 	help
+  	  Support for NEC EMMA2RH I2C Adapter
+ 
++config I2C_VR41XX
++	tristate "VR41xx GPIO-Based I2C Interface"
++	depends on I2C && CPU_VR41XX
++	select I2C_ALGOBIT
++	help
++	  Say Y here if you have an NEC VR41xx based system and are using GPIO
++	  lines for an I2C bus.
++
++	  This support is also available as a module. If so, the module
++	  will be called i2c-vr41xx.
++
+ endmenu
+Index: linux-2.6.10/drivers/i2c/busses/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Makefile
++++ linux-2.6.10/drivers/i2c/busses/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_I2C_OMAP)          += i2c-o
+ obj-$(CONFIG_AVALANCHE_SSP_I2C) += i2c_avalanche.o
+ obj-$(CONFIG_I2C_DAVINCI)       += i2c-davinci.o
+ obj-$(CONFIG_I2C_EMMA2RH)	+= i2c-emma2rh.o
++obj-$(CONFIG_I2C_VR41XX)	+= i2c-vr41xx.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_BUS),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/drivers/i2c/busses/i2c-vr41xx.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/busses/i2c-vr41xx.c
+@@ -0,0 +1,153 @@
++/*
++ * drivers/i2c/busses/i2c-vr41xx.c
++ *
++ * The NEC VR41XX series does not have an I2C controller, but some boards, such
++ * as the NEC CMB-VR4133, use GPIO pins to create an I2C bus.
++ *
++ * Author: Wade Farnsworth <wfarnsworth@mvista.com>
++ *
++ * Copyright (c) 2006 MontaVista Software Inc.
++ *
++ * This is based on i2c-ixp4xx.c by Deepak Saxena <dsaxena@plexity.net>
++ * Copyright (c) 2003-2004 MontaVista Software Inc.
++ *
++ * This file is licensed under the terms of the GNU General Public
++ * License version 2. This program is licensed "as is" without any
++ * warranty of any kind, whether express or implied.
++ */
++
++#include <linux/config.h>
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/i2c-algo-bit.h>
++#include <linux/delay.h>
++
++#include <asm/vr41xx/giu.h>
++
++static inline int vr41xx_scl_pin(void *data)
++{
++	return ((struct vr41xx_i2c_pins*)data)->scl_pin;
++}
++
++static inline int vr41xx_sda_pin(void *data)
++{
++	return ((struct vr41xx_i2c_pins*)data)->sda_pin;
++}
++
++static void vr41xx_bit_setscl(void *data, int val)
++{
++	vr41xx_gpio_set_pin(vr41xx_scl_pin(data), val ? GPIO_DATA_HIGH :
++							GPIO_DATA_LOW);
++}
++
++static void vr41xx_bit_setsda(void *data, int val)
++{
++	vr41xx_gpio_set_direction(vr41xx_sda_pin(data), GPIO_OUTPUT);
++	if (val) {
++		vr41xx_gpio_set_pin(vr41xx_sda_pin(data), GPIO_DATA_HIGH);
++		vr41xx_gpio_set_direction(vr41xx_sda_pin(data), GPIO_INPUT);
++	} else
++		vr41xx_gpio_set_pin(vr41xx_sda_pin(data), GPIO_DATA_LOW);
++}
++
++static int vr41xx_bit_getsda(void *data)
++{
++	return vr41xx_gpio_get_pin(vr41xx_sda_pin(data));
++}
++
++struct vr41xx_i2c_data {
++	struct vr41xx_i2c_pins *gpio_pins;
++	struct i2c_adapter adapter;
++	struct i2c_algo_bit_data algo_data;
++};
++
++static int vr41xx_i2c_remove(struct device *dev)
++{
++	struct platform_device *plat_dev = to_platform_device(dev);
++	struct vr41xx_i2c_data *drv_data = dev_get_drvdata(&plat_dev->dev);
++
++	dev_set_drvdata(&plat_dev->dev, NULL);
++
++	i2c_bit_del_bus(&drv_data->adapter);
++
++	kfree(drv_data);
++
++	return 0;
++}
++
++static int vr41xx_i2c_probe(struct device *dev)
++{
++	int err;
++	struct platform_device *plat_dev = to_platform_device(dev);
++	struct vr41xx_i2c_pins *gpio = plat_dev->dev.platform_data;
++	struct vr41xx_i2c_data *drv_data =
++		kmalloc(sizeof(struct vr41xx_i2c_data), GFP_KERNEL);
++
++	if(!drv_data)
++		return -ENOMEM;
++
++	memset(drv_data, 0, sizeof(struct vr41xx_i2c_data));
++	drv_data->gpio_pins = gpio;
++
++	/*
++	 * We could make a lot of these structures static, but
++	 * certain platforms may have multiple GPIO-based I2C
++	 * buses for various device domains, so we need per-device
++	 * algo_data->data.
++	 */
++	drv_data->algo_data.data = gpio;
++	drv_data->algo_data.setsda = vr41xx_bit_setsda;
++	drv_data->algo_data.setscl = vr41xx_bit_setscl;
++	drv_data->algo_data.getsda = vr41xx_bit_getsda;
++	drv_data->algo_data.udelay = 40;
++	drv_data->algo_data.mdelay = 40;
++	drv_data->algo_data.timeout = 400;
++	drv_data->adapter.id = I2C_HW_B_VR41XX,
++	drv_data->adapter.algo_data = &drv_data->algo_data,
++
++	drv_data->adapter.dev.parent = &plat_dev->dev;
++
++	vr41xx_gpio_set_direction(gpio->scl_pin, GPIO_OUTPUT);
++	vr41xx_gpio_set_pin(gpio->scl_pin, GPIO_DATA_HIGH);
++	vr41xx_gpio_set_direction(gpio->sda_pin, GPIO_OUTPUT);
++	vr41xx_gpio_set_pin(gpio->sda_pin, GPIO_DATA_HIGH);
++
++	if ((err = i2c_bit_add_bus(&drv_data->adapter) != 0)) {
++		printk(KERN_ERR "ERROR: Could not install %s\n", dev->bus_id);
++
++		kfree(drv_data);
++		return err;
++	}
++
++	dev_set_drvdata(&plat_dev->dev, drv_data);
++
++	return 0;
++}
++
++static struct device_driver vr41xx_i2c_driver = {
++	.name	= "VR41XX-I2C",
++	.bus	= &platform_bus_type,
++	.probe	= vr41xx_i2c_probe,
++	.remove	= vr41xx_i2c_remove,
++};
++
++static int __init vr41xx_i2c_init(void)
++{
++	return driver_register(&vr41xx_i2c_driver);
++}
++
++static void __exit vr41xx_i2c_exit(void)
++{
++	driver_unregister(&vr41xx_i2c_driver);
++}
++
++module_init(vr41xx_i2c_init);
++module_exit(vr41xx_i2c_exit);
++
++MODULE_DESCRIPTION("GPIO-based I2C adapter for VR41xx systems");
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Wade Farnsworth <wfarnsworth@mvista.com>");
+Index: linux-2.6.10/include/asm-mips/vr41xx/giu.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/vr41xx/giu.h
++++ linux-2.6.10/include/asm-mips/vr41xx/giu.h
+@@ -66,4 +66,13 @@ typedef enum {
+ 
+ extern int vr41xx_gpio_pullupdown(unsigned int pin, gpio_pull_t pull);
+ 
++/*
++ * The VR41xx chips do not have an I2C unit, so GPIO lines are used to provide
++ * GPIO pin information to the vr41xx I2C driver.
++ */
++struct vr41xx_i2c_pins {
++	unsigned long sda_pin;
++	unsigned long scl_pin;
++};
++
+ #endif /* __NEC_VR41XX_GIU_H */
+Index: linux-2.6.10/include/linux/i2c-id.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/i2c-id.h
++++ linux-2.6.10/include/linux/i2c-id.h
+@@ -237,6 +237,7 @@
+ #define I2C_HW_B_IXP4XX 0x17	/* GPIO on IXP4XX systems		*/
+ #define I2C_HW_B_S3VIA	0x18	/* S3Via ProSavage adapter		*/
+ #define I2C_HW_B_ZR36067 0x19	/* Zoran-36057/36067 based boards	*/
++#define I2C_HW_B_VR41XX 0x1a	/* GPIO on VR41XX systems		*/
+ 
+ /* --- PCF 8584 based algorithms					*/
+ #define I2C_HW_P_LP	0x00	/* Parallel port interface		*/
+Index: linux-2.6.10/include/asm-mips/vr41xx/cmbvr4133.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/vr41xx/cmbvr4133.h
++++ linux-2.6.10/include/asm-mips/vr41xx/cmbvr4133.h
+@@ -60,5 +60,8 @@
+ #define RTC_PORT(x)	(0xaf000100 + (x))
+ #define RTC_IO_EXTENT	0x140
+ 
++#define CMBVR4133_SDA_PIN		6
++#define CMBVR4133_SCL_PIN		35
++
+ void rockhopper_init_irq(void);
+ #endif /* __NEC_CMBVR4133_H */
+Index: linux-2.6.10/mvl_patches/pro-1002.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1002.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1002);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

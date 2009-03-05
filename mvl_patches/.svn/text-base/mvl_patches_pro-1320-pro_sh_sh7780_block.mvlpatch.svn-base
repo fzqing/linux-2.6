@@ -1,0 +1,470 @@
+#! /usr/bin/env bash
+# Patch: -pro_sh_sh7780_block
+# Date: Fri May  4 10:07:33 2007
+# Source: MontaVista Software, Inc.
+# MR: 20464
+# Type: Enhancement
+# Disposition: needs submitting to open-source
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	Implementation of IDE interface driver
+# 
+
+PATCHNUM=1320
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 20464
+Type: Enhancement
+Disposition: needs submitting to open-source
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	Implementation of IDE interface driver
+
+Index: linux-2.6.10/drivers/ide/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/Kconfig
++++ linux-2.6.10/drivers/ide/Kconfig
+@@ -822,6 +822,9 @@ config BLK_DEV_IDE_AU1XXX_SEQTS_PER_RQ
+ 	default "128"
+ 	depends BLK_DEV_IDE_AU1XXX
+ 
++config IDE_SH
++	def_bool SUPERH
++ 
+ config IDE_ARM
+ 	def_bool ARM && (ARCH_A5K || ARCH_CLPS7500 || ARCH_RPC || ARCH_SHARK)
+ 
+Index: linux-2.6.10/drivers/ide/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/Makefile
++++ linux-2.6.10/drivers/ide/Makefile
+@@ -39,6 +39,9 @@ ide-core-$(CONFIG_BLK_DEV_Q40IDE)	+= leg
+ ide-core-$(CONFIG_BLK_DEV_MPC8xx_IDE)	+= ppc/mpc8xx.o
+ ide-core-$(CONFIG_BLK_DEV_IDE_PMAC)	+= ppc/pmac.o
+ 
++# built-in only drivers from sh/
++ide-core-$(CONFIG_IDE_SH)               += sh/ide-sh.o
++
+ # built-in only drivers from h8300/
+ ide-core-$(CONFIG_H8300)		+= h8300/ide-h8300.o
+ 
+Index: linux-2.6.10/drivers/ide/ide.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/ide.c
++++ linux-2.6.10/drivers/ide/ide.c
+@@ -2181,6 +2181,12 @@ static void __init probe_for_hwifs (void
+ #ifdef CONFIG_BLK_DEV_IDEPNP
+ 	pnpide_init();
+ #endif
++#ifdef CONFIG_IDE_SH
++        {
++                extern void ide_sh_init(void);
++                ide_sh_init();
++        }
++#endif
+ #ifdef CONFIG_H8300
+ 	h8300_ide_init();
+ #endif
+Index: linux-2.6.10/drivers/ide/pci/siimage.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/siimage.c
++++ linux-2.6.10/drivers/ide/pci/siimage.c
+@@ -35,6 +35,10 @@
+ #undef SIIMAGE_VIRTUAL_DMAPIO
+ #undef SIIMAGE_LARGE_DMA
+ 
++#ifndef PCI_DEVICE_ID_SII_3512
++#define PCI_DEVICE_ID_SII_3512		0x3512
++#endif
++
+ /**
+  *	pdev_is_sata		-	check if device is SATA
+  *	@pdev:	PCI device to check
+@@ -48,6 +52,7 @@ static int pdev_is_sata(struct pci_dev *
+ 	{
+ 		case PCI_DEVICE_ID_SII_3112:
+ 		case PCI_DEVICE_ID_SII_1210SA:
++		case PCI_DEVICE_ID_SII_3512:
+ 			return 1;
+ 		case PCI_DEVICE_ID_SII_680:
+ 			return 0;
+@@ -1086,7 +1091,8 @@ static void __devinit init_hwif_siimage(
+ static ide_pci_device_t siimage_chipsets[] __devinitdata = {
+ 	/* 0 */ DECLARE_SII_DEV("SiI680"),
+ 	/* 1 */ DECLARE_SII_DEV("SiI3112 Serial ATA"),
+-	/* 2 */ DECLARE_SII_DEV("Adaptec AAR-1210SA")
++	/* 2 */ DECLARE_SII_DEV("Adaptec AAR-1210SA"),
++	/* 3 */ DECLARE_SII_DEV("SiI3512 Serial ATA")
+ };
+ 
+ /**
+@@ -1109,6 +1115,7 @@ static struct pci_device_id siimage_pci_
+ #ifdef CONFIG_BLK_DEV_IDE_SATA
+ 	{ PCI_VENDOR_ID_CMD, PCI_DEVICE_ID_SII_3112, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 1},
+ 	{ PCI_VENDOR_ID_CMD, PCI_DEVICE_ID_SII_1210SA, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 2},
++	{ PCI_VENDOR_ID_CMD, PCI_DEVICE_ID_SII_3512, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 3},
+ #endif
+ 	{ 0, },
+ };
+Index: linux-2.6.10/drivers/ide/sh/ide-sh.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/ide/sh/ide-sh.c
+@@ -0,0 +1,120 @@
++/*
++ * SuperH default IDE host driver
++ *
++ * Copyright (C) 2004  Paul Mundt
++ *
++ * Based on the old include/asm-sh/ide.h
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ */
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/ide.h>
++
++#include <asm/irq.h>
++
++enum {
++	IDE_SH_PRIMARY_IO = 0x1f0,
++	IDE_SH_SECONDARY_IO = 0x170,
++};
++
++#if defined(CONFIG_CF_ENABLER)
++#  if defined(CONFIG_SH_SOLUTION_ENGINE)
++#    define IDE_SH_PRIMARY_IRQ	7
++#    define IDE_SH_SECONDARY_IRQ	0
++#  elif defined(CONFIG_SH_7751_SOLUTION_ENGINE)
++#    define IDE_SH_PRIMARY_IRQ		14
++#    define IDE_SH_SECONDARY_IRQ	15
++#  elif defined(CONFIG_SH_SOLUTION_ENGINE_2ND)
++#    if defined(CONFIG_CPU_SUBTYPE_SH7727)
++#      define IDE_SH_PRIMARY_IRQ	IRQ4_IRQ
++#    elif defined(CONFIG_CPU_SUBTYPE_SH7751)
++#      define IDE_SH_PRIMARY_IRQ	14
++#    elif defined(CONFIG_CPU_SUBTYPE_SH7760)
++#      define IDE_SH_PRIMARY_IRQ	10
++#    endif
++#    define IDE_SH_SECONDARY_IRQ	0
++#  elif defined(CONFIG_SH_SOLUTION_ENGINE_LIGHT)
++#    if defined(CONFIG_CPU_SUBTYPE_SH7727)
++#      define IDE_SH_PRIMARY_IRQ	IRQ4_IRQ
++#    else
++#      define IDE_SH_PRIMARY_IRQ	7
++#    endif
++#    define IDE_SH_SECONDARY_IRQ	0
++#  elif defined(CONFIG_SH_SOLUTION_ENGINE_PLUS)
++#    define IDE_SH_PRIMARY_IRQ		14
++#    define IDE_SH_SECONDARY_IRQ	13
++#  else
++#    define IDE_SH_PRIMARY_IRQ		14
++#    define IDE_SH_SECONDARY_IRQ	15
++#  endif
++#else
++#define IDE_SH_PRIMARY_IRQ	14
++#define IDE_SH_SECONDARY_IRQ	15
++#endif
++
++struct sh_ide_hwif {
++	unsigned long base;
++	int irq;
++} sh_ide_hwifs[] __initdata = {
++	{
++	IDE_SH_PRIMARY_IO, IDE_SH_PRIMARY_IRQ}, {
++	IDE_SH_SECONDARY_IO, IDE_SH_SECONDARY_IRQ}, {
++0,},};
++
++static inline void __init hw_setup(hw_regs_t * hw, int idx)
++{
++	unsigned long base = sh_ide_hwifs[idx].base;
++
++	if (!request_region(base, 8, "ide-sh"))
++		return;
++	if (!request_region(base + 0x206, 1, "ide-sh"))
++		return;
++
++	memset(hw, 0, sizeof(hw_regs_t));
++	ide_std_init_ports(hw, base, base + 0x206);
++
++	hw->irq = sh_ide_hwifs[idx].irq;
++	hw->dma = NO_DMA;
++	hw->chipset = ide_generic;
++}
++
++static inline void __init hwif_setup(ide_hwif_t * hwif)
++{
++	default_hwif_iops(hwif);
++
++	hwif->mmio = 2;
++}
++
++void __init ide_sh_init(void)
++{
++	int i;
++
++	printk(KERN_INFO "ide: SuperH generic IDE interface\n");
++
++	for (i = 0; i < MAX_HWIFS; i++) {
++		ide_hwif_t *hwif;
++		hw_regs_t hw;
++		int idx;
++
++		if (!sh_ide_hwifs[i].base) {
++			printk(KERN_ERR "ide-sh: Attempting to register ide%d "
++			       "when only %d interfaces are available.\n",
++			       i, i - 1);
++			break;
++		}
++
++		hw_setup(&hw, i);
++
++		idx = ide_register_hw(&hw, &hwif);
++		if (idx == -1) {
++			printk(KERN_ERR
++			       "ide-sh: IDE interface registration failed\n");
++			return;
++		}
++
++		hwif_setup(hwif);
++	}
++}
+Index: linux-2.6.10/drivers/scsi/sata_sil.c
+===================================================================
+--- linux-2.6.10.orig/drivers/scsi/sata_sil.c
++++ linux-2.6.10/drivers/scsi/sata_sil.c
+@@ -43,6 +43,7 @@
+ enum {
+ 	sil_3112		= 0,
+ 	sil_3114		= 1,
++	sil_3512                = 2,
+ 
+ 	SIL_SYSCFG		= 0x48,
+ 	SIL_MASK_IDE0_INT	= (1 << 22),
+@@ -165,7 +166,17 @@ static struct ata_port_info sil_port_inf
+ 		.mwdma_mask	= 0x07,			/* mwdma0-2 */
+ 		.udma_mask	= 0x3f,			/* udma0-5 */
+ 		.port_ops	= &sil_ops,
++	},/* sil_3512 */
++	{
++		.sht            = &sil_sht,
++		.host_flags     = ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
++				ATA_FLAG_SRST | ATA_FLAG_MMIO,
++		.pio_mask       = 0x03,                 /* pio0-3 */
++		.mwdma_mask     = 0x07,                 /* mwdma0-2 */
++		.udma_mask      = 0x7f,                 /* udma0-6 */
++		.port_ops       = &sil_ops,
+ 	},
++
+ };
+ 
+ /* per-port register offsets */
+Index: linux-2.6.10/mvl_patches/pro-1320.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1320.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1320);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

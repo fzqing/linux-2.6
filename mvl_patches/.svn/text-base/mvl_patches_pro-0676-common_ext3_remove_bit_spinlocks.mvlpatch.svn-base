@@ -1,0 +1,428 @@
+#! /usr/bin/env bash
+# Patch: -common_ext3_remove_bit_spinlocks
+# Date: Thu Jun 29 13:34:56 2006
+# Source: MontaVista Software, Inc. 
+# MR: 18978
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Daniel Walker <dwalker@mvista.com>
+# Description:
+# 
+# 	This patch is mostly a backport of what's in the current
+# RT patch, 2.6.17-rt1. I had to make some changes due to the 
+
+PATCHNUM=676
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 18978
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Daniel Walker <dwalker@mvista.com>
+Description:
+
+	This patch is mostly a backport of what's in the current
+RT patch, 2.6.17-rt1. I had to make some changes due to the 
+differences in kernel version .
+
+	The reason for this patch is that bit spinlock's don't work
+with SCHED_FIFO and SCHED_RR type tasks in all preempt modes. What
+happens is that a low priority task will lock a bit spinlock, then
+a high priority task will preempt the low priority task and try to
+lock the same bit spinlock. The result is a deadlock.
+
+The fix is not to use bit spinlocks. There's no real reason why they 
+are needed. We've had them replaced now with semaphores, and spinlocks
+both of which seem to work . Spinlocks seem to be more acceptable up
+stream because Andrew Morton has said he doesn't want filesystem ops
+to sleep. Which is why we're using spinlocks.
+
+Index: linux-2.6.10/fs/buffer.c
+===================================================================
+--- linux-2.6.10.orig/fs/buffer.c
++++ linux-2.6.10/fs/buffer.c
+@@ -528,7 +528,6 @@ static void free_more_memory(void)
+  */
+ static void end_buffer_async_read(struct buffer_head *bh, int uptodate)
+ {
+-	static DEFINE_SPINLOCK(page_uptodate_lock);
+ 	unsigned long flags;
+ 	struct buffer_head *tmp;
+ 	struct page *page;
+@@ -550,7 +549,7 @@ static void end_buffer_async_read(struct
+ 	 * two buffer heads end IO at almost the same time and both
+ 	 * decide that the page is now completely done.
+ 	 */
+-	spin_lock_irqsave(&page_uptodate_lock, flags);
++	spin_lock_irqsave(&bh->b_uptodate_lock, flags);
+ 	clear_buffer_async_read(bh);
+ 	unlock_buffer(bh);
+ 	tmp = bh;
+@@ -563,7 +562,7 @@ static void end_buffer_async_read(struct
+ 		}
+ 		tmp = tmp->b_this_page;
+ 	} while (tmp != bh);
+-	spin_unlock_irqrestore(&page_uptodate_lock, flags);
++	spin_unlock_irqrestore(&bh->b_uptodate_lock, flags);
+ 
+ 	/*
+ 	 * If none of the buffers had errors and they are all
+@@ -575,7 +574,7 @@ static void end_buffer_async_read(struct
+ 	return;
+ 
+ still_busy:
+-	spin_unlock_irqrestore(&page_uptodate_lock, flags);
++	spin_unlock_irqrestore(&bh->b_uptodate_lock, flags);
+ 	return;
+ }
+ 
+@@ -586,7 +585,6 @@ still_busy:
+ void end_buffer_async_write(struct buffer_head *bh, int uptodate)
+ {
+ 	char b[BDEVNAME_SIZE];
+-	static DEFINE_SPINLOCK(page_uptodate_lock);
+ 	unsigned long flags;
+ 	struct buffer_head *tmp;
+ 	struct page *page;
+@@ -608,7 +606,7 @@ void end_buffer_async_write(struct buffe
+ 		SetPageError(page);
+ 	}
+ 
+-	spin_lock_irqsave(&page_uptodate_lock, flags);
++	spin_lock_irqsave(&bh->b_uptodate_lock, flags);
+ 	clear_buffer_async_write(bh);
+ 	unlock_buffer(bh);
+ 	tmp = bh->b_this_page;
+@@ -619,12 +617,12 @@ void end_buffer_async_write(struct buffe
+ 		}
+ 		tmp = tmp->b_this_page;
+ 	}
+-	spin_unlock_irqrestore(&page_uptodate_lock, flags);
++	spin_unlock_irqrestore(&bh->b_uptodate_lock, flags);
+ 	end_page_writeback(page);
+ 	return;
+ 
+ still_busy:
+-	spin_unlock_irqrestore(&page_uptodate_lock, flags);
++	spin_unlock_irqrestore(&bh->b_uptodate_lock, flags);
+ 	return;
+ }
+ 
+@@ -3017,6 +3015,8 @@ init_buffer_head(void *data, kmem_cache_
+ 
+ 		memset(bh, 0, sizeof(*bh));
+ 		INIT_LIST_HEAD(&bh->b_assoc_buffers);
++		spin_lock_init(&bh->b_uptodate_lock);
++		spin_lock_init(&bh->b_state_lock);
+ 	}
+ }
+ 
+Index: linux-2.6.10/fs/jbd/transaction.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/transaction.c
++++ linux-2.6.10/fs/jbd/transaction.c
+@@ -1467,7 +1467,7 @@ void __journal_unfile_buffer(struct jour
+ 	transaction_t *transaction;
+ 	struct buffer_head *bh = jh2bh(jh);
+ 
+-	J_ASSERT_JH(jh, jbd_is_locked_bh_state(bh));
++	J_ASSERT_JH_SMP(jh, jbd_is_locked_bh_state(bh));
+ 	transaction = jh->b_transaction;
+ 	if (transaction)
+ 		assert_spin_locked(&transaction->t_journal->j_list_lock);
+@@ -1899,7 +1899,7 @@ void __journal_file_buffer(struct journa
+ 	int was_dirty = 0;
+ 	struct buffer_head *bh = jh2bh(jh);
+ 
+-	J_ASSERT_JH(jh, jbd_is_locked_bh_state(bh));
++	J_ASSERT_JH_SMP(jh, jbd_is_locked_bh_state(bh));
+ 	assert_spin_locked(&transaction->t_journal->j_list_lock);
+ 
+ 	J_ASSERT_JH(jh, jh->b_jlist < BJ_Types);
+@@ -1988,7 +1988,7 @@ void __journal_refile_buffer(struct jour
+ 	int was_dirty;
+ 	struct buffer_head *bh = jh2bh(jh);
+ 
+-	J_ASSERT_JH(jh, jbd_is_locked_bh_state(bh));
++	J_ASSERT_JH_SMP(jh, jbd_is_locked_bh_state(bh));
+ 	if (jh->b_transaction)
+ 		assert_spin_locked(&jh->b_transaction->t_journal->j_list_lock);
+ 
+Index: linux-2.6.10/include/linux/buffer_head.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/buffer_head.h
++++ linux-2.6.10/include/linux/buffer_head.h
+@@ -62,6 +62,8 @@ struct buffer_head {
+ 	bh_end_io_t *b_end_io;		/* I/O completion */
+  	void *b_private;		/* reserved for b_end_io */
+ 	struct list_head b_assoc_buffers; /* associated with another mapping */
++	spinlock_t b_uptodate_lock;
++	spinlock_t b_state_lock;
+ };
+ 
+ /*
+Index: linux-2.6.10/include/linux/jbd.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/jbd.h
++++ linux-2.6.10/include/linux/jbd.h
+@@ -271,6 +271,15 @@ void buffer_assertion_failure(struct buf
+ #define J_ASSERT(assert)	do { } while (0)
+ #endif		/* JBD_ASSERTIONS */
+ 
++/*
++ * For assertions that are only valid on SMP (e.g. spin_is_locked()):
++ */
++#ifdef CONFIG_SMP
++# define J_ASSERT_JH_SMP(jh, expr)	J_ASSERT_JH(jh, expr)
++#else
++# define J_ASSERT_JH_SMP(jh, assert)	do { } while (0)
++#endif
++
+ #if defined(JBD_PARANOID_IOFAIL)
+ #define J_EXPECT(expr, why...)		J_ASSERT(expr)
+ #define J_EXPECT_BH(bh, expr, why...)	J_ASSERT_BH(bh, expr)
+@@ -324,32 +333,32 @@ static inline struct journal_head *bh2jh
+ 
+ static inline void jbd_lock_bh_state(struct buffer_head *bh)
+ {
+-	bit_spin_lock(BH_State, &bh->b_state);
++	spin_lock(&bh->b_state_lock);
+ }
+ 
+ static inline int jbd_trylock_bh_state(struct buffer_head *bh)
+ {
+-	return bit_spin_trylock(BH_State, &bh->b_state);
++	return spin_trylock(&bh->b_state_lock);
+ }
+ 
+ static inline int jbd_is_locked_bh_state(struct buffer_head *bh)
+ {
+-	return bit_spin_is_locked(BH_State, &bh->b_state);
++	return spin_is_locked(&bh->b_state_lock);
+ }
+ 
+ static inline void jbd_unlock_bh_state(struct buffer_head *bh)
+ {
+-	bit_spin_unlock(BH_State, &bh->b_state);
++	spin_unlock(&bh->b_state_lock);
+ }
+ 
+ static inline void jbd_lock_bh_journal_head(struct buffer_head *bh)
+ {
+-	bit_spin_lock(BH_JournalHead, &bh->b_state);
++	spin_lock(&bh->b_uptodate_lock);
+ }
+ 
+ static inline void jbd_unlock_bh_journal_head(struct buffer_head *bh)
+ {
+-	bit_spin_unlock(BH_JournalHead, &bh->b_state);
++	spin_unlock(&bh->b_uptodate_lock);
+ }
+ 
+ struct jbd_revoke_table_s;
+Index: linux-2.6.10/mvl_patches/pro-0676.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0676.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(676);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,989 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_tx493x_mtd
+# Date: Wed Dec 28 15:03:39 2005
+# Source: MontaVista Software, Inc.
+# MR: 14557
+# Type: Enhancement
+# Disposition: needs submitting to linux-mips.org
+# Signed-off-by: Yuri Shpilevsky <yshpilevsky@ru.mvista.com>
+# 	Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     MTD support for RBTX4938 and RBTX4939 NOR flash.
+# 
+
+PATCHNUM=268
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14557
+Type: Enhancement
+Disposition: needs submitting to linux-mips.org
+Signed-off-by: Yuri Shpilevsky <yshpilevsky@ru.mvista.com>
+	Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    MTD support for RBTX4938 and RBTX4939 NOR flash.
+
+Index: linux-2.6.10/arch/mips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/mips/Kconfig
++++ linux-2.6.10/arch/mips/Kconfig
+@@ -942,6 +942,20 @@ config TOSHIBA_RBTX4938
+ 	  This Toshiba board is based on the TX4938 processor. Say Y here to
+ 	  support this machine type
+ 
++choice
++	prompt "Multiplex Pin Select"
++	depends on TOSHIBA_RBTX4938
++
++config TOSHIBA_RBTX4938_MPLEX_PIO58_61
++	bool "TOSHIBA_RBTX4938_MPLEX_PIO58_61"
++
++config TOSHIBA_RBTX4938_MPLEX_NAND
++	bool "TOSHIBA_RBTX4938_MPLEX_NAND"
++
++config TOSHIBA_RBTX4938_MPLEX_ATA
++	bool "TOSHIBA_RBTX4938_MPLEX_ATA"
++endchoice
++
+ config TOSHIBA_RBTX4939
+ 	bool "Support for Toshiba RBTX4939 board"
+ 	select HAVE_STD_PC_SERIAL_PORT
+Index: linux-2.6.10/arch/mips/tx4938/toshiba_rbtx4938/setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/tx4938/toshiba_rbtx4938/setup.c
++++ linux-2.6.10/arch/mips/tx4938/toshiba_rbtx4938/setup.c
+@@ -33,6 +33,9 @@
+ #include <linux/serial.h>
+ #include <linux/serial_core.h>
+ #endif
++#ifdef CONFIG_MTD_TX4938
++#include <linux/mtd/partitions.h>
++#endif
+ 
+ extern char *prom_getcmdline(void);
+ extern void rbtx4938_time_init(void) __init;
+@@ -724,6 +727,44 @@ static void __init rbtx4938_spi_setup(vo
+ 	txx9_spi_init(TX4938_SPI_REG, rbtx4938_spi_cs_func);
+ }
+ 
++#ifdef CONFIG_MTD_TX4938
++extern int __init early_txmtd_setup(int no, char *name,
++				    unsigned long addr, unsigned long size,
++				    int buswidth, int num_partitions,
++				    struct mtd_partition *parts,
++				    char *drvname);
++
++static void __init rbtx4938_mtd_setup(void)
++{
++	int n = 0;
++	u8 sw = TX4938_RD08(rbtx4938_bdipsw_ptr);
++	switch (sw & 7) {
++	case 2:
++		early_txmtd_setup(n++, "Flash CE0_0",
++				0x1f000000, 0x1000000, 4, 0, 0, 0);
++		early_txmtd_setup(n++, "System ROM",
++				0x1e000000, 0x1000000, 4, 0, 0, 0);
++		early_txmtd_setup(n++, "Flash CE0_2",
++				0x1d000000, 0x1000000, 4, 0, 0, 0);
++		break;
++	case 3:
++		early_txmtd_setup(n++, "Flash CE0_1",
++				0x1b000000, 0x1000000, 4, 0, 0, 0);
++		early_txmtd_setup(n++, "System ROM",
++				0x1a000000, 0x1000000, 4, 0, 0, 0);
++		break;
++	default:
++#if 0		/* don't make Flash CE0_0 available to users */
++		early_txmtd_setup(n++, "Flash CE0_0",
++				0x1f000000, 0x1000000, 4, 0, 0, 0);
++#endif /* #if 0 */
++		early_txmtd_setup(n++, "System ROM",
++				/* don't expose yamon data area */
++				0x1e000000, 0x1000000, 4, 0, 0, 0);
++	}
++}
++#endif /* CONFIG_MTD_TX4938 */
++
+ static struct resource rbtx4938_fpga_resource;
+ 
+ static char pcode_str[8];
+@@ -1047,9 +1088,9 @@ void __init rbtx4938_time_init(void)
+ 
+ void __init toshiba_rbtx4938_setup(void)
+ {
+-	unsigned long long pcfg;
++	u64 pcfg, data64;
+ 	char *argptr;
+-	unsigned char v;
++	u8 v;
+ 
+ 	iomem_resource.end = 0xffffffff;	/* 4GB */
+ 
+@@ -1102,25 +1143,25 @@ void __init toshiba_rbtx4938_setup(void)
+ #ifdef CONFIG_TOSHIBA_RBTX4938_MPLEX_PIO58_61
+ 	printk("PIOSEL: disabling both ata and nand selection\n");
+ 	local_irq_disable();
+-	v = TX4938_RD64(&tx4938_ccfgptr->pcfg);
++	data64 = TX4938_RD64(&tx4938_ccfgptr->pcfg);
+ 	TX4938_WR64(&tx4938_ccfgptr->pcfg,
+-		    v & ~(TX4938_PCFG_NDF_SEL | TX4938_PCFG_ATA_SEL));
++		    data64 & ~(TX4938_PCFG_NDF_SEL | TX4938_PCFG_ATA_SEL));
+ #endif
+ 
+ #ifdef CONFIG_TOSHIBA_RBTX4938_MPLEX_NAND
+ 	printk("PIOSEL: enabling nand selection\n");
+-	v = TX4938_RD64(&tx4938_ccfgptr->pcfg);
+-	TX4938_WR64(&tx4938_ccfgptr->pcfg, v | TX4938_PCFG_NDF_SEL);
+-	v = TX4938_RD64(&tx4938_ccfgptr->pcfg);
+-	TX4938_WR64(&tx4938_ccfgptr->pcfg, v & ~TX4938_PCFG_ATA_SEL);
++	data64 = TX4938_RD64(&tx4938_ccfgptr->pcfg);
++	TX4938_WR64(&tx4938_ccfgptr->pcfg, data64 | TX4938_PCFG_NDF_SEL);
++	data64 = TX4938_RD64(&tx4938_ccfgptr->pcfg);
++	TX4938_WR64(&tx4938_ccfgptr->pcfg, data64 & ~TX4938_PCFG_ATA_SEL);
+ #endif
+ 
+ #ifdef CONFIG_TOSHIBA_RBTX4938_MPLEX_ATA
+ 	printk("PIOSEL: enabling ata selection\n");
+-	v = TX4938_RD64(&tx4938_ccfgptr->pcfg);
+-	TX4938_WR64(&tx4938_ccfgptr->pcfg, v | TX4938_PCFG_ATA_SEL);
+-	v = TX4938_RD64(&tx4938_ccfgptr->pcfg);
+-	TX4938_WR64(&tx4938_ccfgptr->pcfg, v & ~TX4938_PCFG_NDF_SEL);
++	data64 = TX4938_RD64(&tx4938_ccfgptr->pcfg);
++	TX4938_WR64(&tx4938_ccfgptr->pcfg, data64 | TX4938_PCFG_ATA_SEL);
++	data64 = TX4938_RD64(&tx4938_ccfgptr->pcfg);
++	TX4938_WR64(&tx4938_ccfgptr->pcfg, data64 & ~TX4938_PCFG_NDF_SEL);
+ #endif
+ 
+ #ifdef CONFIG_IP_PNP
+@@ -1168,6 +1209,10 @@ void __init toshiba_rbtx4938_setup(void)
+ 	       TX4938_RD08(rbtx4938_fpga_rev_ptr));
+ 	printk(" DIPSW:%02x,%02x\n", TX4938_RD08(rbtx4938_dipsw_ptr),
+ 	       TX4938_RD08(rbtx4938_bdipsw_ptr));
++
++#ifdef CONFIG_MTD_TX4938
++	rbtx4938_mtd_setup();
++#endif
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+Index: linux-2.6.10/drivers/mtd/maps/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Kconfig
++++ linux-2.6.10/drivers/mtd/maps/Kconfig
+@@ -301,9 +301,20 @@ config MTD_LASAT
+ 	help
+ 	  Support for the flash chips on the Lasat 100 and 200 boards.
+ 
++config MTD_TX493x
++	tristate
++
++config MTD_TX4938
++	tristate "Flash chip mapping on TX4938 board"
++	depends on TOSHIBA_RBTX4938
++	select MTD_TX493x
++	help
++	  Flash memory access on Toshiba RBTX4938 Reference Boards
++
+ config MTD_TX4939
+ 	tristate "Flash chip mapping on TX4939 board"
+ 	depends on TOSHIBA_RBTX4939
++	select MTD_TX493x
+ 	help
+ 	  Flash memory access on Toshiba RBTX4939 Reference Boards
+ 
+Index: linux-2.6.10/drivers/mtd/maps/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Makefile
++++ linux-2.6.10/drivers/mtd/maps/Makefile
+@@ -74,4 +74,4 @@ obj-$(CONFIG_MTD_DMV182)	+= dmv182.o
+ obj-$(CONFIG_MTD_SHARP_SL)	+= sharpsl-flash.o
+ obj-$(CONFIG_MTD_PLATRAM)	+= plat-ram.o
+ obj-$(CONFIG_MTD_OMAP_NOR)	+= omap_nor.o
+-obj-$(CONFIG_MTD_TX4939)        += tx4939-flash.o
+\ No newline at end of file
++obj-$(CONFIG_MTD_TX493x)	+= tx493x-flash.o
+Index: linux-2.6.10/drivers/mtd/maps/tx4939-flash.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/tx4939-flash.c
++++ /dev/null
+@@ -1,278 +0,0 @@
+-/*
+- * drivers/mtd/maps/tx4939-flash.c
+- *
+- * Mapping of flash on RBTX4939 board.
+- *
+- * Based on cstm_mips_ixx.c by MontaVista Software Inc.
+- *
+- * Author: source@mvista.com
+- *
+- * Copyright (C) 2000-2001,2005 Toshiba Corporation
+- *
+- * 2001-2005 (c) MontaVista Software, Inc. This file is licensed under
+- * the terms of the GNU General Public License version 2. This program
+- * is licensed "as is" without any warranty of any kind, whether express
+- * or implied.
+- *
+- * Support for TX4939 in 2.6 - Hiroshi DOYU <Hiroshi_DOYU@montavista.co.jp>
+- */
+-
+-#include <linux/config.h>
+-#include <linux/module.h>
+-#include <linux/types.h>
+-#include <linux/kernel.h>
+-#include <linux/init.h>
+-#include <asm/io.h>
+-#include <linux/mtd/mtd.h>
+-#include <linux/mtd/map.h>
+-#include <linux/mtd/partitions.h>
+-
+-#include <asm/bootinfo.h>
+-
+-/* board and partition description */
+-
+-#define MAX_PHYSMAP_PARTITIONS	4
+-struct tx4939_info {
+-	char *name;
+-	unsigned long window_addr;
+-	unsigned long window_size;
+-	int buswidth;
+-	char *drvname;
+-	struct mtd_info *mtd_info;
+-#ifdef CONFIG_MTD_PARTITIONS
+-	int num_partitions;
+-	char *part_names[MAX_PHYSMAP_PARTITIONS];
+-	struct mtd_partition partitions[MAX_PHYSMAP_PARTITIONS];
+-#endif
+-};
+-
+-#define PHYSMAP_NUMBER  8	/* number of board desc structs needed, one per contiguous flash type */
+-static struct tx4939_info tx4939_desc[PHYSMAP_NUMBER];
+-static struct map_info tx4939_maps[PHYSMAP_NUMBER];
+-
+-int __init init_txmtd(void)
+-{
+-	int i;
+-	struct mtd_info *mymtd = NULL;
+-#ifdef CONFIG_MTD_PARTITIONS
+-	struct mtd_partition *parts;
+-	int j;
+-#endif
+-
+-	/* tx4939_desc[] is initialized by early_txmtd_setup() */
+-	/* Initialize mapping */
+-	for (i = 0; i < PHYSMAP_NUMBER; i++) {
+-		if (!tx4939_desc[i].name)
+-			continue;
+-		pr_debug("tx4939 flash device: probe %lx at %lx\n",
+-		       tx4939_desc[i].window_size, tx4939_desc[i].window_addr);
+-		printk(KERN_INFO "tx4939 flash device: probe %lx at %lx\n",
+-		       tx4939_desc[i].window_size, tx4939_desc[i].window_addr);
+-		tx4939_maps[i].phys = tx4939_desc[i].window_addr;
+-		tx4939_maps[i].virt =
+-		    (unsigned long)ioremap(tx4939_desc[i].window_addr,
+-					   tx4939_desc[i].window_size);
+-		if (!tx4939_maps[i].virt) {
+-			printk(KERN_WARNING "Failed to ioremap\n");
+-			return -EIO;
+-		}
+-		tx4939_maps[i].name = tx4939_desc[i].name;
+-		tx4939_maps[i].size = tx4939_desc[i].window_size;
+-		tx4939_maps[i].bankwidth = tx4939_desc[i].buswidth;
+-		simple_map_init(&tx4939_maps[i]);
+-		pr_debug("tx4939: ioremap is %x\n", (unsigned int)(tx4939_maps[i].virt));
+-	}
+-
+-	for (i = 0; i < PHYSMAP_NUMBER; i++) {
+-		struct tx4939_info *txinfo = &tx4939_desc[i];
+-		if (!tx4939_maps[i].name)
+-			continue;
+-		if (txinfo->drvname) {
+-			/* probe only specified chipdriver */
+-			mymtd =
+-			    (struct mtd_info *)do_map_probe(txinfo->drvname,
+-							    &tx4939_maps[i]);
+-		} else {
+-			/* probe cfi then try jedec */
+-			mymtd =
+-			    (struct mtd_info *)do_map_probe("cfi_probe",
+-							    &tx4939_maps[i]);
+-			pr_debug("phymap %d cfi_probe: mymtd is %x\n", i, (unsigned int)mymtd);
+-			if (!mymtd) {
+-				mymtd =
+-				    (struct mtd_info *)
+-				    do_map_probe("jedec_probe",
+-						 &tx4939_maps[i]);
+-				pr_debug("tx4939 %d jedec: mymtd is %x\n", i, (unsigned int)mymtd);
+-			}
+-		}
+-		if (!mymtd)
+-			continue;
+-		mymtd->owner = THIS_MODULE;
+-		/* true map size */
+-		tx4939_maps[i].size = mymtd->size;
+-		/* If this window contains boot vector, adjust the map area.
+-		 * 1f000000-1f3fffff to 1fc00000-1fffffff,
+-		 * 1f000000-1f7fffff to 1f800000-1fffffff, etc. */
+-		if (txinfo->window_addr <= 0x1fc00000 &&
+-		    txinfo->window_addr + txinfo->window_size > 0x1fc00000) {
+-			txinfo->window_addr =
+-			    0x1fc00000 / tx4939_maps[i].size *
+-			    tx4939_maps[i].size;
+-			iounmap((void *)tx4939_maps[i].virt);
+-			tx4939_maps[i].virt =
+-			    (unsigned long)ioremap(txinfo->window_addr,
+-						   tx4939_maps[i].size);
+-		}
+-		printk(KERN_NOTICE "tx4939 flash device(%s): %lx at %lx\n",
+-		       tx4939_maps[i].name, tx4939_maps[i].size,
+-		       txinfo->window_addr);
+-		txinfo->mtd_info = mymtd;
+-		tx4939_maps[i].map_priv_2 = 1;	/* mark invalidate */
+-#ifdef CONFIG_MTD_PARTITIONS
+-		parts = &txinfo->partitions[0];
+-		if (txinfo->num_partitions == 0) {
+-			/* initialize txinfo->partitions[] */
+-			if (txinfo->window_addr < 0x1fc00000 &&
+-			    txinfo->window_addr + mymtd->size > 0x1fc00000) {
+-				/* split boot mtd device */
+-				parts[0].offset =
+-				    0x1fc00000 - txinfo->window_addr;
+-				parts[0].size =
+-				    txinfo->window_addr + mymtd->size -
+-				    0x1fc00000;
+-				parts[1].offset = 0;
+-				parts[1].size =
+-				    0x1fc00000 - txinfo->window_addr;
+-				txinfo->num_partitions = 2;
+-			} else {
+-				parts->size = txinfo->window_size;
+-				txinfo->num_partitions = 1;
+-			}
+-		}
+-		for (j = 0; j < txinfo->num_partitions; j++) {
+-			int isboot =
+-			    (txinfo->window_addr + parts[j].offset
+-			     == 0x1fc00000);
+-			char buf[128];
+-			if (parts[j].name)
+-				strcpy(buf, parts[j].name);
+-			else if (txinfo->num_partitions == 1)
+-				strcpy(buf, mymtd->name);
+-			else
+-				sprintf(buf, "%s (part%d)", mymtd->name, j);
+-			if (isboot)
+-				strcat(buf, " (boot)");
+-			txinfo->part_names[j] =
+-			    kmalloc(strlen(buf) + 1, GFP_KERNEL);
+-			if (txinfo->part_names[j]) {
+-				strcpy(txinfo->part_names[j], buf);
+-				parts[j].name = txinfo->part_names[j];
+-			} else {
+-				parts[j].name = mymtd->name;
+-			}
+-		}
+-		add_mtd_partitions(mymtd, parts, txinfo->num_partitions);
+-#else
+-		add_mtd_device(mymtd);
+-#endif
+-	}
+-	if (!mymtd)
+-		return -ENXIO;
+-	return 0;
+-}
+-
+-static void __exit cleanup_txmtd(void)
+-{
+-	int i, j;
+-	struct mtd_info *mymtd;
+-
+-	for (i = 0; i < PHYSMAP_NUMBER; i++) {
+-		mymtd = tx4939_desc[i].mtd_info;
+-		if (mymtd) {
+-#ifdef CONFIG_MTD_PARTITIONS
+-			del_mtd_partitions(mymtd);
+-#else
+-			del_mtd_device(mymtd);
+-#endif
+-			map_destroy(mymtd);
+-		}
+-		if (tx4939_maps[i].virt) {
+-			iounmap((void *)tx4939_maps[i].virt);
+-			tx4939_maps[i].virt = 0;
+-		}
+-#ifdef CONFIG_MTD_PARTITIONS
+-		for (j = 0; j < MAX_PHYSMAP_PARTITIONS; j++) {
+-			if (tx4939_desc[i].part_names[j])
+-				kfree(tx4939_desc[i].part_names[j]);
+-			tx4939_desc[i].part_names[j] = 0;
+-		}
+-#endif
+-	}
+-}
+-
+-module_init(init_txmtd);
+-module_exit(cleanup_txmtd);
+-
+-MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("MTD map driver for TX boards");
+-
+-#ifndef MODULE
+-int __init early_txmtd_setup(int no, char *name,
+-			     unsigned long addr, unsigned long size,
+-			     int buswidth, int num_partitions,
+-			     struct mtd_partition *parts, char *drvname)
+-{
+-	int i;
+-	if (no < 0 || no >= PHYSMAP_NUMBER)
+-		return -EINVAL;
+-	if (num_partitions < 0 || num_partitions >= MAX_PHYSMAP_PARTITIONS)
+-		return -EINVAL;
+-	tx4939_desc[no].name = name;
+-	tx4939_desc[no].window_addr = addr;
+-	tx4939_desc[no].window_size = size;
+-	tx4939_desc[no].buswidth = buswidth;
+-#ifdef CONFIG_MTD_PARTITIONS
+-	tx4939_desc[no].num_partitions = num_partitions;
+-	for (i = 0; i < num_partitions; i++)
+-		tx4939_desc[no].partitions[i] = parts[i];
+-#endif
+-	tx4939_desc[no].drvname = drvname;
+-	return 0;
+-}
+-
+-#ifdef CONFIG_MTD_PARTITIONS
+-/* mtdpart=SZ[@[OFS]][+SZ[@[OFS]]]...[,SZ[@[OFS]][+SZ[@[OFS]]]...]... */
+-static int __init txmtd_part_setup(char *str)
+-{
+-	char buf[128];
+-	char *p1, *p2, *s;
+-	int i, j;
+-
+-	strncpy(buf, str, sizeof(buf) - 1);
+-	buf[sizeof(buf) - 1] = 0;
+-	p1 = buf;
+-	/* for each mtd device... */
+-	for (i = 0; p1 && i < PHYSMAP_NUMBER; i++) {
+-		p2 = strsep(&p1, ",");
+-		if (!*p2)
+-			continue;	/* keep early configurations */
+-		memset(tx4939_desc[i].partitions, 0,
+-		       sizeof(tx4939_desc[i].partitions));
+-		/* for each mtd partition... */
+-		for (j = 0; p2 && j < MAX_PHYSMAP_PARTITIONS; j++) {
+-			struct mtd_partition *part;
+-			s = strsep(&p2, "+");
+-			part = &tx4939_desc[i].partitions[j];
+-			part->size = memparse(s, &s);
+-			part->offset = (*s == '@') ?
+-			    memparse(s + 1, &s) : MTDPART_OFS_NXTBLK;
+-		}
+-		tx4939_desc[i].num_partitions = j;
+-	}
+-	return 1;
+-}
+-
+-__setup("mtdpart=", txmtd_part_setup);
+-#endif				/* CONFIG_MTD_PARTITIONS */
+-#endif				/* !MODULE */
+Index: linux-2.6.10/drivers/mtd/maps/tx493x-flash.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/maps/tx493x-flash.c
+@@ -0,0 +1,291 @@
++/*
++ * drivers/mtd/maps/tx493x-flash.c
++ *
++ * Mapping of flash on RBTX493x board.
++ *
++ * Based on cstm_mips_ixx.c by MontaVista Software Inc.
++ *
++ * Author: source@mvista.com
++ *
++ * Copyright (C) 2000-2001,2005 Toshiba Corporation
++ *
++ * 2001-2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ *
++ * Support for TX493x in 2.6 - Hiroshi DOYU <Hiroshi_DOYU@montavista.co.jp>
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <asm/io.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/map.h>
++#include <linux/mtd/partitions.h>
++
++#include <asm/bootinfo.h>
++
++/* board and partition description */
++
++#define MAX_PHYSMAP_PARTITIONS	4
++struct tx493x_info {
++	char *name;
++	unsigned long window_addr;
++	unsigned long window_size;
++	int buswidth;
++	char *drvname;
++	struct mtd_info *mtd_info;
++#ifdef CONFIG_MTD_PARTITIONS
++	int num_partitions;
++	char *part_names[MAX_PHYSMAP_PARTITIONS];
++	struct mtd_partition partitions[MAX_PHYSMAP_PARTITIONS];
++#endif
++};
++
++#define PHYSMAP_NUMBER  8	/* number of board desc structs needed, one per contiguous flash type */
++static struct tx493x_info tx493x_desc[PHYSMAP_NUMBER];
++static struct map_info tx493x_maps[PHYSMAP_NUMBER];
++
++int __init init_txmtd(void)
++{
++	int i;
++	struct mtd_info *mymtd = NULL;
++#ifdef CONFIG_MTD_PARTITIONS
++	struct mtd_partition *parts;
++	int j;
++#endif
++
++	/* tx493x_desc[] is initialized by early_txmtd_setup() */
++	/* Initialize mapping */
++	for (i = 0; i < PHYSMAP_NUMBER; i++) {
++		if (!tx493x_desc[i].name)
++			continue;
++		pr_debug("tx493x flash device: probe %lx at %lx\n",
++		       tx493x_desc[i].window_size, tx493x_desc[i].window_addr);
++		tx493x_maps[i].phys = tx493x_desc[i].window_addr;
++		tx493x_maps[i].virt =
++		    (unsigned long)ioremap(tx493x_desc[i].window_addr,
++					   tx493x_desc[i].window_size);
++		if (!tx493x_maps[i].virt) {
++			printk(KERN_WARNING "Failed to ioremap\n");
++			return -EIO;
++		}
++		tx493x_maps[i].name = tx493x_desc[i].name;
++		tx493x_maps[i].size = tx493x_desc[i].window_size;
++		tx493x_maps[i].bankwidth = tx493x_desc[i].buswidth;
++		simple_map_init(&tx493x_maps[i]);
++		pr_debug("tx493x: ioremap is %x\n", (unsigned int)(tx493x_maps[i].virt));
++	}
++
++	for (i = 0; i < PHYSMAP_NUMBER; i++) {
++		struct tx493x_info *txinfo = &tx493x_desc[i];
++		if (!tx493x_maps[i].name)
++			continue;
++		if (txinfo->drvname) {
++			/* probe only specified chipdriver */
++			mymtd =
++			    (struct mtd_info *)do_map_probe(txinfo->drvname,
++							    &tx493x_maps[i]);
++		} else {
++			/* probe cfi then try jedec */
++			mymtd =
++			    (struct mtd_info *)do_map_probe("cfi_probe",
++							    &tx493x_maps[i]);
++			pr_debug("phymap %d cfi_probe: mymtd is %x\n", i, (unsigned int)mymtd);
++			if (!mymtd) {
++				mymtd =
++				    (struct mtd_info *)
++				    do_map_probe("jedec_probe",
++						 &tx493x_maps[i]);
++				pr_debug("tx493x %d jedec: mymtd is %x\n", i, (unsigned int)mymtd);
++			}
++		}
++		if (!mymtd)
++			continue;
++		mymtd->owner = THIS_MODULE;
++		/* true map size */
++		tx493x_maps[i].size = mymtd->size;
++		/* If this window contains boot vector, adjust the map area.
++		 * 1f000000-1f3fffff to 1fc00000-1fffffff,
++		 * 1f000000-1f7fffff to 1f800000-1fffffff, etc. */
++		if (txinfo->window_addr <= 0x1fc00000 &&
++		    txinfo->window_addr + txinfo->window_size > 0x1fc00000) {
++			txinfo->window_addr =
++			    0x1fc00000 / tx493x_maps[i].size *
++			    tx493x_maps[i].size;
++			iounmap((void *)tx493x_maps[i].virt);
++			tx493x_maps[i].virt =
++			    (unsigned long)ioremap(txinfo->window_addr,
++						   tx493x_maps[i].size);
++		}
++		pr_debug("tx493x flash device(%s): %lx at %lx\n",
++		       tx493x_maps[i].name, tx493x_maps[i].size,
++		       txinfo->window_addr);
++		txinfo->mtd_info = mymtd;
++		tx493x_maps[i].map_priv_2 = 1;	/* mark invalidate */
++#ifdef CONFIG_MTD_PARTITIONS
++		parts = &txinfo->partitions[0];
++		if (txinfo->num_partitions == 0) {
++			/* initialize txinfo->partitions[] */
++			if (txinfo->window_addr < 0x1fc00000 &&
++			    txinfo->window_addr + mymtd->size > 0x1fc00000) {
++				/* split boot mtd device */
++				parts[0].offset =
++				    0x1fc00000 - txinfo->window_addr;
++				parts[0].size =
++				    txinfo->window_addr + mymtd->size -
++				    0x1fc00000;
++				parts[1].offset = 0;
++				parts[1].size =
++				    0x1fc00000 - txinfo->window_addr;
++				txinfo->num_partitions = 2;
++			} else {
++				if(!strcmp(txinfo->name, "System ROM")) {
++					/* split boot config mtd device */
++					parts[0].offset = 0xfe0000;
++					parts[0].size = 0x20000;
++					parts[0].mask_flags = MTD_WRITEABLE;
++					parts[0].name = kmalloc(strlen("boot config") + 1, GFP_KERNEL);
++					strcpy(parts[0].name, "boot config");
++					parts[1].offset = 0;
++					parts[1].size = 0xfe0000;
++					parts[1].name = kmalloc(strlen("User FS") + 1, GFP_KERNEL);
++					strcpy(parts[1].name, "User FS");
++					txinfo->num_partitions = 2;
++				} else {
++					parts->size = txinfo->window_size;
++					txinfo->num_partitions = 1;
++				}
++			}
++		}
++		for (j = 0; j < txinfo->num_partitions; j++) {
++			int isboot =
++			    (txinfo->window_addr + parts[j].offset
++			     == 0x1fc00000);
++			char buf[128];
++			if (parts[j].name)
++				strcpy(buf, parts[j].name);
++			else if (txinfo->num_partitions == 1)
++				strcpy(buf, mymtd->name);
++			else
++				sprintf(buf, "%s (part%d)", mymtd->name, j);
++			if (isboot)
++				strcat(buf, " (boot)");
++			txinfo->part_names[j] =
++			    kmalloc(strlen(buf) + 1, GFP_KERNEL);
++			if (txinfo->part_names[j]) {
++				strcpy(txinfo->part_names[j], buf);
++				parts[j].name = txinfo->part_names[j];
++			} else {
++				parts[j].name = mymtd->name;
++			}
++		}
++		add_mtd_partitions(mymtd, parts, txinfo->num_partitions);
++#else
++		add_mtd_device(mymtd);
++#endif
++	}
++	if (!mymtd)
++		return -ENXIO;
++	return 0;
++}
++
++static void __exit cleanup_txmtd(void)
++{
++	int i, j;
++	struct mtd_info *mymtd;
++
++	for (i = 0; i < PHYSMAP_NUMBER; i++) {
++		mymtd = tx493x_desc[i].mtd_info;
++		if (mymtd) {
++#ifdef CONFIG_MTD_PARTITIONS
++			del_mtd_partitions(mymtd);
++#else
++			del_mtd_device(mymtd);
++#endif
++			map_destroy(mymtd);
++		}
++		if (tx493x_maps[i].virt) {
++			iounmap((void *)tx493x_maps[i].virt);
++			tx493x_maps[i].virt = 0;
++		}
++#ifdef CONFIG_MTD_PARTITIONS
++		for (j = 0; j < MAX_PHYSMAP_PARTITIONS; j++) {
++			if (tx493x_desc[i].part_names[j])
++				kfree(tx493x_desc[i].part_names[j]);
++			tx493x_desc[i].part_names[j] = 0;
++		}
++#endif
++	}
++}
++
++module_init(init_txmtd);
++module_exit(cleanup_txmtd);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MTD map driver for TX493x boards");
++
++#ifndef MODULE
++int __init early_txmtd_setup(int no, char *name,
++			     unsigned long addr, unsigned long size,
++			     int buswidth, int num_partitions,
++			     struct mtd_partition *parts, char *drvname)
++{
++	int i;
++
++	if (no < 0 || no >= PHYSMAP_NUMBER)
++		return -EINVAL;
++	if (num_partitions < 0 || num_partitions >= MAX_PHYSMAP_PARTITIONS)
++		return -EINVAL;
++	tx493x_desc[no].name = name;
++	tx493x_desc[no].window_addr = addr;
++	tx493x_desc[no].window_size = size;
++	tx493x_desc[no].buswidth = buswidth;
++#ifdef CONFIG_MTD_PARTITIONS
++	tx493x_desc[no].num_partitions = num_partitions;
++	for (i = 0; i < num_partitions; i++)
++		tx493x_desc[no].partitions[i] = parts[i];
++#endif
++	tx493x_desc[no].drvname = drvname;
++	return 0;
++}
++
++#ifdef CONFIG_MTD_PARTITIONS
++/* mtdpart=SZ[@[OFS]][+SZ[@[OFS]]]...[,SZ[@[OFS]][+SZ[@[OFS]]]...]... */
++static int __init txmtd_part_setup(char *str)
++{
++	char buf[128];
++	char *p1, *p2, *s;
++	int i, j;
++
++	strncpy(buf, str, sizeof(buf) - 1);
++	buf[sizeof(buf) - 1] = 0;
++	p1 = buf;
++	/* for each mtd device... */
++	for (i = 0; p1 && i < PHYSMAP_NUMBER; i++) {
++		p2 = strsep(&p1, ",");
++		if (!*p2)
++			continue;	/* keep early configurations */
++		memset(tx493x_desc[i].partitions, 0,
++		       sizeof(tx493x_desc[i].partitions));
++		/* for each mtd partition... */
++		for (j = 0; p2 && j < MAX_PHYSMAP_PARTITIONS; j++) {
++			struct mtd_partition *part;
++			s = strsep(&p2, "+");
++			part = &tx493x_desc[i].partitions[j];
++			part->size = memparse(s, &s);
++			part->offset = (*s == '@') ?
++			    memparse(s + 1, &s) : MTDPART_OFS_NXTBLK;
++		}
++		tx493x_desc[i].num_partitions = j;
++	}
++	return 1;
++}
++
++__setup("mtdpart=", txmtd_part_setup);
++#endif				/* CONFIG_MTD_PARTITIONS */
++#endif				/* !MODULE */
+Index: linux-2.6.10/mvl_patches/pro-0268.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0268.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(268);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

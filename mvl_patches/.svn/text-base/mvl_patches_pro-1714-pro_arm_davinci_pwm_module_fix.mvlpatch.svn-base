@@ -1,0 +1,295 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_pwm_module_fix
+# Date: Fri Jan 25 17:20:49 2008
+# Source: Texas Instruments Inc.
+# MR: 26697
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: David Griego <dgriego@mvista.com>
+# Description:
+# fix memory corruption bug in PWM driver triggered by repeated insmod/rmmod
+
+PATCHNUM=1714
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments Inc.
+MR: 26697
+Type: Defect Fix
+Disposition: local
+Signed-off-by: David Griego <dgriego@mvista.com>
+Description:
+fix memory corruption bug in PWM driver triggered by repeated insmod/rmmod
+Index: linux-2.6.10/drivers/char/davinci_pwm.c
+===================================================================
+--- linux-2.6.10.orig/drivers/char/davinci_pwm.c
++++ linux-2.6.10/drivers/char/davinci_pwm.c
+@@ -36,6 +36,7 @@
+ #include <asm/arch/davinci_pwm.h>
+ #include <asm/arch/cpu.h>
+ #include <asm/semaphore.h>
++#include <asm/arch/irqs.h>
+ 
+ #define	DRIVER_NAME		"PWM"
+ #define	DAVINCI_PWM_TIMEOUT	(1*HZ)
+@@ -51,7 +52,7 @@ struct pwm_davinci_device {
+ 
+ char *dm644x_name[] = { "PWM0_CLK", "PWM1_CLK", "PWM2_CLK" };
+ char *dm646x_name[] = { "PWM0_CLK", "PWM1_CLK" };
+-char *dm355_name[] = { "PWM0_CLK", "PWM1_CLK", "PWM2_CLK", "PWM3_CLK"};
++char *dm355_name[] = { "PWM0_CLK", "PWM1_CLK", "PWM2_CLK", "PWM3_CLK" };
+ 
+ /* Instance of the private WDT device structure */
+ static struct pwm_davinci_device *pwm_dev_array[DAVINCI_PWM_MINORS];
+@@ -129,12 +130,10 @@ int pwm_ioctl(struct inode *inode, struc
+ 		if (mode == PWM_ONESHOT_MODE) {
+ 			pwm_dev->regs->cfg &= 0xFFFFFFFC;
+ 			pwm_dev->regs->cfg |= 0x1;
+-		}
+-		else if (mode == PWM_CONTINUOUS_MODE) {
++		} else if (mode == PWM_CONTINUOUS_MODE) {
+ 			pwm_dev->regs->cfg &= 0xFFFFFFFC;
+ 			pwm_dev->regs->cfg |= 0x2;
+-		}
+-		else
++		} else
+ 			return -EINVAL;
+ 		break;
+ 	case PWMIOC_SET_PERIOD:
+@@ -397,7 +396,7 @@ static int __init pwm_init(void)
+ 				    GFP_KERNEL);
+ 			pwm_dev_array[j]->devno = devno;
+ 			init_waitqueue_head(&pwm_dev_array[j]->intr_wait);
+-			sprintf(pwm_dev_array[j]->name, "dm644xpwm%d", j);
++			sprintf(pwm_dev_array[j]->name, "davinci_pwm%d", j);
+ 
+ 			/* register driver as a platform driver */
+ 			if (driver_register(&pwm_driver[j]) != 0) {
+@@ -426,7 +425,9 @@ static int __init pwm_init(void)
+ 			 * DM355 has PWM3 IRQ at #28
+ 			 */
+ 			if (j == 3) {
+-				result = request_irq(28, pwm_isr, SA_INTERRUPT,
++				result =
++					request_irq(IRQ_DM355_PWMINT3, pwm_isr,
++						SA_INTERRUPT,
+ 						pwm_dev_array[j]->name,
+ 						pwm_dev_array[j]);
+ 			} else {
+@@ -472,7 +473,10 @@ static void __exit pwm_exit(void)
+ 			driver_unregister(&pwm_driver[i]);
+ 			devno = MKDEV(pwm_major, pwm_minor_start + i);
+ 			class_simple_device_remove(devno);
+-			free_irq(IRQ_PWMINT0 + i, pwm_dev_array[i]);
++			if ((i == 3) && (cpu_is_davinci_dm355()))
++				free_irq(IRQ_DM355_PWMINT3, pwm_dev_array[i]);
++			else
++				free_irq(IRQ_PWMINT0 + i, pwm_dev_array[i]);
+ 			clk_unuse(pwm_dev_array[i]->pwm_clk);
+ 			clk_disable(pwm_dev_array[i]->pwm_clk);
+ 			kfree(pwm_dev_array[i]);
+Index: linux-2.6.10/mvl_patches/pro-1714.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1714.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1714);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

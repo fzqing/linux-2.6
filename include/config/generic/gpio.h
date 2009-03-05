@@ -1,0 +1,1 @@
+#define CONFIG_GENERIC_GPIO 1

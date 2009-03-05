@@ -1,0 +1,466 @@
+#! /usr/bin/env bash
+# Patch: -common_pxafb_directfb
+# Date: Fri Dec  7 11:51:26 2007
+# Source: MontaVista Software, Inc.
+# MR: 15187
+# Type: Enhancement
+# Disposition: needs submitting to linux-arm-kernel
+# Signed-off-by: Steve Longerbeam <stevel@mvista.com>
+# Keywords: PXA, framebuffer, DirectFB
+# Description:
+#   This patch adds a module parameter, directfb, that when set, allows
+#   a DirectFB graphics driver for PXA27x to operate. The requirements for
+#   the PXA27x gfxdriver to operate are:
+# 
+#   - do not register, initialize or control the overlays, so that the
+#     gfxdriver can take over overlay control.
+#   - allow user mapping of the PXA27x LCD registers.
+#   - add space to the base framebuffer for the overlays. DirectFB assumes
+#     there is a single contiguous framebuffer large enough to hold pixels
+#     for all layers.
+# 
+
+PATCHNUM=1426
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15187
+Type: Enhancement
+Disposition: needs submitting to linux-arm-kernel
+Signed-off-by: Steve Longerbeam <stevel@mvista.com>
+Keywords: PXA, framebuffer, DirectFB
+Description:
+  This patch adds a module parameter, directfb, that when set, allows
+  a DirectFB graphics driver for PXA27x to operate. The requirements for
+  the PXA27x gfxdriver to operate are:
+
+  - do not register, initialize or control the overlays, so that the
+    gfxdriver can take over overlay control.
+  - allow user mapping of the PXA27x LCD registers.
+  - add space to the base framebuffer for the overlays. DirectFB assumes
+    there is a single contiguous framebuffer large enough to hold pixels
+    for all layers.
+
+Index: linux-2.6.10/drivers/video/pxafb.c
+===================================================================
+--- linux-2.6.10.orig/drivers/video/pxafb.c
++++ linux-2.6.10/drivers/video/pxafb.c
+@@ -113,6 +113,7 @@ static void pxafb_init_unchangeable_vars
+ 
+ #ifdef CONFIG_PXA27x
+ static int yuv420_enabled = 0;
++static int directfb = 0;
+ #endif
+ static struct device *my_device;	/* We preserve reference to the device here */
+ static struct device_driver pxafb_driver;
+@@ -229,6 +230,8 @@ static void printk_state(int state)
+ #ifdef CONFIG_PXA27x
+ static void disable_overlays(struct pxafb_info *fbi)
+ {
++	if (directfb)
++		return;
+ 
+ 	if (fbi->overlay1fb->state == C_ENABLE) {
+ 		overlay1fb_disable(fbi->overlay1fb);
+@@ -248,6 +251,9 @@ static void disable_overlays(struct pxaf
+ 
+ static void enable_overlays(struct pxafb_info *fbi)
+ {
++	if (directfb)
++		return;
++
+ 	if (fbi->overlay1fb && fbi->overlay1fb->state == C_ENABLE) {
+ 		fbi->overlay1fb->state = C_DISABLE;
+ 		overlay1fb_enable(fbi->overlay1fb);
+@@ -2415,7 +2421,13 @@ static struct pxafb_info *__init pxafb_i
+ 	fbi->fb.fix.xpanstep	= 1;
+ 	fbi->fb.fix.ypanstep	= 1;
+ 	fbi->fb.fix.ywrapstep	= 0;
++#ifdef CONFIG_PXA27x
++	fbi->fb.fix.accel	= directfb ? FB_ACCEL_PXA27X : FB_ACCEL_NONE;
++#else
+ 	fbi->fb.fix.accel	= FB_ACCEL_NONE;
++#endif
++	fbi->fb.fix.mmio_start  = 0x44000000;
++	fbi->fb.fix.mmio_len    = 0x270;
+ 
+ 	fbi->fb.var.nonstd	= 0;
+ 	fbi->fb.var.activate	= FB_ACTIVATE_NOW;
+@@ -2446,6 +2458,23 @@ static struct pxafb_info *__init pxafb_i
+ 	fbi->task_state			= (u_char)-1;
+ 	fbi->fb.fix.smem_len = PAGE_ALIGN(MAX_XRES * MAX_YRES * inf->bpp / 8);
+ 
++#ifdef CONFIG_PXA27x
++	if (directfb) {
++		/*
++		 * include space for the two overlay's frame data, where
++		 * each overlay's max resolution is the base layer
++		 * screen size.
++		 */
++		fbi->fb.fix.smem_len += 2 * PAGE_ALIGN(inf->xres * inf->yres *
++						       MAX_BPP / 8);
++		/*
++		 * and add a couple pages that DirectFB can use for
++		 * the overlay DMA descriptors.
++		 */
++		fbi->fb.fix.smem_len += 2*PAGE_SIZE;
++	}
++#endif
++
+ 	init_waitqueue_head(&fbi->ctrlr_wait);
+ 	init_waitqueue_head(&fbi->eof_wait);
+ 	INIT_WORK(&fbi->task, pxafb_task, fbi);
+@@ -3160,20 +3189,22 @@ int __init pxafb_probe(struct device *de
+ #endif
+ 
+ #ifdef CONFIG_PXA27x
+-	/* Overlay 1 window */
+-	overlay1fb = overlay1fb_init_fbinfo(dev);
+-	if (!overlay1fb) {
+-		ret = -ENOMEM;
+-		printk(KERN_ERR "PXA FB: overlay1fb_init_fbinfo failed\n");
+-		goto failed;
+-	}
++	if (!directfb) {
++		/* Overlay 1 window */
++		overlay1fb = overlay1fb_init_fbinfo(dev);
++		if (!overlay1fb) {
++			ret = -ENOMEM;
++			printk(KERN_ERR "PXA FB: overlay1fb_init_fbinfo failed\n");
++			goto failed;
++		}
+ 
+-	/* Overlay 2 window */
+-	overlay2fb = overlay2fb_init_fbinfo(dev);
+-	if (!overlay2fb) {
+-		ret = -ENOMEM;
+-		printk(KERN_ERR "PXA FB: overlay2fb_init_fbinfo failed\n");
+-		goto failed;
++		/* Overlay 2 window */
++		overlay2fb = overlay2fb_init_fbinfo(dev);
++		if (!overlay2fb) {
++			ret = -ENOMEM;
++			printk(KERN_ERR "PXA FB: overlay2fb_init_fbinfo failed\n");
++			goto failed;
++		}
+ 	}
+ 
+ 	/* Hardware cursor window */
+@@ -3189,43 +3220,48 @@ int __init pxafb_probe(struct device *de
+ 	pxafbi->overlay2fb = overlay2fb;
+ 	pxafbi->cursorfb = cursorfb;
+ 
+-	/* set refernce to BaseFrame */
+-	overlay1fb->basefb = pxafbi;
+-	overlay2fb->basefb = pxafbi;
+-	cursorfb->basefb = pxafbi;
+-
+-	/* Initialize video memory for overlay1,
+-	 * we can't do it here for overlay2
+-	 * (because  of mode for overlay2 is unknown)
+-	 */
+-	ret = overlay1fb_map_video_memory(overlay1fb);
+-	if (ret) {
+-		dev_err(dev, "Failed to allocate overlay1 video RAM: %d\n",
+-			ret);
+-		ret = -ENOMEM;
+-		goto failed;
++	if (!directfb) {
++		/* set refernce to BaseFrame */
++		overlay1fb->basefb = pxafbi;
++		overlay2fb->basefb = pxafbi;
+ 	}
++	cursorfb->basefb = pxafbi;
+ 
+-	/*
+-	 * This makes sure that our colour bitfield
+-	 * descriptors are correctly initialised.
+-	 */
+-
+-	/*Overlay 1 */
+-	overlay1fb_check_var(&pxafbi->overlay1fb->fb.var,
+-			     &pxafbi->overlay1fb->fb);
+-
+-	ret = register_framebuffer(&overlay1fb->fb);
+-	if (ret < 0)
+-		goto failed;
++	if (!directfb) {
++		/* Initialize video memory for overlay1,
++		 * we can't do it here for overlay2
++		 * (because  of mode for overlay2 is unknown)
++		 */
++		ret = overlay1fb_map_video_memory(overlay1fb);
++		if (ret) {
++			dev_err(dev,
++				"Failed to allocate overlay1 video RAM: %d\n",
++				ret);
++			ret = -ENOMEM;
++			goto failed;
++		}
+ 
+-	/*Overlay 2 */
+-	overlay2fb_check_var(&pxafbi->overlay2fb->fb.var,
+-			     &pxafbi->overlay2fb->fb);
++		/*
++		 * This makes sure that our colour bitfield
++		 * descriptors are correctly initialised.
++		 */
+ 
+-	ret = register_framebuffer(&overlay2fb->fb);
+-	if (ret < 0)
+-		goto failed;
++		/* Overlay 1 */
++		overlay1fb_check_var(&pxafbi->overlay1fb->fb.var,
++				     &pxafbi->overlay1fb->fb);
++
++		ret = register_framebuffer(&overlay1fb->fb);
++		if (ret < 0)
++			goto failed;
++
++		/*Overlay 2 */
++		overlay2fb_check_var(&pxafbi->overlay2fb->fb.var,
++				     &pxafbi->overlay2fb->fb);
++
++		ret = register_framebuffer(&overlay2fb->fb);
++		if (ret < 0)
++			goto failed;
++	}
+ 
+ 	/* Cursor */
+ 	cursorfb_check_var(&pxafbi->cursorfb->fb.var, &pxafbi->cursorfb->fb);
+@@ -3281,6 +3317,17 @@ int __devinit pxafb_setup(char *options)
+ module_param_string(options, g_options, sizeof(g_options), 0);
+ MODULE_PARM_DESC(options, "LCD parameters (see Documentation/fb/pxafb.txt)");
+ # endif
++#ifdef CONFIG_PXA27x
++module_param(directfb, int, 0);
++MODULE_PARM_DESC(directfb,
++		 "\nSet this to work with the DirectFB PXA27x gfxdriver.\n"
++		 "The gfxdriver takes over control of the overlays, so they\n"
++		 "are not initialized or registered as seperate framebuffer\n"
++		 "devices in this driver. Also, the framebuffer memory must\n"
++		 "be allocated as one contiguous buffer big enough to hold\n"
++		 "the primary base layer and all overlays at the largest\n"
++		 "allowed resolutions in each layer\n");
++#endif /* CONFIG_PXA27x */
+ #endif
+ 
+ int __devinit pxafb_init(void)
+Index: linux-2.6.10/include/linux/fb.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/fb.h
++++ linux-2.6.10/include/linux/fb.h
+@@ -130,6 +130,7 @@
+ #define FB_ACCEL_SUPERSAVAGE    0x8c    /* S3 Supersavage               */
+ #define FB_ACCEL_PROSAVAGE_DDR  0x8d	/* S3 ProSavage DDR             */
+ #define FB_ACCEL_PROSAVAGE_DDRK 0x8e	/* S3 ProSavage DDR-K           */
++#define FB_ACCEL_PXA27X         0x8f    /* PXA27X                       */
+ 
+ struct fb_fix_screeninfo {
+ 	char id[16];			/* identification string eg "TT Builtin" */
+Index: linux-2.6.10/mvl_patches/pro-1426.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1426.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1426);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,543 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_irda
+# Date: Fri Dec  7 11:50:25 2007
+# Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+# MR: 22779
+# Type: Enhancement
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Description:
+#     Marvell PXA3xx IrDA.
+# 
+
+PATCHNUM=1416
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+MR: 22779
+Type: Enhancement
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Description:
+    Marvell PXA3xx IrDA.
+
+Index: linux-2.6.10/drivers/net/irda/pxaficp_ir.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/irda/pxaficp_ir.c
++++ linux-2.6.10/drivers/net/irda/pxaficp_ir.c
+@@ -23,6 +23,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/pm.h>
++#include <linux/delay.h>
+ 
+ #include <net/irda/irda.h>
+ #include <net/irda/irmod.h>
+@@ -87,12 +88,14 @@ struct pxa_irda {
+ 
+ 	struct device		*dev;
+ 	struct pxaficp_platform_data *pdata;
++	unsigned int 		clk_src;
+ };
+ 
+ 
+ #define IS_FIR(si)		((si)->speed >= 4000000)
+ #define IRDA_FRAME_SIZE_LIMIT	2047
+ 
++#ifndef CONFIG_PXA3xx
+ inline static void pxa_irda_fir_dma_rx_start(struct pxa_irda *si)
+ {
+ 	DCSR(si->rxdma)  = DCSR_NODESC;
+@@ -110,6 +113,7 @@ inline static void pxa_irda_fir_dma_tx_s
+ 	DCMD(si->txdma) = DCMD_INCSRCADDR | DCMD_FLOWTRG |  DCMD_ENDIRQEN | DCMD_WIDTH1 | DCMD_BURST32 | si->dma_tx_buff_len;
+ 	DCSR(si->txdma) |= DCSR_RUN;
+ }
++#endif
+ 
+ /*
+  * Set the IrDA communications speed.
+@@ -125,11 +129,17 @@ static int pxa_irda_set_speed(struct pxa
+ 
+ 		/* refer to PXA250/210 Developer's Manual 10-7 */
+ 		/*  BaudRate = 14.7456 MHz / (16*Divisor) */
+-		divisor = 14745600 / (16 * speed);
++		divisor = si->clk_src / (16 * speed);
+ 
+ 		local_irq_save(flags);
+ 
+ 		if (IS_FIR(si)) {
++#ifdef CONFIG_PXA3xx
++			printk(KERN_DEBUG "si->pdata->transceiver_mode=%p\n",
++			       si->pdata->transceiver_mode);
++			si->pdata->transceiver_mode(si->dev, IR_SIRMODE);
++			pxa_set_cken(CKEN_STUART, 1);
++#else
+ 			/* stop RX DMA */
+ 			DCSR(si->rxdma) &= ~DCSR_RUN;
+ 			/* disable FICP */
+@@ -145,6 +155,7 @@ static int pxa_irda_set_speed(struct pxa
+ 
+ 			/* enable the STUART clock */
+ 			pxa_set_cken(CKEN5_STUART, 1);
++#endif
+ 		}
+ 
+ 		/* disable STUART first */
+@@ -164,6 +175,9 @@ static int pxa_irda_set_speed(struct pxa
+ 		break;
+ 
+ 	case 4000000:
++#ifdef CONFIG_PXA3xx
++		return -EINVAL;
++#else
+ 		local_irq_save(flags);
+ 
+ 		/* disable STUART */
+@@ -189,6 +203,7 @@ static int pxa_irda_set_speed(struct pxa
+ 		ICCR0 = ICCR0_ITR | ICCR0_RXE;
+ 
+ 		local_irq_restore(flags);
++#endif
+ 		break;
+ 
+ 	default:
+@@ -280,6 +295,7 @@ static irqreturn_t pxa_irda_sir_irq(int 
+ 	return IRQ_HANDLED;
+ }
+ 
++#ifndef CONFIG_PXA3xx
+ /* FIR Receive DMA interrupt handler */
+ static void pxa_irda_fir_dma_rx_irq(int channel, void *data, struct pt_regs *regs)
+ {
+@@ -421,6 +437,7 @@ static irqreturn_t pxa_irda_fir_irq(int 
+ 
+ 	return IRQ_HANDLED;
+ }
++#endif
+ 
+ /* hard_xmit interface of irda device */
+ static int pxa_irda_hard_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -461,6 +478,7 @@ static int pxa_irda_hard_xmit(struct sk_
+ 		/* enable STUART and transmit interrupts */
+ 		STIER = IER_UUE | IER_TIE;
+ 	} else {
++#ifndef CONFIG_PXA3xx
+ 		unsigned long mtt = irda_get_mtt(skb);
+ 
+ 		si->dma_tx_buff_len = skb->len;
+@@ -476,6 +494,7 @@ static int pxa_irda_hard_xmit(struct sk_
+ 
+ 		pxa_irda_fir_dma_tx_start(si);
+ 		ICCR0 = ICCR0_ITR | ICCR0_TXE;
++#endif
+ 	}
+ 
+ 	dev_kfree_skb(skb);
+@@ -537,6 +556,8 @@ static struct net_device_stats *pxa_irda
+ 
+ static void pxa_irda_startup(struct pxa_irda *si)
+ {
++	unsigned int baudrate_mask;
++
+ 	/* Disable STUART interrupts */
+ 	STIER = 0;
+ 	/* enable STUART interrupt to the processor */
+@@ -546,6 +567,7 @@ static void pxa_irda_startup(struct pxa_
+ 	/* enable FIFO, we use FIFO to improve performance */
+ 	STFCR = FCR_TRFIFOE | FCR_ITL_32;
+ 
++#ifndef CONFIG_PXA3xx
+ 	/* disable FICP */
+ 	ICCR0 = 0;
+ 	/* configure FICP ICCR2 */
+@@ -555,6 +577,18 @@ static void pxa_irda_startup(struct pxa_
+ 	DRCMR17 = si->rxdma | DRCMR_MAPVLD;
+ 	DRCMR18 = si->txdma | DRCMR_MAPVLD;
+ 
++#else
++	/* calculate the divisor */
++	if (ACSR & 0x04000000) {	/* if the CPU is in D0CS mode */
++		baudrate_mask = IR_9600 | IR_19200 | IR_38400;
++		si->clk_src = 729600 * 16;
++	} else {
++		baudrate_mask =
++		    IR_9600 | IR_19200 | IR_38400 | IR_57600 | IR_115200;
++		si->clk_src = 921600 * 16;
++	}
++	si->qos.baud_rate.bits = baudrate_mask;
++#endif
+ 	/* force SIR reinitialization */
+ 	si->speed = 4000000;
+ 	pxa_irda_set_speed(si, 9600);
+@@ -572,6 +606,9 @@ static void pxa_irda_shutdown(struct pxa
+ 	STIER = 0;
+ 	/* disable STUART SIR mode */
+ 	STISR = 0;
++#ifdef CONFIG_PXA3xx
++	pxa_set_cken(CKEN_STUART, 0);
++#else
+ 	/* disable the STUART clock */
+ 	pxa_set_cken(CKEN5_STUART, 0);
+ 
+@@ -585,7 +622,7 @@ static void pxa_irda_shutdown(struct pxa
+ 
+ 	DRCMR17 = 0;
+ 	DRCMR18 = 0;
+-
++#endif
+ 	local_irq_restore(flags);
+ 
+ 	/* power off board transceiver */
+@@ -605,14 +642,16 @@ static int pxa_irda_start(struct net_dev
+ 	if (err)
+ 		goto err_irq1;
+ 
++#ifndef CONFIG_PXA3xx
+ 	err = request_irq(IRQ_ICP, pxa_irda_fir_irq, 0, dev->name, dev);
+ 	if (err)
+ 		goto err_irq2;
+-
++#endif
+ 	/*
+ 	 * The interrupt must remain disabled for now.
+ 	 */
+ 	disable_irq(IRQ_STUART);
++#ifndef CONFIG_PXA3xx
+ 	disable_irq(IRQ_ICP);
+ 
+ 	err = -EBUSY;
+@@ -632,7 +671,7 @@ static int pxa_irda_start(struct net_dev
+ 	si->dma_tx_buff = dma_alloc_coherent(NULL, IRDA_FRAME_SIZE_LIMIT, &si->dma_tx_buff_phy, GFP_KERNEL );
+ 	if (!si->dma_tx_buff)
+ 		goto err_dma_tx_buff;
+-
++#endif
+ 	/* Setup the serial port for the initial speed. */
+ 	pxa_irda_startup(si);
+ 
+@@ -648,7 +687,9 @@ static int pxa_irda_start(struct net_dev
+ 	 * Now enable the interrupt and start the queue
+ 	 */
+ 	enable_irq(IRQ_STUART);
++#ifndef CONFIG_PXA3xx
+ 	enable_irq(IRQ_ICP);
++#endif
+ 	netif_start_queue(dev);
+ 
+ 	printk(KERN_DEBUG "pxa_ir: irda driver opened\n");
+@@ -657,6 +698,7 @@ static int pxa_irda_start(struct net_dev
+ 
+ err_irlap:
+ 	pxa_irda_shutdown(si);
++#ifndef CONFIG_PXA3xx
+ 	dma_free_coherent( NULL, IRDA_FRAME_SIZE_LIMIT, si->dma_tx_buff, si->dma_tx_buff_phy);
+ err_dma_tx_buff:
+ 	dma_free_coherent( NULL, IRDA_FRAME_SIZE_LIMIT, si->dma_rx_buff, si->dma_rx_buff_phy);
+@@ -667,6 +709,7 @@ err_tx_dma:
+ err_rx_dma:
+ 	free_irq(IRQ_ICP, dev);
+ err_irq2:
++#endif
+ 	free_irq(IRQ_STUART, dev);
+ err_irq1:
+ 
+@@ -688,6 +731,7 @@ static int pxa_irda_stop(struct net_devi
+ 	}
+ 
+ 	free_irq(IRQ_STUART, dev);
++#ifndef CONFIG_PXA3xx
+ 	free_irq(IRQ_ICP, dev);
+ 
+ 	pxa_free_dma(si->rxdma);
+@@ -697,6 +741,7 @@ static int pxa_irda_stop(struct net_devi
+ 	if (si->dma_tx_buff) dma_free_coherent( NULL, IRDA_FRAME_SIZE_LIMIT, si->dma_rx_buff, si->dma_rx_buff_phy);
+ 
+ 
++#endif
+ 	printk(KERN_DEBUG "pxa_ir: irda driver closed\n");
+ 	return 0;
+ }
+@@ -757,6 +802,9 @@ static int pxa_irda_probe(struct device 
+ 	unsigned int baudrate_mask;
+ 	int err;
+ 
++	if (!pdev->dev.platform_data)
++		return -ENODEV;
++
+ 	err = request_mem_region(__PREG(STUART), 0x24, "IrDA") ? 0 : -EBUSY;
+ 	if (err)
+ 		goto err_mem_1;
+@@ -841,7 +889,7 @@ static int pxa_irda_remove(struct device
+ }
+ 
+ static struct device_driver pxa_ir_driver = {
+-	.name		= "pxa2xx-ir",
++	.name		= "pxaxxx-ir",
+ 	.bus		= &platform_bus_type,
+ 	.probe		= pxa_irda_probe,
+ 	.remove		= pxa_irda_remove,
+Index: linux-2.6.10/drivers/net/irda/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/irda/Kconfig
++++ linux-2.6.10/drivers/net/irda/Kconfig
+@@ -411,7 +411,7 @@ config VIA_FIR
+ 	  via-ircc.
+ 
+ config PXA_FICP
+-	tristate "Intel PXA2xx Internal FICP"
++	tristate "Intel PXA2xx or Marvell PXA3xx Internal FICP"
+ 	depends on ARCH_PXA && IRDA
+ 
+ endmenu
+Index: linux-2.6.10/arch/arm/mach-pxa/generic.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-pxa/generic.c
++++ linux-2.6.10/arch/arm/mach-pxa/generic.c
+@@ -549,7 +549,7 @@ static struct platform_device i2c_device
+ };
+ 
+ static struct platform_device pxaficp_device = {
+-	.name		= "pxa2xx-ir",
++	.name		= "pxaxxx-ir",
+ 	.id		= -1,
+ #if defined(CONFIG_PXA3xx)
+         .dev            = {
+@@ -686,7 +686,7 @@ static struct platform_device *devices[]
+ 	&sibley_device,
+ 	&w1_device,
+ 	&rtc_device,
+-#ifdef  CONFIG_PXA_IRDA
++#ifdef  CONFIG_PXA_FICP
+ 	&pxaficp_device,
+ #endif
+ 	&mmc0_device,
+Index: linux-2.6.10/arch/arm/mach-pxa/zylonite.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-pxa/zylonite.c
++++ linux-2.6.10/arch/arm/mach-pxa/zylonite.c
+@@ -48,7 +48,7 @@ static void __init zylonite_init_irq(voi
+ 	pxa_init_irq();
+ }
+ 
+-#ifdef CONFIG_PXA_IRDA
++#ifdef CONFIG_PXA_FICP
+ static void zylonite_irda_transceiver_mode(struct device *dev, int mode)
+ {
+         unsigned long flags;
+@@ -1003,8 +1003,9 @@ static void __init zylonite_init(void)
+ 	pxafb_config_lcd_panel();
+ #endif
+ 
+-#ifdef CONFIG_PXA_IRDA
++#ifdef CONFIG_PXA_FICP
+ 	pxa_set_ficp_info(&zylonite_ficp_platform_data);
++	zylonite_enable_stuart_pins();
+ #endif
+ 
+ 	zylonite_enable_eth_pins();
+Index: linux-2.6.10/mvl_patches/pro-1416.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1416.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1416);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,650 @@
+#! /usr/bin/env bash
+# Patch: -pro_carrilloranch_mtd_vermilion_range_nand_flash
+# Date: Mon Mar 26 17:51:16 2007
+# Source: MontaVista Software, Inc.
+# MR: 21360
+# Type: Enhancement
+# Disposition: needs submitting to <linux-mtd@lists.infradead.org>.
+# Signed-off-by: Andy Lowe <alowe@mvista.com>
+# Description:
+#     A driver for NAND flash on the Intel Vermilion Range Expansion Bus.
+#     This driver is designed to support any 8-bit small-page (256- or 512-byte)
+#     NAND device on Chip Select 0 of the Vermilion Range Expansion Bus.
+# 
+
+PATCHNUM=1273
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 21360
+Type: Enhancement
+Disposition: needs submitting to <linux-mtd@lists.infradead.org>.
+Signed-off-by: Andy Lowe <alowe@mvista.com>
+Description:
+    A driver for NAND flash on the Intel Vermilion Range Expansion Bus.
+    This driver is designed to support any 8-bit small-page (256- or 512-byte)
+    NAND device on Chip Select 0 of the Vermilion Range Expansion Bus.
+
+Index: linux-cr/drivers/mtd/nand/intel_vr_nand.c
+===================================================================
+--- /dev/null
++++ linux-cr/drivers/mtd/nand/intel_vr_nand.c
+@@ -0,0 +1,381 @@
++/*
++ * drivers/mtd/nand/intel_vr_nand.c
++ *
++ * A driver for NAND flash on the Intel Vermilion Range Expansion Bus.
++ *
++ * Author: Andy Lowe <alowe@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/init.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/partitions.h>
++#include <linux/delay.h>
++
++struct vr_nand_mtd {
++	void __iomem *csr_base;
++	struct mtd_info *info;
++	int nr_parts;
++	struct pci_dev *dev;
++};
++
++/* Expansion Bus Configuration and Status Registers are in BAR 0 */
++#define EXP_CSR_MBAR 0
++/* Expansion Bus Memory Window is BAR 1 */
++#define EXP_WIN_MBAR 1
++/* We only need to map one page for NAND */
++#define NAND_SIZE 0x1000
++/* Chip Select 0 is at offset 0 in the Memory Window */
++#define CS0_START 0x0
++/* Chip Select 0 Timing Register is at offset 0 in CSR */
++#define EXP_TIMING_CS0 0x00
++#define TIMING_CS_EN		(1 << 31)	/* Chip Select Enable */
++#define TIMING_BOOT_ACCEL_DIS	(1 <<  8)	/* Boot Acceleration Disable */
++#define TIMING_NAND_BOOT	(1 <<  7)	/* NAND Boot Enable */
++#define TIMING_WR_EN		(1 <<  1)	/* Write Enable */
++#define TIMING_MASK		0x3FFF0000
++/* NAND Command register for Chip Select 0 is at offset 0x30 in CSR */
++#define NAND_CMD_0	0x30
++#define NAND_CMD_BSY		(1 << 31)
++#define NAND_CMD_ADDR_MASK(m)	((m) << 12)
++#define NAND_CMD_EN		(1 <<  8)
++#define NAND_CMD_MASK		0xff
++/* NAND Address register is at offset 0x50 in CSR */
++#define NAND_ADDR	0x50
++#define NAND_ADDR_FORCE		(1 << 31)
++
++#define BYTE_LANE(n)		(1 << (n))
++#define ALL_BYTE_LANES \
++	(BYTE_LANE(0) | BYTE_LANE(1) | BYTE_LANE(2) | BYTE_LANE(3))
++
++#define DRV_NAME	"vr_nand"
++
++static void vr_nand_hwcontrol(struct mtd_info *info, int cmd)
++{
++}
++
++static void vr_nand_send_command(struct vr_nand_mtd *p, unsigned cmd,
++				 unsigned addr, unsigned byte_lane_disable)
++{
++	unsigned nand_cmd;
++
++	writel(addr & ~NAND_ADDR_FORCE, p->csr_base + NAND_ADDR);
++
++	nand_cmd = (cmd & NAND_CMD_MASK) | NAND_CMD_EN
++	    | NAND_CMD_ADDR_MASK(byte_lane_disable);
++
++	writel(nand_cmd, p->csr_base + NAND_CMD_0);
++}
++
++static void vr_nand_command(struct mtd_info *info, unsigned command,
++			    int column, int page_addr)
++{
++	struct nand_chip *this = info->priv;
++	struct vr_nand_mtd *p = this->priv;
++	unsigned nand_addr = 0;
++	unsigned byte_lane_disable = ALL_BYTE_LANES;
++
++	/*
++	 * Write out the command to the device.
++	 */
++	if (command == NAND_CMD_SEQIN) {
++		int readcmd;
++
++		if (column >= info->oobblock) {
++			/* OOB area */
++			column -= info->oobblock;
++			readcmd = NAND_CMD_READOOB;
++		} else if (column < 256) {
++			/* First 256 bytes --> READ0 */
++			readcmd = NAND_CMD_READ0;
++		} else {
++			column -= 256;
++			readcmd = NAND_CMD_READ1;
++		}
++		vr_nand_send_command(p, readcmd, 0, ALL_BYTE_LANES);
++	}
++
++	if (column != -1 || page_addr != -1) {
++		if (column != -1) {
++			nand_addr |= (column & 0xff);
++			byte_lane_disable &= ~BYTE_LANE(0);
++		}
++		if (page_addr != -1) {
++			if (this->chipsize > (32 << 20)) {
++				nand_addr |= ((page_addr & 0x3fffff) << 9);
++				byte_lane_disable &= ~(BYTE_LANE(1)
++						       | BYTE_LANE(2) |
++						       BYTE_LANE(3));
++			} else {
++				nand_addr |= ((page_addr & 0xffff) << 9);
++				byte_lane_disable &= ~(BYTE_LANE(1)
++						       | BYTE_LANE(2));
++			}
++		}
++	}
++
++	vr_nand_send_command(p, command, nand_addr, byte_lane_disable);
++
++	/*
++	 * program and erase have their own busy handlers
++	 * status and sequential in need no delay
++	 */
++	switch (command) {
++
++	case NAND_CMD_PAGEPROG:
++	case NAND_CMD_ERASE1:
++	case NAND_CMD_ERASE2:
++	case NAND_CMD_SEQIN:
++	case NAND_CMD_STATUS:
++		return;
++
++	case NAND_CMD_RESET:
++	default:
++		break;
++	}
++	/* Apply this short delay always to ensure that we do wait tWB in
++	 * any case on any machine. */
++	ndelay(100);
++
++	/* wait until command is processed or timeout occurs */
++	{
++		unsigned long timeo = jiffies + 2;
++
++		do {
++			if (this->dev_ready(info))
++				return;
++		} while (time_before(jiffies, timeo));
++	}
++}
++
++static int vr_nand_device_ready(struct mtd_info *info)
++{
++	struct nand_chip *this = info->priv;
++	struct vr_nand_mtd *p = this->priv;
++
++	return !(readl(p->csr_base + NAND_CMD_0) & NAND_CMD_BSY);
++}
++
++static void __devexit vr_nand_release(struct vr_nand_mtd *p)
++{
++	struct nand_chip *this = p->info->priv;
++	unsigned int exp_timing_cs0;
++
++	nand_release(p->info);
++
++	exp_timing_cs0 = readl(p->csr_base + EXP_TIMING_CS0);
++	exp_timing_cs0 &= ~TIMING_WR_EN;
++	writel(exp_timing_cs0, p->csr_base + EXP_TIMING_CS0);
++
++	iounmap(this->IO_ADDR_R);
++
++	kfree(p->info);
++
++	iounmap(p->csr_base);
++}
++
++static int __devinit vr_nand_init(struct vr_nand_mtd *p)
++{
++	unsigned long csr_phys, csr_len;
++	unsigned long win_phys, win_len;
++	unsigned int exp_timing_cs0;
++	int err = 0;
++	struct nand_chip *this;
++#if defined(CONFIG_MTD_PARTITIONS) || defined(CONFIG_MTD_PARTITIONS_MODULE)
++	struct mtd_partition *parts;
++	static const char *part_probes[] = { "cmdlinepart", NULL };
++#endif
++
++	csr_phys = pci_resource_start(p->dev, EXP_CSR_MBAR);
++	csr_len = pci_resource_len(p->dev, EXP_CSR_MBAR);
++	win_phys = pci_resource_start(p->dev, EXP_WIN_MBAR);
++	win_len = pci_resource_len(p->dev, EXP_WIN_MBAR);
++
++	if (!csr_phys || !csr_len || !win_phys || !win_len)
++		return -ENODEV;
++
++	if (win_len < (CS0_START + NAND_SIZE))
++		return -ENXIO;
++
++	p->csr_base = ioremap_nocache(csr_phys, csr_len);
++	if (!p->csr_base)
++		return -ENOMEM;
++
++	exp_timing_cs0 = readl(p->csr_base + EXP_TIMING_CS0);
++	if (!(exp_timing_cs0 & TIMING_CS_EN)) {
++		dev_warn(&p->dev->dev, "Expansion Bus Chip Select 0 "
++		       "is disabled.\n");
++		err = -ENODEV;
++		goto release_csr;
++	}
++	if ((exp_timing_cs0 & TIMING_MASK) == TIMING_MASK) {
++		dev_warn(&p->dev->dev, "Expansion Bus Chip Select 0 "
++		       "is configured for maximally slow access times.\n");
++	}
++
++	/* Allocate memory for MTD device structure and private data */
++	p->info = kzalloc(sizeof(struct mtd_info) +
++			  sizeof(struct nand_chip), GFP_KERNEL);
++	if (!p->info) {
++		err = -ENOMEM;
++		goto release_csr;
++	}
++
++	/* Get pointer to private data */
++	this = (struct nand_chip *)(&p->info[1]);
++
++	/* Link the private data with the MTD structure */
++	p->info->priv = this;
++	this->priv = p;
++
++	/* initialize I/O function pointers */
++	this->hwcontrol = vr_nand_hwcontrol;
++	this->cmdfunc = vr_nand_command;
++	this->dev_ready = vr_nand_device_ready;
++
++	this->options = 0;	/* only 8-bit buswidth is supported */
++	this->eccmode = NAND_ECC_SOFT;
++
++	/* map physical address */
++	this->IO_ADDR_R = ioremap_nocache(win_phys + CS0_START, NAND_SIZE);
++	if (!this->IO_ADDR_R) {
++		err = -ENOMEM;
++		goto release_mtd;
++	}
++	this->IO_ADDR_W = this->IO_ADDR_R;
++
++	/* Enable writes to flash bank */
++	exp_timing_cs0 &= ~TIMING_NAND_BOOT;
++	exp_timing_cs0 |= TIMING_BOOT_ACCEL_DIS | TIMING_WR_EN;
++	writel(exp_timing_cs0, p->csr_base + EXP_TIMING_CS0);
++
++	/* Scan to find the device and allocate data_buf and oob_buf */
++	if (nand_scan(p->info, 1)) {
++		err = -ENODEV;
++		goto release_io;
++	}
++
++	/* register the flash */
++	p->info->name = DRV_NAME;
++#if defined(CONFIG_MTD_PARTITIONS) || defined(CONFIG_MTD_PARTITIONS_MODULE)
++	/* partition the flash bank */
++	p->nr_parts = parse_mtd_partitions(p->info, part_probes, &parts, 0);
++	if (p->nr_parts > 0)
++		err = add_mtd_partitions(p->info, parts, p->nr_parts);
++#endif
++	if (p->nr_parts <= 0)
++		err = add_mtd_device(p->info);
++	if (err)
++		goto release_nand;
++
++	return 0;
++
++      release_nand:
++	nand_release(p->info);
++
++      release_io:
++	exp_timing_cs0 &= ~TIMING_WR_EN;
++	writel(exp_timing_cs0, p->csr_base + EXP_TIMING_CS0);
++	iounmap(this->IO_ADDR_R);
++
++      release_mtd:
++	kfree(p->info);
++
++      release_csr:
++	iounmap(p->csr_base);
++	return err;
++}
++
++static struct pci_device_id vr_nand_pci_ids[] = {
++	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x500D)},
++	{0,}
++};
++
++static void __devexit vr_nand_pci_remove(struct pci_dev *dev)
++{
++	struct vr_nand_mtd *p = pci_get_drvdata(dev);
++
++	pci_set_drvdata(dev, NULL);
++	vr_nand_release(p);
++	kfree(p);
++	pci_release_regions(dev);
++	pci_disable_device(dev);
++}
++
++static int __devinit
++vr_nand_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
++{
++	struct vr_nand_mtd *p = NULL;
++	int err;
++	int was_enabled;
++
++	was_enabled = dev->is_enabled;
++	if (!was_enabled) {
++		err = pci_enable_device(dev);
++		if (err)
++			goto out;
++	}
++
++	err = pci_request_regions(dev, DRV_NAME);
++	if (err)
++		goto disable_dev;
++
++	p = kzalloc(sizeof(*p), GFP_KERNEL);
++	err = -ENOMEM;
++	if (!p)
++		goto release;
++
++	p->dev = dev;
++
++	err = vr_nand_init(p);
++	if (err)
++		goto release;
++
++	pci_set_drvdata(dev, p);
++
++	return 0;
++
++      release:
++	kfree(p);
++	pci_release_regions(dev);
++
++      disable_dev:
++	if (!was_enabled)
++		pci_disable_device(dev);
++
++      out:
++	return err;
++}
++
++static struct pci_driver vr_nand_pci_driver = {
++	.name = DRV_NAME,
++	.probe = vr_nand_pci_probe,
++	.remove = __devexit_p(vr_nand_pci_remove),
++	.id_table = vr_nand_pci_ids,
++};
++
++static int __init vr_nand_mtd_init(void)
++{
++	return pci_register_driver(&vr_nand_pci_driver);
++}
++
++static void __exit vr_nand_mtd_exit(void)
++{
++	pci_unregister_driver(&vr_nand_pci_driver);
++}
++
++module_init(vr_nand_mtd_init);
++module_exit(vr_nand_mtd_exit);
++
++MODULE_AUTHOR("Andy Lowe");
++MODULE_DESCRIPTION("NAND controller driver for Intel Vermilion Range");
++MODULE_LICENSE("GPL");
++MODULE_DEVICE_TABLE(pci, vr_nand_pci_ids);
+Index: linux-cr/drivers/mtd/nand/Kconfig
+===================================================================
+--- linux-cr.orig/drivers/mtd/nand/Kconfig
++++ linux-cr/drivers/mtd/nand/Kconfig
+@@ -249,7 +249,14 @@ config MTD_NAND_DISKONCHIP_BBTWRITE
+ config MTD_NAND_SHARPSL
+  	bool "Support for NAND Flash on Sharp SL Series (C7xx + others)"
+  	depends on MTD_NAND	&& ARCH_PXA
+- 
++
++config MTD_NAND_INTEL_VR
++	tristate "NAND flash on Intel Vermilion Range Expansion Bus CS0"
++	depends on MTD_NAND && PCI
++	help
++	  This enables support for NAND flash located on the Expansion Bus of the
++	  Intel Vermilion Range chipset.
++
+ config MTD_NAND_NANDSIM
+ 	tristate "Support for NAND Flash Simulator"
+ 	depends on m && MTD_NAND && MTD_PARTITIONS
+Index: linux-cr/drivers/mtd/nand/Makefile
+===================================================================
+--- linux-cr.orig/drivers/mtd/nand/Makefile
++++ linux-cr/drivers/mtd/nand/Makefile
+@@ -27,5 +27,6 @@ obj-$(CONFIG_MTD_NAND_OMAP) 		+= omap-na
+ obj-$(CONFIG_MTD_NAND_OMAP_HW)		+= omap-hw.o
+ obj-$(CONFIG_MTD_NAND_PNX8550)		+= pnx8550.o
+ obj-$(CONFIG_MTD_NAND_DAVINCI)          += nand_davinci.o
++obj-$(CONFIG_MTD_NAND_INTEL_VR)		+= intel_vr_nand.o
+ 
+ nand-objs = nand_base.o nand_bbt.o
+Index: linux-cr/mvl_patches/pro-1273.c
+===================================================================
+--- /dev/null
++++ linux-cr/mvl_patches/pro-1273.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1273);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

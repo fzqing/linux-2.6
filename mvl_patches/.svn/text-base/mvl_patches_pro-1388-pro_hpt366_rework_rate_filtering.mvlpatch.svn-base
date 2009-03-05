@@ -1,0 +1,620 @@
+#! /usr/bin/env bash
+# Patch: -pro_hpt366_rework_rate_filtering
+# Date: Mon Nov 26 16:55:47 2007
+# Source: MontaVista Software, Inc.
+# MR: 14142
+# Type: Enhancement
+# Disposition: accepted into 2.6.21-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# hpt366: rework rate filtering
+# 
+# - Rework hpt3xx_ratemask() and hpt3xx_ratefilter() so that the former
+#   returns the max.  mode computed at the load time and doesn't have to do
+#   bad Ultra33 drive list lookups anymore; remove the duplicate code from
+#   the latter function.  Move the quirky drive list lookup into
+#   hpt3xx_quirkproc() where it should have been from the start...
+# 
+# - Disable UltraATA/100 for HPT370 by default as the 33 MHz ATA clock
+#   being used does not allow for it, and this *greatly* increases the
+#   transfer speed.
+# 
+# - Save some space by using byte-wide fields in struct hpt_info; switch to
+#   reading the 8-bit PCI revision ID reg.  only, not the whole 32-bit reg.
+# 
+# - Start incrementing the driver version number with each patch (should
+#   have been done from the first one posted).
+# 
+# This patch is somewhat different from the community one since I didn't pull in
+# the changes that were due to the changed prototype of ide_setup_pci_device[s]()
+# as they seemed too intrusive, and I also didn't pull in the kzalloc() conversion
+# patch...
+# 
+# commit e139b0b02fd35a68c4353db34d3380c8a7c9a90d
+# tree d1765408ccea13b30478dd8b386c5b83e5ae4b23
+# parent 0670afdf0e69e5e73c8358da9c39bf3a8807b03e
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 07 Feb 2007 18:17:37 +0100
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Wed, 07 Feb 2007 18:17:37 +0100
+# 
+#  drivers/ide/pci/hpt366.c |  175 ++++++++++++++++++++++-------------------------
+#  1 files changed, 83 insertions(+), 92 deletions(-)
+# 
+
+PATCHNUM=1388
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14142
+Type: Enhancement
+Disposition: accepted into 2.6.21-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+hpt366: rework rate filtering
+
+- Rework hpt3xx_ratemask() and hpt3xx_ratefilter() so that the former
+  returns the max.  mode computed at the load time and doesn't have to do
+  bad Ultra33 drive list lookups anymore; remove the duplicate code from
+  the latter function.  Move the quirky drive list lookup into
+  hpt3xx_quirkproc() where it should have been from the start...
+
+- Disable UltraATA/100 for HPT370 by default as the 33 MHz ATA clock
+  being used does not allow for it, and this *greatly* increases the
+  transfer speed.
+
+- Save some space by using byte-wide fields in struct hpt_info; switch to
+  reading the 8-bit PCI revision ID reg.  only, not the whole 32-bit reg.
+
+- Start incrementing the driver version number with each patch (should
+  have been done from the first one posted).
+
+This patch is somewhat different from the community one since I didn't pull in
+the changes that were due to the changed prototype of ide_setup_pci_device[s]()
+as they seemed too intrusive, and I also didn't pull in the kzalloc() conversion
+patch...
+
+commit e139b0b02fd35a68c4353db34d3380c8a7c9a90d
+tree d1765408ccea13b30478dd8b386c5b83e5ae4b23
+parent 0670afdf0e69e5e73c8358da9c39bf3a8807b03e
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 07 Feb 2007 18:17:37 +0100
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Wed, 07 Feb 2007 18:17:37 +0100
+
+ drivers/ide/pci/hpt366.c |  175 ++++++++++++++++++++++-------------------------
+ mvl_patches/pro-1388.c   |   16 ++++
+ 2 files changed, 99 insertions(+), 92 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/hpt366.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.c
++++ linux-2.6.10/drivers/ide/pci/hpt366.c
+@@ -1,5 +1,5 @@
+ /*
+- * linux/drivers/ide/pci/hpt366.c		Version 0.36	April 25, 2003
++ * linux/drivers/ide/pci/hpt366.c		Version 0.43	May 17, 2006
+  *
+  * Copyright (C) 1999-2003		Andre Hedrick <andre@linux-ide.org>
+  * Portions Copyright (C) 2001	        Sun Microsystems, Inc.
+@@ -62,8 +62,8 @@
+  *   be done on 66 MHz PCI bus
+  * - avoid calibrating PLL twice as the second time results in a wrong PCI
+  *   frequency and thus in the wrong timings for the secondary channel
+- * - disable UltraATA/133 for HPT372 by default (50 MHz DPLL clock do not
+- *   allow for this speed anyway)
++ * - disable UltraATA/133 for HPT372 and UltraATA/100 for HPT370 by default
++ *   as the ATA clock being used does not allow for this speed anyway
+  * - add support for HPT302N and HPT371N clocking (the same as for HPT372N)
+  * - HPT371/N are single channel chips, so avoid touching the primary channel
+  *   which exists only virtually (there's no pins for it)
+@@ -74,6 +74,7 @@
+  *   and for HPT36x the obsolete HDIO_TRISTATE_HWIF handler was called instead
+  * - pass to init_chipset() handlers a copy of the IDE PCI device structure as
+  *   they tamper with its fields
++ * - optimize the rate masking/filtering and the drive list lookup code
+  *		<source@mvista.com>
+  *
+  */
+@@ -335,7 +336,7 @@ static u32 sixty_six_base_hpt37x[] = {
+ #define HPT371_ALLOW_ATA133_6		0
+ #define HPT302_ALLOW_ATA133_6		0
+ #define HPT372_ALLOW_ATA133_6		0
+-#define HPT370_ALLOW_ATA100_5		1
++#define HPT370_ALLOW_ATA100_5		0
+ #define HPT366_ALLOW_ATA66_4		1
+ #define HPT366_ALLOW_ATA66_3		1
+ #define HPT366_MAX_DEVS			8
+@@ -353,8 +354,8 @@ static u32 sixty_six_base_hpt37x[] = {
+ struct hpt_info
+ {
+ 	u8 max_mode;		/* Speeds allowed */
+-	int revision;		/* Chipset revision */
+-	int flags;		/* Chipset properties */
++	u8 revision;		/* Chipset revision */
++	u8 flags;		/* Chipset properties */
+ #define PLL_MODE	1
+ #define IS_3xxN 	2
+ #define PCI_66MHZ	4
+@@ -363,61 +364,50 @@ struct hpt_info
+ };
+ 
+ /*
+- *	This wants fixing so that we do everything not by classrev
++ *	This wants fixing so that we do everything not by revision
+  *	(which breaks on the newest chips) but by creating an
+  *	enumeration of chip variants and using that
+  */
+ 
+-static __devinit u32 hpt_revision (struct pci_dev *dev)
++static __devinit u8 hpt_revision(struct pci_dev *dev)
+ {
+-	u32 class_rev;
+-	pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_rev);
+-	class_rev &= 0xff;
++	u8 rev = 0;
++
++	pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
+ 
+ 	switch(dev->device) {
+ 		/* Remap new 372N onto 372 */
+ 		case PCI_DEVICE_ID_TTI_HPT372N:
+-			class_rev = PCI_DEVICE_ID_TTI_HPT372; break;
++			rev = PCI_DEVICE_ID_TTI_HPT372; break;
+ 		case PCI_DEVICE_ID_TTI_HPT374:
+-			class_rev = PCI_DEVICE_ID_TTI_HPT374; break;
++			rev = PCI_DEVICE_ID_TTI_HPT374; break;
+ 		case PCI_DEVICE_ID_TTI_HPT371:
+-			class_rev = PCI_DEVICE_ID_TTI_HPT371; break;
++			rev = PCI_DEVICE_ID_TTI_HPT371; break;
+ 		case PCI_DEVICE_ID_TTI_HPT302:
+-			class_rev = PCI_DEVICE_ID_TTI_HPT302; break;
++			rev = PCI_DEVICE_ID_TTI_HPT302; break;
+ 		case PCI_DEVICE_ID_TTI_HPT372:
+-			class_rev = PCI_DEVICE_ID_TTI_HPT372; break;
++			rev = PCI_DEVICE_ID_TTI_HPT372; break;
+ 		default:
+ 			break;
+ 	}
+-	return class_rev;
++	return rev;
+ }
+ 
+-static int check_in_drive_lists(ide_drive_t *drive, const char **list);
+-
+-static u8 hpt3xx_ratemask (ide_drive_t *drive)
++static int check_in_drive_list(ide_drive_t *drive, const char **list)
+ {
+-	ide_hwif_t *hwif	= drive->hwif;
+-	struct hpt_info *info	= ide_get_hwifdata(hwif);
+-	u8 mode			= 0;
++	struct hd_driveid *id = drive->id;
+ 
+-	/* FIXME: TODO - move this to set info->mode once at boot */
++	while (*list)
++		if (!strcmp(*list++,id->model))
++			return 1;
++	return 0;
++}
++
++static u8 hpt3xx_ratemask(ide_drive_t *drive)
++{
++	struct hpt_info *info	= ide_get_hwifdata(HWIF(drive));
++	u8 mode			= info->max_mode;
+ 
+-	if (info->revision >= 8) {		/* HPT374 */
+-		mode = (HPT374_ALLOW_ATA133_6) ? 4 : 3;
+-	} else if (info->revision >= 7) {	/* HPT371 */
+-		mode = (HPT371_ALLOW_ATA133_6) ? 4 : 3;
+-	} else if (info->revision >= 6) {	/* HPT302 */
+-		mode = (HPT302_ALLOW_ATA133_6) ? 4 : 3;
+-	} else if (info->revision >= 5) {	/* HPT372 */
+-		mode = (HPT372_ALLOW_ATA133_6) ? 4 : 3;
+-	} else if (info->revision >= 4) {	/* HPT370A */
+-		mode = (HPT370_ALLOW_ATA100_5) ? 3 : 2;
+-	} else if (info->revision >= 3) {	/* HPT370 */
+-		mode = (HPT370_ALLOW_ATA100_5) ? 3 : 2;
+-		mode = (check_in_drive_lists(drive, bad_ata33)) ? 0 : mode;
+-	} else {				/* HPT366 and HPT368 */
+-		mode = (check_in_drive_lists(drive, bad_ata33)) ? 0 : 2;
+-	}
+ 	if (!eighty_ninty_three(drive) && mode)
+ 		mode = min(mode, (u8)1);
+ 	return mode;
+@@ -428,16 +418,15 @@ static u8 hpt3xx_ratemask (ide_drive_t *
+  *	either PIO or UDMA modes 0,4,5
+  */
+  
+-static u8 hpt3xx_ratefilter (ide_drive_t *drive, u8 speed)
++static u8 hpt3xx_ratefilter(ide_drive_t *drive, u8 speed)
+ {
+-	ide_hwif_t *hwif	= drive->hwif;
+-	struct hpt_info *info	= ide_get_hwifdata(hwif);
++	struct hpt_info *info	= ide_get_hwifdata(HWIF(drive));
+ 	u8 mode			= hpt3xx_ratemask(drive);
+ 
+ 	if (drive->media != ide_disk)
+ 		return min(speed, (u8)XFER_PIO_4);
+ 
+-	switch(mode) {
++	switch (mode) {
+ 		case 0x04:
+ 			speed = min(speed, (u8)XFER_UDMA_6);
+ 			break;
+@@ -445,33 +434,34 @@ static u8 hpt3xx_ratefilter (ide_drive_t
+ 			speed = min(speed, (u8)XFER_UDMA_5);
+ 			if (info->revision >= 5)
+ 				break;
+-			if (check_in_drive_lists(drive, bad_ata100_5))
+-				speed = min(speed, (u8)XFER_UDMA_4);
+-			break;
++			if (!check_in_drive_list(drive, bad_ata100_5))
++				goto check_bad_ata33;
++			/* fall thru */
+ 		case 0x02:
+ 			speed = min(speed, (u8)XFER_UDMA_4);
+ 	/*
+ 	 * CHECK ME, Does this need to be set to 5 ??
+ 	 */
+ 			if (info->revision >= 3)
+-				break;
+-			if ((check_in_drive_lists(drive, bad_ata66_4)) ||
+-			    (!(HPT366_ALLOW_ATA66_4)))
+-				speed = min(speed, (u8)XFER_UDMA_3);
+-			if ((check_in_drive_lists(drive, bad_ata66_3)) ||
+-			    (!(HPT366_ALLOW_ATA66_3)))
+-				speed = min(speed, (u8)XFER_UDMA_2);
+-			break;
++				goto check_bad_ata33;
++			if (HPT366_ALLOW_ATA66_4 &&
++			    !check_in_drive_list(drive, bad_ata66_4))
++				goto check_bad_ata33;
++
++			speed = min(speed, (u8)XFER_UDMA_3);
++			if (HPT366_ALLOW_ATA66_3 &&
++			    !check_in_drive_list(drive, bad_ata66_3))
++				goto check_bad_ata33;
++			/* fall thru */
+ 		case 0x01:
+ 			speed = min(speed, (u8)XFER_UDMA_2);
+-	/*
+-	 * CHECK ME, Does this need to be set to 5 ??
+-	 */
+-			if (info->revision >= 3)
++
++		check_bad_ata33:
++ 			if (info->revision >= 4)
+ 				break;
+-			if (check_in_drive_lists(drive, bad_ata33))
+-				speed = min(speed, (u8)XFER_MW_DMA_2);
+-			break;
++			if (!check_in_drive_list(drive, bad_ata33))
++				break;
++			/* fall thru */
+ 		case 0x00:
+ 		default:
+ 			speed = min(speed, (u8)XFER_MW_DMA_2);
+@@ -480,22 +470,6 @@ static u8 hpt3xx_ratefilter (ide_drive_t
+ 	return speed;
+ }
+ 
+-static int check_in_drive_lists (ide_drive_t *drive, const char **list)
+-{
+-	struct hd_driveid *id = drive->id;
+-
+-	if (quirk_drives == list) {
+-		while (*list)
+-			if (strstr(id->model, *list++))
+-				return 1;
+-	} else {
+-		while (*list)
+-			if (!strcmp(*list++,id->model))
+-				return 1;
+-	}
+-	return 0;
+-}
+-
+ static u32 pci_bus_clock_list(u8 speed, u32 *chipset_table)
+ {
+ 	int i;
+@@ -670,9 +644,15 @@ static int config_chipset_for_dma (ide_d
+ 	return ide_dma_enable(drive);
+ }
+ 
+-static int hpt3xx_quirkproc (ide_drive_t *drive)
++static int hpt3xx_quirkproc(ide_drive_t *drive)
+ {
+-	return ((int) check_in_drive_lists(drive, quirk_drives));
++	struct hd_driveid *id	= drive->id;
++	const  char **list	= quirk_drives;
++
++	while (*list)
++		if (strstr(id->model, *list++))
++			return 1;
++	return 0;
+ }
+ 
+ static void hpt3xx_intrproc (ide_drive_t *drive)
+@@ -1360,7 +1340,7 @@ static void __devinit init_iops_hpt366(i
+ 	struct hpt_info *info	= kmalloc(sizeof(struct hpt_info), GFP_KERNEL);
+ 	struct pci_dev  *dev	= hwif->pci_dev;
+ 	u16 did			= dev->device;
+-	u8  rid			= 0;
++	u8 mode, rid		= 0;
+ 
+ 	if(info == NULL) {
+ 		printk(KERN_WARNING "hpt366: out of memory.\n");
+@@ -1375,7 +1355,7 @@ static void __devinit init_iops_hpt366(i
+ 		return;
+ 	}
+ 
+-	pci_read_config_byte(dev, PCI_CLASS_REVISION, &rid);
++	pci_read_config_byte(dev, PCI_REVISION_ID, &rid);
+ 
+ 	if (( did == PCI_DEVICE_ID_TTI_HPT366  && rid == 6) ||
+ 	    ((did == PCI_DEVICE_ID_TTI_HPT372  ||
+@@ -1384,9 +1364,22 @@ static void __devinit init_iops_hpt366(i
+ 	      did == PCI_DEVICE_ID_TTI_HPT372N)
+ 		info->flags |= IS_3xxN;
+ 
+-	info->revision = hpt_revision(dev);
++	rid = info->revision = hpt_revision(dev);
++	if (rid >= 8)			/* HPT374 */
++		mode = HPT374_ALLOW_ATA133_6 ? 4 : 3;
++	else if (rid >= 7)		/* HPT371 and HPT371N */
++		mode = HPT371_ALLOW_ATA133_6 ? 4 : 3;
++	else if (rid >= 6)		/* HPT302 and HPT302N */
++		mode = HPT302_ALLOW_ATA133_6 ? 4 : 3;
++	else if (rid >= 5)		/* HPT372, HPT372A, and HPT372N */
++		mode = HPT372_ALLOW_ATA133_6 ? 4 : 3;
++	else if (rid >= 3)		/* HPT370 and HPT370A */
++		mode = HPT370_ALLOW_ATA100_5 ? 3 : 2;
++	else				/* HPT366 and HPT368 */
++		mode = (HPT366_ALLOW_ATA66_4 || HPT366_ALLOW_ATA66_3) ? 2 : 1;
++	info->max_mode = mode;
+ 
+-	if (info->revision >= 3)
++	if (rid >= 3)
+ 		hpt37x_clocking(hwif);
+ 	else
+ 		hpt366_clocking(hwif);
+@@ -1442,8 +1435,7 @@ static void __devinit init_setup_hpt371(
+ static void __devinit init_setup_hpt366(struct pci_dev *dev, ide_pci_device_t *d)
+ {
+ 	struct pci_dev *findev = NULL;
+-	u8 pin1 = 0, pin2 = 0;
+-	unsigned int class_rev;
++	u8 rev = 0, pin1 = 0, pin2 = 0;
+ 	char *chipset_names[] = {"HPT366", "HPT366",  "HPT368",
+ 				 "HPT370", "HPT370A", "HPT372",
+ 				 "HPT372N" };
+@@ -1451,16 +1443,15 @@ static void __devinit init_setup_hpt366(
+ 	if (PCI_FUNC(dev->devfn) & 1)
+ 		return;
+ 
+-	pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_rev);
+-	class_rev &= 0xff;
++	pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
+ 
+ 	if(dev->device == PCI_DEVICE_ID_TTI_HPT372N)
+-		class_rev = 6;
++		rev = 6;
+ 		
+-	if(class_rev <= 6)
+-		d->name = chipset_names[class_rev];
++	if(rev <= 6)
++		d->name = chipset_names[rev];
+ 
+-	switch(class_rev) {
++	switch(rev) {
+ 		case 6:
+ 		case 5:
+ 		case 4:
+Index: linux-2.6.10/mvl_patches/pro-1388.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1388.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1388);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

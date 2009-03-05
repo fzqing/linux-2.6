@@ -1,0 +1,524 @@
+#! /usr/bin/env bash
+# Patch: -mips_nec_vr5701_sound_fix.patch
+# Date: Mon Dec 12 12:42:17 2005
+# Source: MontaVista Software, Inc.
+# MR: 14926
+# Type: Defect Fix
+# Disposition: submitted to patagonia
+# Signed-off-by: Aleksey Makarov <makarov@ru.mvista.com>
+# Description:
+#     Fixes bug with sound on 11025 and 22050 rates on NEC vr5701.
+# 
+
+PATCHNUM=12
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14926
+Type: Defect Fix
+Disposition: submitted to patagonia
+Signed-off-by: Aleksey Makarov <makarov@ru.mvista.com>
+Description:
+    Fixes bug with sound on 11025 and 22050 rates on NEC vr5701.
+
+Index: linux-2.6.10/mvl_patches/pro-0012.c
+===================================================================
+--- linux-2.6.10.orig/mvl_patches/pro-0012.c	Thu Aug 30 13:30:55 2001
++++ linux-2.6.10/mvl_patches/pro-0012.c	Mon Dec 12 12:42:17 2005
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(12);
++}
++module_init(regpatch);
+Index: linux-2.6.10/sound/pci/vr5701/nec_vr5701_sg2.c
+===================================================================
+--- linux-2.6.10.orig/sound/pci/vr5701/nec_vr5701_sg2.c	Mon Dec 12 12:36:30 2005
++++ linux-2.6.10/sound/pci/vr5701/nec_vr5701_sg2.c	Mon Dec 12 12:42:17 2005
+@@ -89,6 +89,28 @@
+ 	return snd_ac97_mixer(bus, &ac97, &chip->ac97);
+ }
+ 
++static int set_constraints(snd_pcm_substream_t *substream)
++{
++	int err;
++
++	err = snd_pcm_hw_constraint_step(substream->runtime, 0,
++			SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 0x10);
++	if( err < 0 )
++		return err;
++
++	err = snd_pcm_hw_constraint_step(substream->runtime, 0,
++			SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 0x40);
++	if( err < 0 )
++		return err;
++
++	err = snd_pcm_hw_constraint_list(substream->runtime, 0,
++			SNDRV_PCM_HW_PARAM_RATE, &hw_constraints_rates);
++	if( err < 0 )
++		return err;
++
++	return 0;
++}
++
+ /* open callback */
+ static int snd_vr5701_playback_open(snd_pcm_substream_t *substream)
+ {
+@@ -97,8 +119,7 @@
+ 	substream->runtime->hw = snd_vr5701_playback_hw;
+ 	chip->next_playback = 0;
+ 
+-	return (snd_pcm_hw_constraint_list(substream->runtime, 0,
+-		SNDRV_PCM_HW_PARAM_RATE, &hw_constraints_rates) < 0); 
++	return set_constraints( substream );
+ }
+ 
+ 
+@@ -110,8 +131,7 @@
+ 	substream->runtime->hw = snd_vr5701_capture_hw;
+ 	chip->next_capture = 0;
+ 
+-	return (snd_pcm_hw_constraint_list(substream->runtime, 0,
+-		SNDRV_PCM_HW_PARAM_RATE, &hw_constraints_rates) < 0);
++	return set_constraints( substream );
+ }
+ 
+ /* hw_params callback */
+@@ -215,6 +235,42 @@
+ 	return 0;
+ }
+ 
++static inline void playback_next_position(snd_pcm_substream_t *substream, vr5701_t *chip)
++{
++	chip->next_playback = chip->next_playback ? 0 :
++		frames_to_bytes(substream->runtime, substream->runtime->period_size);
++}
++
++static inline void capture_next_position(snd_pcm_substream_t *substream, vr5701_t *chip)
++{
++	chip->next_capture = chip->next_capture ? 0 :
++		frames_to_bytes(substream->runtime, substream->runtime->period_size);
++}
++
++static inline void playback_setup_next(snd_pcm_substream_t *substream, vr5701_t *chip)
++{
++	u32 ch2_offset = (substream->runtime->channels == 1) ? 0 :
++		substream->runtime->dma_bytes/2;
++
++	outl(substream->runtime->dma_addr + chip->next_playback,
++			chip->port + vr5701_DAC1_BADDR);
++	outl(substream->runtime->dma_addr + chip->next_playback + ch2_offset,
++			chip->port + vr5701_DAC2_BADDR);
++}
++
++static inline void capture_setup_next(snd_pcm_substream_t *substream, vr5701_t *chip)
++{
++	if (substream->runtime->channels == 1) {
++		outl(substream->runtime->dma_addr + chip->next_capture,
++					chip->port + vr5701_ADC1_BADDR);
++	} else {
++		outl(substream->runtime->dma_addr+ chip->next_capture,
++					chip->port + vr5701_ADC1_BADDR);
++		outl(substream->runtime->dma_addr + substream->runtime->dma_bytes/2
++				+ chip->next_capture, chip->port + vr5701_ADC2_BADDR);
++	}
++}
++
+ static void vr5701_dma_start_playback(snd_pcm_substream_t *substream)
+ {
+ 	u32 temp;
+@@ -230,18 +286,7 @@
+ 	temp |= vr5701_INT_MASK_DAC1END | vr5701_INT_MASK_DAC2END;
+ 	outl(temp, chip->port + vr5701_INT_MASK);
+ 
+-	/* setup dma base addr */
+-	if (substream->runtime->channels == 1) {
+-		outl(substream->runtime->dma_addr + chip->next_playback, 
+-						chip->port + vr5701_DAC1_BADDR);
+-		outl(substream->runtime->dma_addr + chip->next_playback, 
+-						chip->port + vr5701_DAC2_BADDR);
+-	} else {
+-		outl(substream->runtime->dma_addr + chip->next_playback, 
+-						chip->port + vr5701_DAC1_BADDR);
+-		outl(substream->runtime->dma_addr + substream->runtime->dma_bytes/2 
+-				+ chip->next_playback, chip->port + vr5701_DAC2_BADDR);
+-	}
++	playback_setup_next( substream, chip );
+ 
+ 	/* set dma length, in the unit of 0x10 bytes */
+ 	period_size = (frames_to_bytes(substream->runtime, 
+@@ -258,27 +303,10 @@
+ 	temp |= (vr5701_CTRL_DAC1ENB | vr5701_CTRL_DAC2ENB);
+ 	outl(temp, chip->port + vr5701_CTRL);
+ 
+-	/* it is time to setup next dma transfer */
+-	temp = chip->next_playback + frames_to_bytes(substream->runtime, 
+-			substream->runtime->period_size);
++	playback_next_position( substream, chip );
++	playback_setup_next( substream, chip );
++	playback_next_position( substream, chip );
+ 
+-	if (substream->runtime->channels == 1) {
+-		if (temp >= substream->runtime->dma_bytes) {
+-			temp = 0;
+-		}
+-		outl(substream->runtime->dma_addr + temp, 
+-				chip->port + vr5701_DAC1_BADDR);
+-		outl(substream->runtime->dma_addr + temp, 
+-				chip->port + vr5701_DAC2_BADDR);
+-	} else {
+-		if (temp >= substream->runtime->dma_bytes/2) {
+-			temp = 0;
+-		}
+-		outl(substream->runtime->dma_addr + temp, 
+-				chip->port + vr5701_DAC1_BADDR);
+-		outl(substream->runtime->dma_addr + substream->runtime->dma_bytes/2
+-						+ temp, chip->port + vr5701_DAC2_BADDR);
+-	}
+ 	return ;
+ }
+ 
+@@ -297,16 +325,7 @@
+ 	temp |= vr5701_INT_MASK_ADC1END | vr5701_INT_MASK_ADC2END;
+ 	outl(temp, chip->port + vr5701_INT_MASK);
+ 
+-	/* setup dma base addr */
+-	if (substream->runtime->channels == 1) {
+-		outl(substream->runtime->dma_addr + chip->next_capture, 
+-					chip->port + vr5701_ADC1_BADDR);
+-	} else {
+-		outl(substream->runtime->dma_addr+ chip->next_capture, 
+-					chip->port + vr5701_ADC1_BADDR);
+-		outl(substream->runtime->dma_addr + substream->runtime->dma_bytes/2 
+-				+ chip->next_capture, chip->port + vr5701_ADC2_BADDR);
+-	}
++	capture_setup_next( substream, chip );
+ 
+ 	/* set dma length, in the unit of 0x10 bytes */
+ 	period_size = (frames_to_bytes(substream->runtime, 
+@@ -331,24 +350,10 @@
+ 	temp |= (vr5701_CTRL_ADC1ENB | vr5701_CTRL_ADC2ENB);
+ 	outl(temp, chip->port + vr5701_CTRL);
+ 
+-	/* it is time to setup next dma transfer */
+-	temp = chip->next_capture + frames_to_bytes(substream->runtime, 
+-			substream->runtime->period_size);
+-	if (substream->runtime->channels == 1) {
+-		if (temp >= substream->runtime->dma_bytes) {
+-			temp = 0;
+-		}
+-		outl(substream->runtime->dma_addr + temp, 
+-				chip->port + vr5701_ADC1_BADDR);
+-	} else {
+-		if (temp >= substream->runtime->dma_bytes/2) {
+-			temp = 0;
+-		}
+-		outl(substream->runtime->dma_addr + temp, 
+-				chip->port + vr5701_ADC1_BADDR);
+-		outl(substream->runtime->dma_addr + substream->runtime->dma_bytes/2
+-						+ temp,	chip->port + vr5701_ADC2_BADDR);
+-	}
++	capture_next_position( substream, chip );
++	capture_setup_next( substream, chip );
++	capture_next_position( substream, chip );
++
+ 	return ;
+ }
+ 
+@@ -474,91 +479,20 @@
+ 	vr5701_t *chip = device->device_data;
+ 	return snd_vr5701_free(chip);
+ }
+-static void vr5701_ac97_adc_interrupt(struct snd_vr5701 *chip)
++static inline void vr5701_ac97_adc_interrupt(struct snd_vr5701 *chip)
+ {
+-	unsigned temp;
+-
+-	/* set the base addr for next DMA transfer */
+-	temp = chip->next_capture + 2*(frames_to_bytes(chip->substream[CAPTURE]->runtime, 
+-			chip->substream[CAPTURE]->runtime->period_size));
+-	if (chip->substream[CAPTURE]->runtime->channels == 1) {
+-		if (temp >= chip->substream[CAPTURE]->runtime->dma_bytes) {
+-			temp -= chip->substream[CAPTURE]->runtime->dma_bytes;
+-		}
+-	} else {
+-		if (temp >= chip->substream[CAPTURE]->runtime->dma_bytes/2) {
+-			temp -= chip->substream[CAPTURE]->runtime->dma_bytes/2;
+-		}
+-	}
+-
+-	if (chip->substream[CAPTURE]->runtime->channels == 1) {
+-		outl(chip->substream[CAPTURE]->runtime->dma_addr 
+-				+ temp, chip->port + vr5701_ADC1_BADDR);
+-	} else {
+-		outl(chip->substream[CAPTURE]->runtime->dma_addr 
+-				+ temp, chip->port + vr5701_ADC1_BADDR);
+-		outl(chip->substream[CAPTURE]->runtime->dma_addr 
+-		+ chip->substream[CAPTURE]->runtime->dma_bytes/2+ temp, 
+-						chip->port + vr5701_ADC2_BADDR);
+-	}
+-
+-	/* adjust next pointer */
+-	chip->next_capture += frames_to_bytes(chip->substream[CAPTURE]->runtime, 
+-					chip->substream[CAPTURE]->runtime->period_size);
+-	if (chip->substream[CAPTURE]->runtime->channels == 1) {
+-		if (chip->next_capture >= chip->substream[CAPTURE]->runtime->dma_bytes){
+-			chip->next_capture = 0;
+-		}
+-	} else {
+-		if (chip->next_capture >= chip->substream[CAPTURE]->runtime->dma_bytes/2){
+-			chip->next_capture = 0;
+-		}
+-	}
++	snd_pcm_substream_t * substream = chip->substream[CAPTURE];
++	capture_setup_next( substream, chip );
++	capture_next_position( substream, chip );
+ }
+ 
+-static void vr5701_ac97_dac_interrupt(struct snd_vr5701 *chip)
++static inline void vr5701_ac97_dac_interrupt(struct snd_vr5701 *chip)
+ {
+-	unsigned temp;
+-
+-	/* let us set for next next DMA transfer */
+-	temp = chip->next_playback + 2*(frames_to_bytes(chip->substream[PLAYBACK]->runtime, 
+-			chip->substream[PLAYBACK]->runtime->period_size));
+-	if (chip->substream[PLAYBACK]->runtime->channels == 1) {
+-		if (temp >= chip->substream[PLAYBACK]->runtime->dma_bytes) {
+-			temp -= chip->substream[PLAYBACK]->runtime->dma_bytes;
+-		}
+-	} else {
+-		if (temp >= chip->substream[PLAYBACK]->runtime->dma_bytes/2) {
+-			temp -= chip->substream[PLAYBACK]->runtime->dma_bytes/2;
+-		}
+-	}
+-
+-	if (chip->substream[PLAYBACK]->runtime->channels == 1) {
+-		outl(chip->substream[PLAYBACK]->runtime->dma_addr 
+-				+ temp, chip->port + vr5701_DAC1_BADDR);
+-		outl(chip->substream[PLAYBACK]->runtime->dma_addr 
+-				+ temp, chip->port + vr5701_DAC2_BADDR);
+-	} else {
+-		outl(chip->substream[PLAYBACK]->runtime->dma_addr 
+-				+ temp, chip->port + vr5701_DAC1_BADDR);
+-		outl(chip->substream[PLAYBACK]->runtime->dma_addr 
+-			+ chip->substream[PLAYBACK]->runtime->dma_bytes/2
+-				+ temp,	chip->port + vr5701_DAC2_BADDR);
+-	}
+-
+-	/* adjust next pointer */
+-	chip->next_playback += frames_to_bytes(chip->substream[PLAYBACK]->runtime, 
+-					chip->substream[PLAYBACK]->runtime->period_size);
+-	if (chip->substream[PLAYBACK]->runtime->channels == 1) {
+-		if (chip->next_playback >= chip->substream[PLAYBACK]->runtime->dma_bytes){
+-			chip->next_playback = 0;
+-		}
+-	} else {
+-		if (chip->next_playback >= chip->substream[PLAYBACK]->runtime->dma_bytes/2){
+-			chip->next_playback = 0;
+-		}
+-	}
++	snd_pcm_substream_t * substream = chip->substream[PLAYBACK];
++	playback_setup_next( substream, chip );
++	playback_next_position( substream, chip );
+ }
++
+ static irqreturn_t snd_vr5701_interrupt(int irq, void *dev_id,
+                                           struct pt_regs *regs)
+ {
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

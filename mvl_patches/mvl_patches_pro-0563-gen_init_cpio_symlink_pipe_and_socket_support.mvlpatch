@@ -1,0 +1,632 @@
+#! /usr/bin/env bash
+# Patch: -gen_init_cpio_symlink_pipe_and_socket_support
+# Date: Fri May 26 10:17:29 2006
+# MR: 17477
+# Commit: 7a2398ccd5341e56172e23489ebaffde61273e38
+# Author: Thayne Harbaugh <tharbaugh@lnxi.com>
+# Date:   Fri Jan 7 21:42:25 2005 -0800
+# 
+#     [PATCH] gen_init_cpio symlink, pipe and socket support
+#     
+#     This patch makes gen_init_cpio more complete by adding symlink, pipe and
+#     socket support.  It updates scripts/gen_initramfs_list.sh to support the
+#     new types.  The patch applies to the recent mm series that already have the
+#     updated gen_init_cpio and gen_initramfs_list.sh.
+#     
+#     From: William Lee Irwin III <wli@holomorphy.com>
+#     
+#     The rest of gen_init_cpio.c seems to cast the result of strlen() to handle
+#     this situation, so this patch follows suit while killing off size_t -related
+#     printk() warnings.
+#     
+#     Signed-off-by: William Irwin <wli@holomorphy.com>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=563
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 17477
+Commit: 7a2398ccd5341e56172e23489ebaffde61273e38
+Author: Thayne Harbaugh <tharbaugh@lnxi.com>
+Date:   Fri Jan 7 21:42:25 2005 -0800
+
+    [PATCH] gen_init_cpio symlink, pipe and socket support
+    
+    This patch makes gen_init_cpio more complete by adding symlink, pipe and
+    socket support.  It updates scripts/gen_initramfs_list.sh to support the
+    new types.  The patch applies to the recent mm series that already have the
+    updated gen_init_cpio and gen_initramfs_list.sh.
+    
+    From: William Lee Irwin III <wli@holomorphy.com>
+    
+    The rest of gen_init_cpio.c seems to cast the result of strlen() to handle
+    this situation, so this patch follows suit while killing off size_t -related
+    printk() warnings.
+    
+    Signed-off-by: William Irwin <wli@holomorphy.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/Documentation/early-userspace/README b/Documentation/early-userspace/README
+index 7d56612..77eaa58 100644
+
+ Documentation/early-userspace/README |   22 +++--
+ drivers/block/Kconfig                |   21 -----
+ mvl_patches/pro-0563.c               |   16 ++++
+ scripts/gen_initramfs_list.sh        |   18 +++-
+ usr/gen_init_cpio.c                  |  138 +++++++++++++++++++++++++++++++----
+ 5 files changed, 173 insertions(+), 42 deletions(-)
+
+Index: linux-2.6.10/Documentation/early-userspace/README
+===================================================================
+--- linux-2.6.10.orig/Documentation/early-userspace/README
++++ linux-2.6.10/Documentation/early-userspace/README
+@@ -1,7 +1,7 @@
+ Early userspace support
+ =======================
+ 
+-Last update: 2003-08-21
++Last update: 2004-11-12
+ 
+ 
+ "Early userspace" is a set of libraries and programs that provide
+@@ -17,14 +17,22 @@ It consists of several major infrastruct
+ - initramfs, a chunk of code that unpacks the compressed cpio image
+   midway through the kernel boot process.
+ - klibc, a userspace C library, currently packaged separately, that is
+-  optimised for correctness and small size.
++  optimized for correctness and small size.
+ 
+ The cpio file format used by initramfs is the "newc" (aka "cpio -c")
+-format, and is documented in the file "buffer-format.txt".  If you
+-want to generate your own cpio files directly instead of hacking on
+-gen_init_cpio, you will need to short-circuit the build process in
+-usr/ so that gen_init_cpio does not get run, then simply pop your own
+-initramfs_data.cpio.gz file into place.
++format, and is documented in the file "buffer-format.txt".  There are
++three ways to add an early userspace filesystem:
++
++1) Put your gzip'ed cpio in usr/initramfs_data.cpio.gz.
++
++2) Set CONFIG_INITRAMFS_SOURCE to the filename of a gen_init_cpio
++input file.  This provides the most flexibility and allows creation of
++archives with files not owned by the build user.  This means that an
++unprivileged user can create an early userspace with files owned by
++root.
++
++3) Set CONFIG_INITRAMFS_SOURCE to point to a directory containing the
++files for your filesystem.
+ 
+ 
+ Where's this all leading?
+Index: linux-2.6.10/drivers/block/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/block/Kconfig
++++ linux-2.6.10/drivers/block/Kconfig
+@@ -368,24 +368,9 @@ config INITRAMFS_SOURCE
+ 	default ""
+ 	help
+ 	  This can be set to either a directory containing files, etc to be
+-	  included in the initramfs archive, or a file containing newline
+-	  separated entries.
+-
+-	  If it is a file, it should be in the following format:
+-	    # a comment
+-	    file <name> <location> <mode> <uid> <gid>
+-	    dir <name> <mode> <uid> <gid>
+-	    nod <name> <mode> <uid> <gid> <dev_type> <maj> <min>
+-
+-	  Where:
+-	    <name>      name of the file/dir/nod in the archive
+-	    <location>  location of the file in the current filesystem
+-	    <mode>      mode/permissions of the file
+-	    <uid>       user id (0=root)
+-	    <gid>       group id (0=root)
+-	    <dev_type>  device type (b=block, c=character)
+-	    <maj>       major number of nod
+-	    <min>       minor number of nod
++	  included in the initramfs archive, or a file containing  entries
++	  according to the format described by the "usr/gen_init_cpio"
++	  program in the kernel tree.
+ 
+ 	  If you are not sure, leave it blank.
+ 
+Index: linux-2.6.10/scripts/gen_initramfs_list.sh
+===================================================================
+--- linux-2.6.10.orig/scripts/gen_initramfs_list.sh
++++ linux-2.6.10/scripts/gen_initramfs_list.sh
+@@ -9,8 +9,6 @@
+ #
+ # The output is suitable for gen_init_cpio as found in usr/Makefile.
+ #
+-# TODO:  Add support for symlinks, sockets and pipes when gen_init_cpio
+-#        supports them.
+ 
+ simple_initramfs() {
+ 	cat <<-EOF
+@@ -25,12 +23,19 @@ simple_initramfs() {
+ filetype() {
+ 	local argv1="$1"
+ 
+-	if [ -f "${argv1}" ]; then
++	# symlink test must come before file test
++	if [ -L "${argv1}" ]; then
++		echo "slink"
++	elif [ -f "${argv1}" ]; then
+ 		echo "file"
+ 	elif [ -d "${argv1}" ]; then
+ 		echo "dir"
+ 	elif [ -b "${argv1}" -o -c "${argv1}" ]; then
+ 		echo "nod"
++	elif [ -p "${argv1}" ]; then
++		echo "pipe"
++	elif [ -S "${argv1}" ]; then
++		echo "sock"
+ 	else
+ 		echo "invalid"
+ 	fi
+@@ -52,6 +57,8 @@ print_mtime() {
+ parse() {
+ 	local location="$1"
+ 	local name="${location/${srcdir}//}"
++	# change '//' into '/'
++	name="${name//\/\///}"
+ 	local mode="$2"
+ 	local uid="$3"
+ 	local gid="$4"
+@@ -79,6 +86,11 @@ parse() {
+ 			fi
+ 			str="${ftype} ${name} ${str} ${dev_type} ${maj} ${min}"
+ 			;;
++		"slink")
++			local target=$(LC_ALL=C ls -l "${location}" | \
++					gawk '{print $11}')
++			str="${ftype} ${name} ${target} ${str}"
++			;;
+ 		*)
+ 			str="${ftype} ${name} ${str}"
+ 			;;
+Index: linux-2.6.10/usr/gen_init_cpio.c
+===================================================================
+--- linux-2.6.10.orig/usr/gen_init_cpio.c
++++ linux-2.6.10/usr/gen_init_cpio.c
+@@ -16,13 +16,19 @@
+ #define PATH_MAX	259
+ #endif
+ 
++/*
++ * Original work by Jeff Garzik
++ *
++ * External file lists, symlink, pipe and fifo support by Thayne Harbaugh
++ */
++
+ #define xstr(s) #s
+ #define str(s) xstr(s)
+ 
+ static unsigned int offset;
+ static unsigned int ino = 721;
+ 
+-struct file_type {
++struct file_handler {
+ 	const char *type;
+ 	int (*handler)(const char *line);
+ };
+@@ -86,7 +92,7 @@ static void cpio_trailer(void)
+ 		0,			/* minor */
+ 		0,			/* rmajor */
+ 		0,			/* rminor */
+-		(unsigned)strlen(name) + 1, /* namesize */
++		(unsigned)strlen(name)+1, /* namesize */
+ 		0);			/* chksum */
+ 	push_hdr(s);
+ 	push_rest(name);
+@@ -97,7 +103,55 @@ static void cpio_trailer(void)
+ 	}
+ }
+ 
+-static int cpio_mkdir(const char *name, unsigned int mode,
++static int cpio_mkslink(const char *name, const char *target,
++			 unsigned int mode, uid_t uid, gid_t gid)
++{
++	char s[256];
++	time_t mtime = time(NULL);
++
++	sprintf(s,"%s%08X%08X%08lX%08lX%08X%08lX"
++	       "%08X%08X%08X%08X%08X%08X%08X",
++		"070701",		/* magic */
++		ino++,			/* ino */
++		S_IFLNK | mode,		/* mode */
++		(long) uid,		/* uid */
++		(long) gid,		/* gid */
++		1,			/* nlink */
++		(long) mtime,		/* mtime */
++		(unsigned)strlen(target)+1, /* filesize */
++		3,			/* major */
++		1,			/* minor */
++		0,			/* rmajor */
++		0,			/* rminor */
++		(unsigned)strlen(name) + 1,/* namesize */
++		0);			/* chksum */
++	push_hdr(s);
++	push_string(name);
++	push_pad();
++	push_string(target);
++	push_pad();
++	return 0;
++}
++
++static int cpio_mkslink_line(const char *line)
++{
++	char name[PATH_MAX + 1];
++	char target[PATH_MAX + 1];
++	unsigned int mode;
++	int uid;
++	int gid;
++	int rc = -1;
++
++	if (5 != sscanf(line, "%" str(PATH_MAX) "s %" str(PATH_MAX) "s %o %d %d", name, target, &mode, &uid, &gid)) {
++		fprintf(stderr, "Unrecognized dir format '%s'", line);
++		goto fail;
++	}
++	rc = cpio_mkslink(name, target, mode, uid, gid);
++ fail:
++	return rc;
++}
++
++static int cpio_mkgeneric(const char *name, unsigned int mode,
+ 		       uid_t uid, gid_t gid)
+ {
+ 	char s[256];
+@@ -107,7 +161,7 @@ static int cpio_mkdir(const char *name, 
+ 	       "%08X%08X%08X%08X%08X%08X%08X",
+ 		"070701",		/* magic */
+ 		ino++,			/* ino */
+-		S_IFDIR | mode,		/* mode */
++		mode,			/* mode */
+ 		(long) uid,		/* uid */
+ 		(long) gid,		/* gid */
+ 		2,			/* nlink */
+@@ -124,7 +178,33 @@ static int cpio_mkdir(const char *name, 
+ 	return 0;
+ }
+ 
+-static int cpio_mkdir_line(const char *line)
++enum generic_types {
++	GT_DIR,
++	GT_PIPE,
++	GT_SOCK
++};
++
++struct generic_type {
++	const char *type;
++	mode_t mode;
++};
++
++static struct generic_type generic_type_table[] = {
++	[GT_DIR] = {
++		.type = "dir",
++		.mode = S_IFDIR
++	},
++	[GT_PIPE] = {
++		.type = "pipe",
++		.mode = S_IFIFO
++	},
++	[GT_SOCK] = {
++		.type = "sock",
++		.mode = S_IFSOCK
++	}
++};
++
++static int cpio_mkgeneric_line(const char *line, enum generic_types gt)
+ {
+ 	char name[PATH_MAX + 1];
+ 	unsigned int mode;
+@@ -133,14 +213,31 @@ static int cpio_mkdir_line(const char *l
+ 	int rc = -1;
+ 
+ 	if (4 != sscanf(line, "%" str(PATH_MAX) "s %o %d %d", name, &mode, &uid, &gid)) {
+-		fprintf(stderr, "Unrecognized dir format '%s'", line);
++		fprintf(stderr, "Unrecognized %s format '%s'",
++			line, generic_type_table[gt].type);
+ 		goto fail;
+ 	}
+-	rc = cpio_mkdir(name, mode, uid, gid);
++	mode |= generic_type_table[gt].mode;
++	rc = cpio_mkgeneric(name, mode, uid, gid);
+  fail:
+ 	return rc;
+ }
+ 
++static int cpio_mkdir_line(const char *line)
++{
++	return cpio_mkgeneric_line(line, GT_DIR);
++}
++
++static int cpio_mkpipe_line(const char *line)
++{
++	return cpio_mkgeneric_line(line, GT_PIPE);
++}
++
++static int cpio_mksock_line(const char *line)
++{
++	return cpio_mkgeneric_line(line, GT_SOCK);
++}
++
+ static int cpio_mknod(const char *name, unsigned int mode,
+ 		       uid_t uid, gid_t gid, char dev_type,
+ 		       unsigned int maj, unsigned int min)
+@@ -292,12 +389,16 @@ void usage(const char *prog)
+ 		"describe the files to be included in the initramfs archive:\n"
+ 		"\n"
+ 		"# a comment\n"
+-		"file <name> <location> <mode> <uid> <gid> \n"
++		"file <name> <location> <mode> <uid> <gid>\n"
+ 		"dir <name> <mode> <uid> <gid>\n"
+ 		"nod <name> <mode> <uid> <gid> <dev_type> <maj> <min>\n"
++		"slink <name> <target> <mode> <uid> <gid>\n"
++		"pipe <name> <mode> <uid> <gid>\n"
++		"sock <name> <mode> <uid> <gid>\n"
+ 		"\n"
+-		"<name>      name of the file/dir/nod in the archive\n"
++		"<name>      name of the file/dir/nod/etc in the archive\n"
+ 		"<location>  location of the file in the current filesystem\n"
++		"<target>    link target\n"
+ 		"<mode>      mode/permissions of the file\n"
+ 		"<uid>       user id (0=root)\n"
+ 		"<gid>       group id (0=root)\n"
+@@ -315,7 +416,7 @@ void usage(const char *prog)
+ 		prog);
+ }
+ 
+-struct file_type file_type_table[] = {
++struct file_handler file_handler_table[] = {
+ 	{
+ 		.type    = "file",
+ 		.handler = cpio_mkfile_line,
+@@ -326,6 +427,15 @@ struct file_type file_type_table[] = {
+ 		.type    = "dir",
+ 		.handler = cpio_mkdir_line,
+ 	}, {
++		.type    = "slink",
++		.handler = cpio_mkslink_line,
++	}, {
++		.type    = "pipe",
++		.handler = cpio_mkpipe_line,
++	}, {
++		.type    = "sock",
++		.handler = cpio_mksock_line,
++	}, {
+ 		.type    = NULL,
+ 		.handler = NULL,
+ 	}
+@@ -388,10 +498,10 @@ int main (int argc, char *argv[])
+ 			ec = -1;
+ 		}
+ 
+-		for (type_idx = 0; file_type_table[type_idx].type; type_idx++) {
++		for (type_idx = 0; file_handler_table[type_idx].type; type_idx++) {
+ 			int rc;
+-			if (! strcmp(line, file_type_table[type_idx].type)) {
+-				if ((rc = file_type_table[type_idx].handler(args))) {
++			if (! strcmp(line, file_handler_table[type_idx].type)) {
++				if ((rc = file_handler_table[type_idx].handler(args))) {
+ 					ec = rc;
+ 					fprintf(stderr, " line %d\n", line_nr);
+ 				}
+@@ -399,7 +509,7 @@ int main (int argc, char *argv[])
+ 			}
+ 		}
+ 
+-		if (NULL == file_type_table[type_idx].type) {
++		if (NULL == file_handler_table[type_idx].type) {
+ 			fprintf(stderr, "unknown file type line %d: '%s'\n",
+ 				line_nr, line);
+ 		}
+Index: linux-2.6.10/mvl_patches/pro-0563.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0563.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(563);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,382 @@
+#! /usr/bin/env bash
+# Patch: -simpler_topdown_mmap_layout_allocator
+# Date: Mon Mar 12 13:51:33 2007
+# ource: git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+# MR: 22105
+# Type: Defect Fix
+# Disposition: backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# Minor changes to get it apply to our tree
+# 
+# Commit: 9fe1f5e6c07607c9fcb28227eda1427534a836bb
+# Author: Ingo Molnar <mingo@elte.hu>
+# Date:   Mon Mar 7 17:25:35 2005 -0800
+# 
+#     [PATCH] simpler topdown mmap layout allocator
+#     
+#     1. typos/spelling ;-)
+#     
+#     2. removed prev_vma and find_vma_prev because the condition checked
+#        later was always true
+#     
+#     3. moved the free_area_cache/mmap_base check into arch_unmap_area_topdown
+#        where i think it belongs.
+#     
+#     4. removed the extra free_area_cache setting code in the while loop
+#        as it only has to be set when we actually (and successfully) return
+#        from this function.
+#     
+#     The only visible change to the layout should be the following:
+# 
+
+PATCHNUM=1194
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+ource: git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+MR: 22105
+Type: Defect Fix
+Disposition: backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+Minor changes to get it apply to our tree
+
+Commit: 9fe1f5e6c07607c9fcb28227eda1427534a836bb
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Mon Mar 7 17:25:35 2005 -0800
+
+    [PATCH] simpler topdown mmap layout allocator
+    
+    1. typos/spelling ;-)
+    
+    2. removed prev_vma and find_vma_prev because the condition checked
+       later was always true
+    
+    3. moved the free_area_cache/mmap_base check into arch_unmap_area_topdown
+       where i think it belongs.
+    
+    4. removed the extra free_area_cache setting code in the while loop
+       as it only has to be set when we actually (and successfully) return
+       from this function.
+    
+    The only visible change to the layout should be the following:
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index a899071..822d7b5 100644
+
+Index: linux-2.6.10/mm/mmap.c
+===================================================================
+--- linux-2.6.10.orig/mm/mmap.c
++++ linux-2.6.10/mm/mmap.c
+@@ -1117,19 +1117,14 @@ arch_get_unmapped_area_topdown(struct fi
+ 			  const unsigned long len, const unsigned long pgoff,
+ 			  const unsigned long flags)
+ {
+-	struct vm_area_struct *vma, *prev_vma;
++	struct vm_area_struct *vma;
+ 	struct mm_struct *mm = current->mm;
+-	unsigned long base = mm->mmap_base, addr = addr0;
+-	int first_time = 1;
++	unsigned long addr = addr0;
+ 
+ 	/* requested length too big for entire address space */
+ 	if (len > TASK_SIZE)
+ 		return -ENOMEM;
+ 
+-	/* dont allow allocations above current base */
+-	if (mm->free_area_cache > base)
+-		mm->free_area_cache = base;
+-
+ 	/* requesting a specific address */
+ 	if (addr) {
+ 		addr = PAGE_ALIGN(addr);
+@@ -1139,48 +1134,34 @@ arch_get_unmapped_area_topdown(struct fi
+ 			return addr;
+ 	}
+ 
+-try_again:
++	/* either no address requested or can't fit in requested address hole */
++	addr = mm->free_area_cache;
++
+ 	/* make sure it can fit in the remaining address space */
+-	if (mm->free_area_cache < len)
+-		goto fail;
++	if (addr >= len) {
++		vma = find_vma(mm, addr-len);
++		if (!vma || addr <= vma->vm_start)
++			/* remember the address as a hint for next time */
++			return (mm->free_area_cache = addr-len);
++	}
++
++	addr = mm->mmap_base-len;
+ 
+-	/* either no address requested or cant fit in requested address hole */
+-	addr = (mm->free_area_cache - len) & PAGE_MASK;
+ 	do {
+ 		/*
+ 		 * Lookup failure means no vma is above this address,
+-		 * i.e. return with success:
++		 * else if new region fits below vma->vm_start,
++		 * return with success:
+ 		 */
+- 	 	if (!(vma = find_vma_prev(mm, addr, &prev_vma)))
+-			return addr;
+-
+-		/*
+-		 * new region fits between prev_vma->vm_end and
+-		 * vma->vm_start, use it:
+-		 */
+-		if (addr+len <= vma->vm_start &&
+-				(!prev_vma || (addr >= prev_vma->vm_end)))
++		vma = find_vma(mm, addr);
++		if (!vma || addr+len <= vma->vm_start)
+ 			/* remember the address as a hint for next time */
+ 			return (mm->free_area_cache = addr);
+-		else
+-			/* pull free_area_cache down to the first hole */
+-			if (mm->free_area_cache == vma->vm_end)
+-				mm->free_area_cache = vma->vm_start;
+ 
+ 		/* try just below the current vma->vm_start */
+ 		addr = vma->vm_start-len;
+ 	} while (len <= vma->vm_start);
+ 
+-fail:
+-	/*
+-	 * if hint left us with no space for the requested
+-	 * mapping then try again:
+-	 */
+-	if (first_time) {
+-		mm->free_area_cache = base;
+-		first_time = 0;
+-		goto try_again;
+-	}
+ 	/*
+ 	 * A failed mmap() very likely causes application failure,
+ 	 * so fall back to the bottom-up function here. This scenario
+@@ -1192,7 +1173,7 @@ fail:
+ 	/*
+ 	 * Restore the topdown base:
+ 	 */
+-	mm->free_area_cache = base;
++	mm->free_area_cache = mm->mmap_base;
+ 
+ 	return addr;
+ }
+@@ -1205,6 +1186,10 @@ void arch_unmap_area_topdown(struct vm_a
+ 	 */
+ 	if (area->vm_end > area->vm_mm->free_area_cache)
+ 		area->vm_mm->free_area_cache = area->vm_end;
++
++	/* dont allow allocations above current base */
++	if (area->vm_mm->free_area_cache > area->vm_mm->mmap_base)
++		area->vm_mm->free_area_cache = area->vm_mm->mmap_base;
+ }
+ 
+ unsigned long
+Index: linux-2.6.10/mvl_patches/pro-1194.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1194.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1194);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

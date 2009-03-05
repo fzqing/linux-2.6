@@ -1,0 +1,564 @@
+#! /usr/bin/env bash
+# Patch: -pro_ti_titan_mtd
+# Date: Wed Aug 16 10:58:01 2006
+# Source: Texas Instruments Inc.
+# MR: 18281
+# Type: Enhancement 
+# Disposition: Needs submitting to linux-mips.org
+# Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+# Description:
+# 
+# [PATCH 2/4] Support for MTD on TI TITAN Board
+# 
+#  drivers/mtd/maps/Kconfig           |   33 ++++
+#  drivers/mtd/maps/Makefile          |    1 
+#  drivers/mtd/maps/avalanche-flash.c |  260 +++++++++++++++++++++++++++++++++++++
+#  3 files changed, 294 insertions(+)
+# 
+
+PATCHNUM=870
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments Inc.
+MR: 18281
+Type: Enhancement 
+Disposition: Needs submitting to linux-mips.org
+Signed-off-by: Manish Lachwani <mlachwani@mvista.com>
+Description:
+
+[PATCH 2/4] Support for MTD on TI TITAN Board
+
+ drivers/mtd/maps/Kconfig           |   33 ++++
+ drivers/mtd/maps/Makefile          |    1 
+ drivers/mtd/maps/avalanche-flash.c |  260 +++++++++++++++++++++++++++++++++++++
+ mvl_patches/pro-0870.c             |   16 ++
+ 4 files changed, 310 insertions(+)
+
+Index: linux-2.6.10/drivers/mtd/maps/avalanche-flash.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/mtd/maps/avalanche-flash.c
+@@ -0,0 +1,260 @@
++/*
++ * $Id: pro_ti_titan_mtd.patch,v 1.1.2.1 2006/05/24 19:41:03 mlachwani Exp $
++ *
++ * Normal mappings of chips in physical memory
++ */
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <asm/io.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/map.h>
++#include <linux/config.h>
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/major.h>
++#include <linux/root_dev.h>
++#include <linux/mtd/partitions.h>
++#include <asm/mach-avalanche/pal.h>
++
++#define MAX_NUM_PARTITIONS 4
++
++#include <asm/mips-boards/prom.h>
++
++struct avalanche_chip_info
++{
++	char *name;
++	int addr;
++	int size;
++	int buswidth;
++};
++
++struct avalanche_mtd
++{
++	struct avalanche_chip_info *avalanche_chip_info;
++	struct mtd_partition avalanche_partition_info[MAX_NUM_PARTITIONS];
++	struct mtd_info *avalanche_mtd_info; 
++	struct map_info avalanche_map;
++	int num_of_partitions;
++};
++
++extern char *prom_getenv(char *name);
++
++static int create_mtd_partitions(void);
++static void __exit avalanche_mtd_cleanup(void);
++	
++struct avalanche_chip_info avalanche_chip_info[] = {   
++	{ "Primary flash device", CONFIG_MTD_AVALANCHE_CHIP0_START, CONFIG_MTD_AVALANCHE_CHIP0_LEN, CONFIG_MTD_AVALANCHE_CHIP0_BUSWIDTH},
++#ifdef CONFIG_MTD_AVALANCHE_SEC_FLASH
++	{ "Secondary flash device", CONFIG_MTD_AVALANCHE_CHIP1_START, CONFIG_MTD_AVALANCHE_CHIP1_LEN, CONFIG_MTD_AVALANCHE_CHIP1_BUSWIDTH},
++#endif
++};
++
++#define NUM_OF_MTD_DEVICES 1
++
++struct avalanche_mtd avalanche_mtd[NUM_OF_MTD_DEVICES];
++
++int avalanche_mtd_ready = 0;
++
++int avalanche_flash_init(struct avalanche_mtd *dev)
++{
++	struct avalanche_chip_info *chip_info = dev->avalanche_chip_info;
++	struct map_info *avalanche_map = &dev->avalanche_map;
++	struct mtd_info *avalanche_mtd_info;
++        
++	avalanche_map->name = chip_info->name;
++	avalanche_map->size = chip_info->size;
++	avalanche_map->bankwidth = chip_info->buswidth;
++	avalanche_map->phys = chip_info->addr;
++
++	printk(KERN_NOTICE "avalanche flash device: 0x%lx at 0x%lx.\n",(unsigned long) chip_info->size, (unsigned long)chip_info->addr);
++
++	avalanche_map->virt = (void *)ioremap_nocache(chip_info->addr, chip_info->size);
++
++	if (!avalanche_map->virt) {
++		printk(KERN_ERR "Failed to ioremap avalanche flash device.\n");
++		return -EIO;
++	}
++	
++	avalanche_mtd_info = do_map_probe("cfi_probe", avalanche_map);
++	if (!avalanche_mtd_info) {
++		printk(KERN_ERR "Error in do_map_probe on avalanche flash device.\n");
++		return -ENXIO;
++	}
++
++	simple_map_init(avalanche_map);
++	dev->avalanche_mtd_info = avalanche_mtd_info;	
++	avalanche_mtd_info->owner = THIS_MODULE;
++	
++	return 0;	
++}
++
++int __init avalanche_mtd_init(void)
++{      
++	int i;
++	
++	for (i = 0; i < NUM_OF_MTD_DEVICES; i++) {
++		int ret;
++
++		avalanche_mtd[i].avalanche_chip_info = &avalanche_chip_info[i];
++		ret = avalanche_flash_init(avalanche_mtd + i);	
++		
++		if (ret != 0)
++			printk("failed initializing  flash dev %d\n",i);
++
++	}
++
++	create_mtd_partitions(); 
++	avalanche_mtd_ready=1;
++	ROOT_DEV = MKDEV(MTD_BLOCK_MAJOR, 0);
++	return 0;
++}
++
++static char *strdup(char *str)
++{
++	int n = strlen(str)+1;
++	char *s = kmalloc(n, GFP_KERNEL);
++
++	if (!s) 
++		return NULL;
++
++	return strcpy(s, str);
++}
++
++static int avalanche_check_mtd(struct avalanche_mtd *dev, unsigned int flash_base, unsigned int flash_end)
++{
++	int window_start = dev->avalanche_chip_info->addr;
++	int window_size = dev->avalanche_chip_info->size;
++
++	flash_base = CPHYSADDR((void*)flash_base);	
++	flash_end  = CPHYSADDR((void*)flash_end);	
++
++	if ( (flash_base >= window_start && flash_base <= (window_start + window_size) )  &&
++		 (flash_end >= window_start && flash_end <= (window_start + window_size)) )
++        		return 1;
++
++	return 0;
++}
++
++static void avalanche_add_partition(char * env_name, char * flash_base, char * flash_end)
++{
++	int i = 0;
++	int found = 0;
++	int mtd_partition;
++	int offset;
++	int size;
++		
++	struct avalanche_mtd *dev = NULL;
++	struct mtd_partition *avalanche_partition_info;
++	struct avalanche_chip_info *avalanche_chip_info;
++ 	struct mtd_info *avalanche_mtd_info;
++
++	for (i = 0; i < NUM_OF_MTD_DEVICES; i++) {
++		dev = &avalanche_mtd[i];
++		if ( !avalanche_check_mtd(dev,(unsigned int)flash_base, (unsigned int)flash_end))
++			continue;
++
++		found = 1;
++		break;
++	}
++                        
++ 	if (!found) {
++                printk("avalanche_check_mtd returns error on partition %s\n", env_name);
++		return;
++        }
++
++	avalanche_partition_info = dev->avalanche_partition_info;
++	avalanche_chip_info = dev->avalanche_chip_info;
++	avalanche_mtd_info = dev->avalanche_mtd_info;
++
++	offset = CPHYSADDR(flash_base) - avalanche_chip_info->addr;
++	size = flash_end - flash_base;
++	
++	printk("Found a %s image (0x%x), with size (0x%x).\n",env_name, offset, size);
++
++	mtd_partition = dev->num_of_partitions;
++	avalanche_partition_info[mtd_partition].name = strdup(env_name);
++	avalanche_partition_info[mtd_partition].offset = offset;
++	avalanche_partition_info[mtd_partition].size = size;
++	avalanche_partition_info[mtd_partition].mask_flags = 0;
++	add_mtd_partitions(avalanche_mtd_info, &avalanche_partition_info[mtd_partition], 1);
++	dev->num_of_partitions++;
++}
++
++static int create_mtd_partitions(void)
++{
++	unsigned char *flash_base;
++	unsigned char *flash_end;
++	char env_ptr[50];
++	char *p_env_ptr = env_ptr; /* cant modify array names, you see.. */
++	char *base_ptr;
++	char *end_ptr;
++        int num_of_partitions = 0;
++
++	do {
++		char env_name[20];
++
++		sprintf(env_name, "mtd%1u", num_of_partitions);
++		printk("Looking for mtd device :%s:\n", env_name);
++		if (prom_getenv(env_name) != NULL) {
++			strcpy(env_ptr, prom_getenv(env_name));	
++			p_env_ptr = env_ptr;
++		} else {
++			break;
++		}
++		
++		strsep(&p_env_ptr, ",");
++		base_ptr = env_ptr; 
++		end_ptr = p_env_ptr; 
++		if ((base_ptr == NULL) || (end_ptr == NULL)) {	
++			printk("ERROR: Invalid %s start,end.\n", env_name);
++			break;
++		}
++
++		flash_base = (unsigned char*) simple_strtol(base_ptr, NULL, 0);
++		flash_end = (unsigned char*) simple_strtol(end_ptr, NULL, 0);
++		if ((!flash_base) || (!flash_end)) {
++			printk("ERROR: Invalid %s start,end.\n", env_name);
++			break;
++		}
++                
++		avalanche_add_partition(env_name,flash_base,flash_end);
++		num_of_partitions++;
++
++	} while (num_of_partitions < MAX_NUM_PARTITIONS);
++
++	return num_of_partitions;
++}
++
++static void __exit avalanche_mtd_cleanup(void)
++{
++	int i;
++
++	avalanche_mtd_ready = 0;
++	for (i = 0; i < NUM_OF_MTD_DEVICES; i++) {
++		struct mtd_info *avalanche_mtd_info = avalanche_mtd[i].avalanche_mtd_info;
++		struct map_info *avalanche_map = &avalanche_mtd[i].avalanche_map;		
++
++		if (avalanche_mtd_info) {
++			del_mtd_partitions(avalanche_mtd_info);
++			del_mtd_device(avalanche_mtd_info);
++			map_destroy(avalanche_mtd_info);
++		}
++
++		if (avalanche_map->map_priv_1) {
++			iounmap((void *)avalanche_map->map_priv_1);
++			avalanche_map->map_priv_1 = 0;
++		}
++	}
++}
++
++module_init(avalanche_mtd_init);
++module_exit(avalanche_mtd_cleanup);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Avalanche CFI map driver");
++
+Index: linux-2.6.10/drivers/mtd/maps/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Kconfig
++++ linux-2.6.10/drivers/mtd/maps/Kconfig
+@@ -146,6 +146,38 @@ config MTD_MULTI_PHYSMAP_4_WIDTH
+ 	depends on MTD_MULTI_PHYSMAP
+ 	default "2"
+ 
++config MTD_AVALANCHE 
++	depends on MIPS_AVALANCHE_SOC && MTD
++	bool "Avalanche SoC MTD mapping driver"
++	default y
++	help
++	 This is required for booting up Linux from flash on Avalanche
++	 SoC. This helps create partitions on flash for accessing the 
++	 File System, Kernel etc as MTD block devices. 
++	 If unsure choose Y. 
++
++config MTD_AVALANCHE_CHIP0_START
++	depends on MTD_AVALANCHE
++	hex "Starting (physical) address of the primary flash device"
++	default 0x10000000
++	help
++	  The CS0 physical address. Changes VERY rarely.
++
++config MTD_AVALANCHE_CHIP0_LEN 
++	depends on MTD_AVALANCHE
++	hex "Length (in bytes) of the primary flash device"
++	default 0x400000
++	help
++	  Give the length of the CS0 flash chip.
++
++config MTD_AVALANCHE_CHIP0_BUSWIDTH 
++	depends on MTD_AVALANCHE = 'y'
++	int "Buswidth (aka bankwidth) of the primary flash device"
++	default 2
++	help
++	 The bankwidth of the CS0 chip. May vary depending on the chip type. Read
++	 the manual and give the correct value if you wish to see the sleek prompt.
++
+ config MTD_SUN_UFLASH
+ 	tristate "Sun Microsystems userflash support"
+ 	depends on (SPARC32 || SPARC64) && MTD_CFI
+@@ -752,3 +784,4 @@ config MTD_PLATRAM
+ 
+ endmenu
+ 
++
+Index: linux-2.6.10/drivers/mtd/maps/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/mtd/maps/Makefile
++++ linux-2.6.10/drivers/mtd/maps/Makefile
+@@ -75,3 +75,4 @@ obj-$(CONFIG_MTD_SHARP_SL)	+= sharpsl-fl
+ obj-$(CONFIG_MTD_PLATRAM)	+= plat-ram.o
+ obj-$(CONFIG_MTD_OMAP_NOR)	+= omap_nor.o
+ obj-$(CONFIG_MTD_TX493x)	+= tx493x-flash.o
++obj-$(CONFIG_MTD_AVALANCHE)	+= avalanche-flash.o
+Index: linux-2.6.10/mvl_patches/pro-0870.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0870.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(870);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

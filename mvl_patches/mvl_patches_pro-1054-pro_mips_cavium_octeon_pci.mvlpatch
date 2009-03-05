@@ -1,0 +1,2359 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_cavium_octeon_pci
+# Date: Tue Feb  6 08:14:42 2007
+# Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+# MR: 19270
+# Type: Enhancement
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Description:
+#     PCI support for Cavium Octeon
+# 
+
+PATCHNUM=1054
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+MR: 19270
+Type: Enhancement
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Description:
+    PCI support for Cavium Octeon
+
+Index: linux-2.6.10/arch/mips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/mips/Kconfig
++++ linux-2.6.10/arch/mips/Kconfig
+@@ -1396,6 +1396,7 @@ config CPU_CAVIUM_OCTEON
+ 	select IRQ_CPU_OCTEON
+ 	select CPU_HAS_PREFETCH
+ 	select CPU_MIPS64
++	select HW_HAS_PCI
+ 	help
+ 	  The Cavium Octeon processor is a highly integrated chip containing
+ 	  many ethernet hardware widgets for networking tasks. The processor
+Index: linux-2.6.10/arch/mips/cavium-octeon/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/mips/cavium-octeon/Makefile
++++ linux-2.6.10/arch/mips/cavium-octeon/Makefile
+@@ -3,7 +3,8 @@
+ # under Linux.
+ #
+ 
+-obj-y                                 := setup.o serial.o int_handler.o hal.o adel_workaround.o perf_counters.o octeon_info.o
++obj-y                                 := setup.o serial.o int_handler.o hal.o adel_workaround.o perf_counters.o octeon_info.o 
++obj-y				      += i8259.o
+ obj-$(CONFIG_SMP)                     += smp.o
+ obj-$(CONFIG_CAVIUM_OCTEON_USER_IO)   += userio.o
+ obj-$(CONFIG_CAVIUM_OCTEON_EBT3000)   += ebt3000_cf.o
+Index: linux-2.6.10/arch/mips/cavium-octeon/i8259.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/cavium-octeon/i8259.c
+@@ -0,0 +1,177 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2006 Cavium Networks
++ */
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/interrupt.h>
++#include "hal.h"
++
++#define SLAVE           (0xa0 - 0x20)
++
++/* Initialization Command Word 1 (ICW1 address 0x20 or 0xa0) */
++/* 7:5 Interrupt Vector Addresses for MCS-80/85 Mode. */
++#define ICW1_ADDRESS    0x20
++#define ICW1            0x10	// 4   Must be set to 1 for ICW1
++#define ICW1_LEVEL_TRIG (1<<3)	// 3   1 Level Triggered Interrupts, 0 Edge Triggered Interrupts
++#define ICW1_INTERVAL4  (1<<2)	// 2   1 Call Address Interval of 4, 0 Call Address Interval of 8
++#define ICW1_SINGLE_PIC (1<<1)	// 1   1 Single PIC, 0 Cascaded PICs
++#define ICW1_NEED_ICW4  (1<<0)	// 0   1 Will be Sending ICW4, 0 Don't need ICW4
++
++/* Initialization Command Word 2 (ICW2 address 0x21 or 0xa1) */
++#define ICW2_ADDRESS    0x21
++/* Bit 8086/8080 Mode  MCS 80/85 Mode
++    7   I7              A15
++    6   I6              A14
++    5   I5              A13
++    4   I4              A12
++    3   I3              A11
++    2   -               A10
++    1   -               A9
++    0   -               A8 */
++
++/* Initialization Command Word 3 (ICW3 address 0x21 or 0xa1)
++    For the master, this is a bitfield saying which line is hooked to a slave.
++    For a slave, this is the slave's ID, the line it is hooked to */
++#define ICW3_ADDRESS    0x21
++
++/* Initialization Command Word 4 (ICW4 address 0x21 or 0xa1) */
++/* Bits 7-5 are reserved */
++#define ICW4_ADDRESS        0x21
++#define ICW4_FULLY_NESTED   (1<<4)	// 4   1 Special Fully Nested Mode, 0 Not Special Fully Nested Mode
++#define ICW4_BUFFERED       (3<<2)	// 3   1 Buffered Mode, 0 Unbuffered
++#define ICW4_MASTER         (2<<2)	// 2   1 Master, 0 Slave
++#define ICW4_AUTO_EOI       (1<<1)	// 1   1 Auto EOI, 0 Normal EOI
++#define ICW4_8086           (1<<0)	// 0   1 8086/8080 Mode, 0 MCS-80/85
++
++/* Operation Control Word 1 (OCW1 address 0x21 or 0xa1)
++    This is a bitmask for each interrupt */
++#define OCW1_ADDRESS    0x21
++
++/* Operation Control Word 2 (OCW2 address 0x20 or 0xa0) */
++#define OCW2_ADDRESS    0x20
++#define OCW2            0x00	// Bits 4:3 must be zero
++#define OCW2_ROTATE_AUTO_EOI_CLEAR  (0<<5)	// 7:5     000 Rotate in Auto EOI Mode (Clear)
++#define OCW2_NON_SPECIFIC_EOI       (1<<5)	//         001 Non Specific EOI
++#define OCW2_NOP                    (2<<5)	//         010 NOP
++#define OCW2_SPECIFIC_EOI           (3<<5)	//         011 Specific EOI
++#define OCW2_ROTATE_AUTO_EOI_SET    (4<<5)	//         100 Rotate in Auto EOI Mode (Set)
++#define OCW2_ROTATE_NON_SPECIFIC_EOI (5<<5)	//         101 Rotate on Non-Specific EOI
++#define OCW2_SET_PRIORITY           (6<<5)	//         110 Set Priority Command (Use Bits 2:0)
++#define OCW2_ROTATE_SPECIFIC_EOI    (7<<5)	//         111 Rotate on Specific EOI (Use Bits 2:0)
++
++/* Operation Control Word 3 (OCW3 address 0x20 or 0xa0) */
++/* Bit 7 Must be set to 0 */
++#define OCW3_ADDRESS    0x20
++#define OCW3            0x08	// 4:3     Must be set to 01
++#define OCW3_RESET_SPECIAL_MASK (2<<5)	// 6:5     00 Reserved, 01 Reserved, 10 Reset Special Mask
++#define OCW3_SET_SPECIAL_MASK   (3<<5)	//         11 Set Special Mask
++#define OCW3_POLL               (1<<2)	// 2       1 Poll Command, 0 No Poll Command
++#define OCW3_READ_IRR           (2<<0)	// 1:0     00 Reserved, 01 Reserved, 10 Next Read Returns Interrupt Request Register
++#define OCW3_READ_ISR           (3<<0)	//         11 Next Read Returns In-Service Register
++
++static struct timer_list octeon_i8259_poll_timer;
++
++static irqreturn_t octeon_i8259_interrupt(int cpl, void *dev_id,
++					  struct pt_regs *regs)
++{
++	u8 master_isr, slave_isr;
++	int irq;
++
++	outb(OCW3 | OCW3_POLL, OCW3_ADDRESS);
++	master_isr = inb(OCW3_ADDRESS);
++	if (master_isr & 0x80) {	/* Top bit is set if the master requested the interrupt */
++		if ((master_isr & 0x7) == 2) {
++			outb(OCW3 | OCW3_POLL, OCW3_ADDRESS + SLAVE);
++			slave_isr = inb(OCW3_ADDRESS + SLAVE);
++			if (slave_isr & 0x80) {	/* Top bit is set if the slave requested the interrupt */
++				irq = (slave_isr & 7) + 8 + 80;
++
++				if (irq_desc[irq].action)
++					do_IRQ(irq, regs);
++
++				/* Ack the slave */
++				outb(OCW2 | OCW2_SPECIFIC_EOI | (slave_isr & 7),
++				     OCW2_ADDRESS + SLAVE);
++			} else
++				printk
++				    ("8259: Spurious interrupt from master for slave\n");
++		} else {
++			irq = (master_isr & 7) + 80;
++			if (irq_desc[irq].action)
++				do_IRQ(irq, regs);
++		}
++
++		/* Ack the master */
++		outb(OCW2 | OCW2_SPECIFIC_EOI | (master_isr & 7), OCW2_ADDRESS);
++
++		return IRQ_HANDLED;
++	} else {
++		printk("8259: Spurious interrupt from master\n");
++		return IRQ_NONE;
++	}
++}
++
++static void octeon_i8259_poll(unsigned long irq_line)
++{
++	uint64_t active_irqs =
++	    octeon_read_csr(OCTEON_CIU_INTX_SUM0(octeon_get_core_num() * 2));
++	if ((active_irqs & (1ull << (irq_line - 8))) == 0)
++		octeon_i8259_interrupt(irq_line, NULL, NULL);
++
++	mod_timer(&octeon_i8259_poll_timer, jiffies + 1);
++}
++
++void octeon_i8259_setup(int irq_line)
++{
++	static int do_once = 0;
++
++	if (do_once)
++		return;
++
++	do_once = 1;
++
++	printk("8259: Initializing\n");
++
++	/* Setup the Master 8259 */
++	outb(ICW1 | ICW1_NEED_ICW4, ICW1_ADDRESS);	/* Begin the init sequence */
++	outb(0, ICW2_ADDRESS);	/* Master base address is zero, interrupts 0-7 */
++	outb(1 << 2, ICW3_ADDRESS);	/* Slave is connected to line 2 */
++	outb(ICW4_FULLY_NESTED | ICW4_MASTER | ICW4_BUFFERED | ICW4_8086, ICW4_ADDRESS);	/* Set the mode to buffered with edge triggering */
++	outb(OCW3 | OCW3_READ_ISR, OCW3_ADDRESS);	/* Read ISR */
++
++	/* Setup the Slave 8259 */
++	outb(ICW1 | ICW1_NEED_ICW4, ICW1_ADDRESS + SLAVE);	/* Begin the init sequence */
++	outb(8, ICW2_ADDRESS + SLAVE);	/* Slave base address is 8, interrupts 8-15 */
++	outb(2, ICW3_ADDRESS + SLAVE);	/* Slave is connected to line 2 */
++	outb(ICW4_BUFFERED | ICW4_8086, ICW4_ADDRESS + SLAVE);	/* Set the mode to buffered with edge triggering */
++	outb(OCW3 | OCW3_READ_ISR, OCW3_ADDRESS + SLAVE);	/* Read ISR */
++
++	/* Set interrupt mask to disable all interrupts */
++	outb(0xfb, OCW1_ADDRESS);
++	outb(0xff, OCW1_ADDRESS + SLAVE);
++
++	/* Setup the GPIO pin if the interrupt is hooked to it */
++	if ((irq_line >= 24) && (irq_line <= 39)) {
++		printk("8259: Setting GPIO %d for the interrupt\n",
++		       irq_line - 24);
++		octeon_write_csr(OCTEON_GPIO_BIT_CFGX(irq_line - 24), 0x114);
++		request_irq(irq_line, octeon_i8259_interrupt, SA_SHIRQ, "8259",
++			    octeon_i8259_interrupt);
++	} else if ((irq_line >= 44) && (irq_line <= 48)) {
++		/* We're hooked to a PCI line... */
++		printk
++		    ("8259: Setting up polling since interrupt logic is inverted\n");
++		init_timer(&octeon_i8259_poll_timer);
++		octeon_i8259_poll_timer.data = irq_line;
++		octeon_i8259_poll_timer.function = octeon_i8259_poll;
++		mod_timer(&octeon_i8259_poll_timer, jiffies + 1);
++	} else {
++		panic("8259: Don't know how to setup the interrupt IRQ %d\n",
++		      irq_line);
++	}
++}
+Index: linux-2.6.10/arch/mips/pci/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/mips/pci/Makefile
++++ linux-2.6.10/arch/mips/pci/Makefile
+@@ -57,3 +57,4 @@ obj-$(CONFIG_VICTOR_MPC30X)	+= fixup-mpc
+ obj-$(CONFIG_ZAO_CAPCELLA)	+= fixup-capcella.o
+ obj-$(CONFIG_VR5701_SG2)	+= pci-vr5701_sg2.o ops-vr5701_sg2.o
+ obj-$(CONFIG_MARKEINS)		+= ops-emma2rh.o pci-emma2rh.o fixup-emma2rh.o
++obj-$(CONFIG_CPU_CAVIUM_OCTEON)	+= ops-cvmx.o pci-cvmx.o fixup-cvmx.o
+Index: linux-2.6.10/arch/mips/pci/fixup-cvmx.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/fixup-cvmx.c
+@@ -0,0 +1,535 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2005, 2006 Cavium Networks
++*/
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/interrupt.h>
++#include <asm/time.h>
++#include "pci-cvmx.h"
++
++/* Octeon's PCI controller uses did=3, subdid=2 for PCI IO addresses.
++   Use PCI endian swapping 1 so no address swapping is necessary. The
++   Linux io routines will endian swap the data */
++#define OCTEON_PCI_IOSPACE_BASE     0x80011a0400000000ull
++#define OCTEON_PCI_IOSPACE_SIZE     (1ull<<32)
++/* Octeon't PCI controller uses did=3, subdid=3 for PCI memory. Start PCI
++       memory from 0x8000000, right after the 0-128MB BAR1 mapping */
++#define OCTEON_PCI_MEMSPACE_OFFSET  (0x00011b0000000000ull)
++#define OCTEON_PCI_MEMSPACE_BASE    (0x0000000008000000ull)
++#define OCTEON_PCI_MEMSPACE_SIZE    (1ull<<35)
++
++static inline int cavium_irq_map_asus_na038(struct pci_dev *dev, u8 slot,
++					    u8 pin)
++{
++	int irq = ((PCI_SLOT(dev->devfn) + pin - 2) & 3) + 44;
++	int irqmap_by_func[] =
++	    { 80 + 10, 80 + 14, 80 + 13, 80 + 13, 80, 80, 80, 80 };
++
++	/* The NEC USB */
++	if (PCI_SLOT(dev->devfn) == 5)
++		irq = (pin - 2) + 44;
++
++	/* The Via southbridge (device 2) is on the GPIO Pin 15 */
++	if (PCI_SLOT(dev->devfn) == 2) {
++		octeon_i8259_setup(39);
++		irq = irqmap_by_func[PCI_FUNC(dev->devfn)];
++	}
++	return irq;
++}
++
++static inline int cavium_irq_map_sonicwall_gadwin(struct pci_dev *dev, u8 slot,
++						  u8 pin)
++{
++	int irqmap_by_slot[] = {
++		[0] = -1,
++		[1] = 44 + pin - 1,
++		[2] = 44,
++		[3] = 46,
++		[4] = 46,
++		[5] = 47,
++		[6] = 46,
++		[7] = -1,
++		[8] = 44,
++		[9] = 44,
++		[0xA] = 44,[0xB] = 44,[0xC] = 44,[0xE] = 44,[0xF] = 44,
++		[0x10] = 44,[0x11] = 44,[0x12] = 44,[0x13] = 44,
++		[0x14] = 44,[0x15] = 44,[0x16] = 44,[0x17] = 44,
++		[0x18] = 44,[0x19] = 44,[0x1A] = 44,[0x1B] = 44,
++		[0x1C] = 44,[0x1D] = 44,[0x1E] = 44,[0x1F] = 44,
++	};
++	int irqmap_by_func[] = { 80 + 10, 80 + 14, 80 + 13, 80 + 13,
++		80, 80, 80,
++	};
++
++	int irq;
++
++	if (PCI_SLOT(dev->devfn) == 7) {	/* INTB VIA Southbridge */
++		octeon_i8259_setup(39);
++		irq = irqmap_by_func[PCI_FUNC(dev->devfn)];
++	} else
++		irq = irqmap_by_slot[PCI_SLOT(dev->devfn)];
++	return irq;
++
++}
++
++static inline int cavium_irq_map_ebh3100(struct pci_dev *dev, u8 slot, int pin)
++{
++	return ((PCI_SLOT(dev->devfn) - 2) & 3) + 44;
++}
++
++/**
++ * Map a PCI device to the appropriate interrupt line
++ *
++ * @param dev
++ * @param slot
++ * @param pin
++ * @return
++**/
++int __init pcibios_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
++{
++	int irq_num;
++
++	/* Force the Cache line setting. The standard Linux bus scan doesn't seem
++	   to set it */
++	pci_write_config_byte(dev, PCI_CACHE_LINE_SIZE, L1_CACHE_BYTES/4);
++	irq_num = cavium_irq_map(dev, slot, pin);
++	printk("Device at %d:%d.%d slot %d pin %d irqmapped to %d\n",
++	       dev->bus->number,
++	       PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
++	       slot, pin, irq_num);
++	return irq_num;
++}
++
++static void chip_bridge_setup(struct pci_dev *dev)
++{
++	uint16_t val;
++       
++	pci_read_config_word(dev, 0x3e, &val);
++	val &= ~(1 << 2);	/* Disable the ISA port filtering */
++	val |= 1 << 3;		/* Enable VGA */
++	val |= 1 << 4;		/* Enable VGA Alias Filter */
++	pci_write_config_word(dev, 0x3E, val);
++	pci_write_config_byte(dev, 1, 0x00);
++	pci_write_config_byte(dev, 1, 0x00);
++}
++
++static void chip_vt82c686b_setup(struct pci_dev *dev)
++{
++	u8 kbc_rtc;
++#ifdef CONFIG_PCI_NAMES
++	printk("%s(bus=%d, dev=%d, func=%d, name=%s)\n", __FUNCTION__,
++	       dev->bus->number, dev->devfn >> 3, dev->devfn & 7,
++	       dev->pretty_name);
++#endif
++/*
++Offset 48 - Miscellaneous Control 3 ................................ RW
++  7-4 Reserved ........................................ always reads 0
++   3    Extra RTC Port 74/75 Enable
++            0 Disable ...................................................default
++            1 Enable
++   2    Integrated USB Controller Disable
++            0 Enable ....................................................default
++            1 Disable
++   1    Integrated IDE Controller Disable
++            0 Enable ....................................................default
++            1 Disable
++   0    512K PCI Memory Decode
++            0 Use Rx4E[15-12] to select top of PCI memory
++            1 Use contents of Rx4E[15-12] plus 512K as top
++               of PCI memory.......................................default
++*/
++	pci_write_config_byte( dev, 0x48, 0x09);
++
++/*
++Offset 4A - IDE Interrupt Routing..................................RW
++   7    Wait for PGNT Before Grant to ISA Master /
++        DMA
++           0 Disable ...................................................default
++           1 Enable
++   6    Bus Select for Access to I/O Devices Below 100h
++           0 Access ports 00-FFh via XD bus ...........default
++           1 Access ports 00-FFh via SD bus (applies to
++              external devices only; internal devices such as
++              the mouse controller are not effected)
++  5-4 Reserved (do not program)..................... default = 0
++  3-2 IDE Second Channel IRQ Routing
++          00 IRQ14
++          01 IRQ15.....................................................default
++          10 IRQ10
++          11 IRQ11
++  1-0 IDE Primary Channel IRQ Routing
++          00 IRQ14.....................................................default
++          01 IRQ15
++          10 IRQ10
++          11 IRQ11
++*/
++	pci_write_config_byte(dev, 0x4a, 0x04);
++
++/*
++Offset 4F-4E - ISA DMA/Master Mem Access Ctrl 3 ... RW
++ 15-12 Top of PCI Memory for ISA DMA/Master accesses
++         0000 1M .................................................... default
++         0001 2M
++          ... ...
++         1111 16M
++Note: All ISA DMA / Masters that access addresses higher
++        than the top of PCI memory will not be directed to
++        the PCI bus.
++   11 Forward E0000-EFFFF Accesses to PCI ....... def=0
++   10 Forward A0000-BFFFF Accesses to PCI ....... def=0
++    9   Forward 80000-9FFFF Accesses to PCI ........def=1
++    8   Forward 00000-7FFFF Accesses to PCI ........def=1
++    7   Forward DC000-DFFFF Accesses to PCI ...... def=0
++    6   Forward D8000-DBFFF Accesses to PCI ......def=0
++    5   Forward D4000-D7FFF Accesses to PCI ......def=0
++    4   Forward D0000-D3FFF Accesses to PCI ......def=0
++    3   Forward CC000-CFFFF Accesses to PCI .....def=0
++    2   Forward C8000-CBFFF Accesses to PCI ......def=0
++    1   Forward C4000-C7FFF Accesses to PCI ......def=0
++    0   Forward C0000-C3FFF Accesses to PCI ......def=0
++*/
++	pci_write_config_word(dev, 0x4e, 0xf000);
++
++/*
++Offset 51 - PNP IRQ Routing 1........................................RW
++  7-4 PnP Routing for Parallel Port IRQ (see PnP IRQ
++        routing table)
++  3-0 PnP Routing for Floppy IRQ (see PnP IRQ routing
++        table)
++*/
++	pci_write_config_byte(dev, 0x51, 0x76);
++
++/*
++Offset 52 - PNP IRQ Routing 2........................................RW
++  7-4 PnP Routing for Serial Port 2 IRQ (see PnP IRQ
++        routing table)
++  3-0 PnP Routing for Serial Port 1 IRQ (see PnP IRQ
++        routing table)
++*/
++	pci_write_config_byte(dev, 0x52, 0x34);
++
++/*
++Offset 5A  KBC / RTC Control......................................RW
++Bits 7-4 of this register are latched from pins SD7-4 at power-
++up but are read/write accessible so may be changed after
++power-up to change the default strap setting:
++    7    Keyboard RP16........................... latched from SD7
++    6    Keyboard RP15 .......................... latched from SD6
++    5    Keyboard RP14 .......................... latched from SD5
++    4    Keyboard RP13 .......................... latched from SD4
++    3    Reserved ........................................ always reads 0
++    2    Internal RTC Enable
++            0 Disable
++            1 Enable ...................................................default
++    1    Internal PS2 Mouse Enable
++            0 Disable ..................................................default
++            1 Enable
++    0    Internal KBC Enable
++            0 Disable ..................................................default
++            1 Enable
++*/
++	pci_read_config_byte(dev, 0x5a, &kbc_rtc);
++	pci_write_config_byte(dev, 0x5a, kbc_rtc | 0x07);
++
++/*
++Offset 61-60 - Distributed DMA Ch 0 Base / Enable ..... RW
++ 15-4 Channel 0 Base Address Bits 15-4.......... default = 0
++   3    Channel 0 Enable
++           0 Disable ...................................................default
++           1 Enable
++  2-0 Reserved ........................................ always reads 0
++*/
++	pci_write_config_word(dev, 0x60, 0x04);
++
++/*
++Offset 63-62 - Distributed DMA Ch 1 Base / Enable ..... RW
++ 15-4 Channel 1 Base Address Bits 15-4.......... default = 0
++   3    Channel 1 Enable
++           0 Disable ...................................................default
++           1 Enable
++  2-0 Reserved ........................................ always reads 0
++*/
++	pci_write_config_word(dev, 0x62, 0x4);
++
++/*
++Offset 65-64 - Distributed DMA Ch 2 Base / Enable ..... RW
++ 15-4 Channel 2 Base Address Bits 15-4.......... default = 0
++   3    Channel 2 Enable
++           0 Disable ...................................................default
++           1 Enable
++  2-0 Reserved ........................................ always reads 0
++*/
++	pci_write_config_word(dev, 0x64, 0x4);
++
++/*
++Offset 67-66 - Distributed DMA Ch 3 Base / Enable ..... RW
++ 15-4 Channel 3 Base Address Bits 15-4.......... default = 0
++   3    Channel 3 Enable
++           0 Disable ...................................................default
++           1 Enable
++  2-0 Reserved ........................................ always reads 0
++*/
++	pci_write_config_word(dev, 0x66, 0x4);
++
++/*
++Offset 77  GPIO Control 4 Control (10h)..................... RW
++   7    DRQ / DACK# Pins are GPI / GPO
++           0 Disable................................................... default
++           1 Enable
++   6    Game Port XY Pins are GPI / GPO
++           0 Disable................................................... default
++           1 Enable
++   5    Reserved    ........................................always reads 0
++   4    Internal APIC Enable
++           0 Disable
++           1 Enable (U10 = WSC#, V9 = APICD0, T10 =
++              APICD1)................................................ default
++   3    IRQ0 Output
++           0 Disable................................................... default
++           1 Enable IRQ0 output to GPIOC
++   2    RTC Rx32 Write Protect
++           0 Disable................................................... default
++           1 Enable
++   1    RTC Rx0D Write Protect
++           0 Disable................................................... default
++           1 Enable
++   0    GPO13 Enable (Pin U5)
++           0 Pin defined as SOE#.............................. default
++           1 Pin defined as GPO13
++*/
++	pci_write_config_byte(dev, 0x77, 0);
++
++/*
++Offset 81  ISA Positive Decoding Control 1..................RW
++ 7  On-Board I/O Port Positive Decoding
++      0 Disable ...................................................default
++      1 Enable
++ 6  Microsoft-Sound System I/O Port Positive
++    Decoding
++      0 Disable ...................................................default
++      1 Enable
++5-4 Microsoft-Sound System I/O Decode Range
++     00 0530h-0537h ..........................................default
++     01 0604h-060Bh
++     10 0E80-0E87h
++     11 0F40h-0F47h
++ 3  APIC Positive Decoding
++      0 Disable ...................................................default
++      1 Enable
++ 2  BIOS ROM Positive Decoding
++      0 Disable ...................................................default
++      1 Enable
++ 1  Reserved ........................................ always reads 0
++ 0  PCS0 Positive Decoding
++      0 Disable ...................................................default
++      1 Enable
++*/
++	pci_write_config_byte(dev, 0x81, 0xc0);
++
++/*
++Offset 82  ISA Positive Decoding Control 2..................RW
++   7    FDC Positive Decoding
++            0 Disable ...................................................default
++            1 Enable
++   6    LPT Positive Decoding
++            0 Disable ...................................................default
++            1 Enable
++  5-4 LPT Decode Range
++           00 3BCh-3BFh, 7BCh-7BEh ......................default
++           01 378h-37Fh, 778h-77Ah
++           10 278h-27Fh, 678h-67Ah
++           11 -reserved-
++   3    Game Port Positive Decoding
++            0 Disable ...................................................default
++            1 Enable
++   2    MIDI Positive Decoding
++            0 Disable ...................................................default
++            1 Enable
++  1-0 MIDI Decode Range
++           00 300h-303h ..............................................default
++           01 310h-313h
++           10 320h-323h
++           11 330h-333h
++*/
++	pci_write_config_byte(dev, 0x82, 0xdc);
++
++/*
++Offset 83  ISA Positive Decoding Control 3 ................. RW
++   7    COM Port B Positive Decoding
++           0 Disable................................................... default
++           1 Enable
++  6-4 COM-Port B Decode Range
++          000 3F8h-3FFh (COM1)............................ default
++          001 2F8h-2FFh (COM2)
++          010 220h-227h
++          011 228h-22Fh
++          100 238h-23Fh
++          101 2E8h-2EFh (COM4)
++          110 338h-33Fh
++          111 3E8h-3EFh (COM3)
++   3    COM Port A Positive Decoding
++           0 Disable................................................... default
++           1 Enable
++  2-0 COM-Port A Decode Range
++          000 3F8h-3FFh (COM1)............................ default
++          001 2F8h-2FFh (COM2)
++          010 220h-227h
++          011 228h-22Fh
++          100 238h-23Fh
++          101 2E8h-2EFh (COM4)
++          110 338h-33Fh
++          111 3E8h-3EFh (COM3)
++*/
++	pci_write_config_byte(dev, 0x83, 0x98);
++
++/*
++Offset 84  ISA Positive Decoding Control 4 ................. RW
++  7-5 Reserved        ........................................always reads 0
++   4    CD: Reserved.....................................always reads 0
++        CE: Port CF9 Positive Decoding
++            0 Disable
++            1 Enable................................................... default
++   3    FDC Decoding Range
++            0 Primary .................................................. default
++            1 Secondary
++   2    Sound Blaster Positive Decoding
++            0 Disable................................................... default
++            1 Enable
++  1-0 Sound Blaster Decode Range
++           00 220h-22Fh, 230h-233h .......................... default
++           01 240h-24Fh, 250h-253h
++           10 260h-26Fh, 270h-273h
++           11 280h-28Fh, 290h-293h
++*/
++	pci_write_config_byte(dev, 0x84, 0x04);
++
++/*
++Offset 85  Extended Function Enable............................RW
++  7-6 PCI Master Grant Timeout Select
++           00 Disable ...................................................default
++           01 32 PCI Clocks
++           10 64 PCI Clocks
++           11 96 PCI Clocks
++   5    Keyboard Controller Configuration
++            0 Disable ...................................................default
++            1 Enable
++   4    Function 3 USB Ports 2-3
++            0 Enable ....................................................default
++            1 Disable
++   3    Function 6 Modem / Audio
++            0 Enable ....................................................default
++            1 Disable
++   2    Function 5 Audio
++            0 Enable ....................................................default
++            1 Disable
++   1    Super-I/O Configuration
++            0 Disable ...................................................default
++            1 Enable
++   0    Super-I/O
++            0 Disable ...................................................default
++            1 Enable
++*/
++	pci_write_config_byte(dev, 0x85, 0x23);
++
++/*
++Index E0  Super-I/O Device ID (3Ch) ............................ RO
++  7-0 Super-I/O ID ........................................ default = 3Ch
++*/
++	outb(0xe0, 0x3f0);
++	if (inb(0x3f1) != 0x3c)
++		printk
++		    (KERN_ERR"Super-I/O Device ID not found (read 0x%x, expected 0x3c)\n",
++		     inb(0x3f1));
++
++/*
++Index E2  Super-I/O Function Select (03h)...................RW
++  7-5 Reserved ........................................ always reads 0
++   4   Floppy Controller Enable
++           0 Disable ...................................................default
++           1 Enable
++   3   Serial Port 2 Enable
++           0 Disable ...................................................default
++           1 Enable
++   2   Serial Port 1 Enable
++           0 Disable ...................................................default
++           1 Enable
++  1-0 Parallel Port Mode / Enable
++          00 Unidirectional mode
++          01 ECP
++          10 EPP
++          11 Parallel Port Disable ..............................default
++*/
++	outb(0xe2, 0x3f0);
++	outb(0x1d, 0x3f1);
++
++	/* Set the floppy controller address */
++	outb(0xe3, 0x3f0);
++	outb(0x3f0 >> 2, 0x3f1);	/* PC Legacy default is 0x3f0 */
++
++	/* Set the LTP port address */
++	outb(0xe6, 0x3f0);
++	outb(0x378 >> 2, 0x3f1);	/* PC Legacy default is 0x378 */
++
++	/* Set the Serail Port 1 port address */
++	outb(0xe7, 0x3f0);
++	outb(0x3f8 >> 2, 0x3f1);	/* PC Legacy default is 0x3f8 */
++
++	/* Set the Serail Port 2 port address */
++	outb(0xe8, 0x3f0);
++	outb(0x2f8 >> 2, 0x3f1);	/* PC Legacy default is 0x2f8 */
++
++/*
++Index F6  Floppy Controller Configuration................. RW
++  7-6 Reserved         ........................................always reads 0
++   5    Floppy Drive On Parallel Port
++           0 Parallel Port (SPP) Mode ...................... default
++           1 FDC Mode
++   4    3-Mode FDD
++           0 Disable................................................... default
++           1 Enable
++   3    Reserved       ........................................always reads 0
++   2    Four Floppy Drive Option
++           0 Internal 2-Drive Decoder....................... default
++           1 External 4-Drive Decoder
++   1    FDC DMA Non-Burst
++           0 Burst .................................................... default
++           1 Non-Burst
++   0    FDC Swap
++           0 Disable................................................... default
++           1 Enable
++*/
++	outb(0xf6, 0x3f0);
++	outb(0x20, 0x3f1);
++
++	printk("    Disabling   [Super-I/O Configuration]\n");
++	pci_write_config_byte(dev, 0x85, 0x21);
++}
++
++static void chip_vt82c686b_usb_setup(struct pci_dev *dev)
++{
++	printk("Routing VT82C686B USB interrupt to legacy irq 13\n");
++	pci_write_config_byte(dev, 0x3C, 80 + 13);
++}
++
++static void chip_vt82c686b_ide_setup(struct pci_dev *dev)
++{
++	u8 b;
++
++	printk("Enabling VT82C686B IDE channels\n");
++	pci_read_config_byte(dev, 0x40, &b);
++	pci_write_config_byte(dev, 0x40, b | 3);
++}
++
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x537c, chip_bridge_setup);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_PLX, 0x6520, chip_bridge_setup);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C686,
++			chip_vt82c686b_setup);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C586_2,
++			chip_vt82c686b_usb_setup);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C586_1,
++			chip_vt82c686b_ide_setup);
+Index: linux-2.6.10/arch/mips/pci/ops-cvmx.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/ops-cvmx.c
+@@ -0,0 +1,104 @@
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/interrupt.h>
++#include <asm/time.h>
++#include "pci-cvmx.h"
++
++/**
++ * Read a value from configuration space
++ *
++ * @param bus
++ * @param devfn
++ * @param reg
++ * @param size
++ * @param val
++ * @return
++ */
++static int octeon_read_config(struct pci_bus *bus, unsigned int devfn, int reg,
++			      int size, u32 * val)
++{
++	static int do_once = 0;
++	octeon_pci_address_t pci_addr;
++
++	pci_addr.u64 = 0;
++	pci_addr.s.upper = 2;
++	pci_addr.s.io = 1;
++	pci_addr.s.did = 3;
++	pci_addr.s.subdid = 1;
++	pci_addr.s.endian_swap = 1;
++	pci_addr.s.bus = bus->number;
++	pci_addr.s.dev = devfn >> 3;
++	pci_addr.s.func = devfn & 0x7;
++	pci_addr.s.reg = reg;
++
++	switch (size) {
++	case 4:
++		*val = le32_to_cpup(pci_addr.u32_ptr);
++		if (unlikely(!do_once && (bus->number == 1) && (reg == 0)
++			     && (*val == 0x06861106))) {
++			/* VT82C686B Super South South Bridge */
++			pci_addr.s.reg = 0x48;
++			if (*pci_addr.u8_ptr & 0x2) {
++				printk
++				    ("Force enabling the Via IDE (bus=%d, dev=%d)\n",
++				     bus->number, devfn >> 3);
++				*pci_addr.u8_ptr ^= 2;
++			}
++			do_once = 1;
++		}
++		return PCIBIOS_SUCCESSFUL;
++	case 2:
++		*val = le16_to_cpup(pci_addr.u16_ptr);
++		return PCIBIOS_SUCCESSFUL;
++	case 1:
++		*val = *pci_addr.u8_ptr;
++		return PCIBIOS_SUCCESSFUL;
++	}
++	return PCIBIOS_FUNC_NOT_SUPPORTED;
++}
++
++/**
++ * Write a value to PCI configuration space
++ *
++ * @param bus
++ * @param devfn
++ * @param reg
++ * @param size
++ * @param val
++ * @return
++ */
++static int octeon_write_config(struct pci_bus *bus, unsigned int devfn, int reg,
++			       int size, u32 val)
++{
++	octeon_pci_address_t pci_addr;
++
++	pci_addr.u64 = 0;
++	pci_addr.s.upper = 2;
++	pci_addr.s.io = 1;
++	pci_addr.s.did = 3;
++	pci_addr.s.subdid = 1;
++	pci_addr.s.endian_swap = 1;
++	pci_addr.s.bus = bus->number;
++	pci_addr.s.dev = devfn >> 3;
++	pci_addr.s.func = devfn & 0x7;
++	pci_addr.s.reg = reg;
++
++	switch (size) {
++	case 4:
++		*pci_addr.u32_ptr = cpu_to_le32(val);
++		return PCIBIOS_SUCCESSFUL;
++	case 2:
++		*pci_addr.u16_ptr = cpu_to_le16(val);
++		return PCIBIOS_SUCCESSFUL;
++	case 1:
++		*pci_addr.u8_ptr = val;
++		return PCIBIOS_SUCCESSFUL;
++	}
++	return PCIBIOS_FUNC_NOT_SUPPORTED;
++}
++
++struct pci_ops octeon_pci_ops = {
++	.read = octeon_read_config,
++	.write = octeon_write_config,
++};
+Index: linux-2.6.10/arch/mips/pci/pci-cvmx.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/pci-cvmx.c
+@@ -0,0 +1,332 @@
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <asm/time.h>
++#include "pci-cvmx.h"
++
++/* Octeon's PCI controller uses did=3, subdid=2 for PCI IO addresses.
++    Use PCI endian swapping 1 so no address swapping is necessary. The
++    Linux io routines will endian swap the data */
++#define OCTEON_PCI_IOSPACE_BASE     0x80011a0400000000ull
++#define OCTEON_PCI_IOSPACE_SIZE     (1ull<<32)
++
++/* Octeon't PCI controller uses did=3, subdid=3 for PCI memory. Start PCI
++    memory from 0x8000000, right after the 0-128MB BAR1 mapping */
++#define OCTEON_PCI_MEMSPACE_OFFSET  (0x00011b0000000000ull)
++#define OCTEON_PCI_MEMSPACE_BASE    (0x0000000008000000ull)
++#define OCTEON_PCI_MEMSPACE_SIZE    (1ull<<35)
++
++static struct resource octeon_pci_mem_resource = {
++	"Octeon PCI memory",
++	OCTEON_PCI_MEMSPACE_OFFSET + OCTEON_PCI_MEMSPACE_BASE,
++	OCTEON_PCI_MEMSPACE_OFFSET + OCTEON_PCI_MEMSPACE_BASE +
++	    OCTEON_PCI_MEMSPACE_SIZE - 1,
++	IORESOURCE_MEM,
++};
++
++/* PCI ports must be above 16KB so the ISA bus filtering in the PCI-X to PCI bridge */
++static struct resource octeon_pci_io_resource = {
++	"Octeon PCI IO", 0x4000, OCTEON_PCI_IOSPACE_SIZE - 1, IORESOURCE_IO,
++};
++
++extern struct pci_ops octeon_pci_ops;
++
++static struct pci_controller octeon_pci_controller = {
++	.pci_ops = &octeon_pci_ops,
++	.mem_resource = &octeon_pci_mem_resource,
++	.mem_offset = OCTEON_PCI_MEMSPACE_OFFSET,
++	.io_resource = &octeon_pci_io_resource,
++	.io_offset = 0,
++};
++
++
++/**
++ * The normal Linux udelay doesn't work for delays greater than 1ms
++ *
++ * @param usec
++ */
++static void _mdelay(uint64_t msec)
++{
++    uint64_t start = get_cycles();
++    uint64_t delay = (1000 * msec) * mips_hpt_frequency / 1000000;
++
++    do
++    {
++    } while (get_cycles() < start + delay);
++}
++
++
++/**
++ * Write a 32bit value to the Octeon NPI register space
++ *
++ * @param address Address to write to
++ * @param val     Value to write
++ */
++static void npi_write32(uint64_t address, uint32_t val)
++{
++	volatile uint32_t *ptr = (volatile uint32_t *)(address ^ 4);
++	*ptr = val;
++}
++
++/**
++ * Read a 32bit value from the Octeon NPI register space
++ *
++ * @param address Address to read
++ * @return The result
++ */
++static uint32_t npi_read32(uint64_t address)
++{
++	volatile uint32_t *ptr = (volatile uint32_t *)(address ^ 4);
++	uint32_t d;
++        d = *ptr;
++	return d;
++}
++
++/**
++ * Low level initialize the Octeon PCI controller
++ *
++ * @return
++ */
++static inline void octeon_pci_initialize(void)
++{
++	int64_t stat;
++	octeon_pci_cfg01_t cfg01;
++	octeon_npi_ctl_status_t ctl_status;
++	octeon_pci_ctl_status_2_t ctl_status_2;
++	octeon_pci_cfg19_t cfg19;
++	octeon_pci_cfg16_t cfg16;
++	octeon_pci_cfg22_t cfg22;
++	octeon_pci_cfg56_t cfg56;
++
++	/* Reset the PCI Bus */
++	octeon_write_csr(OCTEON_CIU_SOFT_PRST, 0x1);
++	stat = octeon_read_csr(OCTEON_CIU_SOFT_PRST);
++
++	_mdelay(2);		/* Hold  PCI reset for 2 ms */
++
++	ctl_status.u64 = 0;
++	ctl_status.s.max_word = 1;
++	ctl_status.s.timer = 1;
++	octeon_write_csr(OCTEON_NPI_CTL_STATUS, ctl_status.u64);
++
++	/* Deassert PCI reset and advertize PCX Host Mode Device Capability (64b) */
++	octeon_write_csr(OCTEON_CIU_SOFT_PRST, 0x4);
++	stat = octeon_read_csr(OCTEON_CIU_SOFT_PRST);
++
++	_mdelay(2);		/* Wait 2 ms after deasserting PCI reset */
++
++	ctl_status_2.u32 = 0;
++	ctl_status_2.s.tsr_hwm = 1;	/* Initializes to 0.  Must be set before any PCI reads. */
++	npi_write32(OCTEON_NPI_PCI_CTL_STATUS_2, ctl_status_2.u32);
++	_mdelay(4);		/* Wait 2 ms before doing PCI reads */
++
++	ctl_status_2.u32 = npi_read32(OCTEON_NPI_PCI_CTL_STATUS_2);
++	printk("PCI Status: %s %s-bit\n",
++	       ctl_status_2.s.ap_pcix ? "PCI-X" : "PCI",
++	       ctl_status_2.s.ap_64ad ? "64" : "32");
++
++	/*
++	 ** TDOMC must be set to one in PCI mode. TDOMC should be set to 4
++	 ** in PCI-X mode to allow four oustanding splits. Otherwise,
++	 ** should not change from its reset value. Don't write PCI_CFG19
++	 ** in PCI mode (0x82000001 reset value), write it to 0x82000004
++	 ** after PCI-X mode is known. MRBCI,MDWE,MDRE -> must be zero.
++	 ** MRBCM -> must be one.
++	 */
++	if (ctl_status_2.s.ap_pcix) {
++		cfg19.u32 = 0;
++		cfg19.s.tdomc = 4;	/* Target Delayed/Split request
++					   outstanding maximum count. [1..31]
++					   and 0=32.  NOTE: If the user
++					   programs these bits beyond the
++					   Designed Maximum outstanding count,
++					   then the designed maximum table
++					   depth will be used instead.  No
++					   additional Deferred/Split
++					   transactions will be accepted if
++					   this outstanding maximum count is
++					   reached. Furthermore, no additional
++					   deferred/split transactions will be
++					   accepted if the I/O delay/ I/O
++					   Split Request outstanding maximum
++					   is reached. */
++		cfg19.s.mdrrmc = 2;	/* Master Deferred Read Request Outstanding Max
++					   Count (PCI only).
++					   CR4C[26:24]  Max SAC cycles   MAX DAC cycles
++					   000              8                4
++					   001              1                0
++					   010              2                1
++					   011              3                1
++					   100              4                2
++					   101              5                2
++					   110              6                3
++					   111              7                3
++					   For example, if these bits are programmed to
++					   100, the core can support 2 DAC cycles, 4 SAC
++					   cycles or a combination of 1 DAC and 2 SAC cycles.
++					   NOTE: For the PCI-X maximum outstanding split
++					   transactions, refer to CRE0[22:20]  */
++
++		cfg19.s.mrbcm = 1;	/* Master Request (Memory Read) Byte Count/Byte
++					   Enable select.
++					   0 = Byte Enables valid. In PCI mode, a burst
++					   transaction cannot be performed using
++					   Memory Read command=4?h6.
++					   1 = DWORD Byte Count valid (default). In PCI
++					   Mode, the memory read byte enables are
++					   automatically generated by the core.
++					   Note: N3 Master Request transaction sizes are
++					   always determined through the
++					   am_attr[<35:32>|<7:0>] field.  */
++		npi_write32(OCTEON_NPI_PCI_CFG19, cfg19.u32);
++	}
++
++	cfg01.u32 = 0;
++	cfg01.s.msae = 1;	/* Memory Space Access Enable */
++	cfg01.s.me = 1;		/* Master Enable */
++	cfg01.s.pee = 1;	/* PERR# Enable */
++	cfg01.s.see = 1;	/* System Error Enable */
++	cfg01.s.fbbe = 1;	/* Fast Back to Back Transaction Enable */
++
++	npi_write32(OCTEON_NPI_PCI_CFG01, cfg01.u32);
++	npi_read32(OCTEON_NPI_PCI_CFG01);
++
++#ifdef USE_OCTEON_INTERNAL_ARBITER
++	/*
++	 ** When OCTEON is a PCI host, most systems will use OCTEON's
++	 ** internal arbiter, so must enable it before any PCI/PCI-X
++	 ** traffic can occur.
++	 */
++	{
++		octeon_npi_pci_int_arb_cfg_t pci_int_arb_cfg;
++
++		pci_int_arb_cfg.u64 = 0;
++		pci_int_arb_cfg.s.en = 1;	/* Internal arbiter enable */
++		octeon_write_csr(OCTEON_NPI_PCI_INT_ARB_CFG,
++				 pci_int_arb_cfg.u64);
++	}
++#endif				/* USE_OCTEON_INTERNAL_ARBITER */
++
++	/*
++	 ** Preferrably written to 1 to set MLTD. [RDSATI,TRTAE,
++	 ** TWTAE,TMAE,DPPMR -> must be zero. TILT -> must not be set to
++	 ** 1..7.
++	 */
++	cfg16.u32 = 0;
++	cfg16.s.mltd = 1;	/* Master Latency Timer Disable */
++	npi_write32(OCTEON_NPI_PCI_CFG16, cfg16.u32);
++
++	/*
++	 ** Should be written to 0x4ff00. MTTV -> must be zero.
++	 ** FLUSH -> must be 1. MRV -> should be 0xFF.
++	 */
++	cfg22.u32 = 0;
++	cfg22.s.mrv = 0xff;	/* Master Retry Value [1..255] and 0=infinite */
++	cfg22.s.flush = 1;	/* AM_DO_FLUSH_I control NOTE: This
++				   bit MUST BE ONE for proper N3K
++				   operation */
++	npi_write32(OCTEON_NPI_PCI_CFG22, cfg22.u32);
++
++	/*
++	 ** MOST Indicates the maximum number of outstanding splits (in -1
++	 ** notation) when OCTEON is in PCI-X mode.  PCI-X performance is
++	 ** affected by the MOST selection.  Should generally be written
++	 ** with one of 0x3be807, 0x2be807, 0x1be807, or 0x0be807,
++	 ** depending on the desired MOST of 3, 2, 1, or 0, respectively.
++	 */
++	cfg56.u32 = 0;
++	cfg56.s.pxcid = 7;	/* RO - PCI-X Capability ID */
++	cfg56.s.ncp = 0xe8;	/* RO - Next Capability Pointer */
++	cfg56.s.dpere = 1;	/* Data Parity Error Recovery Enable */
++	cfg56.s.roe = 1;	/* Relaxed Ordering Enable */
++	cfg56.s.mmbc = 1;	/* Maximum Memory Byte Count [0=512B,1=1024B,2=2048B,3=4096B] */
++	cfg56.s.most = 3;	/* Maximum outstanding Split transactions [0=1 .. 7=32] */
++
++	npi_write32(OCTEON_NPI_PCI_CFG56, cfg56.u32);
++
++	/*
++	 ** Affects PCI performance when OCTEON services reads to its
++	 ** BAR1/BAR2. Refer to Section 10.6.1.  The recommended values are
++	 ** 0x22, 0x33, and 0x33 for PCI_READ_CMD_6, PCI_READ_CMD_C, and
++	 ** PCI_READ_CMD_E, respectively. Note that these values differ
++	 ** from their reset values.
++	 */
++	npi_write32(OCTEON_NPI_PCI_READ_CMD_6, 0x22);
++	npi_write32(OCTEON_NPI_PCI_READ_CMD_C, 0x33);
++	npi_write32(OCTEON_NPI_PCI_READ_CMD_E, 0x33);
++}
++
++/**
++ * Initialize the Octeon PCI controller
++ *
++ * @return
++ */
++extern octeon_bootinfo_t *octeon_bootinfo;
++
++static int __init octeon_pci_setup(void)
++{
++	int index;
++	octeon_pci_bar1_indexx_t bar1_index;
++	octeon_npi_mem_access_subid_t mem_access;
++	/* PCI I/O and PCI MEM values */
++	set_io_port_base(OCTEON_PCI_IOSPACE_BASE);
++	ioport_resource.start = 0;
++	ioport_resource.end   = OCTEON_PCI_IOSPACE_SIZE - 1;
++
++	if (!(octeon_bootinfo->config_flags & CVMX_BOOTINFO_CFG_FLAG_PCI_HOST))
++	{
++		printk("Not in host mode, PCI Controller not initialized\n");
++		return 0;
++	}
++
++	octeon_pci_initialize();
++	mem_access.u64 = 0;
++	mem_access.s.esr = 1;
++			    /**< Endian-Swap on read. */
++	mem_access.s.esw = 1;
++			    /**< Endian-Swap on write. */
++	mem_access.s.nsr = 0;
++			    /**< No-Snoop on read. */
++	mem_access.s.nsw = 0;
++			    /**< No-Snoop on write. */
++	mem_access.s.ror = 0;
++			    /**< Relax Read on read. */
++	mem_access.s.row = 0;
++			    /**< Relax Order on write. */
++	mem_access.s.ba = OCTEON_PCI_MEMSPACE_BASE >> 36;
++						       /**< PCI Address bits [63:36]. */
++	octeon_write_csr(OCTEON_NPI_MEM_ACCESS_SUBID3, mem_access.u64);
++
++	/* Remap the Octeon BAR 0 to disable it. We'll map to to the highest possible address */
++	npi_write32(OCTEON_NPI_PCI_CFG04, 0xffffffff);
++	npi_write32(OCTEON_NPI_PCI_CFG05, 0xffffffff);
++
++	/* Remap the Octeon BAR 1 to map 0-128MB */
++	bar1_index.u32 = 0;
++	bar1_index.s.ca = 1;	/* 1 = Put in L2 cache */
++	bar1_index.s.end_swp = 1;	/* 1 = Byte swapping */
++	bar1_index.s.addr_v = 1;	/* This entry is valid */
++	for (index = 0; index < 32; index++) {
++		bar1_index.s.addr_idx = index;
++		npi_write32(OCTEON_NPI_PCI_BAR1_INDEXX(index), bar1_index.u32);
++	}
++	npi_write32(OCTEON_NPI_PCI_CFG06, 0);
++	npi_write32(OCTEON_NPI_PCI_CFG07, 0);
++
++	/* Remap the Octeon BAR 2 to disable it. We'll map to to the highest possible address */
++	npi_write32(OCTEON_NPI_PCI_CFG08, 0xffffffff);
++	npi_write32(OCTEON_NPI_PCI_CFG09, 0xffffffff);
++
++	register_pci_controller(&octeon_pci_controller);
++	return 0;
++}
++
++arch_initcall(octeon_pci_setup);
++
++int pcibios_plat_dev_init(struct pci_dev *dev)
++{
++	octeon_write_lcd("pci-plat");
++	return 0;
++}
+Index: linux-2.6.10/arch/mips/pci/pci-cvmx.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/mips/pci/pci-cvmx.h
+@@ -0,0 +1,40 @@
++#include <hal.h>
++
++#define USE_OCTEON_INTERNAL_ARBITER
++
++/**
++ * This is the bit decoding used for the Octeon PCI controller addresses
++ */
++typedef union {
++	uint64_t u64;
++	uint64_t *u64_ptr;
++	uint32_t *u32_ptr;
++	uint16_t *u16_ptr;
++	uint8_t *u8_ptr;
++	struct {
++		uint64_t upper:2;
++		uint64_t reserved:13;
++		uint64_t io:1;
++		uint64_t did:5;
++		uint64_t subdid:3;
++		uint64_t reserved2:4;
++		uint64_t endian_swap:2;
++		uint64_t reserved3:10;
++		uint64_t bus:8;
++		uint64_t dev:5;
++		uint64_t func:3;
++		uint64_t reg:8;
++	} s;
++} octeon_pci_address_t;
++
++extern int octeon_i8259_setup(int);
++
++#if defined(CONFIG_CAVIUM_OCTEON_ASUS_NA038)
++#define cavium_irq_map cavium_irq_map_asus_na038
++#elif defined(CONFIG_CAVIUM_OCTEON_SONICWALL_GADWIN)
++#define cavium_irq_map cavium_irq_map_sonicwall_gadwin
++#elif defined(CONFIG_CAVIUM_OCTEON_EBT3000) || defined(CONFIG_CAVIUM_OCTEON_EBH3100)
++#define cavium_irq_map cavium_irq_map_ebh3100
++#else
++#error PCI IRQ routing needs to be setup for this board
++#endif
+Index: linux-2.6.10/include/asm-mips/mach-cavium-octeon/hal.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/mach-cavium-octeon/hal.h
++++ linux-2.6.10/include/asm-mips/mach-cavium-octeon/hal.h
+@@ -8,12 +8,12 @@
+ #ifndef __CAVIUM_OCTEON_HAL_H
+ #define __CAVIUM_OCTEON_HAL_H
+ 
+-/* Copy of cvmx_bootinfo_t structure from cvmx-app-init.h.  This must be kept in sync
+-** with that definition */
+ extern void *octeon_bootmem_alloc(uint64_t size, uint64_t alignment);
+ extern void *octeon_bootmem_alloc_range(uint64_t size, uint64_t alignment,
+ 					uint64_t min_addr, uint64_t max_addr);
+ 
++/* Copy of cvmx_bootinfo_t structure from cvmx-app-init.h.  This must be kept in sync
++** with that definition */
+ typedef struct {
+ 	uint32_t major_version;
+ 	uint32_t minor_version;
+@@ -48,6 +48,7 @@ typedef struct {
+ 	char board_serial_number[20];
+ 	uint8_t mac_addr_base[6];
+ 	uint8_t mac_addr_count;
++
+     /***************** Start of fields added in cvmx_bootinfo_t version 1.1 ******/
+ 	/* Several boards support compact flash on the Octeon boot bus.  The CF
+ 	 ** memory spaces may be mapped to different addresses on different boards.
+@@ -60,28 +61,17 @@ typedef struct {
+ 	 ** This will be 0 if LED display not present. */
+ 	uint64_t led_display_base_addr;
+     /***************** End of fields added in cvmx_bootinfo_t version 1.1 ******/
+-
++    /***************** Start of fields added in cvmx_bootinfo_t version 2 ******/
++    uint32_t dfa_ref_clock_hz;  /**< DFA reference clock in hz (if applicable)*/
++    uint32_t config_flags;  /**< flags indicating various configuration options.  These flags supercede
++                            ** the 'flags' variable and should be used instead if available */
++    /***************** End of fields added in cvmx_bootinfo_t version 2 ******/
+ } octeon_bootinfo_t;
+ 
+-#define OCTEON_MIO_BOOT_REG_CFGX(offset) (0x8001180000000000ull+((offset)*8))
+-typedef union
+-{
+-    uint64_t u64;
+-    struct
+-    {
+-        uint64_t reserved                : 27;      /**< Reserved */
+-        uint64_t sam                     : 1;       /**< Region 0 SAM */
+-        uint64_t we_ext                  : 2;       /**< Region 0 write enable count extension */
+-        uint64_t oe_ext                  : 2;       /**< Region 0 output enable count extension */
+-        uint64_t en                      : 1;       /**< Region 0 enable */
+-        uint64_t orbit                   : 1;       /**< No function for region 0 */
+-        uint64_t ale                     : 1;       /**< Region 0 ALE mode */
+-        uint64_t width                   : 1;       /**< Region 0 bus width */
+-        uint64_t size                    : 12;      /**< Region 0 size */
+-        uint64_t base                    : 16;      /**< Region 0 base address */
+-    } s;
+-} octeon_mio_boot_reg_cfgx_t;
+-
++#define CVMX_BOOTINFO_CFG_FLAG_PCI_HOST     (1ull << 0)
++#define CVMX_BOOTINFO_CFG_FLAG_PCI_TARGET   (1ull << 1)
++#define CVMX_BOOTINFO_CFG_FLAG_DEBUG        (1ull << 2)
++#define CVMX_BOOTINFO_CFG_FLAG_NO_MAGIC     (1ull << 3)
+ 
+ typedef union {
+ 	uint64_t u64;
+@@ -94,42 +84,42 @@ typedef union {
+ 		uint64_t wbfbist:1;	    /**< RO 1 = BIST fail, 0 = BIST pass */
+ 		uint64_t reserved:22;	    /**< Reserved */
+ 		uint64_t dismarkwblongto:1; /**< R/W If set, marked write-buffer entries time out the same as
+-						as other entries; if clear, marked write-buffer entries use the
+-						maximum timeout. */
++                                                as other entries; if clear, marked write-buffer entries use the
++                                                maximum timeout. */
+ 		uint64_t dismrgclrwbto:1;   /**< R/W If set, a merged store does not clear the write-buffer entry
+-						timeout state. */
++                                                timeout state. */
+ 		uint64_t iobdmascrmsb:2;    /**< R/W Two bits that are the MSBs of the resultant CVMSEG LM word
+-						location for an IOBDMA. The other 8 bits come from the SCRADDR
+-						field of the IOBDMA. */
++                                                location for an IOBDMA. The other 8 bits come from the SCRADDR
++                                                field of the IOBDMA. */
+ 		uint64_t syncwsmarked:1;    /**< R/W If set, SYNCWS and SYNCS only order marked stores; if clear,
+-						SYNCWS and SYNCS only order unmarked stores. SYNCWSMARKED has no
+-						effect when DISSYNCWS is set. */
++                                                SYNCWS and SYNCS only order unmarked stores. SYNCWSMARKED has no
++                                                effect when DISSYNCWS is set. */
+ 		uint64_t dissyncws:1;	    /**< R/W If set, SYNCWS acts as SYNCW and SYNCS acts as SYNC. */
+ 		uint64_t diswbfst:1;	    /**< R/W If set, no stall happens on write buffer full. */
+ 		uint64_t xkmemenas:1;	    /**< R/W If set (and SX set), supervisor-level loads/stores can use
+-						XKPHYS addresses with VA<48>==0 */
++                                                XKPHYS addresses with VA<48>==0 */
+ 		uint64_t xkmemenau:1;	    /**< R/W If set (and UX set), user-level loads/stores can use XKPHYS
+-						addresses with VA<48>==0 */
++                                                addresses with VA<48>==0 */
+ 		uint64_t xkioenas:1;	    /**< R/W If set (and SX set), supervisor-level loads/stores can use
+-						XKPHYS addresses with VA<48>==1 */
++                                                XKPHYS addresses with VA<48>==1 */
+ 		uint64_t xkioenau:1;	    /**< R/W If set (and UX set), user-level loads/stores can use XKPHYS
+-						addresses with VA<48>==1 */
++                                                addresses with VA<48>==1 */
+ 		uint64_t allsyncw:1;	    /**< R/W If set, all stores act as SYNCW (NOMERGE must be set when
+-						this is set) RW, reset to 0. */
++                                                this is set) RW, reset to 0. */
+ 		uint64_t nomerge:1;	    /**< R/W If set, no stores merge, and all stores reach the coherent
+-						bus in order. */
++                                                bus in order. */
+ 		uint64_t didtto:2;	    /**< R/W Selects the bit in the counter used for DID time-outs
+-						0 = 231, 1 = 230, 2 = 229, 3 = 214. Actual time-out is between
+-						1× and 2× this interval. For example, with DIDTTO=3, expiration
+-						interval is between 16K and 32K. */
++                                                0 = 231, 1 = 230, 2 = 229, 3 = 214. Actual time-out is between
++                                                1ï¿½and 2ï¿½this interval. For example, with DIDTTO=3, expiration
++                                                interval is between 16K and 32K. */
+ 		uint64_t csrckalwys:1;	    /**< R/W If set, the (mem) CSR clock never turns off. */
+ 		uint64_t mclkalwys:1;	    /**< R/W If set, mclk never turns off. */
+ 		uint64_t wbfltime:3;	    /**< R/W Selects the bit in the counter used for write buffer flush
+-						time-outs (WBFLT+11) is the bit position in an internal counter
+-						used to determine expiration. The write buffer expires between
+-						1× and 2× this interval. For example, with WBFLT = 0, a write
+-						buffer expires between 2K and 4K cycles after the write buffer
+-						entry is allocated. */
++                                                time-outs (WBFLT+11) is the bit position in an internal counter
++                                                used to determine expiration. The write buffer expires between
++                                                1ï¿½and 2ï¿½this interval. For example, with WBFLT = 0, a write
++                                                buffer expires between 2K and 4K cycles after the write buffer
++                                                entry is allocated. */
+ 		uint64_t istrnol2:1;	    /**< R/W If set, do not put Istream in the L2 cache. */
+ 		uint64_t wbthresh:4;	    /**< R/W The write buffer threshold. */
+ 		uint64_t reserved2:2;	    /**< Reserved */
+@@ -234,17 +224,17 @@ typedef union {
+ 		uint64_t devt:2;		    /**< DEVSEL# timing (for PCI only/for PCIX = don?t care) */
+ 		uint64_t mdpe:1;		    /**< Master Data Parity Error */
+ 		uint64_t fbb:1;			    /**< Fast Back-to-Back Transactions Capable
+-							 Mode               1 = PCI Mode     0 = PCIX Mode
+-							 Dependent */
++                                                         Mode               1 = PCI Mode     0 = PCIX Mode
++                                                         Dependent */
+ 		uint64_t reserved:1;		    /**< Reserved */
+ 		uint64_t m66:1;			    /**< 66MHz Capable */
+ 		uint64_t cle:1;			    /**< Capabilities List Enable */
+ 		uint64_t i_stat:1;		    /**< When INTx# is asserted by N3 this bit will be set.
+-							 When deasserted by N3 this bit will be cleared. */
++                                                         When deasserted by N3 this bit will be cleared. */
+ 		uint64_t reserved1:8;		    /**< Reserved */
+ 		uint64_t i_dis:1;		    /**< When asserted '1' disables the generation of INTx#
+-							 by N3. When disabled '0' allows assertion of INTx#
+-							 by N3. */
++                                                         by N3. When disabled '0' allows assertion of INTx#
++                                                         by N3. */
+ 		uint64_t fbbe:1;		    /**< Fast Back to Back Transaction Enable */
+ 		uint64_t see:1;			    /**< System Error Enable */
+ 		uint64_t ads:1;			    /**< Address/Data Stepping */
+@@ -273,14 +263,14 @@ typedef union {
+ 	struct {
+ 		uint64_t bcap:1;		    /**< BIST Capable */
+ 		uint64_t brb:1;			    /**< BIST Request/busy bit
+-							 Note: N3 does not support PCI BIST, therefore
+-							 this bit should remain zero. */
++                                                         Note: N3 does not support PCI BIST, therefore
++                                                         this bit should remain zero. */
+ 		uint64_t reserved:2;		    /**< Reserved */
+ 		uint64_t bcod:4;		    /**< BIST Code */
+ 		uint64_t ht:8;			    /**< Header Type (Type 0) */
+ 		uint64_t lt:8;			    /**< Latency Timer
+-							 (0=PCI)                 (0=PCI)
+-							 (0x40=PCIX)             (0x40=PCIX) */
++                                                         (0=PCI)                 (0=PCI)
++                                                         (0x40=PCIX)             (0x40=PCIX) */
+ 		uint64_t cls:8;			    /**< Cache Line Size */
+ 	} s;
+ } octeon_pci_cfg03_t;
+@@ -398,55 +388,55 @@ typedef union {
+ 	uint32_t u32;
+ 	struct {
+ 		uint64_t trdnpr:1;		    /**< Target Read Delayed Transaction for I/O and
+-							 non-prefetchable regions discarded. */
++                                                         non-prefetchable regions discarded. */
+ 		uint64_t trdard:1;		    /**< Target Read Delayed Transaction for all regions
+-							 discarded. */
++                                                         discarded. */
+ 		uint64_t rdsati:1;		    /**< Target(I/O and Memory) Read Delayed/Split at
+-							 timeout/immediately (default timeout). */
++                                                         timeout/immediately (default timeout). */
+ 		uint64_t trdrs:1;		    /**< Target(I/O and Memory) Read Delayed/Split or Retry
+-							 select (of the application interface is not ready)
+-							 0 = Delayed Split Transaction
+-							 1 = Retry Transaction (always Immediate Retry, no
+-							 AT_REQ to application). */
++                                                         select (of the application interface is not ready)
++                                                         0 = Delayed Split Transaction
++                                                         1 = Retry Transaction (always Immediate Retry, no
++                                                         AT_REQ to application). */
+ 		uint64_t trtae:1;		    /**< Target(I/O and Memory) Read Target Abort Enable
+-							 (if application interface is not ready at the
+-							 latency timeout).
+-							 Note: N3 as target will never target-abort,
+-							 therefore this bit should never be set. */
++                                                         (if application interface is not ready at the
++                                                         latency timeout).
++                                                         Note: N3 as target will never target-abort,
++                                                         therefore this bit should never be set. */
+ 		uint64_t twsei:1;		    /**< Target(I/O) Write Split Enable (at timeout /
+-							 iately; default timeout) */
++                                                         iately; default timeout) */
+ 		uint64_t twsen:1;		    /**< T(I/O) write split Enable (if the application
+-							 interface is not ready) */
++                                                         interface is not ready) */
+ 		uint64_t twtae:1;		    /**< Target(I/O and Memory) Write Target Abort Enable
+-							 (if the application interface is not ready at the
+-							 start of the cycle).
+-							 Note: N3 as target will never target-abort,
+-							 therefore this bit should never be set. */
++                                                         (if the application interface is not ready at the
++                                                         start of the cycle).
++                                                         Note: N3 as target will never target-abort,
++                                                         therefore this bit should never be set. */
+ 		uint64_t tmae:1;		    /**< Target(Read/Write) Master Abort Enable; check
+-							 at the start of each transaction.
+-							 Note: This bit can be used to force a Master
+-							 Abort when N3 is acting as the intended target
+-							 device. */
++                                                         at the start of each transaction.
++                                                         Note: This bit can be used to force a Master
++                                                         Abort when N3 is acting as the intended target
++                                                         device. */
+ 		uint64_t tslte:3;		    /**< Target Subsequent(2nd-last) Latency Timeout Enable
+-							 Valid range: [1..7] and 0=8. */
++                                                         Valid range: [1..7] and 0=8. */
+ 		uint64_t tilt:4;		    /**< Target Initial(1st data) Latency Timeout in PCI
+-							 ModeValid range: [8..15] and 0=16. */
++                                                         ModeValid range: [8..15] and 0=16. */
+ 		uint64_t pbe:12;		    /**< Programmable Boundary Enable to disconnect/prefetch
+-							 for target burst read cycles to prefetchable
+-							 region in PCI. A value of 1 indicates end of
+-							 boundary (64 KB down to 16 Bytes). */
++                                                         for target burst read cycles to prefetchable
++                                                         region in PCI. A value of 1 indicates end of
++                                                         boundary (64 KB down to 16 Bytes). */
+ 		uint64_t dppmr:1;		    /**< Disconnect/Prefetch to prefetchable memory
+-							 regions Enable. Prefetchable memory regions
+-							 are always disconnected on a region boundary.
+-							 Non-prefetchable regions for PCI are always
+-							 disconnected on the first transfer.
+-							 Note: N3 as target will never target-disconnect,
+-							 therefore this bit should never be set. */
++                                                         regions Enable. Prefetchable memory regions
++                                                         are always disconnected on a region boundary.
++                                                         Non-prefetchable regions for PCI are always
++                                                         disconnected on the first transfer.
++                                                         Note: N3 as target will never target-disconnect,
++                                                         therefore this bit should never be set. */
+ 		uint64_t reserved:1;		    /**< Reserved */
+ 		uint64_t tswc:1;		    /**< Target Split Write Control
+-							 0 = Blocks all requests except PMW
+-							 1 = Blocks all requests including PMW until
+-							 split completion occurs. */
++                                                         0 = Blocks all requests except PMW
++                                                         1 = Blocks all requests including PMW until
++                                                         split completion occurs. */
+ 		uint64_t mltd:1;		    /**< Master Latency Timer Disable */
+ 	} s;
+ } octeon_pci_cfg16_t;
+@@ -472,96 +462,96 @@ typedef union {
+ 	uint32_t u32;
+ 	struct {
+ 		uint64_t mrbcm:1;		    /**< Master Request (Memory Read) Byte Count/Byte
+-							 Enable select.
+-							 0 = Byte Enables valid. In PCI mode, a burst
+-							 transaction cannot be performed using
+-							 Memory Read command=4?h6.
+-							 1 = DWORD Byte Count valid (default). In PCI
+-							 Mode, the memory read byte enables are
+-							 automatically generated by the core.
+-							 Note: N3 Master Request transaction sizes are
+-							 always determined through the
+-							 am_attr[<35:32>|<7:0>] field. */
++                                                         Enable select.
++                                                         0 = Byte Enables valid. In PCI mode, a burst
++                                                         transaction cannot be performed using
++                                                         Memory Read command=4?h6.
++                                                         1 = DWORD Byte Count valid (default). In PCI
++                                                         Mode, the memory read byte enables are
++                                                         automatically generated by the core.
++                                                         Note: N3 Master Request transaction sizes are
++                                                         always determined through the
++                                                         am_attr[<35:32>|<7:0>] field. */
+ 		uint64_t mrbci:1;		    /**< Master Request (I/O and CR cycles) byte count/byte
+-							 enable select.
+-							 0 = Byte Enables valid (default)
+-							 1 = DWORD byte count valid
+-							 Note: For N3K, This bit must always be zero
+-							 for proper operation (in support of
+-							 Type0/1 Cfg Space accesses which require byte
+-							 enable generation directly from a read mask). */
++                                                         enable select.
++                                                         0 = Byte Enables valid (default)
++                                                         1 = DWORD byte count valid
++                                                         Note: For N3K, This bit must always be zero
++                                                         for proper operation (in support of
++                                                         Type0/1 Cfg Space accesses which require byte
++                                                         enable generation directly from a read mask). */
+ 		uint64_t mdwe:1;		    /**< Master (Retry) Deferred Write Enable (allow
+-							 read requests to pass).
+-							 NOTE: Applicable to PCI Mode I/O and memory
+-							 transactions only.
+-							 0 = New read requests are NOT accepted until
+-							 the current write cycle completes. [Reads
+-							 cannot pass writes]
+-							 1 = New read requests are accepted, even when
+-							 there is a write cycle pending [Reads can
+-							 pass writes]. */
++                                                         read requests to pass).
++                                                         NOTE: Applicable to PCI Mode I/O and memory
++                                                         transactions only.
++                                                         0 = New read requests are NOT accepted until
++                                                         the current write cycle completes. [Reads
++                                                         cannot pass writes]
++                                                         1 = New read requests are accepted, even when
++                                                         there is a write cycle pending [Reads can
++                                                         pass writes]. */
+ 		uint64_t mdre:1;		    /**< Master (Retry) Deferred Read Enable (Allows
+-							 read/write requests to pass).
+-							 NOTE: Applicable to PCI mode I/O and memory
+-							 transactions only.
+-							 0 = New read/write requests are NOT accepted
+-							 until the current read cycle completes.
+-							 [Read/write requests CANNOT pass reads]
+-							 1 = New read/write requests are accepted, even
+-							 when there is a read cycle pending.
+-							 [Read/write requests CAN pass reads] */
++                                                         read/write requests to pass).
++                                                         NOTE: Applicable to PCI mode I/O and memory
++                                                         transactions only.
++                                                         0 = New read/write requests are NOT accepted
++                                                         until the current read cycle completes.
++                                                         [Read/write requests CANNOT pass reads]
++                                                         1 = New read/write requests are accepted, even
++                                                         when there is a read cycle pending.
++                                                         [Read/write requests CAN pass reads] */
+ 		uint64_t mdrimc:1;		    /**< Master I/O Deferred/Split Request Outstanding
+-							 Maximum Count
+-							 0 = 4Ch[26:24]
+-							 1 = 1 */
++                                                         Maximum Count
++                                                         0 = 4Ch[26:24]
++                                                         1 = 1 */
+ 		uint64_t mdrrmc:3;		    /**< Master Deferred Read Request Outstanding Max
+-							 Count (PCI only).
+-							 CR4C[26:24]  Max SAC cycles   MAX DAC cycles
+-							 000              8                4
+-							 001              1                0
+-							 010              2                1
+-							 011              3                1
+-							 100              4                2
+-							 101              5                2
+-							 110              6                3
+-							 111              7                3
+-							 For example, if these bits are programmed to
+-							 100, the core can support 2 DAC cycles, 4 SAC
+-							 cycles or a combination of 1 DAC and 2 SAC cycles.
+-							 NOTE: For the PCI-X maximum outstanding split
+-							 transactions, refer to CRE0[22:20] */
++                                                         Count (PCI only).
++                                                         CR4C[26:24]  Max SAC cycles   MAX DAC cycles
++                                                         000              8                4
++                                                         001              1                0
++                                                         010              2                1
++                                                         011              3                1
++                                                         100              4                2
++                                                         101              5                2
++                                                         110              6                3
++                                                         111              7                3
++                                                         For example, if these bits are programmed to
++                                                         100, the core can support 2 DAC cycles, 4 SAC
++                                                         cycles or a combination of 1 DAC and 2 SAC cycles.
++                                                         NOTE: For the PCI-X maximum outstanding split
++                                                         transactions, refer to CRE0[22:20] */
+ 		uint64_t tmes:8;		    /**< Target/Master Error Sequence # */
+ 		uint64_t teci:1;		    /**< Target Error Command Indication
+-							 0 = Delayed/Split
+-							 1 = Others */
++                                                         0 = Delayed/Split
++                                                         1 = Others */
+ 		uint64_t tmei:1;		    /**< Target/Master Error Indication
+-							 0 = Target
+-							 1 = Master */
++                                                         0 = Target
++                                                         1 = Master */
+ 		uint64_t tmse:1;		    /**< Target/Master System Error. This bit is set
+-							 whenever ATM_SERR_O is active. */
++                                                         whenever ATM_SERR_O is active. */
+ 		uint64_t tmdpes:1;		    /**< Target/Master Data PERR# error status. This
+-							 bit is set whenever ATM_DATA_PERR_O is active. */
++                                                         bit is set whenever ATM_DATA_PERR_O is active. */
+ 		uint64_t tmapes:1;		    /**< Target/Master Address PERR# error status. This
+-							 bit is set whenever ATM_ADDR_PERR_O is active. */
++                                                         bit is set whenever ATM_ADDR_PERR_O is active. */
+ 		uint64_t reserved:2;		    /**< Reserved */
+ 		uint64_t tibcd:1;		    /**< Target Illegal I/O DWORD byte combinations detected. */
+ 		uint64_t tibde:1;		    /**< Target Illegal I/O DWORD byte detection enable */
+ 		uint64_t reserved1:1;		    /**< Reserved */
+ 		uint64_t tidomc:1;		    /**< Target I/O Delayed/Split request outstanding
+-							 maximum count.
+-							 0 = 4Ch[4:0],
+-							 1 = 1 */
++                                                         maximum count.
++                                                         0 = 4Ch[4:0],
++                                                         1 = 1 */
+ 		uint64_t tdomc:5;		    /**< Target Delayed/Split request outstanding maximum
+-							 count. [1..31] and 0=32.
+-							 NOTE: If the user programs these bits beyond the
+-							 Designed Maximum outstanding count, then the
+-							 designed maximum table depth will be used instead.
+-							 No additional Deferred/Split transactions will be
+-							 accepted if this outstanding maximum count
+-							 is reached. Furthermore, no additional
+-							 deferred/split transactions will be accepted if
+-							 the I/O delay/ I/O Split Request outstanding
+-							 maximum is reached. */
++                                                         count. [1..31] and 0=32.
++                                                         NOTE: If the user programs these bits beyond the
++                                                         Designed Maximum outstanding count, then the
++                                                         designed maximum table depth will be used instead.
++                                                         No additional Deferred/Split transactions will be
++                                                         accepted if this outstanding maximum count
++                                                         is reached. Furthermore, no additional
++                                                         deferred/split transactions will be accepted if
++                                                         the I/O delay/ I/O Split Request outstanding
++                                                         maximum is reached. */
+ 	} s;
+ } octeon_pci_cfg19_t;
+ 
+@@ -578,7 +568,7 @@ typedef union {
+ 	uint32_t u32;
+ 	struct {
+ 		uint64_t scmre:32;		    /**< Master Split Completion message received with
+-							 error message. */
++                                                         error message. */
+ 	} s;
+ } octeon_pci_cfg21_t;
+ 
+@@ -587,35 +577,35 @@ typedef union {
+ 	uint32_t u32;
+ 	struct {
+ 		uint64_t mac:7;			    /**< Master Arbiter Control
+-							 [31:26]: Used only in Fixed Priority mode
+-							 (when [25]=1)
+-							 [31:30]: MSI Request
+-							 00 = Highest Priority
+-							 01 = Medium Priority
+-							 10 = Lowest Priority
+-							 11 = RESERVED
+-							 [29:28]: Target Split Completion
+-							 00 = Highest Priority
+-							 01 = Medium Priority
+-							 10 = Lowest Priority
+-							 11 = RESERVED
+-							 [27:26]: New Request; Deferred Read,Deferred Write
+-							 00 = Highest Priority
+-							 01 = Medium Priority
+-							 10 = Lowest Priority
+-							 11 = RESERVED
+-							 [25]: Fixed/Round Robin Priority Selector
+-							 0 = Round Robin
+-							 1 = Fixed */
++                                                         [31:26]: Used only in Fixed Priority mode
++                                                         (when [25]=1)
++                                                         [31:30]: MSI Request
++                                                         00 = Highest Priority
++                                                         01 = Medium Priority
++                                                         10 = Lowest Priority
++                                                         11 = RESERVED
++                                                         [29:28]: Target Split Completion
++                                                         00 = Highest Priority
++                                                         01 = Medium Priority
++                                                         10 = Lowest Priority
++                                                         11 = RESERVED
++                                                         [27:26]: New Request; Deferred Read,Deferred Write
++                                                         00 = Highest Priority
++                                                         01 = Medium Priority
++                                                         10 = Lowest Priority
++                                                         11 = RESERVED
++                                                         [25]: Fixed/Round Robin Priority Selector
++                                                         0 = Round Robin
++                                                         1 = Fixed */
+ 		uint64_t reserved:6;		    /**< Reserved */
+ 		uint64_t flush:1;		    /**< AM_DO_FLUSH_I control
+-							 NOTE: This bit MUST BE ONE for proper N3K operation */
++                                                         NOTE: This bit MUST BE ONE for proper N3K operation */
+ 		uint64_t mra:1;			    /**< Master Retry Aborted */
+ 		uint64_t mtta:1;		    /**< Master TRDY timeout aborted */
+ 		uint64_t mrv:8;			    /**< Master Retry Value [1..255] and 0=infinite */
+ 		uint64_t mttv:8;		    /**< Master TRDY timeout value [1..255] and 0=disabled
+-							 Note: N3 does not support master TRDY timeout
+-							 (target is expected to be well behaved). */
++                                                         Note: N3 does not support master TRDY timeout
++                                                         (target is expected to be well behaved). */
+ 	} s;
+ } octeon_pci_cfg22_t;
+ 
+@@ -625,9 +615,9 @@ typedef union {
+ 	struct {
+ 		uint64_t reserved:9;		    /**< RESERVED */
+ 		uint64_t most:3;		    /**< Maximum outstanding Split transactions
+-							 [000b=1..111b=32] */
++                                                         [000b=1..111b=32] */
+ 		uint64_t mmbc:2;		    /**< Maximum Memory Byte Count
+-							 [0=512B,1=1024B,2=2048B,3=4096B] */
++                                                         [0=512B,1=1024B,2=2048B,3=4096B] */
+ 		uint64_t roe:1;			    /**< Relaxed Ordering Enable */
+ 		uint64_t dpere:1;		    /**< Data Parity Error Recovery Enable */
+ 		uint64_t ncp:8;			    /**< Next Capability Pointer */
+@@ -645,17 +635,17 @@ typedef union {
+ 		uint64_t mostd:3;		    /**< Maximum Outstanding Split transaction designed */
+ 		uint64_t mmrbcd:2;		    /**< Maximum Memory Read byte count designed */
+ 		uint64_t dc:1;			    /**< Device Complexity
+-							 0 = Simple Device
+-							 1 = Bridge Device */
++                                                         0 = Simple Device
++                                                         1 = Bridge Device */
+ 		uint64_t usc:1;			    /**< Unexpected Split Completion */
+ 		uint64_t scd:1;			    /**< Split Completion Discarded */
+ 		uint64_t m133:1;		    /**< 133MHz Capable */
+ 		uint64_t w64:1;			    /**< Indicates a 32b(=0) or 64b(=1) device */
+ 		uint64_t bn:8;			    /**< Bus Number. Updated on all configuration write
+-							 (0x11=PCI)             cycles. It?s value is dependent upon the PCI/X
+-							 (0xFF=PCIX)            mode. */
++                                                         (0x11=PCI)             cycles. It?s value is dependent upon the PCI/X
++                                                         (0xFF=PCIX)            mode. */
+ 		uint64_t dn:5;			    /**< Device Number. Updated on all configuration
+-							 write cycles. */
++                                                         write cycles. */
+ 		uint64_t fn:3;			    /**< Function Number */
+ 	} s;
+ } octeon_pci_cfg57_t;
+@@ -672,11 +662,11 @@ typedef union {
+ 		uint64_t reserved:1;		    /**< Reserved */
+ 		uint64_t pmec:1;		    /**< PME Clock */
+ 		uint64_t pcimiv:3;		    /**< Indicates the version of the PCI
+-							 Management
+-							 Interface Specification with which the core
+-							 complies.
+-							 010b = Complies with PCI Management Interface
+-							 Specification Revision 1.1 */
++                                                         Management
++                                                         Interface Specification with which the core
++                                                         complies.
++                                                         010b = Complies with PCI Management Interface
++                                                         Specification Revision 1.1 */
+ 		uint64_t ncp:8;			    /**< Next Capability Pointer */
+ 		uint64_t pmcid:8;		    /**< Power Management Capability ID */
+ 	} s;
+@@ -687,25 +677,25 @@ typedef union {
+ 	uint32_t u32;
+ 	struct {
+ 		uint64_t pmdia:8;		    /**< Power Management data input from application
+-							 (PME_DATA) */
++                                                         (PME_DATA) */
+ 		uint64_t bpccen:1;		    /**< BPCC_En (bus power/clock control) enable */
+ 		uint64_t bd3h:1;		    /**< B2_B3#, B2/B3 Support for D3hot */
+ 		uint64_t reserved:6;		    /**< Reserved */
+ 		uint64_t pmess:1;		    /**< PME_Status sticky bit */
+ 		uint64_t pmedsia:2;		    /**< PME_Data_Scale input from application
+-							 Device                  (PME_DATA_SCALE[1:0])
+-							 Specific */
++                                                         Device                  (PME_DATA_SCALE[1:0])
++                                                         Specific */
+ 		uint64_t pmds:4;		    /**< Power Management Data_select */
+ 		uint64_t pmeens:1;		    /**< PME_En sticky bit */
+ 		uint64_t reserved1:6;		    /**< RESERVED */
+ 		uint64_t ps:2;			    /**< Power State (D0 to D3)
+-							 The N2 DOES NOT support D1/D2 Power Management
+-							 states, therefore writing to this register has
+-							 no effect (please refer to the PCI Power
+-							 Management
+-							 Specification v1.1 for further details about
+-							 it?s R/W nature. This is not a conventional
+-							 R/W style register. */
++                                                         The N2 DOES NOT support D1/D2 Power Management
++                                                         states, therefore writing to this register has
++                                                         no effect (please refer to the PCI Power
++                                                         Management
++                                                         Specification v1.1 for further details about
++                                                         it?s R/W nature. This is not a conventional
++                                                         R/W style register. */
+ 	} s;
+ } octeon_pci_cfg59_t;
+ 
+@@ -749,6 +739,70 @@ typedef union {
+ 	} s;
+ } octeon_pci_cfg63_t;
+ 
++#define OCTEON_NPI_CTL_STATUS   (0x80011F0000000010ull)
++typedef union {
++	uint64_t u64;
++	struct {
++		uint64_t reserved:1;		    /**< Reserved */
++		uint64_t chip_rev:8;		    /**< The revision of the N3.
++                                                         register will be disabled. */
++		uint64_t dis_pniw:1;		    /**< When asserted '1' access from the PNI Window
++                                                         Registers are disabled. */
++		uint64_t out3_enb:1;		    /**< When asserted '1' the output3 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t out2_enb:1;		    /**< When asserted '1' the output2 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t out1_enb:1;		    /**< When asserted '1' the output1 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t out0_enb:1;		    /**< When asserted '1' the output0 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t ins3_enb:1;		    /**< When asserted '1' the gather3 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed.
++                                                         write operation. */
++		uint64_t ins2_enb:1;		    /**< When asserted '1' the gather2 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t ins1_enb:1;		    /**< When asserted '1' the gather1 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t ins0_enb:1;		    /**< When asserted '1' the gather0 engine is enabled.
++                                                         After enabling the values of the associated
++                                                         Address and Size Register should not be changed. */
++		uint64_t ins3_64b:1;		    /**< When asserted '1' the instructions read by the
++                                                         gather3 engine are 64-Byte instructions, when
++                                                         de-asserted '0' instructions are 32-byte. */
++		uint64_t ins2_64b:1;		    /**< When asserted '1' the instructions read by the
++                                                         gather2 engine are 64-Byte instructions, when
++                                                         de-asserted '0' instructions are 32-byte. */
++		uint64_t ins1_64b:1;		    /**< When asserted '1' the instructions read by the
++                                                         gather1 engine are 64-Byte instructions, when
++                                                         de-asserted '0' instructions are 32-byte. */
++		uint64_t ins0_64b:1;		    /**< When asserted '1' the instructions read by the
++                                                         gather0 engine are 64-Byte instructions, when
++                                                         de-asserted '0' instructions are 32-byte. */
++		uint64_t pci_wdis:1;		    /**< When set '1' disables access to registers in
++                                                         PNI address range 0x1000 - 0x17FF from the PCI. */
++		uint64_t wait_com:1;		    /**< When set '1' casues the NPI to wait for a commit
++                                                         from the L2C before sending additional access to
++                                                         the L2C from the PCI. */
++		uint64_t spares1:3;		    /**< These bits are reserved and should be set to 0. */
++		uint64_t max_word:5;		    /**< The maximum number of words to merge into a single
++                                                         write operation from the PPs to the PCI. Legal
++                                                         values are 1 to 32, where a '0' is treated as 32. */
++		uint64_t spares0:22;		    /**< These bits are reserved and should be set to 0. */
++		uint64_t timer:10;		    /**< When the NPI starts a PP to PCI write it will wait
++                                                         no longer than the value of TIMER in eclks to
++                                                         merge additional writes from the PPs into 1
++                                                         large write. The values for this field is 1 to
++                                                         1024 where a value of '0' is treated as 1024. */
++	} s;
++} octeon_npi_ctl_status_t;
++
+ #define OCTEON_NPI_PCI_CTL_STATUS_2 (0x80011F000000118Cull)
+ typedef union {
+ 	uint32_t u32;
+@@ -756,94 +810,106 @@ typedef union {
+ 		uint64_t reserved:12;		    /**< Reserved */
+ 		uint64_t erst_n:1;		    /**< Reset active Low. PASS-2 */
+ 		uint64_t bar2pres:1;		    /**< From fuse block. When fuse(MIO_FUS_DAT3[BAR2_EN])
+-							 is NOT blown the value of this field is '0' after
+-							 reset and BAR2 is NOT present. When the fuse IS
+-							 blown the value of this field is '1' after reset
+-							 and BAR2 is present. Note that SW can change this
+-							 field after reset. This is a PASS-2 field. */
++                                                         is NOT blown the value of this field is '0' after
++                                                         reset and BAR2 is NOT present. When the fuse IS
++                                                         blown the value of this field is '1' after reset
++                                                         and BAR2 is present. Note that SW can change this
++                                                         field after reset. This is a PASS-2 field. */
+ 		uint64_t scmtyp:1;		    /**< Split Completion Message CMD Type (0=RD/1=WR)
+-							 When SCM=1, SCMTYP specifies the CMD intent (R/W) */
++                                                         When SCM=1, SCMTYP specifies the CMD intent (R/W) */
+ 		uint64_t scm:1;			    /**< Split Completion Message Detected (Read or Write) */
+ 		uint64_t en_wfilt:1;		    /**< When '1' the window-access filter is enabled.
+-							 Unfilter writes are:
+-							 MIO, SubId0
+-							 MIO, SubId7
+-							 NPI, SubId0
+-							 NPI, SubId7
+-							 POW, SubId7
+-							 DFA, SubId7
+-							 IPD, SubId7
+-							 Unfiltered Reads are:
+-							 MIO, SubId0
+-							 MIO, SubId7
+-							 NPI, SubId0
+-							 NPI, SubId7
+-							 POW, SubId1
+-							 POW, SubId2
+-							 POW, SubId3
+-							 POW, SubId7
+-							 DFA, SubId7
+-							 IPD, SubId7 */
++                                                         Unfilter writes are:
++                                                         MIO, SubId0
++                                                         MIO, SubId7
++                                                         NPI, SubId0
++                                                         NPI, SubId7
++                                                         POW, SubId7
++                                                         DFA, SubId7
++                                                         IPD, SubId7
++                                                         Unfiltered Reads are:
++                                                         MIO, SubId0
++                                                         MIO, SubId7
++                                                         NPI, SubId0
++                                                         NPI, SubId7
++                                                         POW, SubId1
++                                                         POW, SubId2
++                                                         POW, SubId3
++                                                         POW, SubId7
++                                                         DFA, SubId7
++                                                         IPD, SubId7 */
+ 		uint64_t spare:1;		    /**< Spare Bit */
+ 		uint64_t ap_pcix:1;		    /**< PCX Core Mode status (0=PCI Bus/1=PCIX) */
+ 		uint64_t ap_64ad:1;		    /**< PCX Core Bus status (0=32b Bus/1=64b Bus) */
+ 		uint64_t b12_bist:1;		    /**< Bist Status For Memeory In B12 */
+ 		uint64_t pmo_amod:1;		    /**< PMO-ARB Mode (0=FP[HP=CMD1,LP=CMD0]/1=RR) */
+ 		uint64_t pmo_fpc:3;		    /**< PMO-ARB Fixed Priority Counter
+-							 When PMO_AMOD=0 (FP mode), this field represents
+-							 the # of CMD1 requests that are issued (at higher
+-							 priority) before a single lower priority CMD0
+-							 is allowed to issue (to ensure foward progress).
+-							 0: 1 CMD1 Request issued before CMD0 allowed
+-							 ...
+-							 7: 8 CMD1 Requests issued before CMD0 allowed */
++                                                         When PMO_AMOD=0 (FP mode), this field represents
++                                                         the # of CMD1 requests that are issued (at higher
++                                                         priority) before a single lower priority CMD0
++                                                         is allowed to issue (to ensure foward progress).
++                                                         0: 1 CMD1 Request issued before CMD0 allowed
++                                                         ...
++                                                         7: 8 CMD1 Requests issued before CMD0 allowed */
+ 		uint64_t tsr_hwm:3;		    /**< Target Split-Read ADB(allowable disconnect boundary)
+-							 High Water Mark.
+-							 Specifies the number of ADBs(128 Byte aligned chunks)
+-							 that are accumulated(pending) BEFORE the Target Split
+-							 completion is attempted on the PCI bus.
+-							 0: RESERVED/ILLEGAL
+-							 1: 2 Pending ADBs (129B-256B)
+-							 2: 3 Pending ADBs (257B-384B)
+-							 3: 4 Pending ADBs (385B-512B)
+-							 4: 5 Pending ADBs (513B-640B)
+-							 5: 6 Pending ADBs (641B-768B)
+-							 6: 7 Pending ADBs (769B-896B)
+-							 7: 8 Pending ADBs (897B-1024B)
+-							 Example: Suppose a 1KB target memory request with
+-							 starting byte offset address[6:0]=0x7F is split by
+-							 the OCTEON and the TSR_HWM=1(2 ADBs).
+-							 The OCTEON will start the target split completion
+-							 on the PCI Bus after 1B(1st ADB)128B(2nd ADB)=129B
+-							 of data have been received from memory (even though
+-							 the remaining 895B has not yet been received). The
+-							 OCTEON will continue the split completion until it
+-							 has consumed all of the pended split data. If the
+-							 full transaction length(1KB) of data was NOT entirely
+-							 transferred, then OCTEON will terminate the split
+-							 completion and again wait for another 2 ADB-aligned data
+-							 chunks(256B) of pended split data to be received from
+-							 memory before starting another split completion request.
+-							 This allows Octeon (as split completer), to send back
+-							 multiple split completions for a given large split
+-							 transaction without having to wait for the entire
+-							 transaction length to be received from memory.
+-							 NOTE: For split transaction sizes 'smaller' than the
+-							 specified TSR_HWM value, the split completion
+-							 is started when the last datum has been received from
+-							 memory.
+-							 NOTE: It is IMPERATIVE that this field NEVER BE
+-							 written to a ZERO value. A value of zero is
+-							 reserved/illegal and can result in PCIX bus hangs). */
++                                                         High Water Mark.
++                                                         Specifies the number of ADBs(128 Byte aligned chunks)
++                                                         that are accumulated(pending) BEFORE the Target Split
++                                                         completion is attempted on the PCI bus.
++                                                         0: RESERVED/ILLEGAL
++                                                         1: 2 Pending ADBs (129B-256B)
++                                                         2: 3 Pending ADBs (257B-384B)
++                                                         3: 4 Pending ADBs (385B-512B)
++                                                         4: 5 Pending ADBs (513B-640B)
++                                                         5: 6 Pending ADBs (641B-768B)
++                                                         6: 7 Pending ADBs (769B-896B)
++                                                         7: 8 Pending ADBs (897B-1024B)
++                                                         Example: Suppose a 1KB target memory request with
++                                                         starting byte offset address[6:0]=0x7F is split by
++                                                         the OCTEON and the TSR_HWM=1(2 ADBs).
++                                                         The OCTEON will start the target split completion
++                                                         on the PCI Bus after 1B(1st ADB)+128B(2nd ADB)=129B
++                                                         of data have been received from memory (even though
++                                                         the remaining 895B has not yet been received). The
++                                                         OCTEON will continue the split completion until it
++                                                         has consumed all of the pended split data. If the
++                                                         full transaction length(1KB) of data was NOT entirely
++                                                         transferred, then OCTEON will terminate the split
++                                                         completion and again wait for another 2 ADB-aligned data
++                                                         chunks(256B) of pended split data to be received from
++                                                         memory before starting another split completion request.
++                                                         This allows Octeon (as split completer), to send back
++                                                         multiple split completions for a given large split
++                                                         transaction without having to wait for the entire
++                                                         transaction length to be received from memory.
++                                                         NOTE: For split transaction sizes 'smaller' than the
++                                                         specified TSR_HWM value, the split completion
++                                                         is started when the last datum has been received from
++                                                         memory.
++                                                         NOTE: It is IMPERATIVE that this field NEVER BE
++                                                         written to a ZERO value. A value of zero is
++                                                         reserved/illegal and can result in PCIX bus hangs). */
+ 		uint64_t bar2_enb:1;		    /**< When set '1' BAR2 is enable and will respond when
+-							 clear '0' BAR2 access will be target-aborted. */
++                                                         clear '0' BAR2 access will be target-aborted. */
+ 		uint64_t bar2_esx:2;		    /**< Value will be XORed with pci-address[37:36] to
+-							 determine the endian swap mode. */
++                                                         determine the endian swap mode. */
+ 		uint64_t bar2_cax:1;		    /**< Value will be XORed with pci-address[38] to
+-							 determine the L2 cache attribute. */
++                                                         determine the L2 cache attribute. */
+ 	} s;
+ } octeon_pci_ctl_status_2_t;
+ 
++#define OCTEON_NPI_PCI_BAR1_INDEXX(offset) (0x80011F0000001100ull+((offset)*4))
++typedef union {
++	uint32_t u32;
++	struct {
++		uint64_t reserved:14;		    /**< Reserved */
++		uint64_t addr_idx:14;		    /**< Address bits [35:22] sent to L2C */
++		uint64_t ca:1;			    /**< Set '1' when access is to be cached in L2. */
++		uint64_t end_swp:2;		    /**< Endian Swap Mode */
++		uint64_t addr_v:1;		    /**< Set '1' when the selected address range is valid. */
++	} s;
++} octeon_pci_bar1_indexx_t;
++
+ #define OCTEON_NPI_PCI_READ_CMD_6   (0x80011F0000001180ull)
+ #define OCTEON_NPI_PCI_READ_CMD_C   (0x80011F0000001184ull)
+ #define OCTEON_NPI_PCI_READ_CMD_E   (0x80011F0000001188ull)
+@@ -859,10 +925,28 @@ typedef union {
+ 	} s;
+ } octeon_npi_pci_int_arb_cfg_t;
+ 
++#define OCTEON_MIO_BOOT_REG_CFGX(offset) (0x8001180000000000ull+((offset)*8))
++typedef union {
++	uint64_t u64;
++	struct {
++		uint64_t reserved:27;		    /**< Reserved */
++		uint64_t sam:1;			    /**< Region 0 SAM */
++		uint64_t we_ext:2;		    /**< Region 0 write enable count extension */
++		uint64_t oe_ext:2;		    /**< Region 0 output enable count extension */
++		uint64_t en:1;			    /**< Region 0 enable */
++		uint64_t orbit:1;		    /**< No function for region 0 */
++		uint64_t ale:1;			    /**< Region 0 ALE mode */
++		uint64_t width:1;		    /**< Region 0 bus width */
++		uint64_t size:12;		    /**< Region 0 size */
++		uint64_t base:16;		    /**< Region 0 base address */
++	} s;
++} octeon_mio_boot_reg_cfgx_t;
++
+ #define OCTEON_CIU_MBOX_SETX(offset)    (0x8001070000000600ull+((offset)*8))
+ #define OCTEON_CIU_MBOX_CLRX(offset)    (0x8001070000000680ull+((offset)*8))
+ #define OCTEON_CIU_SOFT_RST             (0x8001070000000740ull)
+ #define OCTEON_CIU_SOFT_PRST            (0x8001070000000748ull)
++#define OCTEON_CIU_SOFT_BIST            (0x8001070000000738ull)
+ #define OCTEON_LMC_MEM_CFG0             (0x8001180088000000ull)
+ #define OCTEON_L2C_CFG                  (0x8001180080000000ull)
+ #define OCTEON_L2T_ERR                  (0x8001180080000008ull)
+@@ -895,12 +979,13 @@ typedef union {
+ #define OCTEON_TIM_REG_ERROR            (0x8001180058000088ull)
+ #define OCTEON_FPA_INT_SUM              (0x8001180028000040ull)
+ #define OCTEON_IOB_INT_ENB              (0x80011800F0000060ull)
+-#define OCTEON_IPD_CLK_COUNT            (0x80014F0000000338ull)
+ #define OCTEON_IPD_INT_ENB              (0x80014F0000000160ull)
+ #define OCTEON_ZIP_INT_MASK             (0x8001180038000090ull)
+ #define OCTEON_PKO_REG_INT_MASK         (0x8001180050000090ull)
+ #define OCTEON_TIM_REG_INT_MASK         (0x8001180058000090ull)
+ #define OCTEON_FPA_INT_ENB              (0x8001180028000048ull)
++#define OCTEON_IPD_CLK_COUNT            (0x80014F0000000338ull)
++#define OCTEON_GPIO_BIT_CFGX(offset)    (0x8001070000000800ull+((offset)*8))
+ 
+ static inline uint64_t octeon_ptr_to_phys(void *ptr)
+ {
+Index: linux-2.6.10/mvl_patches/pro-1054.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1054.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1054);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

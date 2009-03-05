@@ -1,0 +1,1324 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_nec_emma2rh_i2c
+# Date: Wed Jul 26 21:43:40 2006
+# Source: MontaVista Software, Inc.
+# MR: 18172
+# Type: Integration
+# Disposition: needs submitting to lm-sensors
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	Implementation support of IIC adapter on NEC EMMA2RH board
+# 
+
+PATCHNUM=804
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18172
+Type: Integration
+Disposition: needs submitting to lm-sensors
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	Implementation support of IIC adapter on NEC EMMA2RH board
+
+Index: linux-2.6.10/drivers/i2c/algos/i2c-algo-emma2rh.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/i2c-algo-emma2rh.c
+@@ -0,0 +1,445 @@
++/*
++   -------------------------------------------------------------------------
++   i2c-algo-emma2rh.c i2c driver algorithms for NEC EMMA2RH I2C adapters
++   -------------------------------------------------------------------------
++
++    Copyright (C) NEC Electronics Corporation 2005-2006
++
++    Changes made to support the I2C peripheral on the NEC EMMA2RH
++
++   -------------------------------------------------------------------------
++    This file was highly leveraged from i2c-algo-pcf.c, which was created
++    by Simon G. Vogl and Hans Berglund:
++
++     Copyright (C) 1995-1997 Simon G. Vogl
++                   1998-2000 Hans Berglund
++
++    With some changes from Kyösti Mälkki <kmalkki@cc.hut.fi> and
++    Frodo Looijaard <frodol@dds.nl> ,and also from Martin Bailey
++    <mbailey@littlefeet-inc.com>
++
++    Partially rewriten by Oleg I. Vdovikin <vdovikin@jscc.ru> to handle multiple
++    messages, proper stop/repstart signaling during receive,
++    added detect code
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++   -------------------------------------------------------------------------
++*/
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/version.h>
++#include <linux/init.h>
++#include <asm/uaccess.h>
++#include <linux/ioport.h>
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <linux/interrupt.h>
++
++#include <linux/i2c.h>
++#include <linux/i2c-algo-emma2rh.h>
++
++#include <asm/emma2rh/emma2rh.h>
++
++#ifdef DEBUG
++#define i2c_emma2rh_debug(level,op) do { if (i2c_debug>=(level)) { op; } } while (0)
++static int i2c_debug;
++module_param(i2c_debug, int, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(i2c_debug,
++		 "debug level - 0 off; 1 normal; 2,3 more verbose; 9 i2c-protocol");
++#else
++#define i2c_emma2rh_debug(level,op) /* nothing */
++#endif
++
++#define DEB(x) i2c_emma2rh_debug(1, x)
++#define DEB2(x) i2c_emma2rh_debug(2, x)
++#define DEB3(x) i2c_emma2rh_debug(3, x)
++#define DEBPROTO(x) i2c_emma2rh_debug(9,x)
++
++#define EMMA2RH_I2C_RETRIES 3
++#define EMMA2RH_I2C_TIMEOUT 100
++
++/* --- setting states on the bus with the right timing: ---------------	*/
++#define set_emma(adap, ctl, val) adap->setemma(adap->data, ctl, val)
++#define get_emma(adap, ctl) adap->getemma(adap->data, ctl)
++#define get_own(adap) adap->getown(adap->data)
++#define get_clock(adap) adap->getclock(adap->data)
++
++/* --- other auxiliary functions --------------------------------------	*/
++
++static void i2c_start(struct i2c_algo_emma_data *adap)
++{
++	DEBPROTO(printk("S "));
++	set_emma(adap, I2C_EMMA_CNT, I2C_EMMA_START);
++}
++
++static void i2c_repstart(struct i2c_algo_emma_data *adap)
++{
++	DEBPROTO(printk(" Sr "));
++	set_emma(adap, I2C_EMMA_CNT, I2C_EMMA_REPSTART);
++}
++
++static void i2c_stop(struct i2c_algo_emma_data *adap)
++{
++	DEBPROTO(printk("P\n"));
++	set_emma(adap, I2C_EMMA_CNT, I2C_EMMA_STOP);
++}
++
++static inline void emma_sleep(unsigned long timeout)
++{
++	schedule_timeout(timeout * HZ);
++}
++
++static int wait_for_pin(struct i2c_algo_emma_data *adap, int *status)
++{
++	adap->waitforpin(adap->data);
++	*status = get_emma(adap, I2C_EMMA_STA);
++	return 0;
++}
++
++static int emma_init(struct i2c_algo_emma_data *adap)
++{
++	unsigned char temp;
++
++	/* serial interface off */
++	set_emma(adap, I2C_EMMA_CNT, 0);
++
++#if CONFIG_SLAVE_MODE
++	/* load own address in SVA, effective address is (own & 0xfe) */
++	set_emma(adap, I2C_EMMA_SVA, get_own(adap));
++	udelay(20);
++	/* check it's realy written */
++	if ((temp = get_emma(adap, I2C_EMMA_SVA)) != get_own(adap)) {
++		DEB2(printk
++		     (KERN_ERR
++		      "%s: EMMA detection failed -- can't set I2C_EMMA_SVA (0x%02x).\n",
++		      __FUNCTION__,temp));
++		return -ENXIO;
++	}
++#endif
++	/* load clock register CS */
++	set_emma(adap, I2C_EMMA_CSEL, get_clock(adap));
++	udelay(20);		/* wait awhile */
++	/* check it's realy written, the only 4 lowest bits does matter */
++	if (((temp = get_emma(adap, I2C_EMMA_CSEL)) & 0x8f) != get_clock(adap)) {
++		DEB2(printk
++		     (KERN_ERR
++		      "%s: EMMA detection failed -- can't set I2C_EMMA_CSEL (0x%02x).\n",
++		      __FUNCTION__, temp));
++		return -ENXIO;
++	}
++
++	/* initialize interrupt mask */
++	set_emma(adap, I2C_EMMA_INT, 0);
++	set_emma(adap, I2C_EMMA_INTM, INTE0);
++
++	/* Enable serial interface */
++	set_emma(adap, I2C_EMMA_CNT, IICE);
++
++	/* generate a STOP condition, first of all */
++	i2c_stop(adap);
++
++	return 0;
++}
++
++static int emma_exit(struct i2c_algo_emma_data *adap)
++{
++	set_emma(adap, I2C_EMMA_INTM, 0);
++}
++
++/* --- Utility functions ---------------------------------------------- */
++
++static inline int try_address(struct i2c_algo_emma_data *adap,
++			      unsigned char addr, int retries)
++{
++	int i, status, ret = -1;
++
++	for (i = 0; i < retries; i++) {
++		i2c_start(adap);
++		set_emma(adap, I2C_EMMA_SHR, addr);
++		if (wait_for_pin(adap, &status) >= 0)
++			if (status & ACKD) {
++				i2c_stop(adap);
++				ret = 1;
++				break;	/* success! */
++			}
++		i2c_stop(adap);
++		udelay(adap->udelay);
++	}
++	DEB2(if (i)
++	     printk(KERN_DEBUG "%s: needed %d retries for %d\n", __FUNCTION__, i, addr)) ;
++	return ret;
++}
++
++static int emma_sendbytes(struct i2c_adapter *i2c_adap, const char *buf,
++			  int count, int last)
++{
++	struct i2c_algo_emma_data *adap = i2c_adap->algo_data;
++	int wrcount, status, timeout;
++
++	set_emma(adap, I2C_EMMA_CNT, IICE | WTIM);
++	for (wrcount = 0; wrcount < count; wrcount++) {
++		set_emma(adap, I2C_EMMA_INT, 0);
++		set_emma(adap, I2C_EMMA_SHR, buf[wrcount] & SR);
++		timeout = wait_for_pin(adap, &status);
++		if (timeout) {
++			i2c_stop(adap);
++			printk(KERN_ERR "%s i2c_write: "
++			       "error - timeout.\n", i2c_adap->name);
++			return -EREMOTEIO;	/* got a better one ?? */
++		}
++		if (!(status & ACKD)) {
++			i2c_stop(adap);
++			printk(KERN_ERR "%s i2c_write: "
++			       "error - no ack.\n", i2c_adap->name);
++			return -EREMOTEIO;	/* got a better one ?? */
++		}
++	}
++
++	if (last)
++		i2c_stop(adap);
++	else
++		i2c_repstart(adap);
++
++	return (wrcount);
++}
++
++static int emma_readbytes(struct i2c_adapter *i2c_adap, char *buf,
++			  int count, int last)
++{
++	struct i2c_algo_emma_data *adap = i2c_adap->algo_data;
++	int rdcount, status, timeout;
++
++	for (rdcount = 0; rdcount < count; rdcount++) {
++
++		/* we will suffer from unexpected interrupts if we
++		 * use 8-clock-wait.
++		 */
++
++		set_emma(adap, I2C_EMMA_INT, 0);
++		if (rdcount == count - 1)
++			/* last byte */
++			set_emma(adap, I2C_EMMA_CNT, IICE | WREL | WTIM);
++		else
++			set_emma(adap, I2C_EMMA_CNT, IICE | WREL | WTIM | ACKE);
++
++		timeout = wait_for_pin(adap, &status);
++		if (timeout) {
++			i2c_stop(adap);
++			printk(KERN_ERR
++			       "i2c-algo-emma.o: emma_readbytes timed out.\n");
++			return (-1);
++		}
++		if (!(status & ACKD) && (rdcount != count - 1)) {
++			i2c_stop(adap);
++			printk(KERN_ERR
++			       "i2c-algo-emma.o: i2c_read: i2c_inb, No ack.\n");
++			return (-1);
++		}
++		buf[rdcount] = get_emma(adap, I2C_EMMA_SHR);
++	}
++
++	if (last)
++		i2c_stop(adap);
++	else
++		i2c_repstart(adap);
++
++	return (rdcount);
++}
++
++static inline int emma_doAddress(struct i2c_algo_emma_data *adap,
++				 struct i2c_msg *msg, int retries)
++{
++	unsigned short flags = msg->flags;
++	unsigned int addr;
++	int ret;
++
++	set_emma(adap, I2C_EMMA_INT, 0);
++
++	if (flags & I2C_M_TEN) {
++		/* a ten bit address */
++		addr = 0xf0 | ((msg->addr >> 7) & 0x03);
++		DEB2(printk(KERN_DEBUG "addr0: %d\n", addr));
++
++		/* try extended address code... */
++		ret = try_address(adap, addr, retries);
++		if (ret != 1) {
++			printk(KERN_ERR "died at extended address code.\n");
++			return -EREMOTEIO;
++		}
++		/* the remaining 8 bit address */
++		/* ...TBD */
++		printk(KERN_ERR"10 bit addresses are not supported in this driver.\n");
++		return -EREMOTEIO;
++	} else {		/* normal 7bit address  */
++		addr = (msg->addr << 1);
++		if (flags & I2C_M_RD)
++			addr |= 1;
++		if (flags & I2C_M_REV_DIR_ADDR)
++			addr ^= 1;
++		set_emma(adap, I2C_EMMA_SHR, addr);
++	}
++	return 0;
++}
++
++static int emma_xfer(struct i2c_adapter *i2c_adap,
++		     struct i2c_msg msgs[], int num)
++{
++	struct i2c_algo_emma_data *adap = i2c_adap->algo_data;
++	struct i2c_msg *pmsg;
++	int i;
++	int ret = 0, timeout, status;
++
++	for (i = 0; ret >= 0 && i < num; i++) {
++		pmsg = &msgs[i];
++
++		DEB2(printk
++		     (KERN_DEBUG
++		      "Doing %s %d bytes to 0x%02x - %d of %d messages\n",
++		      pmsg->flags & I2C_M_RD ? "read" : "write", pmsg->len,
++		      pmsg->addr, i + 1, num));
++
++		/* Send START */
++		if (i == 0)
++			i2c_start(adap);
++
++		ret = emma_doAddress(adap, pmsg, i2c_adap->retries);
++
++		/* Wait for PIN (pending interrupt NOT) */
++		timeout = wait_for_pin(adap, &status);
++		if (timeout) {
++			i2c_stop(adap);
++			DEB2(printk(KERN_ERR "Timeout waiting "
++				    "for PIN(1) in emma_xfer\n"));
++			return (-EREMOTEIO);
++		}
++
++		/* Check LRB (last rcvd bit - slave ack) */
++		if (!(status & ACKD)) {
++			i2c_stop(adap);
++			DEB2(printk
++			     (KERN_ERR
++			      "No LRB(1) in emma_xfer\n"));
++			return (-EREMOTEIO);
++		}
++
++		DEB3(printk
++		     (KERN_DEBUG
++		      "i2c-algo-emma.o: Msg %d, addr=0x%x, flags=0x%x, len=%d\n",
++		      i, msgs[i].addr, msgs[i].flags, msgs[i].len));
++
++		if (pmsg->flags & I2C_M_RD)
++			/* read bytes into buffer */
++			ret = emma_readbytes(i2c_adap, pmsg->buf, pmsg->len,
++					     (i + 1 == num));
++		 else 	/* Write */
++			ret = emma_sendbytes(i2c_adap, pmsg->buf, pmsg->len,
++					     (i + 1 == num));
++
++		DEB2( printk( KERN_DEBUG "transferred %d bytes of %d -- %s\n",
++					ret, pmsg->len, ret != pmsg->len ? "FAIL" : "succeeded"));
++	}
++
++	return (i);
++}
++
++static int algo_control(struct i2c_adapter *adapter,
++			unsigned int cmd, unsigned long arg)
++{
++	return 0;
++}
++
++static u32 emma_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_SMBUS_EMUL | I2C_FUNC_PROTOCOL_MANGLING;
++}
++
++/* --- exported algorithm data ---------------------------------------- */
++
++static struct i2c_algorithm emma_algo = {
++	.name = "NEC EMMA2RH I2C algorithm",
++	.id = I2C_ALGO_EXP,
++	.master_xfer = emma_xfer,
++	.smbus_xfer = NULL,
++	.slave_send = NULL,	/* slave_send */
++	.slave_recv = NULL,	/* slave_recv */
++	.algo_control = algo_control,	/* ioctl */
++	.functionality = emma_func,	/* functionality */
++};
++
++/*
++ * registering functions to load algorithms at routine
++ */
++int i2c_emma_add_bus(struct i2c_adapter *adap)
++{
++	int i;
++	struct i2c_algo_emma_data *emma_adap = adap->algo_data;
++
++	DEB2(printk
++	     (KERN_DEBUG "hw routines for %s registered.\n",
++	      adap->name));
++
++	/* register new adapter to i2c module... */
++
++	adap->id |= emma_algo.id;
++	adap->algo = &emma_algo;
++
++	adap->timeout = EMMA2RH_I2C_TIMEOUT;	/* default values, should */
++	adap->retries = EMMA2RH_I2C_RETRIES;	/* be replaced by defines */
++
++	if ((i = emma_init(emma_adap)))
++		return i;
++
++	i2c_add_adapter(adap);
++
++	return 0;
++}
++
++int i2c_emma_del_bus(struct i2c_adapter *adap)
++{
++	int res;
++	struct i2c_algo_emma_data *emma_adap = adap->algo_data;
++
++	emma_exit(emma_adap);
++
++	if ((res = i2c_del_adapter(adap)) < 0)
++		return res;
++	DEB2(printk(KERN_DEBUG "adapter unregistered: %s\n",
++		    adap->name));
++
++	return 0;
++}
++
++int __init i2c_algo_emma_init(void)
++{
++	return 0;
++}
++
++void i2c_algo_emma_exit(void)
++{
++	return;
++}
++
++EXPORT_SYMBOL_GPL(i2c_emma_add_bus);
++EXPORT_SYMBOL_GPL(i2c_emma_del_bus);
++
++MODULE_AUTHOR("NEC Electronics Corporation <www.necel.com>");
++MODULE_DESCRIPTION("NEC EMMA2RH I2C-Bus algorithm");
++MODULE_LICENSE("GPL");
++
++module_init(i2c_algo_emma_init);
++module_exit(i2c_algo_emma_exit);
+Index: linux-2.6.10/drivers/i2c/algos/i2c-algo-emma2rh.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/i2c-algo-emma2rh.h
+@@ -0,0 +1,105 @@
++/* -------------------------------------------------------------------- */
++/* i2c-algo-emma2rh.h: NEC EMMA2RH global defines                       */
++/* -------------------------------------------------------------------- */
++/*
++    Copyright (C) NEC Electronics Corporation 2005-2006
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA*/
++/* --------------------------------------------------------------------	*/
++
++#ifndef I2C_EMMA2RH_H
++#define I2C_EMMA2RH_H
++
++/*---------------------------------------------------------------------------*/
++/* CNT - Control register (00H R/W)                                          */
++/*---------------------------------------------------------------------------*/
++#define SPT         0x00000001
++#define STT         0x00000002
++#define ACKE        0x00000004
++#define WTIM        0x00000008
++#define SPIE        0x00000010
++#define WREL        0x00000020
++#define LREL        0x00000040
++#define IICE        0x00000080
++#define CNT_RESERVED    0x000000ff	/* reserved bit 0 */
++
++#define I2C_EMMA_START      (IICE | STT)
++#define I2C_EMMA_STOP       (IICE | SPT)
++#define I2C_EMMA_REPSTART   I2C_EMMA_START
++
++/*---------------------------------------------------------------------------*/
++/* STA - Status register (10H Read)                                          */
++/*---------------------------------------------------------------------------*/
++#define MSTS        0x00000080
++#define ALD         0x00000040
++#define EXC         0x00000020
++#define COI         0x00000010
++#define TRC         0x00000008
++#define ACKD        0x00000004
++#define STD         0x00000002
++#define SPD         0x00000001
++
++/*---------------------------------------------------------------------------*/
++/* CSEL - Clock select register (20H R/W)                                    */
++/*---------------------------------------------------------------------------*/
++#define FCL         0x00000080
++#define ND50        0x00000040
++#define CLD         0x00000020
++#define DAD         0x00000010
++#define SMC         0x00000008
++#define DFC         0x00000004
++#define CL          0x00000003
++#define CSEL_RESERVED   0x000000ff	/* reserved bit 0 */
++
++#define FAST397     0x0000008b
++#define FAST297     0x0000008a
++#define FAST347     0x0000000b
++#define FAST260     0x0000000a
++#define FAST130     0x00000008
++#define STANDARD108 0x00000083
++#define STANDARD83  0x00000082
++#define STANDARD95  0x00000003
++#define STANDARD73  0x00000002
++#define STANDARD36  0x00000001
++#define STANDARD71  0x00000000
++
++/*---------------------------------------------------------------------------*/
++/* SVA - Slave address register (30H R/W)                                    */
++/*---------------------------------------------------------------------------*/
++#define SVA         0x000000fe
++
++/*---------------------------------------------------------------------------*/
++/* SHR - Shift register (40H R/W)                                            */
++/*---------------------------------------------------------------------------*/
++#define SR          0x000000ff
++
++/*---------------------------------------------------------------------------*/
++/* INT - Interrupt register (50H R/W)                                        */
++/* INTM - Interrupt mask register (60H R/W)                                  */
++/*---------------------------------------------------------------------------*/
++#define INTE0       0x00000001
++
++/***********************************************************************
++ * I2C registers
++ ***********************************************************************
++ */
++#define I2C_EMMA_CNT            0x00
++#define I2C_EMMA_STA            0x10
++#define I2C_EMMA_CSEL           0x20
++#define I2C_EMMA_SVA            0x30
++#define I2C_EMMA_SHR            0x40
++#define I2C_EMMA_INT            0x50
++#define I2C_EMMA_INTM           0x60
++#endif				/* I2C_EMMA2RH_H */
+Index: linux-2.6.10/drivers/i2c/algos/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/algos/Kconfig
++++ linux-2.6.10/drivers/i2c/algos/Kconfig
+@@ -73,5 +73,10 @@ config I2C_ALGO_XILINX
+ 	help
+ 	  Supports I2C IP from Xilinx EDK.
+ 
++config I2C_ALGO_EMMA2RH
++	tristate "I2C EMMA2RH interfaces"
++	depends on I2C && MARKEINS
++	help
++	  NEC EMMA2RH I2C Algorithm
+ endmenu
+ 
+Index: linux-2.6.10/drivers/i2c/algos/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/algos/Makefile
++++ linux-2.6.10/drivers/i2c/algos/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_I2C_ALGO_SIBYTE)	+= i2c-alg
+ obj-$(CONFIG_I2C_ALGO_SGI)	+= i2c-algo-sgi.o
+ obj-$(CONFIG_I2C_ALGO8XX)	+= i2c-algo-8xx.o
+ obj-$(CONFIG_I2C_ALGO_XILINX)	+= xilinx_iic/
++obj-$(CONFIG_I2C_ALGO_EMMA2RH)	+= i2c-algo-emma2rh.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_ALGO),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/drivers/i2c/busses/i2c-emma2rh.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/busses/i2c-emma2rh.c
+@@ -0,0 +1,253 @@
++/*
++   -------------------------------------------------------------------------
++   i2c-emma2rh.c i2c-hw access for the I2C peripheral on the NEC EMMA2RH
++   -------------------------------------------------------------------------
++
++    Copyright (C) NEC Electronics Corporation 2005-2006
++
++    Changes made to support the I2C peripheral on the NEC EMMA2RH
++
++   -------------------------------------------------------------------------
++    This file was highly leveraged from i2c-elektor.c, which was created
++    by Simon G. Vogl and Hans Berglund:
++
++     Copyright (C) 1995-97 Simon G. Vogl
++                   1998-99 Hans Berglund
++
++    With some changes from Kyösti Mälkki <kmalkki@cc.hut.fi> and even
++    Frodo Looijaard <frodol@dds.nl>
++
++    Partialy rewriten by Oleg I. Vdovikin for mmapped support of
++    for Alpha Processor Inc. UP-2000(+) boards
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++   -------------------------------------------------------------------------
++*/
++
++#include <linux/kernel.h>
++#include <linux/ioport.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/version.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/i2c-id.h>
++#include <linux/i2c-algo-emma2rh.h>
++#include <asm/irq.h>
++#include <asm/io.h>
++#include <asm/atomic.h>
++#include <asm/emma2rh/emma2rh.h>
++
++#define I2C_EMMA2RH "emma2rh-iic"
++static int i2c_debug = 0;
++
++/* ----- global defines -----------------------------------------------	*/
++#define DEB(x)	if (i2c_debug>=1) x
++#define DEB2(x) if (i2c_debug>=2) x
++#define DEB3(x) if (i2c_debug>=3) x
++#define DEBE(x)	x		/* error messages */
++
++struct i2c_drvdata {
++	struct i2c_algo_emma_data alg;
++	struct i2c_adapter adap;
++	spinlock_t lock;
++	atomic_t pending;
++	u32 base;
++	int irq;
++	int clock;
++	int own;
++	wait_queue_head_t wait;
++};
++
++/* ----- local functions ----------------------------------------------	*/
++static void i2c_emma_setbyte(void *data, int ctl, int val)
++{
++	int address = ((struct i2c_drvdata *)data)->base + ctl;
++
++	DEB3(printk
++	     (KERN_DEBUG "i2c_emma_setbyte: Write 0x%08x 0x%08x\n", address,
++	      val));
++	__raw_writel(val, (void *)address);
++}
++
++static int i2c_emma_getbyte(void *data, int ctl)
++{
++	int address = ((struct i2c_drvdata *)data)->base + ctl;
++	int val = __raw_readl((void *)address);
++
++	DEB3(printk
++	     (KERN_DEBUG "i2c_emma_getbyte: Read 0x%08x 0x%08x\n", address,
++	      val));
++	return (val);
++}
++
++static int i2c_emma_getown(void *data)
++{
++	return (((struct i2c_drvdata *)data)->own);
++}
++
++static int i2c_emma_getclock(void *data)
++{
++	return (((struct i2c_drvdata *)data)->clock);
++}
++
++
++
++static int i2c_emma_reg(struct i2c_client *client)
++{
++	return 0;
++}
++
++static int i2c_emma_unreg(struct i2c_client *client)
++{
++	return 0;
++}
++
++
++static irqreturn_t i2c_emma_handler(int this_irq, void *dev_id,
++				    struct pt_regs *regs)
++{
++	struct i2c_drvdata *dd = dev_id;
++
++	DEB2(printk("i2c_emma_handler: status = 0x%08x\n",
++		    __raw_readl((void *)(dd->base + I2C_EMMA_INT))));
++	/* clear interrupt */
++	__raw_writel(0, (void *)(dd->base + I2C_EMMA_INT));
++
++	atomic_set(&dd->pending, 1);
++	wake_up(&dd->wait);
++	return IRQ_HANDLED;
++}
++
++static void i2c_emma_waitforpin(void *data)
++{
++	int timeout = 2;
++	struct i2c_drvdata *dd = data;
++
++	if (dd->irq >=0) {
++		timeout = wait_event_timeout(dd->wait,
++					     atomic_read(&dd->pending),
++					     timeout * HZ);
++		atomic_set(&dd->pending,0);
++	} else
++		udelay(100);
++}
++
++static int __devinit i2c_emma_probe(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct i2c_drvdata *dd;
++	int err = 0;
++	struct resource *r;
++
++	dd = kzalloc (sizeof *dd, SLAB_KERNEL);
++	if (dd == NULL) {
++		err = -ENOMEM;
++		goto out;
++	}
++	dd->alg.data = dd;
++	dd->alg.setemma = i2c_emma_setbyte;
++	dd->alg.getemma = i2c_emma_getbyte;
++	dd->alg.getown = i2c_emma_getown;
++	dd->alg.getclock = i2c_emma_getclock;
++	dd->alg.waitforpin = i2c_emma_waitforpin;
++	dd->alg.udelay = 80;
++	dd->alg.mdelay = 80;
++	dd->alg.timeout = 200;
++
++	strcpy(dd->adap.name, dev->bus_id);
++	dd->adap.id = 0x00;
++	dd->adap.algo = NULL;
++	dd->adap.algo_data = &dd->alg;
++	dd->adap.client_register = i2c_emma_reg;
++	dd->adap.client_unregister = i2c_emma_unreg;
++
++	spin_lock_init(&dd->lock);
++
++	atomic_set(&dd->pending,0);
++	init_waitqueue_head(&dd->wait);
++
++	dev_set_drvdata(dev, dd);
++
++	r = platform_get_resource(pdev, 0, 0);
++	/* get resource of type '0' with #0 */
++
++	if (!r) {
++		printk("Cannot get resource\n");
++		err = -ENODEV;
++		goto out_free;
++	}
++	dd->base = r->start;
++
++	dd->irq = platform_get_irq(pdev,0);
++	dd->clock = FAST397;
++	dd->own = 0x40 + pdev->id * 4;
++
++	err = request_irq(dd->irq, i2c_emma_handler, 0, dev->bus_id, dd);
++	if (err < 0)
++		goto out_free;
++
++	if ((err = i2c_emma_add_bus(&dd->adap)) < 0)
++		goto out_irq;
++
++	return 0;
++out_irq:
++	free_irq(dd->irq, dev->bus_id);
++out_free:
++	kfree(dd);
++out:
++	return err;
++}
++
++static int __devexit i2c_emma_remove (struct device *dev)
++{
++	struct i2c_drvdata* dd = dev_get_drvdata(dev);
++
++	if (dd) {
++		disable_irq(dd->irq);
++		free_irq(dd->irq, dev->bus_id);
++		i2c_emma_del_bus(&dd->adap);
++		kfree(dd);
++	}
++	return 0;
++}
++
++static struct device_driver i2c_emma_driver = {
++	.bus = &platform_bus_type,
++	.name = I2C_EMMA2RH,
++	.probe = i2c_emma_probe,
++	.remove = i2c_emma_remove,
++};
++
++static int __init i2c_emma_init(void)
++{
++	return driver_register(&i2c_emma_driver);
++}
++
++static void __exit i2c_emma_exit(void)
++{
++	driver_unregister(&i2c_emma_driver);
++}
++
++MODULE_AUTHOR("NEC Electronics Corporation <www.necel.com>");
++MODULE_DESCRIPTION("I2C-Bus adapter routines for EMMA2RH I2C bus adapter");
++MODULE_LICENSE("GPL");
++
++module_param(i2c_debug, int, S_IRUGO | S_IWUSR);
++module_init(i2c_emma_init);
++module_exit(i2c_emma_exit);
+Index: linux-2.6.10/drivers/i2c/busses/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Kconfig
++++ linux-2.6.10/drivers/i2c/busses/Kconfig
+@@ -82,7 +82,7 @@ config I2C_ELEKTOR
+ 	  This supports the PCF8584 ISA bus I2C adapter.  Say Y if you own
+ 	  such an adapter.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called i2c-elektor.
+ 
+ config I2C_HYDRA
+@@ -122,7 +122,7 @@ config I2C_I810
+ 	select I2C_ALGOBIT
+ 	help
+ 	  If you say yes to this option, support will be included for the Intel
+-	  810/815 family of mainboard I2C interfaces.  Specifically, the 
++	  810/815 family of mainboard I2C interfaces.  Specifically, the
+ 	  following versions of the chipset is supported:
+ 	    i810AA
+ 	    i810AB
+@@ -136,8 +136,8 @@ config I2C_IBM_IIC
+ 	tristate "IBM PPC 4xx on-chip I2C interface"
+ 	depends on IBM_OCP && I2C
+ 	help
+-	  Say Y here if you want to use IIC peripheral found on 
+-	  embedded IBM PPC 4xx based systems. 
++	  Say Y here if you want to use IIC peripheral found on
++	  embedded IBM PPC 4xx based systems.
+ 
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called i2c-ibm_iic.
+@@ -171,7 +171,7 @@ config I2C_ITE
+ 	  systems. Say Y if you have one of these. You should also say Y for
+ 	  the ITE I2C driver algorithm support above.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called i2c-ite.
+ 
+ config I2C_IXP4XX
+@@ -179,7 +179,7 @@ config I2C_IXP4XX
+ 	depends on I2C && ARCH_IXP4XX
+ 	select I2C_ALGOBIT
+ 	help
+-	  Say Y here if you have an Intel IXP4xx(420,421,422,425) based 
++	  Say Y here if you have an Intel IXP4xx(420,421,422,425) based
+ 	  system and are using GPIO lines for an I2C bus.
+ 
+ 	  This support is also available as a module. If so, the module
+@@ -190,7 +190,7 @@ config I2C_IXP2000
+ 	depends on I2C && ARCH_IXP2000
+ 	select I2C_ALGOBIT
+ 	help
+-	  Say Y here if you have an Intel IXP2000(2400, 2800, 2850) based 
++	  Say Y here if you have an Intel IXP2000(2400, 2800, 2850) based
+ 	  system and are using GPIO lines for an I2C bus.
+ 
+ 	  This support is also available as a module. If so, the module
+@@ -203,7 +203,7 @@ config I2C_KEYWEST
+ 	  This supports the use of the I2C interface in the combo-I/O
+ 	  chip on recent Apple machines.  Say Y if you have such a machine.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called i2c-keywest.
+ 
+ config I2C_MPC
+@@ -242,12 +242,12 @@ config I2C_PARPORT
+ 	  This driver is a replacement for (and was inspired by) an older
+ 	  driver named i2c-philips-par.  The new driver supports more devices,
+ 	  and makes it easier to add support for new devices.
+-	  
++
+ 	  Another driver exists, named i2c-parport-light, which doesn't depend
+ 	  on the parport driver.  This is meant for embedded systems. Don't say
+ 	  Y here if you intend to say Y or M there.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called i2c-parport.
+ 
+ config I2C_PARPORT_LIGHT
+@@ -266,12 +266,12 @@ config I2C_PARPORT_LIGHT
+ 	  the clean but heavy parport handling is not an option.  The
+ 	  drawback is a reduced portability and the impossibility to
+ 	  dasiy-chain other parallel port devices.
+-	  
++
+ 	  Don't say Y here if you said Y or M to i2c-parport.  Saying M to
+ 	  both is possible but both modules should not be loaded at the same
+ 	  time.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called i2c-parport-light.
+ 
+ config I2C_PXA
+@@ -311,7 +311,7 @@ config I2C_PROSAVAGE
+ 	    S3/VIA KM266/VT8375 aka ProSavage8
+ 	    S3/VIA KM133/VT8365 aka Savage4
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called i2c-prosavage.
+ 
+ config I2C_RPXLITE
+@@ -331,7 +331,7 @@ config I2C_SAVAGE4
+ 	depends on I2C && PCI && EXPERIMENTAL
+ 	select I2C_ALGOBIT
+ 	help
+-	  If you say yes to this option, support will be included for the 
++	  If you say yes to this option, support will be included for the
+ 	  S3 Savage 4 I2C interface.
+ 
+ 	  This driver can also be built as a module.  If so, the module
+@@ -352,7 +352,7 @@ config SCx200_I2C
+ 
+ 	  If you don't know what to do here, say N.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called scx200_i2c.
+ 
+ config SCx200_I2C_SCL
+@@ -379,14 +379,14 @@ config SCx200_ACB
+ 
+ 	  If you don't know what to do here, say N.
+ 
+-	  This support is also available as a module.  If so, the module 
++	  This support is also available as a module.  If so, the module
+ 	  will be called scx200_acb.
+ 
+ config I2C_SIS5595
+ 	tristate "SiS 5595"
+ 	depends on I2C && PCI && EXPERIMENTAL
+ 	help
+-	  If you say yes to this option, support will be included for the 
++	  If you say yes to this option, support will be included for the
+ 	  SiS5595 SMBus (a subset of I2C) interface.
+ 
+ 	  This driver can also be built as a module.  If so, the module
+@@ -396,7 +396,7 @@ config I2C_SIS630
+ 	tristate "SiS 630/730"
+ 	depends on I2C && PCI && EXPERIMENTAL
+ 	help
+-	  If you say yes to this option, support will be included for the 
++	  If you say yes to this option, support will be included for the
+ 	  SiS630 and SiS730 SMBus (a subset of I2C) interface.
+ 
+ 	  This driver can also be built as a module.  If so, the module
+@@ -450,7 +450,7 @@ config I2C_VIAPRO
+ 	help
+ 
+ 	  If you say yes to this option, support will be included for the VIA
+-	  82C596/82C686/823x I2C interfaces.  Specifically, the following 
++	  82C596/82C686/823x I2C interfaces.  Specifically, the following
+ 	  chipsets are supported:
+ 	  82C596A/B
+ 	  82C686A/B
+@@ -482,7 +482,7 @@ config I2C_PCA_ISA
+ 	help
+ 	  This driver supports ISA boards using the Philips PCA 9564
+ 	  Parallel bus to I2C bus controller
+-	  
++
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called i2c-pca-isa.
+ 
+@@ -508,4 +508,11 @@ config I2C_DAVINCI
+         tristate "Davinci i2c driver"
+         depends on I2C && ARCH_DAVINCI
+ 
++config I2C_EMMA2RH
++	tristate "EMMA2RH I2C adapter"
++	depends on I2C && MARKEINS
++	select I2C_ALGO_EMMA2RH
++	help
++ 	  Support for NEC EMMA2RH I2C Adapter
++
+ endmenu
+Index: linux-2.6.10/include/linux/i2c-algo-emma2rh.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/linux/i2c-algo-emma2rh.h
+@@ -0,0 +1,51 @@
++/* ------------------------------------------------------------------------- */
++/* i2c-algo-emma2rh.h i2c driver algorithms for NEC EMMA2RH I2C adapters     */
++/* ------------------------------------------------------------------------- */
++/*   Copyright (C) 1995-97 Simon G. Vogl
++                   1998-99 Hans Berglund
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.                */
++/* ------------------------------------------------------------------------- */
++
++/* With some changes from Kyösti Mälkki <kmalkki@cc.hut.fi> and even
++   Frodo Looijaard <frodol@dds.nl> */
++
++/* Modifications by NEC Electronics Corporation, 2003-2006
++   Changes made to support the I2C peripheral on the NEC EMMA2RH */
++
++#ifndef I2C_ALGO_EMMA2RH_H
++#define I2C_ALGO_EMMA2RH_H
++
++/* --- Defines for pcf-adapters ---------------------------------------	*/
++#include <linux/i2c.h>
++
++struct i2c_algo_emma_data {
++	void *data;		/* private data for lolevel routines    */
++	void (*setemma) (void *data, int ctl, int val);
++	int (*getemma) (void *data, int ctl);
++	int (*getown) (void *data);
++	int (*getclock) (void *data);
++	void (*waitforpin) (void *data);
++
++	/* local settings */
++	int udelay;
++	int mdelay;
++	int timeout;
++};
++
++int i2c_emma_add_bus(struct i2c_adapter *);
++int i2c_emma_del_bus(struct i2c_adapter *);
++
++#endif				/* I2C_ALGO_EMMA2RH_H */
+Index: linux-2.6.10/drivers/i2c/busses/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/busses/Makefile
++++ linux-2.6.10/drivers/i2c/busses/Makefile
+@@ -43,6 +43,7 @@ obj-$(CONFIG_SCx200_ACB)	+= scx200_acb.o
+ obj-$(CONFIG_SCx200_I2C)	+= scx200_i2c.o
+ obj-$(CONFIG_I2C_OMAP)          += i2c-omap.o
+ obj-$(CONFIG_I2C_DAVINCI)       += i2c-davinci.o
++obj-$(CONFIG_I2C_EMMA2RH)	+= i2c-emma2rh.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_BUS),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/mvl_patches/pro-0804.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0804.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(804);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1122 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_sound_02
+# Date: Fri Dec  7 11:53:08 2007
+# Source: Montavista
+# MR: 23868
+# Type: Enhancement
+# Disposition: Montavista
+# Signed-off-by: Aleksey Makarov <amakarov@ru.mvista.com>
+# Description:
+# 	adds support for the ac97 controller
+# 	and wm9713l codec found on
+# 	PXA3xx Processor Developer Kiti (Zylonite)
+# 
+
+PATCHNUM=1451
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Montavista
+MR: 23868
+Type: Enhancement
+Disposition: Montavista
+Signed-off-by: Aleksey Makarov <amakarov@ru.mvista.com>
+Description:
+	adds support for the ac97 controller
+	and wm9713l codec found on
+	PXA3xx Processor Developer Kiti (Zylonite)
+
+Index: linux-2.6.10/arch/arm/mach-pxa/zylonite.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-pxa/zylonite.c
++++ linux-2.6.10/arch/arm/mach-pxa/zylonite.c
+@@ -414,14 +414,8 @@ void zylonite_enable_dfc_pins(void)
+ }
+ 
+ static struct mhn_pin_config zylonite_ac97_pins[] = {
+-#ifdef CONFIG_AC97_EXTCLK
+-/* At this time, the clock of ac97 codec is instead by CLK_POUT. */
+-	MHN_MFP_CFG("AC97 SYSCLK", MFP_AC97_SYSCLK,      MFP_AF0,
+-			MFP_DS03X, 0, MFP_LPM_PULL_LOW, MFP_EDGE_NONE),
+-#else
+ 	MHN_MFP_CFG("AC97 SYSCLK", MFP_AC97_SYSCLK,      MFP_AC97_SYSCLK_AF,
+ 			MFP_DS03X, 0, MFP_LPM_DRIVE_LOW, MFP_EDGE_NONE),
+-#endif
+ 	MHN_MFP_CFG("AC97 BITCLK", MFP_AC97_AC97_BITCLK, MFP_AC97_AC97_BITCLK_AF,
+ 			MFP_DS03X, 0, MFP_LPM_FLOAT,     MFP_EDGE_NONE),
+ 	MHN_MFP_CFG("AC97 SYNC",   MFP_AC97_SYNC,        MFP_AC97_SYNC_AF,
+@@ -1082,7 +1076,6 @@ static void __init zylonite_init(void)
+ 	zylonite_enable_eth_pins();
+ 	zylonite_enable_i2c_pins();
+ 
+-	zylonite_enable_ac97_pins();
+ 	zylonite_enable_keyp_pins();
+ 
+ 	zylonite_enable_ffuart_pins();
+Index: linux-2.6.10/include/asm-arm/arch-pxa/pxa-regs.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-pxa/pxa-regs.h
++++ linux-2.6.10/include/asm-arm/arch-pxa/pxa-regs.h
+@@ -593,6 +593,9 @@
+ #define MCCR_FSRIE	(1 << 1)	/* FIFO Service Request Interrupt Enable */
+ 
+ #define GCR		__REG(0x4050000C)  /* Global Control Register */
++#ifdef CONFIG_PXA3xx
++#define GCR_CLKBPB      (1 << 31)	/* Internal Clock Enable */
++#endif
+ #define GCR_nDMAEN	(1 << 24)	/* non DMA Enable */
+ #define GCR_CDONE_IE	(1 << 19)	/* Command Done Interrupt Enable */
+ #define GCR_SDONE_IE	(1 << 18)	/* Status Done Interrupt Enable */
+Index: linux-2.6.10/sound/arm/Kconfig
+===================================================================
+--- linux-2.6.10.orig/sound/arm/Kconfig
++++ linux-2.6.10/sound/arm/Kconfig
+@@ -24,6 +24,15 @@ config SND_PXA2xx_SND
+ 	  Say Y or M if you want to support any AC97 codec attached to
+ 	  the PXA2xx AC97 interface.
+ 
++config SND_PXA3xx_SND
++	tristate "AC97 driver for the Marvell PXA3xx chip"
++	depends on ARCH_PXA && SND
++	select SND_PXA2xx_PCM
++	select SND_PXA2xx_AC97
++	help
++	  Say Y or M if you want to support Wolfson WM9713L codec
++	  attached to the PXA3xx AC97 interface.
++
+ config SND_PXA2xx_AC97
+ 	tristate
+ 	depends on ARCH_PXA
+Index: linux-2.6.10/sound/arm/Makefile
+===================================================================
+--- linux-2.6.10.orig/sound/arm/Makefile
++++ linux-2.6.10/sound/arm/Makefile
+@@ -6,9 +6,11 @@ snd-sa11xx-uda1341-objs := sa11xx-uda134
+ snd-pxa2xx-pcm-objs := pxa2xx-pcm.o
+ snd-pxa2xx-ac97-objs := pxa2xx-ac97.o
+ snd-pxa2xx-snd-objs := pxa2xx-snd.o
++snd-pxa3xx-snd-objs := pxa3xx-snd.o pxa3xx-wm9713l.o
+ 
+ # Toplevel Module Dependency
+ obj-$(CONFIG_SND_SA11XX_UDA1341) += snd-sa11xx-uda1341.o 
+ obj-$(CONFIG_SND_PXA2xx_PCM) += snd-pxa2xx-pcm.o
+ obj-$(CONFIG_SND_PXA2xx_AC97) += snd-pxa2xx-ac97.o
+ obj-$(CONFIG_SND_PXA2xx_SND) += snd-pxa2xx-snd.o
++obj-$(CONFIG_SND_PXA3xx_SND) += snd-pxa3xx-snd.o
+Index: linux-2.6.10/sound/arm/pxa2xx-ac97.c
+===================================================================
+--- linux-2.6.10.orig/sound/arm/pxa2xx-ac97.c
++++ linux-2.6.10/sound/arm/pxa2xx-ac97.c
+@@ -26,6 +26,8 @@
+ #include <asm/semaphore.h>
+ #include <asm/hardware.h>
+ #include <asm/arch/pxa-regs.h>
++#include <asm/arch/mhn_gpio.h>
++#include <asm/arch/mfp.h>
+ 
+ static DECLARE_MUTEX(car_mutex);
+ static DECLARE_WAIT_QUEUE_HEAD(gsr_wq);
+@@ -93,6 +95,7 @@ void pxa2xx_ac97_write(int num, unsigned
+ out:	up(&car_mutex);
+ }
+ 
++#ifndef CONFIG_PXA3xx
+ void pxa2xx_ac97_reset(void)
+ {
+ 	/* First, try cold reset */
+@@ -140,6 +143,62 @@ void pxa2xx_ac97_reset(void)
+ 	GCR &= ~(GCR_PRIRDY_IEN|GCR_SECRDY_IEN);
+ 	GCR |= GCR_SDONE_IE|GCR_CDONE_IE;
+ }
++#else
++
++static struct mhn_pin_config zylonite_ac97_pins_low[] = {
++	MHN_MFP_CFG("AC97 SDOUT",  MFP_PIN_GPIO27, MFP_PIN_GPIO27_AF_GPIO_27,
++			MFP_DS03X, 0, MFP_LPM_DRIVE_LOW, MFP_EDGE_NONE),
++	MHN_MFP_CFG("AC97 SYNC",   MFP_PIN_GPIO28, MFP_PIN_GPIO28_AF_GPIO_28,
++			MFP_DS03X, 0, MFP_LPM_DRIVE_LOW, MFP_EDGE_NONE),
++};
++
++static struct mhn_pin_config zylonite_ac97_pins_ac97[] = {
++	MHN_MFP_CFG("AC97 SDOUT",  MFP_AC97_SDATA_OUT, MFP_AC97_SDATA_OUT_AF,
++			MFP_DS03X, 0, MFP_LPM_DRIVE_LOW, MFP_EDGE_NONE),
++	MHN_MFP_CFG("AC97 SYNC",   MFP_AC97_SYNC, MFP_AC97_SYNC_AF,
++			MFP_DS03X, 0, MFP_LPM_DRIVE_LOW, MFP_EDGE_NONE),
++};
++
++static void pins_low(void)
++{
++	mhn_gpio_set_direction(MFP_PIN_GPIO27, GPIO_DIR_OUT);
++	mhn_gpio_set_level(MFP_PIN_GPIO27, GPIO_LEVEL_LOW);
++
++	mhn_gpio_set_direction(MFP_PIN_GPIO28, GPIO_DIR_OUT);
++	mhn_gpio_set_level(MFP_PIN_GPIO28, GPIO_LEVEL_LOW);
++
++	mhn_mfp_set_configs(zylonite_ac97_pins_low, ARRAY_SIZE(zylonite_ac97_pins_low));
++
++}
++
++static void pins_ac97(void)
++{
++	mhn_mfp_set_configs(zylonite_ac97_pins_ac97, ARRAY_SIZE(zylonite_ac97_pins_ac97));
++}
++
++void pxa2xx_ac97_reset(void)
++{
++	gsr_bits = 0;
++	GSR = ~0;             /* Clear status bits */
++
++	GCR &= GCR_COLD_RST;  /* Clear everything but nCRST */
++	/* Turn on internal clock - see 6.4.9.2.2; enable interrupts on reset done */
++	GCR |= GCR_CLKBPB | GCR_PRIRDY_IEN | GCR_SECRDY_IEN;
++	pins_low();           /* Drive SYNC and OUT pins low; see WM9713L datasheet */
++	GCR &= ~GCR_COLD_RST; /* Assert nCRST */
++	udelay(100);          /* Hold reset active for a minimum time */
++	GCR |= GCR_COLD_RST;
++	pins_ac97();
++	udelay(10);           /* For some reason, without this the sequence does not work */
++	GCR &= ~GCR_CLKBPB;
++
++	wait_event_timeout(gsr_wq, (GSR | gsr_bits) & (GSR_PCR | GSR_SCR), 10);
++
++	GCR &= ~(GCR_PRIRDY_IEN|GCR_SECRDY_IEN);
++	GCR |= GCR_SDONE_IE|GCR_CDONE_IE;
++}
++
++#endif
+ 
+ static irqreturn_t pxa2xx_ac97_irq(int irq, void *dev_id, struct pt_regs *regs)
+ {
+@@ -158,6 +217,17 @@ static irqreturn_t pxa2xx_ac97_irq(int i
+ 		PISR = PISR_EOC;
+ 		MCSR = MCSR_EOC;
+ 
++		/*
++		 * GSR_PCR and GSR_SCR monitors bits received from ac97 link
++		 * So it is not enough to clear it -- at the next ac97 period
++		 * it will be set again
++		 */
++		if (status & GSR_PCR)
++			GCR &= ~GCR_PRIRDY_IEN;
++
++		if (status & GSR_SCR)
++			GCR &= ~GCR_SECRDY_IEN;
++
+ 		return IRQ_HANDLED;
+ 	}
+ 
+@@ -166,11 +236,19 @@ static irqreturn_t pxa2xx_ac97_irq(int i
+ 
+ static inline void pxa2xx_ac97_do_suspend(void) {
+ 	GCR |= GCR_ACLINK_OFF;
++#ifndef CONFIG_PXA3xx
+ 	pxa_set_cken(CKEN2_AC97, 0);
++#else
++	pxa_set_cken(CKEN_AC97, 0);
++#endif
+ }
+ 
+ static inline void pxa2xx_ac97_do_resume(void) {
++#ifndef CONFIG_PXA3xx
+ 	pxa_set_cken(CKEN2_AC97, 1);
++#else
++	pxa_set_cken(CKEN_AC97, 1);
++#endif
+ }
+ 
+ #ifdef CONFIG_PM
+@@ -188,14 +266,10 @@ EXPORT_SYMBOL(pxa2xx_ac97_resume);
+ 
+ #endif
+ 
+-int pxa2xx_ac97_init(void)
+-{
+-	int ret;
+-
+-	ret = request_irq(IRQ_AC97, pxa2xx_ac97_irq, 0, "AC97", NULL);
+-	if (ret < 0)
+-		return ret;
++#ifndef CONFIG_PXA3xx
+ 
++static void set_pins(void)
++{
+ 	pxa_gpio_mode(GPIO31_SYNC_AC97_MD);
+ 	pxa_gpio_mode(GPIO30_SDATA_OUT_AC97_MD);
+ 	pxa_gpio_mode(GPIO28_BITCLK_AC97_MD);
+@@ -204,6 +278,27 @@ int pxa2xx_ac97_init(void)
+ 	/* Use GPIO 113 as AC97 Reset on Bulverde */
+ 	pxa_gpio_mode(113 | GPIO_ALT_FN_2_OUT);
+ #endif
++}
++
++#else
++
++extern void zylonite_enable_ac97_pins(void);
++static void set_pins(void)
++{
++	zylonite_enable_ac97_pins();
++}
++
++#endif
++
++int pxa2xx_ac97_init(void)
++{
++	int ret;
++
++	ret = request_irq(IRQ_AC97, pxa2xx_ac97_irq, 0, "AC97", NULL);
++	if (ret < 0)
++		return ret;
++
++	set_pins();
+ 
+ 	pxa2xx_ac97_do_resume();
+ 
+Index: linux-2.6.10/sound/arm/pxa3xx-snd.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/sound/arm/pxa3xx-snd.c
+@@ -0,0 +1,238 @@
++/*
++ * linux/sound/pxa3xx-snd.c -- AC97 support for the Intel PXA2xx chip.
++ *
++ * Author:	Nicolas Pitre
++ * Created:	Dec 02, 2004
++ * Copyright:	MontaVista Software Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++
++#include <sound/driver.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/initval.h>
++
++#include <asm/hardware.h>
++#include <asm/arch/audio.h>
++#include <asm/arch/pxa3xx-wm9713l.h>
++
++#include "pxa2xx-pcm.h"
++
++#define SOUND_RATES	SNDRV_PCM_RATE_8000  | SNDRV_PCM_RATE_11025 | \
++			SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_22050 | \
++			SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | \
++			SNDRV_PCM_RATE_48000 ;
++
++static pxa2xx_pcm_dma_params_t pxa3xx_wm9713l_pcm_out = {
++	.name			= "AC97 PCM out",
++	.dev_addr		= __PREG(PCDR),
++	.drcmr			= &DRCMRTXPCDR,
++	.dcmd			= DCMD_INCSRCADDR | DCMD_FLOWTRG |
++				  DCMD_BURST32 | DCMD_WIDTH4,
++};
++
++static pxa2xx_pcm_dma_params_t pxa3xx_wm9713l_pcm_in = {
++	.name			= "AC97 PCM in",
++	.dev_addr		= __PREG(PCDR),
++	.drcmr			= &DRCMRRXPCDR,
++	.dcmd			= DCMD_INCTRGADDR | DCMD_FLOWSRC |
++				  DCMD_BURST32 | DCMD_WIDTH4,
++};
++
++static snd_pcm_t *pxa3xx_wm9713l_pcm;
++
++static int pxa3xx_wm9713l_pcm_startup(snd_pcm_substream_t *substream)
++{
++	snd_pcm_runtime_t *runtime = substream->runtime;
++	pxa2xx_audio_ops_t *platform_ops;
++
++	runtime->hw.channels_min = 2;
++	runtime->hw.channels_max = 2;
++
++	runtime->hw.rates = SOUND_RATES;
++	snd_pcm_limit_hw_rates(runtime);
++
++	platform_ops = substream->pcm->card->dev->platform_data;
++	if (platform_ops && platform_ops->startup)
++		return platform_ops->startup(substream, platform_ops->priv);
++	else
++		return 0;
++}
++
++static void pxa3xx_wm9713l_pcm_shutdown(snd_pcm_substream_t *substream)
++{
++	pxa2xx_audio_ops_t *platform_ops;
++
++	platform_ops = substream->pcm->card->dev->platform_data;
++	if (platform_ops && platform_ops->shutdown)
++		platform_ops->shutdown(substream, platform_ops->priv);
++}
++
++static int pxa3xx_wm9713l_pcm_prepare(snd_pcm_substream_t *substream)
++{
++	snd_pcm_runtime_t *runtime = substream->runtime;
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++		return pxa3xx_wm9713l_snd_set_playback_rate(runtime->rate);
++	else
++		return pxa3xx_wm9713l_snd_set_capture_rate(runtime->rate);
++}
++
++static pxa2xx_pcm_client_t pxa3xx_wm9713l_pcm_client = {
++	.playback_params	= &pxa3xx_wm9713l_pcm_out,
++	.capture_params		= &pxa3xx_wm9713l_pcm_in,
++	.startup		= pxa3xx_wm9713l_pcm_startup,
++	.shutdown		= pxa3xx_wm9713l_pcm_shutdown,
++	.prepare		= pxa3xx_wm9713l_pcm_prepare,
++};
++
++#ifdef CONFIG_PM
++
++static int pxa3xx_snd_do_suspend(snd_card_t *card, unsigned int state)
++{
++	if (card->power_state != SNDRV_CTL_POWER_D3cold) {
++		pxa2xx_audio_ops_t *platform_ops = card->dev->platform_data;
++		snd_pcm_suspend_all(pxa3xx_wm9713l_pcm);
++		pxa3xx_wm9713l_snd_suspend();
++		snd_power_change_state(card, SNDRV_CTL_POWER_D3cold);
++		if (platform_ops && platform_ops->suspend)
++			platform_ops->suspend(platform_ops->priv);
++	}
++
++	return 0;
++}
++
++static int pxa3xx_snd_do_resume(snd_card_t *card, unsigned int state)
++{
++	if (card->power_state != SNDRV_CTL_POWER_D0) {
++		pxa2xx_audio_ops_t *platform_ops = card->dev->platform_data;
++		if (platform_ops && platform_ops->resume)
++			platform_ops->resume(platform_ops->priv);
++		pxa3xx_wm9713l_snd_resume();
++		snd_power_change_state(card, SNDRV_CTL_POWER_D0);
++	}
++
++	return 0;
++}
++
++static int pxa3xx_snd_suspend(struct device *_dev, u32 state, u32 level)
++{
++	snd_card_t *card = dev_get_drvdata(_dev);
++	int ret = 0;
++
++	if (card && level == SUSPEND_DISABLE)
++		ret = pxa3xx_snd_do_suspend(card, SNDRV_CTL_POWER_D3cold);
++
++	return ret;
++}
++
++static int pxa3xx_snd_resume(struct device *_dev, u32 level)
++{
++	snd_card_t *card = dev_get_drvdata(_dev);
++	int ret = 0;
++
++	if (card && level == RESUME_ENABLE)
++		ret = pxa3xx_snd_do_resume(card, SNDRV_CTL_POWER_D0);
++
++	return ret;
++}
++
++#else
++#define pxa3xx_snd_suspend	NULL
++#define pxa3xx_snd_resume	NULL
++#endif
++
++static int pxa3xx_snd_probe(struct device *dev)
++{
++	snd_card_t *card;
++	int ret;
++
++	ret = pxa3xx_wm9713l_snd_init();
++	if (ret)
++		return ret;
++
++	ret = -ENOMEM;
++	card = snd_card_new(SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
++			    THIS_MODULE, 0);
++	if (!card)
++		goto err;
++
++	card->dev = dev;
++	strncpy(card->driver, dev->driver->name, sizeof(card->driver));
++
++	ret = pxa2xx_pcm_new(card, &pxa3xx_wm9713l_pcm_client, &pxa3xx_wm9713l_pcm);
++	if (ret)
++		goto err;
++
++	ret = pxa3xx_wm9713l_snd_mixer(card);
++	if (ret)
++		goto err;
++
++	snprintf(card->shortname, sizeof(card->shortname),
++		 "%s", "WM9713L");
++	snprintf(card->longname, sizeof(card->longname),
++		 "%s (%s)", dev->driver->name, card->mixername);
++
++	snd_card_set_pm_callback(card, pxa3xx_snd_do_suspend,
++				 pxa3xx_snd_do_resume, NULL);
++	ret = snd_card_register(card);
++	if (ret == 0) {
++		dev_set_drvdata(dev, card);
++		return 0;
++	}
++
++err:
++	if (card)
++		snd_card_free(card);
++
++	pxa3xx_wm9713l_snd_exit();
++
++	return ret;
++}
++
++static int pxa3xx_snd_remove(struct device *dev)
++{
++	snd_card_t *card = dev_get_drvdata(dev);
++
++	if (card) {
++		snd_card_free(card);
++		dev_set_drvdata(dev, NULL);
++	}
++
++	pxa3xx_wm9713l_snd_exit();
++
++	return 0;
++}
++
++static struct device_driver pxa3xx_snd_driver = {
++	.name		= "pxa2xx-ac97",
++	.bus		= &platform_bus_type,
++	.probe		= pxa3xx_snd_probe,
++	.remove		= pxa3xx_snd_remove,
++	.suspend	= pxa3xx_snd_suspend,
++	.resume		= pxa3xx_snd_resume,
++};
++
++static int __init pxa3xx_snd_init(void)
++{
++	return driver_register(&pxa3xx_snd_driver);
++}
++
++static void __exit pxa3xx_snd_exit(void)
++{
++	driver_unregister(&pxa3xx_snd_driver);
++}
++
++module_init(pxa3xx_snd_init);
++module_exit(pxa3xx_snd_exit);
++
++MODULE_AUTHOR("Nicolas Pitre");
++MODULE_DESCRIPTION("AC97 driver for the Intel PXA3xx chip");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/sound/arm/pxa3xx-wm9713l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/sound/arm/pxa3xx-wm9713l.c
+@@ -0,0 +1,345 @@
++/*
++ * linux/sound/arm/pxa3xx-wm9713l.c -- Driver for Wolfson wm9713l on
++ *					Zylonite development platform
++ *
++ * Author:	Aleksey Makarov
++ * Created:	Jul 04, 2007
++ * Copyright:	MontaVista Software, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <sound/driver.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/ac97_codec.h>
++
++#include <asm/arch/pxa3xx-wm9713l.h>
++
++#include "pxa2xx-ac97.h"
++
++/*
++ * Registers that are specific to WM9713L
++ */
++#define WM9713L_DAC_PGA_VOL_ROUTE              0x0C
++#define WM9713L_REC_PGA_VOL                    0x12
++#define WM9713L_REC_ROUTE_MUX_SEL              0x14
++#define WM9713L_OUTPUT_PGA_MUX                 0x1C
++#define WM9713L_MIC_BIAS                       0x22
++#define WM9713L_AUDIO_DAC_RATE                 0x2C
++#define WM9713L_AUDIO_ADC_RATE                 0x32
++#define WM9713L_POWER_DOWN_1                   0x3C
++#define WM9713L_POWER_DOWN_2                   0x3E
++
++/*
++ * Vendor IDs (registers 0x7c, 0x7e)
++ */
++#define WM9713L_VENDOR_ID_1		0x574D
++#define WM9713L_VENDOR_ID_2		0x4C13
++
++/*
++ * Conrtrols
++ */
++#define WM9713L_DOUBLE(xname, reg, shift_left, shift_right, mask, invert) \
++{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = (xname), .info = snd_wm9713l_info_double, \
++  .get = snd_wm9713l_get_double, .put = snd_wm9713l_put_double, \
++  .private_value = (reg) | ((shift_left) << 8) | ((shift_right) << 12) | ((mask) << 16) | ((invert) << 24) }
++
++static int snd_wm9713l_info_double(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo)
++{
++	int mask = (kcontrol->private_value >> 16) & 0xff;
++
++	uinfo->type = mask == 1 ? SNDRV_CTL_ELEM_TYPE_BOOLEAN : SNDRV_CTL_ELEM_TYPE_INTEGER;
++	uinfo->count = 2;
++	uinfo->value.integer.min = 0;
++	uinfo->value.integer.max = mask;
++	return 0;
++}
++
++static int snd_wm9713l_get_double(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
++{
++	int reg = kcontrol->private_value & 0xff;
++	int shift_left = (kcontrol->private_value >> 8) & 0x0f;
++	int shift_right = (kcontrol->private_value >> 12) & 0x0f;
++	int mask = (kcontrol->private_value >> 16) & 0xff;
++	int invert = (kcontrol->private_value >> 24) & 0xff;
++	unsigned short val;
++
++	val = pxa2xx_ac97_read(0, reg);
++
++	ucontrol->value.integer.value[0] = (val >> shift_left) & mask;
++	ucontrol->value.integer.value[1] = (val >> shift_right) & mask;
++	if (invert) {
++		ucontrol->value.integer.value[0] = mask - ucontrol->value.integer.value[0];
++		ucontrol->value.integer.value[1] = mask - ucontrol->value.integer.value[1];
++	}
++	return 0;
++}
++
++static int snd_wm9713l_put_double(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
++{
++	int reg = kcontrol->private_value & 0xff;
++	int shift_left = (kcontrol->private_value >> 8) & 0x0f;
++	int shift_right = (kcontrol->private_value >> 12) & 0x0f;
++	int mask = (kcontrol->private_value >> 16) & 0xff;
++	int invert = (kcontrol->private_value >> 24) & 0xff;
++	unsigned short val1, val2;
++
++	val1 = ucontrol->value.integer.value[0] & mask;
++	val2 = ucontrol->value.integer.value[1] & mask;
++	if (invert) {
++		val1 = mask - val1;
++		val2 = mask - val2;
++	}
++
++	pxa2xx_ac97_modify_register(0, reg,
++		(mask << shift_left) | (mask << shift_right),
++		(val1 << shift_left) | (val2 << shift_right));
++
++	return 0;
++}
++
++#define WM9713L_SINGLE(xname, reg, shift, mask, invert) \
++{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = xname, .info = snd_wm9713l_info_single, \
++  .get = snd_wm9713l_get_single, .put = snd_wm9713l_put_single, \
++  .private_value = ((reg) | ((shift) << 8) | ((mask) << 16) | ((invert) << 24)) }
++
++int snd_wm9713l_info_single(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo)
++{
++	int mask = (kcontrol->private_value >> 16) & 0xff;
++
++	uinfo->type = mask == 1 ? SNDRV_CTL_ELEM_TYPE_BOOLEAN : SNDRV_CTL_ELEM_TYPE_INTEGER;
++	uinfo->count = 1;
++	uinfo->value.integer.min = 0;
++	uinfo->value.integer.max = mask;
++	return 0;
++}
++
++int snd_wm9713l_get_single(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
++{
++	int reg = kcontrol->private_value & 0xff;
++	int shift = (kcontrol->private_value >> 8) & 0xff;
++	int mask = (kcontrol->private_value >> 16) & 0xff;
++	int invert = (kcontrol->private_value >> 24) & 0x01;
++	unsigned short val;
++
++	val = pxa2xx_ac97_read(0, reg);
++
++	ucontrol->value.integer.value[0] = (val >> shift) & mask;
++	if (invert)
++		ucontrol->value.integer.value[0] = mask - ucontrol->value.integer.value[0];
++
++	return 0;
++}
++
++int snd_wm9713l_put_single(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
++{
++	int reg = kcontrol->private_value & 0xff;
++	int shift = (kcontrol->private_value >> 8) & 0xff;
++	int mask = (kcontrol->private_value >> 16) & 0xff;
++	int invert = (kcontrol->private_value >> 24) & 0x01;
++	unsigned short val;
++
++	val = (ucontrol->value.integer.value[0] & mask);
++	if (invert)
++		val = mask - val;
++
++	pxa2xx_ac97_modify_register(0, reg, (mask << shift), (val << shift));
++
++	return 0;
++}
++
++static snd_kcontrol_new_t wm9713_controls[] = {
++WM9713L_DOUBLE("Headphone Playback Volume", AC97_HEADPHONE,       8, 0, 0x3f, 1),
++WM9713L_DOUBLE("Headphone Playback Switch", AC97_HEADPHONE,      15, 7, 0x01, 1),
++WM9713L_DOUBLE("Mic Capture Volume",        WM9713L_REC_PGA_VOL,  8, 0, 0x3f, 1),
++WM9713L_SINGLE("Mic Capture Switch",        WM9713L_REC_PGA_VOL,    15, 0x01, 1),
++};
++
++int pxa3xx_wm9713l_snd_mixer(snd_card_t * card)
++{
++	snd_kcontrol_t *kctl;
++	int i;
++	int err;
++
++	/*
++	 * Add controls
++	 */
++	for (i = 0; i < ARRAY_SIZE(wm9713_controls); i++) {
++
++		kctl = snd_ctl_new1(&wm9713_controls[i], NULL);
++		if (!kctl)
++			return -ENOMEM;
++
++		err = snd_ctl_add(card, kctl);
++		if (err < 0) {
++			snd_ctl_free_one(kctl);
++			return err;
++		}
++	}
++
++	return 0;
++}
++
++int pxa3xx_wm9713l_snd_set_playback_rate(unsigned int rate)
++{
++	pxa2xx_ac97_write(0, WM9713L_AUDIO_DAC_RATE, rate);
++	return 0;
++}
++
++int pxa3xx_wm9713l_snd_set_capture_rate(unsigned int rate)
++{
++	pxa2xx_ac97_write(0, WM9713L_AUDIO_ADC_RATE, rate);
++	return 0;
++}
++
++static int init_chip(void)
++{
++	unsigned short val;
++	static int initialized;
++
++	if (initialized)
++		return 0;
++
++	pxa2xx_ac97_init();
++	pxa2xx_ac97_reset();
++
++	/*
++	 * Check that the is codec connected to ac97 bus is WM9713L
++	 */
++	val = pxa2xx_ac97_read(0, AC97_VENDOR_ID1);
++	if (val != WM9713L_VENDOR_ID_1)
++		return -ENODEV;
++
++	val = pxa2xx_ac97_read(0, AC97_VENDOR_ID2);
++	if (val != WM9713L_VENDOR_ID_2)
++		return -ENODEV;
++
++	pxa2xx_ac97_write(0, AC97_POWERDOWN, 0x000);
++
++	initialized = 1;
++
++	return 0;
++}
++
++static void snd_pw_on(void)
++{
++	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_1, 0x25fc, 0);
++	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_2, 0x460a, 0);
++}
++
++static void snd_pw_off(void)
++{
++	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_1, 0, 0x25fc);
++	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_2, 0, 0x460a);
++}
++
++int pxa3xx_wm9713l_snd_init(void)
++{
++	int err;
++
++	err = init_chip();
++	if (err)
++		return err;
++
++	snd_pw_on();
++
++	/*
++	 * PLL
++	 */
++	/* initialise PLL when appropriate - do not forget to power on PLL */
++
++	/*
++	 * Capture path
++	 */
++	/* Turn on MIC1 only */
++	pxa2xx_ac97_write(0, WM9713L_MIC_BIAS, 0xc440);
++	/* Select MUX source: MICA for both channels; no boost; no path to phone mixer */
++	pxa2xx_ac97_write(0, WM9713L_REC_ROUTE_MUX_SEL, 0xd600);
++
++	/*
++	 * Playback path
++	 */
++	/* Unmute to phones mixer only; 0dB gain */
++	pxa2xx_ac97_write(0, WM9713L_DAC_PGA_VOL_ROUTE, 0x6808);
++	/* mono, spk, out <- disable; hp <- hpmix */
++	pxa2xx_ac97_write(0, WM9713L_OUTPUT_PGA_MUX, 0xffaf);
++
++	/*
++	 * Playbacl/Capture rates
++	 */
++	/* Enable variable rate audio */
++	pxa2xx_ac97_write(0, AC97_EXTENDED_STATUS, 0x1);
++	/* Set rates */
++	pxa2xx_ac97_write(0, WM9713L_AUDIO_DAC_RATE, 44100); /* 0x2c */
++	pxa2xx_ac97_write(0, WM9713L_AUDIO_ADC_RATE, 16000); /* 0x32 */
++
++	return 0;
++}
++
++void pxa3xx_wm9713l_snd_exit(void)
++{
++	snd_pw_off();
++}
++
++#ifdef CONFIG_PM
++
++void pxa3xx_wm9713l_snd_suspend(void)
++{
++	snd_pw_on();
++}
++
++void pxa3xx_wm9713l_snd_resume(void)
++{
++	snd_pw_off();
++}
++
++#endif
++
++/*
++ * Touchscreen
++ */
++
++static void ts_pw_on(void)
++{
++	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_1, 0x8000, 0);
++}
++
++static void ts_pw_off(void)
++{
++	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_1, 0, 0x8000);
++}
++
++int pxa3xx_wm9713l_ts_init(void)
++{
++	int err;
++
++	err = init_chip();
++	if (err)
++		return err;
++
++	ts_pw_on();
++
++	return 0;
++}
++
++void pxa3xx_wm9713l_ts_exit(void)
++{
++	ts_pw_off();
++}
++
++#ifdef CONFIG_PM
++
++void pxa3xx_wm9713l_ts_suspend(void)
++{
++	ts_pw_on();
++}
++
++void pxa3xx_wm9713l_ts_resume(void)
++{
++	ts_pw_off();
++}
++
++#endif
+Index: linux-2.6.10/include/asm-arm/arch-pxa/pxa3xx-wm9713l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-pxa/pxa3xx-wm9713l.h
+@@ -0,0 +1,46 @@
++/*
++ * linux/sound/arm/pxa3xx-wm9713l.h -- Driver for Wolfson wm9713l on
++ *					Zylonite development platform
++ *
++ * Author:	Aleksey Makarov
++ * Created:	Jul 04, 2007
++ * Copyright:	MontaVista Software, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <sound/driver.h>
++#include <sound/core.h>
++
++/*
++ * Sound
++ */
++
++         int pxa3xx_wm9713l_snd_init(void);
++        void pxa3xx_wm9713l_snd_exit(void);
++
++	 int pxa3xx_wm9713l_snd_mixer(snd_card_t * card);
++
++	 int pxa3xx_wm9713l_snd_set_playback_rate(unsigned int rate);
++	 int pxa3xx_wm9713l_snd_set_capture_rate(unsigned int rate);
++
++#ifdef CONFIG_PM
++        void pxa3xx_wm9713l_snd_suspend(void);
++        void pxa3xx_wm9713l_snd_resume(void);
++#endif
++
++/*
++ * Touchscreen
++ */
++
++         int pxa3xx_wm9713l_ts_init(void);
++        void pxa3xx_wm9713l_ts_exit(void);
++
++#ifdef CONFIG_PM
++        void pxa3xx_wm9713l_ts_suspend(void);
++        void pxa3xx_wm9713l_ts_resume(void);
++#endif
++
++
+Index: linux-2.6.10/mvl_patches/pro-1451.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1451.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1451);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

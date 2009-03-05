@@ -1,0 +1,838 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_irq_dont_use_eabase_or_iram
+# Date: Mon Jan 21 23:06:35 2008
+# Source: Kevin Hilman <khilman@mvista.com>
+# MR: 25684 
+# Type: Enhancement
+# Disposition: merged from 2.6.21-rc1
+# Description:
+# Eliminate the need to use IRAM and eabse for interrupt handling.  Also,
+# backport irq.c to clean up register overlay and add the abililty to set
+# default interrupt priority level.
+# 
+# Patches updated
+# pro_arm_davinci_mach-dm64xx.patch
+# pro_arm_davinci_4457-2-GPIO-support.patch
+# pro_arm_davinci_new_pinmux_layer.patch (line numbers only)
+# 
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+# author	Kevin Hilman <khilman@mvista.com>
+# 	Mon, 30 Apr 2007 18:37:19 +0000 (19:37 +0100)
+# committer	Russell King <rmk+kernel@arm.linux.org.uk>
+# 	Fri, 11 May 2007 16:26:55 +0000 (17:26 +0100)
+# commit	7c6337e225364870e9bf02a3ae277d9fdea483f8
+# tree	1ba5819dfc424beea0086cd3b855839be29370dd	tree | snapshot
+# parent	7fdc7849d2f9f926cbaec224bbcbacb164b07b23	commit | diff
+# [ARM] 4303/3: base kernel support for TI DaVinci
+# 
+# Add base kernel support for the TI DaVinci platform.
+# 
+# This patch only includes interrupts, timers, CPU identification,
+# serial support and basic power and sleep controller init.  More
+# drivers to come.
+# 
+# Signed-off-by: Kevin Hilman <khilman@mvista.com>
+# Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+
+PATCHNUM=1683
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Kevin Hilman <khilman@mvista.com>
+MR: 25684 
+Type: Enhancement
+Disposition: merged from 2.6.21-rc1
+Description:
+Eliminate the need to use IRAM and eabse for interrupt handling.  Also,
+backport irq.c to clean up register overlay and add the abililty to set
+default interrupt priority level.
+
+Patches updated
+pro_arm_davinci_mach-dm64xx.patch
+pro_arm_davinci_4457-2-GPIO-support.patch
+pro_arm_davinci_new_pinmux_layer.patch (line numbers only)
+
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+author	Kevin Hilman <khilman@mvista.com>
+	Mon, 30 Apr 2007 18:37:19 +0000 (19:37 +0100)
+committer	Russell King <rmk+kernel@arm.linux.org.uk>
+	Fri, 11 May 2007 16:26:55 +0000 (17:26 +0100)
+commit	7c6337e225364870e9bf02a3ae277d9fdea483f8
+tree	1ba5819dfc424beea0086cd3b855839be29370dd	tree | snapshot
+parent	7fdc7849d2f9f926cbaec224bbcbacb164b07b23	commit | diff
+[ARM] 4303/3: base kernel support for TI DaVinci
+
+Add base kernel support for the TI DaVinci platform.
+
+This patch only includes interrupts, timers, CPU identification,
+serial support and basic power and sleep controller init.  More
+drivers to come.
+
+Signed-off-by: Kevin Hilman <khilman@mvista.com>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+Index: linux-2.6.10/arch/arm/mach-davinci/irq.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/irq.c
++++ linux-2.6.10/arch/arm/mach-davinci/irq.c
+@@ -1,12 +1,8 @@
+ /*
+- * linux/arch/arm/mach-davinci/irq.c
+- *
+- * TI DaVinci INTC config file
++ * Interrupt handler for DaVinci boards.
+  *
+  * Copyright (C) 2006 Texas Instruments.
+  *
+- * ----------------------------------------------------------------------------
+- *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+@@ -17,13 +13,11 @@
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+- *  You should have received a copy of the GNU General Public License
+- *  along with this program; if not, write to the Free Software
+- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+- * ----------------------------------------------------------------------------
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  *
+  */
+-
+ #include <linux/config.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+@@ -41,119 +35,133 @@
+ #include <asm/arch/memory.h>
+ #include <asm/arch/hardware.h>
+ 
+-void intcInit(void);
+ 
+-#define INTNUM                      DAVINCI_MAXIRQNUM
+-#define EXCNUM                      ( 8 - 1 )
+-#define INTC_NUM_INTS_ONE_REGISTER  32
++#define IRQ_BIT(irq)		((irq) & 0x1f)
+ 
+-#define INTC_CLEAR_INTERRUPTS       0xFFFFFFFF
+-#define INTC_IDT_BASE			DAVINCI_IRAM_VIRT
+-#define INTC_DISABLE_WHEN_CLEARED_MODE   0x4
+-#define INTC_IRQ_ENTRY_RAW				0x2
+-#define INTC_FIQ_ENTRY_RAW				0x1
+-#define INTC_VECT_OFFSET				0x100
++#define FIQ_REG0_OFFSET		0x0000
++#define FIQ_REG1_OFFSET		0x0004
++#define IRQ_REG0_OFFSET		0x0008
++#define IRQ_REG1_OFFSET		0x000C
++#define IRQ_ENT_REG0_OFFSET	0x0018
++#define IRQ_ENT_REG1_OFFSET	0x001C
++#define IRQ_INCTL_REG_OFFSET	0x0020
++#define IRQ_EABASE_REG_OFFSET	0x0024
++#define IRQ_INTPRI0_REG_OFFSET	0x0030
++#define IRQ_INTPRI7_REG_OFFSET	0x004C
+ 
+-volatile intc_registers *pintc = (intc_registers *) IO_ADDRESS(DAVINCI_ARM_INTC_BASE);
++const u8 *davinci_def_priorities;
+ 
++static inline unsigned int davinci_irq_readl(int offset)
++{
++	return davinci_readl(DAVINCI_ARM_INTC_BASE + offset);
++}
+ 
+-void davinci_intcinit(void);
++static inline void davinci_irq_writel(unsigned long value, int offset)
++{
++	davinci_writel(value, DAVINCI_ARM_INTC_BASE + offset);
++}
+ 
+ /* Disable interrupt */
+-static void davinci_xdisable_int(unsigned int intno)
++static void davinci_mask_irq(unsigned int irq)
+ {
+ 	unsigned int mask;
++	u32 l;
+ 
+-	if (intno < INTC_NUM_INTS_ONE_REGISTER) {
+-		mask = 1 << intno;
+-		pintc->eint0 &= ~mask;
+-	} else if (intno <= INTNUM) {
+-		mask = 1 << (intno - INTC_NUM_INTS_ONE_REGISTER);
+-		pintc->eint1 &= ~mask;
++	mask = 1 << IRQ_BIT(irq);
++
++	if (irq > 31) {
++		l = davinci_irq_readl(IRQ_ENT_REG1_OFFSET);
++		l &= ~mask;
++		davinci_irq_writel(l, IRQ_ENT_REG1_OFFSET);
++	} else {
++		l = davinci_irq_readl(IRQ_ENT_REG0_OFFSET);
++		l &= ~mask;
++		davinci_irq_writel(l, IRQ_ENT_REG0_OFFSET);
+ 	}
+ }
+ 
+ /* Enable interrupt */
+-static void davinci_xenable_int(unsigned int intno)
++static void davinci_unmask_irq(unsigned int irq)
+ {
+ 	unsigned int mask;
+-	if (intno < INTC_NUM_INTS_ONE_REGISTER) {
+-		mask = 1 << intno;
+-		pintc->eint0 |= mask;
+-	} else if (intno <= INTNUM) {
+-		mask = 1 << (intno - INTC_NUM_INTS_ONE_REGISTER);
+-		pintc->eint1 |= mask;
++	u32 l;
++
++	mask = 1 << IRQ_BIT(irq);
++
++	if (irq > 31) {
++		l = davinci_irq_readl(IRQ_ENT_REG1_OFFSET);
++		l |= mask;
++		davinci_irq_writel(l, IRQ_ENT_REG1_OFFSET);
++	} else {
++		l = davinci_irq_readl(IRQ_ENT_REG0_OFFSET);
++		l |= mask;
++		davinci_irq_writel(l, IRQ_ENT_REG0_OFFSET);
+ 	}
+ }
+ 
+ /* EOI interrupt */
+-void davinci_xeoi_pic(unsigned int intno)
++static void davinci_ack_irq(unsigned int irq)
+ {
+ 	unsigned int mask;
+-	if (intno < INTC_NUM_INTS_ONE_REGISTER) {
+-		mask = 1 << intno;
+-		pintc->irq0 = mask;
+-	} else if (intno < INTNUM) {
+-		mask = 1 << (intno - INTC_NUM_INTS_ONE_REGISTER);
+-		pintc->irq1 = mask;
+-	}
+-}
+-
+-static struct irqchip irqchip_0 = {
+-	.ack = davinci_xeoi_pic,
+-	.mask = davinci_xdisable_int,
+-	.unmask = davinci_xenable_int,
+-};
+ 
+-void davinci_irq_init(void)
+-{
+-	int i;
+-	unsigned int *ptr = (unsigned int *)INTC_IDT_BASE;
++	mask = 1 << IRQ_BIT(irq);
+ 
+-	davinci_intcinit();
++	if (irq > 31)
++		davinci_irq_writel(mask, IRQ_REG1_OFFSET);
++	else
++		davinci_irq_writel(mask, IRQ_REG0_OFFSET);
++}
+ 
+-	ptr += INTC_VECT_OFFSET / (sizeof(*ptr));
++static struct irqchip davinci_irq_chip_0 = {
++	.ack	= davinci_ack_irq,
++	.mask	= davinci_mask_irq,
++	.unmask = davinci_unmask_irq,
++};
+ 
+-	for (i = 0; i < INTNUM; i++) {
+-		if (i == 0) {
+-			*ptr = 0xFFFFFFFF;
+-		} else {
+-			*ptr = i - 1;
+-		}
+-		ptr++;
+-	}
+-	/* Proggam the irqchip structures for ARM INTC */
+ 
+-	for (i = 0; i < NR_IRQS; i++) {
+-                if (i != IRQ_TINT1_TINT34)
+-                        set_irq_handler(i, do_edge_IRQ);
+-                else
+-                        set_irq_handler(i, do_level_IRQ);
+-		set_irq_chip(i, &irqchip_0);
+-		set_irq_flags(i, IRQF_VALID | IRQF_PROBE);
+-	}
+-}
+-
+-/* Interrupt Controller Initialize */
+-void davinci_intcinit(void)
++/* ARM Interrupt Controller Initialization */
++void __init davinci_irq_init(void)
+ {
+-	/* Clear all interrupt requests - write 1 to clear the interrupt */
+-	pintc->fiq0 = pintc->irq0 = INTC_CLEAR_INTERRUPTS;
+-	pintc->fiq1 = pintc->irq1 = INTC_CLEAR_INTERRUPTS;
++	unsigned i;
++
++	/* Clear all interrupt requests */
++	davinci_irq_writel(~0x0, FIQ_REG0_OFFSET);
++	davinci_irq_writel(~0x0, FIQ_REG1_OFFSET);
++	davinci_irq_writel(~0x0, IRQ_REG0_OFFSET);
++	davinci_irq_writel(~0x0, IRQ_REG1_OFFSET);
+ 
+ 	/* Disable all interrupts */
+-	pintc->eint0 = pintc->eint1 = 0;
++	davinci_irq_writel(0x0, IRQ_ENT_REG0_OFFSET);
++	davinci_irq_writel(0x0, IRQ_ENT_REG1_OFFSET);
+ 
+-	/* Interrupts disabled immediately. IRQ entry reflects all interrupts */
+-	pintc->inctl = 0;
++	/* Interrupts disabled immediately, IRQ entry reflects all */
++	davinci_irq_writel(0x0, IRQ_INCTL_REG_OFFSET);
+ 
+-	/* Set vector table base address
+-	 * last two bits are zero which means 4 byte entry */
+-	pintc->eabase = (unsigned int)INTC_VECT_OFFSET;
++	/* we don't use the hardware vector table, just its entry addresses */
++	davinci_irq_writel(0, IRQ_EABASE_REG_OFFSET);
+ 
+-	/* Clear all interrupt requests - write 1 to clear the interrupt */
+-	pintc->fiq0 = pintc->irq0 = INTC_CLEAR_INTERRUPTS;
+-	pintc->fiq1 = pintc->irq1 = INTC_CLEAR_INTERRUPTS;
++	/* Clear all interrupt requests */
++	davinci_irq_writel(~0x0, FIQ_REG0_OFFSET);
++	davinci_irq_writel(~0x0, FIQ_REG1_OFFSET);
++	davinci_irq_writel(~0x0, IRQ_REG0_OFFSET);
++	davinci_irq_writel(~0x0, IRQ_REG1_OFFSET);
++
++	for (i = IRQ_INTPRI0_REG_OFFSET; i <= IRQ_INTPRI7_REG_OFFSET; i += 4) {
++		unsigned	j;
++		u32		pri;
++
++		for (j = 0, pri = 0; j < 32; j += 4, davinci_def_priorities++)
++			pri |= (*davinci_def_priorities & 0x07) << j;
++		davinci_irq_writel(pri, i);
++	}
+ 
+-	return;
++	/* set up genirq dispatch for ARM INTC */
++	for (i = 0; i < DAVINCI_N_AINTC_IRQ; i++) {
++		set_irq_chip(i, &davinci_irq_chip_0);
++		set_irq_flags(i, IRQF_VALID | IRQF_PROBE);
++		if (i != IRQ_TINT1_TINT34)
++			set_irq_handler(i, do_edge_IRQ);
++		else
++			set_irq_handler(i, do_level_IRQ);
++	}
+ }
+Index: linux-2.6.10/include/asm-arm/arch-davinci/entry-macro.S
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-davinci/entry-macro.S
++++ linux-2.6.10/include/asm-arm/arch-davinci/entry-macro.S
+@@ -14,8 +14,8 @@
+ 
+ 		.macro	get_irqnr_and_base, irqnr, irqstat, base, tmp
+ 	/* GIVEN:
+-	 *   IRQ Entry Table Base Address
+-	 * RETURN:
++	 *   EABASE = 0 ... so IRQNR = (IRQENTRY/4) - 1
++ 	 * RETURN:
+ 	 *   irqnr:  Interrupt number.  Zero corresponds
+ 	 *     to bit 0 of the status register
+ 	 *   irqstat, base, and tmp may be considered
+@@ -24,11 +24,9 @@
+ 	 */
+ 		ldr \base, =IO_ADDRESS(DAVINCI_ARM_INTC_BASE)
+ 		ldr \tmp, [\base, #0x14]
+-		ldr  \irqstat, =DAVINCI_IRAM_VIRT
+-		add  \tmp, \irqstat, \tmp
+-		ldr  \irqnr, [\tmp]
+-		ldr  \irqstat, =0xFFFFFFFF
+-		cmp  \irqnr, \irqstat
++		mov \tmp, \tmp, lsr #2
++		sub \irqnr, \tmp, #1
++		cmp \tmp, #0
+ 		.endm
+ 
+ 		.macro	irq_prio_table
+Index: linux-2.6.10/arch/arm/mach-davinci/board-evm.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/board-evm.c
++++ linux-2.6.10/arch/arm/mach-davinci/board-evm.c
+@@ -334,6 +334,73 @@ static struct platform_device *davinci_e
+ #endif
+ };
+ 
++/* FIQ are pri 0-1; otherwise 2-7, with 7 lowest priority */
++static const u8 dm644x_default_priorities[DAVINCI_N_AINTC_IRQ] = {
++	[IRQ_VDINT0]		= 2,
++	[IRQ_VDINT1]		= 6,
++	[IRQ_VDINT2]		= 6,
++	[IRQ_HISTINT]		= 6,
++	[IRQ_H3AINT]		= 6,
++	[IRQ_PRVUINT]		= 6,
++	[IRQ_RSZINT]		= 6,
++	[IRQ_VFOCINT]		= 7,
++	[IRQ_VENCINT]		= 6,
++	[IRQ_ASQINT]		= 6,
++	[IRQ_IMXINT]		= 6,
++	[IRQ_VLCDINT]		= 6,
++	[IRQ_USBINT]		= 4,
++	[IRQ_EMACINT]		= 4,
++	[IRQ_IEEE1394INT]	= 7,
++	[IRQ_IEEE1394WK]	= 7,
++	[IRQ_CCINT0]		= 5,	/* dma */
++	[IRQ_CCERRINT]		= 5,	/* dma */
++	[IRQ_TCERRINT0]		= 5,	/* dma */
++	[IRQ_TCERRINT]		= 5,	/* dma */
++	[IRQ_PSCINT]		= 7,
++	[21]			= 7,
++	[IRQ_IDE]		= 4,
++	[IRQ_HPIINT]		= 7,
++	[IRQ_MBXINT]		= 7,
++	[IRQ_MBRINT]		= 7,
++	[IRQ_MMCINT]		= 7,
++	[IRQ_SDIOINT]		= 7,
++	[IRQ_HPIINT]		= 7,
++	[IRQ_DDRINT]		= 7,
++	[IRQ_AEMIFINT]		= 7,
++	[IRQ_VLQINT]		= 4,
++	[IRQ_TINT0_TINT12]	= 2,	/* clockevent */
++	[IRQ_TINT0_TINT34]	= 2,	/* clocksource */
++	[IRQ_TINT1_TINT12]	= 7,	/* DSP timer */
++	[IRQ_TINT1_TINT34]	= 7,	/* system tick */
++	[IRQ_PWMINT0]		= 7,
++	[IRQ_PWMINT1]		= 7,
++	[IRQ_PWMINT2]		= 7,
++	[IRQ_I2C]		= 3,
++	[IRQ_UARTINT0]		= 3,
++	[IRQ_UARTINT1]		= 3,
++	[IRQ_UARTINT2]		= 3,
++	[IRQ_SPINT0]		= 3,
++	[IRQ_SPINT1]		= 3,
++	[45]			= 7,
++	[IRQ_DSP2ARM0]		= 4,
++	[IRQ_DSP2ARM1]		= 4,
++	[IRQ_GPIO0]		= 7,
++	[IRQ_GPIO1]		= 7,
++	[IRQ_GPIO2]		= 7,
++	[IRQ_GPIO3]		= 7,
++	[IRQ_GPIO4]		= 7,
++	[IRQ_GPIO5]		= 7,
++	[IRQ_GPIO6]		= 7,
++	[IRQ_GPIO7]		= 7,
++	[IRQ_GPIOBNK0]		= 7,
++	[IRQ_GPIOBNK1]		= 7,
++	[IRQ_GPIOBNK2]		= 7,
++	[IRQ_GPIOBNK3]		= 7,
++	[IRQ_GPIOBNK4]		= 7,
++	[IRQ_COMMTX]		= 7,
++	[IRQ_COMMRX]		= 7,
++	[IRQ_EMUINT]		= 7,
++};
+ static void board_init(void)
+ {
+ 	board_setup_psc(DAVINCI_GPSC_ARMDOMAIN, DAVINCI_LPSC_VLYNQ, 1);
+@@ -389,9 +456,12 @@ static void dm644x_setup_pinmux(unsigned
+ 	}
+ }
+ 
++extern const u8 *davinci_def_priorities;
++
+ static void __init davinci_map_io(void)
+ {
+ 	davinci_pinmux_setup = dm644x_setup_pinmux;
++	davinci_def_priorities = dm644x_default_priorities;
+ 	davinci_map_common_io();
+ 
+ #ifdef CONFIG_KGDB_8250
+Index: linux-2.6.10/arch/arm/mach-davinci/board-dm355-evm.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/board-dm355-evm.c
++++ linux-2.6.10/arch/arm/mach-davinci/board-dm355-evm.c
+@@ -426,6 +426,73 @@ static struct platform_device *dm355_evm
+ #endif
+ };
+ 
++/* FIQ are pri 0-1; otherwise 2-7, with 7 lowest priority */
++static const u8 dm355_default_priorities[DAVINCI_N_AINTC_IRQ] = {
++	[IRQ_DM355_CCDC_VDINT0]		= 2,
++	[IRQ_DM355_CCDC_VDINT1]		= 6,
++	[IRQ_DM355_CCDC_VDINT2]		= 6,
++	[IRQ_DM355_IPIPE_HST]		= 6,
++	[IRQ_DM355_H3AINT]		= 6,
++	[IRQ_DM355_IPIPE_SDR]		= 6,
++	[IRQ_DM355_IPIPEIFINT]		= 6,
++	[IRQ_DM355_OSDINT]		= 7,
++	[IRQ_DM355_VENCINT]		= 6,
++	[IRQ_ASQINT]			= 6,
++	[IRQ_IMXINT]			= 6,
++	[IRQ_DM644X_VLCDINT]		= 6,
++	[IRQ_USBINT]			= 4,
++	[IRQ_DM355_RTOINT]		= 4,
++	[IRQ_DM355_UARTINT2]		= 7,
++	[IRQ_DM355_TINT6]		= 7,
++	[IRQ_CCINT0]			= 5,	/* dma */
++	[IRQ_CCERRINT]			= 5,	/* dma */
++	[IRQ_TCERRINT0]			= 5,	/* dma */
++	[IRQ_TCERRINT]			= 5,	/* dma */
++	[IRQ_PSCINT]			= 7,
++	[IRQ_DM355_SPINT2_1]		= 7,
++	[IRQ_DM355_TINT7]		= 4,
++	[IRQ_DM355_SDIOINT0]		= 7,
++	[IRQ_MBXINT]			= 7,
++	[IRQ_MBRINT]			= 7,
++	[IRQ_MMCINT]			= 7,
++	[IRQ_DM355_MMCINT1]		= 7,
++	[IRQ_DM355_PWMINT3]		= 7,
++	[IRQ_DDRINT]			= 7,
++	[IRQ_AEMIFINT]			= 7,
++	[IRQ_DM355_SDIOINT1]		= 4,
++	[IRQ_TINT0_TINT12]		= 2,	/* clockevent */
++	[IRQ_TINT0_TINT34]		= 2,	/* clocksource */
++	[IRQ_TINT1_TINT12]		= 7,	/* DSP timer */
++	[IRQ_TINT1_TINT34]		= 7,	/* system tick */
++	[IRQ_PWMINT0]			= 7,
++	[IRQ_PWMINT1]			= 7,
++	[IRQ_PWMINT2]			= 7,
++	[IRQ_I2C]			= 3,
++	[IRQ_UARTINT0]			= 3,
++	[IRQ_UARTINT1]			= 3,
++	[IRQ_DM355_SPINT0_0]		= 3,
++	[IRQ_DM355_SPINT0_1]		= 3,
++	[IRQ_DM355_GPIO0]		= 3,
++	[IRQ_DM355_GPIO1]		= 7,
++	[IRQ_DM355_GPIO2]		= 4,
++	[IRQ_DM355_GPIO3]		= 4,
++	[IRQ_DM355_GPIO4]		= 7,
++	[IRQ_DM355_GPIO5]		= 7,
++	[IRQ_DM355_GPIO6]		= 7,
++	[IRQ_DM355_GPIO7]		= 7,
++	[IRQ_DM355_GPIO8]		= 7,
++	[IRQ_DM355_GPIO9]		= 7,
++	[IRQ_DM355_GPIOBNK0]		= 7,
++	[IRQ_DM355_GPIOBNK1]		= 7,
++	[IRQ_DM355_GPIOBNK2]		= 7,
++	[IRQ_DM355_GPIOBNK3]		= 7,
++	[IRQ_DM355_GPIOBNK4]		= 7,
++	[IRQ_DM355_GPIOBNK5]		= 7,
++	[IRQ_DM355_GPIOBNK6]		= 7,
++	[IRQ_COMMTX]			= 7,
++	[IRQ_COMMRX]			= 7,
++	[IRQ_EMUINT]			= 7,
++};
+ static void board_init(void)
+ {
+ 	board_setup_psc(DAVINCI_GPSC_ARMDOMAIN, DAVINCI_LPSC_VPSSMSTR, 1);
+@@ -483,10 +550,12 @@ static void dm355_setup_pinmux(unsigned 
+ 	}
+ }
+ 
+-static void __init
+-davinci_map_io(void)
++extern const u8 *davinci_def_priorities;
++
++static void __init davinci_map_io(void)
+ {
+ 	davinci_pinmux_setup = dm355_setup_pinmux;
++	davinci_def_priorities = dm355_default_priorities;
+ 	davinci_map_common_io();
+ 
+ #ifdef CONFIG_KGDB_8250
+Index: linux-2.6.10/arch/arm/mach-davinci/board-dm6467-evm.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/board-dm6467-evm.c
++++ linux-2.6.10/arch/arm/mach-davinci/board-dm6467-evm.c
+@@ -281,6 +281,73 @@ static struct platform_device *davinci_e
+ #endif
+ };
+ 
++/* FIQ are pri 0-1; otherwise 2-7, with 7 lowest priority */
++static const u8 dm646x_default_priorities[DAVINCI_N_AINTC_IRQ] = {
++	[IRQ_DM646X_VP_VERTINT0]	= 2,
++	[IRQ_DM646X_VP_VERTINT1]	= 6,
++	[IRQ_DM646X_VP_VERTINT2]	= 6,
++	[IRQ_DM646X_VP_VERTINT3]	= 6,
++	[IRQ_DM646X_VP_ERRINT]		= 6,
++	[IRQ_DM646X_RESERVED_1]		= 7,
++	[IRQ_DM646X_RESERVED_2]		= 7,
++	[IRQ_DM646X_WDINT]		= 7,
++	[IRQ_DM646X_CRGENINT0]		= 6,
++	[IRQ_DM646X_CRGENINT1]		= 6,
++	[IRQ_DM646X_TSIFINT0]		= 6,
++	[IRQ_DM646X_TSIFINT1]		= 6,
++	[IRQ_DM646X_VDCEINT]		= 4,
++	[IRQ_DM646X_USBINT]		= 4,
++	[IRQ_DM646X_USBDMAINT]		= 7,
++	[IRQ_DM646X_PCIINT]		= 7,
++	[IRQ_CCINT0]			= 5,	/* dma */
++	[IRQ_CCERRINT]			= 5,	/* dma */
++	[IRQ_TCERRINT0]			= 5,	/* dma */
++	[IRQ_TCERRINT]			= 5,	/* dma */
++	[IRQ_DM646X_TCERRINT2]		= 7,
++	[IRQ_DM646X_TCERRINT3]		= 7,
++	[IRQ_DM646X_IDE]		= 4,
++	[IRQ_DM646X_HPIINT]		= 7,
++	[IRQ_DM646X_EMACRXTHINT]	= 7,
++	[IRQ_DM646X_EMACRXINT]		= 7,
++	[IRQ_DM646X_EMACTXINT]		= 7,
++	[IRQ_DM646X_EMACMISCINT]	= 7,
++	[IRQ_DM646X_MCASP0TXINT]	= 7,
++	[IRQ_DM646X_MCASP0RXINT]	= 7,
++	[IRQ_AEMIFINT]			= 7,
++	[IRQ_DM646X_RESERVED_3]		= 4,
++	[IRQ_DM646X_MCASP1TXINT]	= 2,	/* clockevent */
++	[IRQ_TINT0_TINT34]		= 2,	/* clocksource */
++	[IRQ_TINT1_TINT12]		= 7,	/* DSP timer */
++	[IRQ_TINT1_TINT34]		= 7,	/* system tick */
++	[IRQ_PWMINT0]			= 7,
++	[IRQ_PWMINT1]			= 7,
++	[IRQ_DM646X_VLQINT]		= 7,
++	[IRQ_I2C]			= 3,
++	[IRQ_UARTINT0]			= 3,
++	[IRQ_UARTINT1]			= 3,
++	[IRQ_DM646X_UARTINT2]		= 3,
++	[IRQ_DM646X_SPINT0]		= 3,
++	[IRQ_DM646X_SPINT1]		= 3,
++	[IRQ_DM646X_DSP2ARMINT]		= 7,
++	[IRQ_DM646X_RESERVED_4]		= 7,
++	[IRQ_DM646X_PSCINT]		= 4,
++	[IRQ_DM646X_GPIO0]		= 7,
++	[IRQ_DM646X_GPIO1]		= 7,
++	[IRQ_DM646X_GPIO2]		= 7,
++	[IRQ_DM646X_GPIO3]		= 7,
++	[IRQ_DM646X_GPIO4]		= 7,
++	[IRQ_DM646X_GPIO5]		= 7,
++	[IRQ_DM646X_GPIO6]		= 7,
++	[IRQ_DM646X_GPIO7]		= 7,
++	[IRQ_DM646X_GPIOBNK0]		= 7,
++	[IRQ_DM646X_GPIOBNK1]		= 7,
++	[IRQ_DM646X_GPIOBNK2]		= 7,
++	[IRQ_DM646X_DDRINT]		= 7,
++	[IRQ_DM646X_AEMIFINT]		= 7,
++	[IRQ_COMMTX]			= 7,
++	[IRQ_COMMRX]			= 7,
++	[IRQ_EMUINT]			= 7,
++};
+ static void board_init(void)
+ {
+ 	board_setup_psc(DAVINCI_GPSC_ARMDOMAIN, DAVINCI_LPSC_VLYNQ, 1);
+@@ -321,9 +388,12 @@ static void dm646x_setup_pinmux(unsigned
+ 	}
+ }
+ 
++extern const u8 *davinci_def_priorities;
++
+ static void __init davinci_map_io(void)
+ {
+ 	davinci_pinmux_setup = dm646x_setup_pinmux;
++	davinci_def_priorities = dm646x_default_priorities;
+ 	davinci_map_common_io();
+ 
+ #ifdef CONFIG_KGDB_8250
+Index: linux-2.6.10/mvl_patches/pro-1683.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1683.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1683);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

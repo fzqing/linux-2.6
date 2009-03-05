@@ -1,0 +1,984 @@
+#! /usr/bin/env bash
+# Patch: -common_NETFILTER_ip6tables_remove_duplicate_code
+# Date: Sun Apr  8 23:14:44 2007
+# Source: kernel.org
+# MR: 22184
+# Type: Defect fix
+# Disposition: merged from 2.6.14-rc1
+# 
+# Commit: e674d0f38de6109b59dbe30fba8b296a03229b8e
+# Author: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+# Date:   Mon Sep 19 15:34:40 2005 -0700
+# 
+#     [NETFILTER] ip6tables: remove duplicate code
+#     
+#     Some IPv6 matches have very similar loops to find IPv6 extension header
+#     and we can unify them. This patch introduces ipv6_find_hdr() to do it.
+#     I just checked that it can find the target headers in the packet which has
+#     dst,hbh,rt,frag,ah,esp headers.
+#     
+#     Signed-off-by: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+#     Signed-off-by: Harald Welte <laforge@netfilter.org>
+#     Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1280
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: kernel.org
+MR: 22184
+Type: Defect fix
+Disposition: merged from 2.6.14-rc1
+
+Commit: e674d0f38de6109b59dbe30fba8b296a03229b8e
+Author: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+Date:   Mon Sep 19 15:34:40 2005 -0700
+
+    [NETFILTER] ip6tables: remove duplicate code
+    
+    Some IPv6 matches have very similar loops to find IPv6 extension header
+    and we can unify them. This patch introduces ipv6_find_hdr() to do it.
+    I just checked that it can find the target headers in the packet which has
+    dst,hbh,rt,frag,ah,esp headers.
+    
+    Signed-off-by: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+    Signed-off-by: Harald Welte <laforge@netfilter.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Index: linux-2.6.10/include/linux/netfilter_ipv6/ip6_tables.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/netfilter_ipv6/ip6_tables.h
++++ linux-2.6.10/include/linux/netfilter_ipv6/ip6_tables.h
+@@ -456,6 +456,9 @@ extern unsigned int ip6t_do_table(struct
+ 
+ /* Check for an extension */
+ extern int ip6t_ext_hdr(u8 nexthdr);
++/* find specified header and get offset to it */
++extern int ipv6_find_hdr(const struct sk_buff *skb, unsigned int *offset,
++			 u8 target);
+ 
+ #define IP6T_ALIGN(s) (((s) + (__alignof__(struct ip6t_entry)-1)) & ~(__alignof__(struct ip6t_entry)-1))
+ 
+Index: linux-2.6.10/net/ipv6/netfilter/ip6_tables.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6_tables.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6_tables.c
+@@ -1970,6 +1970,57 @@ static void __exit fini(void)
+ #endif
+ }
+ 
++/*
++ * find specified header up to transport protocol header.
++ * If found target header, the offset to the header is set to *offset
++ * and return 0. otherwise, return -1.
++ *
++ * Notes: - non-1st Fragment Header isn't skipped.
++ *	  - ESP header isn't skipped.
++ *	  - The target header may be trancated.
++ */
++int ipv6_find_hdr(const struct sk_buff *skb, unsigned int *offset, u8 target)
++{
++	unsigned int start = (u8*)(skb->nh.ipv6h + 1) - skb->data;
++	u8 nexthdr = skb->nh.ipv6h->nexthdr;
++	unsigned int len = skb->len - start;
++
++	while (nexthdr != target) {
++		struct ipv6_opt_hdr _hdr, *hp;
++		unsigned int hdrlen;
++
++		if ((!ipv6_ext_hdr(nexthdr)) || nexthdr == NEXTHDR_NONE)
++			return -1;
++		hp = skb_header_pointer(skb, start, sizeof(_hdr), &_hdr);
++		if (hp == NULL)
++			return -1;
++		if (nexthdr == NEXTHDR_FRAGMENT) {
++			unsigned short _frag_off, *fp;
++			fp = skb_header_pointer(skb,
++						start+offsetof(struct frag_hdr,
++							       frag_off),
++						sizeof(_frag_off),
++						&_frag_off);
++			if (fp == NULL)
++				return -1;
++
++			if (ntohs(*fp) & ~0x7)
++				return -1;
++			hdrlen = 8;
++		} else if (nexthdr == NEXTHDR_AUTH)
++			hdrlen = (hp->hdrlen + 2) << 2; 
++		else
++			hdrlen = ipv6_optlen(hp); 
++
++		nexthdr = hp->nexthdr;
++		len -= hdrlen;
++		start += hdrlen;
++	}
++
++	*offset = start;
++	return 0;
++}
++
+ EXPORT_SYMBOL(ip6t_register_table);
+ EXPORT_SYMBOL(ip6t_unregister_table);
+ EXPORT_SYMBOL(ip6t_do_table);
+@@ -1978,6 +2029,7 @@ EXPORT_SYMBOL(ip6t_unregister_match);
+ EXPORT_SYMBOL(ip6t_register_target);
+ EXPORT_SYMBOL(ip6t_unregister_target);
+ EXPORT_SYMBOL(ip6t_ext_hdr);
++EXPORT_SYMBOL(ipv6_find_hdr);
+ 
+ module_init(init);
+ module_exit(fini);
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_ah.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_ah.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_ah.c
+@@ -48,92 +48,21 @@ match(const struct sk_buff *skb,
+       unsigned int protoff,
+       int *hotdrop)
+ {
+-	struct ip_auth_hdr *ah = NULL, _ah;
++	struct ip_auth_hdr *ah, _ah;
+ 	const struct ip6t_ah *ahinfo = matchinfo;
+-	unsigned int temp;
+-	int len;
+-	u8 nexthdr;
+ 	unsigned int ptr;
+ 	unsigned int hdrlen = 0;
+ 
+-	/*DEBUGP("IPv6 AH entered\n");*/
+-	/* if (opt->auth == 0) return 0;
+-	* It does not filled on output */
+-
+-	/* type of the 1st exthdr */
+-	nexthdr = skb->nh.ipv6h->nexthdr;
+-	/* pointer to the 1st exthdr */
+-	ptr = sizeof(struct ipv6hdr);
+-	/* available length */
+-	len = skb->len - ptr;
+-	temp = 0;
+-
+-	while (ip6t_ext_hdr(nexthdr)) {
+-		struct ipv6_opt_hdr _hdr, *hp;
+-
+-		DEBUGP("ipv6_ah header iteration \n");
+-
+-		/* Is there enough space for the next ext header? */
+-		if (len < sizeof(struct ipv6_opt_hdr))
+-			return 0;
+-		/* No more exthdr -> evaluate */
+-		if (nexthdr == NEXTHDR_NONE)
+-			break;
+-		/* ESP -> evaluate */
+-		if (nexthdr == NEXTHDR_ESP)
+-			break;
+-
+-		hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
+-		BUG_ON(hp == NULL);
+-
+-		/* Calculate the header length */
+-		if (nexthdr == NEXTHDR_FRAGMENT)
+-			hdrlen = 8;
+-		else if (nexthdr == NEXTHDR_AUTH)
+-			hdrlen = (hp->hdrlen+2)<<2;
+-		else
+-			hdrlen = ipv6_optlen(hp);
+-
+-		/* AH -> evaluate */
+-		if (nexthdr == NEXTHDR_AUTH) {
+-			temp |= MASK_AH;
+-			break;
+-		}
+-
+-		
+-		/* set the flag */
+-		switch (nexthdr) {
+-		case NEXTHDR_HOP:
+-		case NEXTHDR_ROUTING:
+-		case NEXTHDR_FRAGMENT:
+-		case NEXTHDR_AUTH:
+-		case NEXTHDR_DEST:
+-			break;
+-		default:
+-			DEBUGP("ipv6_ah match: unknown nextheader %u\n",nexthdr);
+-			return 0;
+-		}
+-
+-		nexthdr = hp->nexthdr;
+-		len -= hdrlen;
+-		ptr += hdrlen;
+-		if (ptr > skb->len) {
+-			DEBUGP("ipv6_ah: new pointer too large! \n");
+-			break;
+-		}
+-	}
+-
+-	/* AH header not found */
+-	if (temp != MASK_AH)
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_AUTH) < 0)
+ 		return 0;
+ 
+-	if (len < sizeof(struct ip_auth_hdr)){
++	ah = skb_header_pointer(skb, ptr, sizeof(_ah), &_ah);
++	if (ah == NULL) {
+ 		*hotdrop = 1;
+ 		return 0;
+ 	}
+ 
+-	ah = skb_header_pointer(skb, ptr, sizeof(_ah), &_ah);
+-	BUG_ON(ah == NULL);
++	hdrlen = (ah->hdrlen + 2) << 2;
+ 
+ 	DEBUGP("IPv6 AH LEN %u %u ", hdrlen, ah->hdrlen);
+ 	DEBUGP("RES %04X ", ah->reserved);
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_dst.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_dst.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_dst.c
+@@ -63,8 +63,6 @@ match(const struct sk_buff *skb,
+        struct ipv6_opt_hdr _optsh, *oh;
+        const struct ip6t_opts *optinfo = matchinfo;
+        unsigned int temp;
+-       unsigned int len;
+-       u8 nexthdr;
+        unsigned int ptr;
+        unsigned int hdrlen = 0;
+        unsigned int ret = 0;
+@@ -72,97 +70,25 @@ match(const struct sk_buff *skb,
+        u8 _optlen, *lp = NULL;
+        unsigned int optlen;
+        
+-       /* type of the 1st exthdr */
+-       nexthdr = skb->nh.ipv6h->nexthdr;
+-       /* pointer to the 1st exthdr */
+-       ptr = sizeof(struct ipv6hdr);
+-       /* available length */
+-       len = skb->len - ptr;
+-       temp = 0;
+-
+-        while (ip6t_ext_hdr(nexthdr)) {
+-               struct ipv6_opt_hdr _hdr, *hp;
+-
+-              DEBUGP("ipv6_opts header iteration \n");
+-
+-              /* Is there enough space for the next ext header? */
+-                if (len < (int)sizeof(struct ipv6_opt_hdr))
+-                        return 0;
+-              /* No more exthdr -> evaluate */
+-                if (nexthdr == NEXTHDR_NONE) {
+-                     break;
+-              }
+-              /* ESP -> evaluate */
+-                if (nexthdr == NEXTHDR_ESP) {
+-                     break;
+-              }
+-
+-	      hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
+-	      BUG_ON(hp == NULL);
+-
+-              /* Calculate the header length */
+-                if (nexthdr == NEXTHDR_FRAGMENT) {
+-                        hdrlen = 8;
+-                } else if (nexthdr == NEXTHDR_AUTH)
+-                        hdrlen = (hp->hdrlen+2)<<2;
+-                else
+-                        hdrlen = ipv6_optlen(hp);
+-
+-              /* OPTS -> evaluate */
+ #if HOPBYHOP
+-                if (nexthdr == NEXTHDR_HOP) {
+-                     temp |= MASK_HOPOPTS;
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_HOP) < 0)
+ #else
+-                if (nexthdr == NEXTHDR_DEST) {
+-                     temp |= MASK_DSTOPTS;
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_DEST) < 0)
+ #endif
+-                     break;
+-              }
+-
+-
+-              /* set the flag */
+-              switch (nexthdr){
+-                     case NEXTHDR_HOP:
+-                     case NEXTHDR_ROUTING:
+-                     case NEXTHDR_FRAGMENT:
+-                     case NEXTHDR_AUTH:
+-                     case NEXTHDR_DEST:
+-                            break;
+-                     default:
+-                            DEBUGP("ipv6_opts match: unknown nextheader %u\n",nexthdr);
+-                            return 0;
+-                            break;
+-              }
+-
+-                nexthdr = hp->nexthdr;
+-                len -= hdrlen;
+-                ptr += hdrlen;
+-		if ( ptr > skb->len ) {
+-			DEBUGP("ipv6_opts: new pointer is too large! \n");
+-			break;
+-		}
+-        }
++		return 0;
+ 
+-       /* OPTIONS header not found */
+-#if HOPBYHOP
+-       if ( temp != MASK_HOPOPTS ) return 0;
+-#else
+-       if ( temp != MASK_DSTOPTS ) return 0;
+-#endif
+-
+-       if (len < (int)sizeof(struct ipv6_opt_hdr)){
++       oh = skb_header_pointer(skb, ptr, sizeof(_optsh), &_optsh);
++       if (oh == NULL){
+ 	       *hotdrop = 1;
+        		return 0;
+        }
+ 
+-       if (len < hdrlen){
++       hdrlen = ipv6_optlen(oh);
++       if (skb->len - ptr < hdrlen){
+ 	       /* Packet smaller than it's length field */
+        		return 0;
+        }
+ 
+-       oh = skb_header_pointer(skb, ptr, sizeof(_optsh), &_optsh);
+-       BUG_ON(oh == NULL);
+-
+        DEBUGP("IPv6 OPTS LEN %u %u ", hdrlen, oh->hdrlen);
+ 
+        DEBUGP("len %02X %04X %02X ",
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_esp.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_esp.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_esp.c
+@@ -48,87 +48,22 @@ match(const struct sk_buff *skb,
+       unsigned int protoff,
+       int *hotdrop)
+ {
+-	struct ip_esp_hdr _esp, *eh = NULL;
++	struct ip_esp_hdr _esp, *eh;
+ 	const struct ip6t_esp *espinfo = matchinfo;
+-	unsigned int temp;
+-	int len;
+-	u8 nexthdr;
+ 	unsigned int ptr;
+ 
+ 	/* Make sure this isn't an evil packet */
+ 	/*DEBUGP("ipv6_esp entered \n");*/
+ 
+-	/* type of the 1st exthdr */
+-	nexthdr = skb->nh.ipv6h->nexthdr;
+-	/* pointer to the 1st exthdr */
+-	ptr = sizeof(struct ipv6hdr);
+-	/* available length */
+-	len = skb->len - ptr;
+-	temp = 0;
+-
+-	while (ip6t_ext_hdr(nexthdr)) {
+-		struct ipv6_opt_hdr _hdr, *hp;
+-		int hdrlen;
+-
+-		DEBUGP("ipv6_esp header iteration \n");
+-
+-		/* Is there enough space for the next ext header? */
+-		if (len < sizeof(struct ipv6_opt_hdr))
+-			return 0;
+-		/* No more exthdr -> evaluate */
+-		if (nexthdr == NEXTHDR_NONE)
+-			break;
+-		/* ESP -> evaluate */
+-		if (nexthdr == NEXTHDR_ESP) {
+-			temp |= MASK_ESP;
+-			break;
+-		}
+-
+-		hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
+-		BUG_ON(hp == NULL);
+-
+-		/* Calculate the header length */
+-		if (nexthdr == NEXTHDR_FRAGMENT)
+-			hdrlen = 8;
+-		else if (nexthdr == NEXTHDR_AUTH)
+-			hdrlen = (hp->hdrlen+2)<<2;
+-		else
+-			hdrlen = ipv6_optlen(hp);
+-
+-		/* set the flag */
+-		switch (nexthdr) {
+-		case NEXTHDR_HOP:
+-		case NEXTHDR_ROUTING:
+-		case NEXTHDR_FRAGMENT:
+-		case NEXTHDR_AUTH:
+-		case NEXTHDR_DEST:
+-			break;
+-		default:
+-			DEBUGP("ipv6_esp match: unknown nextheader %u\n",nexthdr);
+-			return 0;
+-		}
+-
+-		nexthdr = hp->nexthdr;
+-		len -= hdrlen;
+-		ptr += hdrlen;
+-		if (ptr > skb->len) {
+-			DEBUGP("ipv6_esp: new pointer too large! \n");
+-			break;
+-		}
+-	}
+-
+-	/* ESP header not found */
+-	if (temp != MASK_ESP)
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_ESP) < 0)
+ 		return 0;
+ 
+-	if (len < sizeof(struct ip_esp_hdr)) {
++	eh = skb_header_pointer(skb, ptr, sizeof(_esp), &_esp);
++	if (eh == NULL) {
+ 		*hotdrop = 1;
+ 		return 0;
+ 	}
+ 
+-	eh = skb_header_pointer(skb, ptr, sizeof(_esp), &_esp);
+-	BUG_ON(eh == NULL);
+-
+ 	DEBUGP("IPv6 ESP SPI %u %08X\n", ntohl(eh->spi), ntohl(eh->spi));
+ 
+ 	return (eh != NULL)
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_frag.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_frag.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_frag.c
+@@ -48,90 +48,18 @@ match(const struct sk_buff *skb,
+       unsigned int protoff,
+       int *hotdrop)
+ {
+-       struct frag_hdr _frag, *fh = NULL;
++       struct frag_hdr _frag, *fh;
+        const struct ip6t_frag *fraginfo = matchinfo;
+-       unsigned int temp;
+-       int len;
+-       u8 nexthdr;
+        unsigned int ptr;
+-       unsigned int hdrlen = 0;
+ 
+-       /* type of the 1st exthdr */
+-       nexthdr = skb->nh.ipv6h->nexthdr;
+-       /* pointer to the 1st exthdr */
+-       ptr = sizeof(struct ipv6hdr);
+-       /* available length */
+-       len = skb->len - ptr;
+-       temp = 0;
+-
+-        while (ip6t_ext_hdr(nexthdr)) {
+-               struct ipv6_opt_hdr _hdr, *hp;
+-
+-              DEBUGP("ipv6_frag header iteration \n");
+-
+-              /* Is there enough space for the next ext header? */
+-                if (len < (int)sizeof(struct ipv6_opt_hdr))
+-                        return 0;
+-              /* No more exthdr -> evaluate */
+-                if (nexthdr == NEXTHDR_NONE) {
+-                     break;
+-              }
+-              /* ESP -> evaluate */
+-                if (nexthdr == NEXTHDR_ESP) {
+-                     break;
+-              }
+-
+-	      hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
+-	      BUG_ON(hp == NULL);
+-
+-              /* Calculate the header length */
+-                if (nexthdr == NEXTHDR_FRAGMENT) {
+-                        hdrlen = 8;
+-                } else if (nexthdr == NEXTHDR_AUTH)
+-                        hdrlen = (hp->hdrlen+2)<<2;
+-                else
+-                        hdrlen = ipv6_optlen(hp);
+-
+-              /* FRAG -> evaluate */
+-                if (nexthdr == NEXTHDR_FRAGMENT) {
+-                     temp |= MASK_FRAGMENT;
+-                     break;
+-              }
+-
+-
+-              /* set the flag */
+-              switch (nexthdr){
+-                     case NEXTHDR_HOP:
+-                     case NEXTHDR_ROUTING:
+-                     case NEXTHDR_FRAGMENT:
+-                     case NEXTHDR_AUTH:
+-                     case NEXTHDR_DEST:
+-                            break;
+-                     default:
+-                            DEBUGP("ipv6_frag match: unknown nextheader %u\n",nexthdr);
+-                            return 0;
+-                            break;
+-              }
+-
+-                nexthdr = hp->nexthdr;
+-                len -= hdrlen;
+-                ptr += hdrlen;
+-		if ( ptr > skb->len ) {
+-			DEBUGP("ipv6_frag: new pointer too large! \n");
+-			break;
+-		}
+-        }
+-
+-       /* FRAG header not found */
+-       if ( temp != MASK_FRAGMENT ) return 0;
+-
+-       if (len < sizeof(struct frag_hdr)){
+-	       *hotdrop = 1;
+-       		return 0;
+-       }
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_FRAGMENT) < 0)
++		return 0;
+ 
+-       fh = skb_header_pointer(skb, ptr, sizeof(_frag), &_frag);
+-       BUG_ON(fh == NULL);
++	fh = skb_header_pointer(skb, ptr, sizeof(_frag), &_frag);
++	if (fh == NULL){
++		*hotdrop = 1;
++		return 0;
++	}
+ 
+        DEBUGP("INFO %04X ", fh->frag_off);
+        DEBUGP("OFFSET %04X ", ntohs(fh->frag_off) & ~0x7);
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_hbh.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_hbh.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_hbh.c
+@@ -63,8 +63,6 @@ match(const struct sk_buff *skb,
+        struct ipv6_opt_hdr _optsh, *oh;
+        const struct ip6t_opts *optinfo = matchinfo;
+        unsigned int temp;
+-       unsigned int len;
+-       u8 nexthdr;
+        unsigned int ptr;
+        unsigned int hdrlen = 0;
+        unsigned int ret = 0;
+@@ -72,97 +70,25 @@ match(const struct sk_buff *skb,
+        u8 _optlen, *lp = NULL;
+        unsigned int optlen;
+        
+-       /* type of the 1st exthdr */
+-       nexthdr = skb->nh.ipv6h->nexthdr;
+-       /* pointer to the 1st exthdr */
+-       ptr = sizeof(struct ipv6hdr);
+-       /* available length */
+-       len = skb->len - ptr;
+-       temp = 0;
+-
+-        while (ip6t_ext_hdr(nexthdr)) {
+-               struct ipv6_opt_hdr _hdr, *hp;
+-
+-              DEBUGP("ipv6_opts header iteration \n");
+-
+-              /* Is there enough space for the next ext header? */
+-                if (len < (int)sizeof(struct ipv6_opt_hdr))
+-                        return 0;
+-              /* No more exthdr -> evaluate */
+-                if (nexthdr == NEXTHDR_NONE) {
+-                     break;
+-              }
+-              /* ESP -> evaluate */
+-                if (nexthdr == NEXTHDR_ESP) {
+-                     break;
+-              }
+-
+-	      hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
+-	      BUG_ON(hp == NULL);
+-
+-              /* Calculate the header length */
+-                if (nexthdr == NEXTHDR_FRAGMENT) {
+-                        hdrlen = 8;
+-                } else if (nexthdr == NEXTHDR_AUTH)
+-                        hdrlen = (hp->hdrlen+2)<<2;
+-                else
+-                        hdrlen = ipv6_optlen(hp);
+-
+-              /* OPTS -> evaluate */
+ #if HOPBYHOP
+-                if (nexthdr == NEXTHDR_HOP) {
+-                     temp |= MASK_HOPOPTS;
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_HOP) < 0)
+ #else
+-                if (nexthdr == NEXTHDR_DEST) {
+-                     temp |= MASK_DSTOPTS;
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_DEST) < 0)
+ #endif
+-                     break;
+-              }
+-
+-
+-              /* set the flag */
+-              switch (nexthdr){
+-                     case NEXTHDR_HOP:
+-                     case NEXTHDR_ROUTING:
+-                     case NEXTHDR_FRAGMENT:
+-                     case NEXTHDR_AUTH:
+-                     case NEXTHDR_DEST:
+-                            break;
+-                     default:
+-                            DEBUGP("ipv6_opts match: unknown nextheader %u\n",nexthdr);
+-                            return 0;
+-                            break;
+-              }
+-
+-                nexthdr = hp->nexthdr;
+-                len -= hdrlen;
+-                ptr += hdrlen;
+-		if ( ptr > skb->len ) {
+-			DEBUGP("ipv6_opts: new pointer is too large! \n");
+-			break;
+-		}
+-        }
++		return 0;
+ 
+-       /* OPTIONS header not found */
+-#if HOPBYHOP
+-       if ( temp != MASK_HOPOPTS ) return 0;
+-#else
+-       if ( temp != MASK_DSTOPTS ) return 0;
+-#endif
+-
+-       if (len < (int)sizeof(struct ipv6_opt_hdr)){
++       oh = skb_header_pointer(skb, ptr, sizeof(_optsh), &_optsh);
++       if (oh == NULL){
+ 	       *hotdrop = 1;
+        		return 0;
+        }
+ 
+-       if (len < hdrlen){
++       hdrlen = ipv6_optlen(oh);
++       if (skb->len - ptr < hdrlen){
+ 	       /* Packet smaller than it's length field */
+        		return 0;
+        }
+ 
+-       oh = skb_header_pointer(skb, ptr, sizeof(_optsh), &_optsh);
+-       BUG_ON(oh == NULL);
+-
+        DEBUGP("IPv6 OPTS LEN %u %u ", hdrlen, oh->hdrlen);
+ 
+        DEBUGP("len %02X %04X %02X ",
+Index: linux-2.6.10/net/ipv6/netfilter/ip6t_rt.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6t_rt.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6t_rt.c
+@@ -50,98 +50,29 @@ match(const struct sk_buff *skb,
+       unsigned int protoff,
+       int *hotdrop)
+ {
+-       struct ipv6_rt_hdr _route, *rh = NULL;
++       struct ipv6_rt_hdr _route, *rh;
+        const struct ip6t_rt *rtinfo = matchinfo;
+        unsigned int temp;
+-       unsigned int len;
+-       u8 nexthdr;
+        unsigned int ptr;
+        unsigned int hdrlen = 0;
+        unsigned int ret = 0;
+        struct in6_addr *ap, _addr;
+ 
+-       /* type of the 1st exthdr */
+-       nexthdr = skb->nh.ipv6h->nexthdr;
+-       /* pointer to the 1st exthdr */
+-       ptr = sizeof(struct ipv6hdr);
+-       /* available length */
+-       len = skb->len - ptr;
+-       temp = 0;
+-
+-        while (ip6t_ext_hdr(nexthdr)) {
+-               struct ipv6_opt_hdr _hdr, *hp;
+-
+-              DEBUGP("ipv6_rt header iteration \n");
+-
+-              /* Is there enough space for the next ext header? */
+-                if (len < (int)sizeof(struct ipv6_opt_hdr))
+-                        return 0;
+-              /* No more exthdr -> evaluate */
+-                if (nexthdr == NEXTHDR_NONE) {
+-                     break;
+-              }
+-              /* ESP -> evaluate */
+-                if (nexthdr == NEXTHDR_ESP) {
+-                     break;
+-              }
+-
+-	      hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
+-	      BUG_ON(hp == NULL);
+-
+-              /* Calculate the header length */
+-                if (nexthdr == NEXTHDR_FRAGMENT) {
+-                        hdrlen = 8;
+-                } else if (nexthdr == NEXTHDR_AUTH)
+-                        hdrlen = (hp->hdrlen+2)<<2;
+-                else
+-                        hdrlen = ipv6_optlen(hp);
+-
+-              /* ROUTING -> evaluate */
+-                if (nexthdr == NEXTHDR_ROUTING) {
+-                     temp |= MASK_ROUTING;
+-                     break;
+-              }
+-
+-
+-              /* set the flag */
+-              switch (nexthdr){
+-                     case NEXTHDR_HOP:
+-                     case NEXTHDR_ROUTING:
+-                     case NEXTHDR_FRAGMENT:
+-                     case NEXTHDR_AUTH:
+-                     case NEXTHDR_DEST:
+-                            break;
+-                     default:
+-                            DEBUGP("ipv6_rt match: unknown nextheader %u\n",nexthdr);
+-                            return 0;
+-                            break;
+-              }
+-
+-                nexthdr = hp->nexthdr;
+-                len -= hdrlen;
+-                ptr += hdrlen;
+-		if ( ptr > skb->len ) {
+-			DEBUGP("ipv6_rt: new pointer is too large! \n");
+-			break;
+-		}
+-        }
+-
+-       /* ROUTING header not found */
+-       if ( temp != MASK_ROUTING ) return 0;
++	if (ipv6_find_hdr(skb, &ptr, NEXTHDR_ROUTING) < 0)
++		return 0;
+ 
+-       if (len < (int)sizeof(struct ipv6_rt_hdr)){
++       rh = skb_header_pointer(skb, ptr, sizeof(_route), &_route);
++       if (rh == NULL){
+ 	       *hotdrop = 1;
+        		return 0;
+        }
+ 
+-       if (len < hdrlen){
++       hdrlen = ipv6_optlen(rh);
++       if (skb->len - ptr < hdrlen){
+ 	       /* Pcket smaller than its length field */
+        		return 0;
+        }
+ 
+-       rh = skb_header_pointer(skb, ptr, sizeof(_route), &_route);
+-       BUG_ON(rh == NULL);
+-
+        DEBUGP("IPv6 RT LEN %u %u ", hdrlen, rh->hdrlen);
+        DEBUGP("TYPE %04X ", rh->type);
+        DEBUGP("SGS_LEFT %u %02X\n", rh->segments_left, rh->segments_left);
+Index: linux-2.6.10/mvl_patches/pro-1280.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1280.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1280);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1 @@
+#define CONFIG_JFFS_FS_VERBOSE 0

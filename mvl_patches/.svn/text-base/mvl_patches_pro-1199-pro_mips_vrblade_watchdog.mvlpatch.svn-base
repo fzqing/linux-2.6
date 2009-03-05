@@ -1,0 +1,584 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_vrblade_watchdog
+# Date: Mon Mar 12 13:52:33 2007
+# Source: MontaVista Software, Inc.
+# MR:21157 
+# Type: Integration
+# Disposition: needs submitting to linux-mips community
+# Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+# Description: Watchdog driver for VRBlade VR4133 Wildcat
+# 
+
+PATCHNUM=1199
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR:21157 
+Type: Integration
+Disposition: needs submitting to linux-mips community
+Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+Description: Watchdog driver for VRBlade VR4133 Wildcat
+
+Index: linux-2.6.10/drivers/char/watchdog/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/watchdog/Kconfig
++++ linux-2.6.10/drivers/char/watchdog/Kconfig
+@@ -564,4 +564,11 @@ config OMAP16XX_WATCHDOG
+ 	  Support for TI OMAP1610/OMAP1710 watchdog. Say 'Y' here to enable the
+ 	  OMAP1610/OMAP1710 watchdog timer.
+ 
++config VR41XX_WDT
++	tristate "VRBlade Watchdog"
++	depends on WATCHDOG && MACH_VR41XX
++	help
++	  Support for VRBlade watchdog. Say 'Y' here to enable the
++	  VRBlade watchdog timer.
++
+ endmenu
+Index: linux-2.6.10/drivers/char/watchdog/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/watchdog/Makefile
++++ linux-2.6.10/drivers/char/watchdog/Makefile
+@@ -42,3 +42,4 @@ obj-$(CONFIG_8xx_WDT) += mpc8xx_wdt.o
+ obj-$(CONFIG_OMAP16XX_WATCHDOG) += omap1610_wdt.o
+ obj-$(CONFIG_MV64X60_WDT) += mv64x60_wdt.o
+ obj-$(CONFIG_BOOKE_WDT) += booke_wdt.o
++obj-$(CONFIG_VR41XX_WDT) += vr41xxwdt.o
+Index: linux-2.6.10/drivers/char/watchdog/vr41xxwdt.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/watchdog/vr41xxwdt.c
+@@ -0,0 +1,327 @@
++/*
++ * drivers/char/vr41xxwdt.c
++ *
++ * Watchdog driver for integrated watchdog in the NEC VR41xx processors.
++ *
++ * Copyright (C) 2001 Paul Mundt <lethal@chaoticdreams.org>
++ * Copyright 2004 (c) MontaVista, Software, Inc.
++ *          <source@mvista.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ */
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/miscdevice.h>
++#include <linux/watchdog.h>
++#include <linux/reboot.h>
++#include <linux/notifier.h>
++#include <linux/smp_lock.h>
++#include <linux/ioport.h>
++#include <linux/fs.h>
++
++#include <asm/io.h>
++#include <asm/uaccess.h>
++#include <asm/vr41xx/vrblade4133a.h>
++
++#define VR41XX_WDT_CNTREG	 (void *)KSEG1ADDR(0x0f000200)
++#define VR41XX_WDT_SETREG	 (void *)KSEG1ADDR(0x0f000202)
++#define VR41XX_WDT_CLRREG	 (void *)KSEG1ADDR(0x0f000204)
++#define VR41XX_WDT_TIMREG	 (void *)KSEG1ADDR(0x0f000206)
++#define VR41XX_WDT_UNUTREG	 (void *)KSEG1ADDR(0x0f00020c)
++
++#define WDT_MARGIN_MIN		1	/* in seconds */
++#define WDT_MARGIN_MAX		255
++#define WDT_MARGIN_DEFAULT	10
++
++static int vr41xx_wdt_is_open = 0;
++static struct watchdog_info vr41xx_wdt_info;
++
++static int timer_margin = WDT_MARGIN_DEFAULT;	/* in seconds */
++
++/**
++ * 	vr41xx_wdt_start - Start the Watchdog
++ *
++ * 	Starts the watchdog.
++ */
++static void vr41xx_wdt_start(void)
++{
++
++	/* Clear the counter */
++	writew(0x01, VR41XX_WDT_CLRREG);
++
++	/* Set the overflow period (in seconds) */
++	writew(timer_margin, VR41XX_WDT_SETREG);
++
++	/* Turn on the watchdog */
++	writew(0x01, VR41XX_WDT_CNTREG);
++}
++
++/**
++ * 	vr41xx_wdt_stop - Stop the Watchdog
++ *
++ * 	Stops the watchdog.
++ */
++static void vr41xx_wdt_stop(void)
++{
++	/* Clear the counter */
++	writew(0x01, VR41XX_WDT_CLRREG);
++
++	/* Turn off the watchdog */
++	writew(0x00, VR41XX_WDT_CNTREG);
++}
++
++/**
++ * 	vr41xx_wdt_ping - Ping the Watchdog
++ *
++ * 	@data: Unused
++ *
++ * 	Clears WDT_ counter.
++ */
++static void vr41xx_wdt_ping(void)
++{
++	writew(0x01, VR41XX_WDT_CLRREG);
++}
++
++/**
++ * 	vr41xx_wdt_open - Open the Device
++ *
++ * 	@inode: inode of device
++ * 	@file: file handle of device
++ *
++ * 	Watchdog device is opened and started.
++ */
++static int vr41xx_wdt_open(struct inode *inode, struct file *file)
++{
++	switch (MINOR(inode->i_rdev)) {
++	case WATCHDOG_MINOR:
++		if (vr41xx_wdt_is_open)
++			return -EBUSY;
++
++		vr41xx_wdt_is_open = 1;
++		vr41xx_wdt_start();
++
++		break;
++	default:
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++/**
++ * 	vr41xx_wdt_close - Close the Device
++ *
++ * 	@inode: inode of device
++ * 	@file: file handle of device
++ *
++ * 	Watchdog is closed and stopped.
++ */
++static int vr41xx_wdt_close(struct inode *inode, struct file *file)
++{
++	lock_kernel();
++
++	if (MINOR(inode->i_rdev) == WATCHDOG_MINOR) {
++#ifndef CONFIG_WATCHDOG_NOWAYOUT
++		vr41xx_wdt_stop();
++#endif
++		vr41xx_wdt_is_open = 0;
++	}
++
++	unlock_kernel();
++
++	return 0;
++}
++
++/**
++ * 	vr41xx_wdt_read - Read from Device
++ *
++ * 	@file: file handle of device
++ * 	@buf: buffer to write to
++ * 	@count: length of buffer
++ * 	@ppos: offset
++ *
++ * 	Unsupported.
++ */
++static ssize_t vr41xx_wdt_read(struct file *file, char *buf,
++			       size_t count, loff_t * ppos)
++{
++	return -EINVAL;
++}
++
++/**
++ * 	vr41xx_wdt_write - Write to Device
++ *
++ * 	@file: file handle of device
++ * 	@buf: buffer to write
++ * 	@count: length of buffer
++ * 	@ppos: offset
++ *
++ * 	Updates next heartbeat interval on write.
++ */
++static ssize_t vr41xx_wdt_write(struct file *file, const char *buf,
++				size_t count, loff_t * ppos)
++{
++	if (count) {
++		vr41xx_wdt_ping();
++		return 1;
++	}
++
++	return 0;
++}
++
++/**
++ * 	vr41xx_wdt_ioctl - Query Device
++ *
++ * 	@inode: inode of device
++ * 	@file: file handle of device
++ * 	@cmd: watchdog command
++ * 	@arg: argument
++ *
++ * 	Query basic information from the device or ping it, as outlined by the
++ * 	watchdog API.
++ */
++static int vr41xx_wdt_ioctl(struct inode *inode, struct file *file,
++			    unsigned int cmd, unsigned long arg)
++{
++	int new_margin;
++
++	switch (cmd) {
++	case WDIOC_GETSUPPORT:
++		return copy_to_user((struct watchdog_info *)arg,
++				    &vr41xx_wdt_info, sizeof(vr41xx_wdt_info))
++		    ? -EFAULT : 0;
++	case WDIOC_GETSTATUS:
++		return copy_to_user((int *)arg, &vr41xx_wdt_is_open,
++				    sizeof(int)) ? -EFAULT : 0;
++	case WDIOC_KEEPALIVE:
++		vr41xx_wdt_ping();
++		break;
++	case WDIOC_SETTIMEOUT:
++
++		if (get_user(new_margin, (int *)arg)) {
++			printk("return -EFAULT\n");
++			return -EFAULT;
++		}
++		if ((new_margin < WDT_MARGIN_MIN)
++		    || (new_margin > WDT_MARGIN_MAX))
++			timer_margin = WDT_MARGIN_DEFAULT;  /* default timeout */
++		else
++			timer_margin = new_margin;
++
++		if (vr41xx_wdt_is_open) {
++			vr41xx_wdt_stop();
++			writew(timer_margin, VR41XX_WDT_TIMREG);
++			vr41xx_wdt_start();
++		} else {
++			printk("vr41xx_wdt_is_open is not open\n");
++		}
++		/* Fall */
++	case WDIOC_GETTIMEOUT:
++		return put_user(timer_margin, (int *)arg);
++	default:
++		return -ENOTTY;
++	}
++
++	return 0;
++}
++
++/**
++ * 	vr41xx_wdt_notify_sys - Notifier Handler
++ *
++ * 	@this: notifier block
++ * 	@code: notifier event
++ * 	@unused: unused.
++ *
++ * 	Handles specific events, such as turning off the watchdog during a
++ * 	shutdown event.
++ */
++static int vr41xx_wdt_notify_sys(struct notifier_block *this,
++				 unsigned long code, void *unused)
++{
++	if (code == SYS_DOWN || code == SYS_HALT)
++		vr41xx_wdt_stop();
++
++	return NOTIFY_DONE;
++}
++
++static struct file_operations vr41xx_wdt_fops = {
++	owner:THIS_MODULE,
++	read:vr41xx_wdt_read,
++	write:vr41xx_wdt_write,
++	ioctl:vr41xx_wdt_ioctl,
++	open:vr41xx_wdt_open,
++	release:vr41xx_wdt_close,
++};
++
++static struct watchdog_info vr41xx_wdt_info = {
++	WDIOF_KEEPALIVEPING,
++	1,
++	"VR41xx WDT",
++};
++
++static struct notifier_block vr41xx_wdt_notifier = {
++	vr41xx_wdt_notify_sys,
++	NULL,
++	0
++};
++
++static struct miscdevice vr41xx_wdt_miscdev = {
++	WATCHDOG_MINOR,
++	"watchdog",
++	&vr41xx_wdt_fops,
++};
++
++/**
++ * 	vr41xx_wdt_init - Initialize module
++ *
++ * 	Registers the device, reserves register region, and registers the
++ * 	notifier handler. Actual device initialization is handled by
++ * 	vr41xx_wdt_open().
++ */
++static int __init vr41xx_wdt_init(void)
++{
++
++	if (misc_register(&vr41xx_wdt_miscdev)) {
++		printk(KERN_ERR "vr41xx wdt: Can't register misc device\n");
++		return -EINVAL;
++	}
++
++	if (register_reboot_notifier(&vr41xx_wdt_notifier)) {
++		printk(KERN_ERR "vr41xx wdt: Can't register reboot notifier\n");
++		release_region((unsigned long)VR41XX_WDT_CNTREG, 8);
++		misc_deregister(&vr41xx_wdt_miscdev);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/**
++ * 	vr41xx_wdt_exit - Deinitialize module
++ *
++ * 	Unregisters the device, releases reserved register region, and
++ * 	deregisters the notifier handler. Actual device deinitialization is
++ * 	handled by vr41xx_wdt_close().
++ */
++static void __exit vr41xx_wdt_exit(void)
++{
++	unregister_reboot_notifier(&vr41xx_wdt_notifier);
++	release_region((unsigned long)VR41XX_WDT_CNTREG, 8);
++	misc_deregister(&vr41xx_wdt_miscdev);
++}
++
++MODULE_AUTHOR("Paul Mundt <lethal@chaoticdreams.org>");
++MODULE_DESCRIPTION("NEC VR41xx watchdog driver");
++MODULE_PARM(timer_margin, "i");
++MODULE_PARM_DESC(timer_margin,
++		 "Number of seconds for overflow period. (1 - 255 seconds).");
++MODULE_LICENSE("GPL");
++
++module_init(vr41xx_wdt_init);
++module_exit(vr41xx_wdt_exit);
+Index: linux-2.6.10/mvl_patches/pro-1199.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1199.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1199);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

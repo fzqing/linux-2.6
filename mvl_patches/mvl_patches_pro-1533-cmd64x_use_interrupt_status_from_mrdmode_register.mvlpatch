@@ -1,0 +1,439 @@
+#! /usr/bin/env bash
+# Patch: -cmd64x_use_interrupt_status_from_mrdmode_register
+# Date: Fri Jan  4 18:40:45 2008
+# Source: MontaVista Software, Inc.
+# MR: 23989
+# Type: Enhancement
+# Disposition: accepted into 2.6.22-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# cmd64x: use interrupt status from MRDMODE register (take 2)
+# 
+# Fold the parts of the ide_dma_end() methods identical to __ide_dma_end() into a
+# mere call to it.
+# Start using faster versions of the ide_dma_end() and ide_dma_test_irq() methods
+# for the PCI0646U and newer chips that have the duplicate interrupt status bits
+# in the I/O mapped MRDMODE register, determing what methods to use at the driver
+# load time. Do some cleanup/renaming in the "old" ide_dma_test_irq() method too.
+# 
+# This patch is a bit different from the community variant because of hwif->IN*()
+# and hwif->OUT*() calls being replaced by mere in*() and out*() throughout the
+# IDE drivers...
+# 
+# commit 66602c83dcb6a5d82772d88ae7a32cd4a1213528
+# tree 5a282168207c87a1ff23175df3f2e10a822fd550
+# parent 5826b318aa02e81575c352ca26f00773c999795b
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:50 +0200
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:50 +0200
+# 
+#  drivers/ide/pci/cmd64x.c |  117 +++++++++++++++++++++++++++--------------------
+#  1 files changed, 69 insertions(+), 48 deletions(-)
+# 
+
+PATCHNUM=1533
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 23989
+Type: Enhancement
+Disposition: accepted into 2.6.22-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+cmd64x: use interrupt status from MRDMODE register (take 2)
+
+Fold the parts of the ide_dma_end() methods identical to __ide_dma_end() into a
+mere call to it.
+Start using faster versions of the ide_dma_end() and ide_dma_test_irq() methods
+for the PCI0646U and newer chips that have the duplicate interrupt status bits
+in the I/O mapped MRDMODE register, determing what methods to use at the driver
+load time. Do some cleanup/renaming in the "old" ide_dma_test_irq() method too.
+
+This patch is a bit different from the community variant because of hwif->IN*()
+and hwif->OUT*() calls being replaced by mere in*() and out*() throughout the
+IDE drivers...
+
+commit 66602c83dcb6a5d82772d88ae7a32cd4a1213528
+tree 5a282168207c87a1ff23175df3f2e10a822fd550
+parent 5826b318aa02e81575c352ca26f00773c999795b
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:50 +0200
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:50 +0200
+
+ drivers/ide/pci/cmd64x.c |  117 +++++++++++++++++++++++++++--------------------
+ mvl_patches/pro-1533.c   |   16 ++++++
+ 2 files changed, 85 insertions(+), 48 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/cmd64x.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/cmd64x.c
++++ linux-2.6.10/drivers/ide/pci/cmd64x.c
+@@ -1,5 +1,5 @@
+ /*
+- * linux/drivers/ide/pci/cmd64x.c		Version 1.46	Mar 16, 2007
++ * linux/drivers/ide/pci/cmd64x.c		Version 1.47	Mar 19, 2007
+  *
+  * cmd64x.c: Enable interrupts at initialization time on Ultra/PCI machines.
+  *           Due to massive hardware bugs, UltraDMA is only supported
+@@ -450,67 +450,80 @@ fast_ata_pio:
+ 	return 0;
+ }
+ 
+-static int cmd64x_alt_dma_status (struct pci_dev *dev)
++static int cmd648_ide_dma_end (ide_drive_t *drive)
+ {
+-	switch(dev->device) {
+-		case PCI_DEVICE_ID_CMD_648:
+-		case PCI_DEVICE_ID_CMD_649:
+-			return 1;
+-		default:
+-			break;
+-	}
+-	return 0;
++	ide_hwif_t *hwif	= HWIF(drive);
++	int err			= __ide_dma_end(drive);
++	u8  irq_mask		= hwif->channel ? MRDMODE_INTR_CH1 :
++						  MRDMODE_INTR_CH0;
++	u8  mrdmode		= inb(hwif->dma_master + 0x01);
++
++	/* clear the interrupt bit */
++	outb(mrdmode | irq_mask, hwif->dma_master + 0x01);
++
++	return err;
+ }
+ 
+ static int cmd64x_ide_dma_end (ide_drive_t *drive)
+ {
+-	u8 dma_stat = 0, dma_cmd = 0;
+ 	ide_hwif_t *hwif	= HWIF(drive);
+ 	struct pci_dev *dev	= hwif->pci_dev;
++	int irq_reg		= hwif->channel ? ARTTIM23 : CFR;
++	u8  irq_mask		= hwif->channel ? ARTTIM23_INTR_CH1 :
++						  CFR_INTR_CH0;
++	u8  irq_stat		= 0;
++	int err			= __ide_dma_end(drive);
+ 
+-	drive->waiting_for_dma = 0;
+-	/* read DMA command state */
+-	dma_cmd = hwif->INB(hwif->dma_command);
+-	/* stop DMA */
+-	hwif->OUTB((dma_cmd & ~1), hwif->dma_command);
+-	/* get DMA status */
+-	dma_stat = hwif->INB(hwif->dma_status);
+-	/* clear the INTR & ERROR bits */
+-	hwif->OUTB(dma_stat|6, hwif->dma_status);
+-	if (cmd64x_alt_dma_status(dev)) {
+-		u8 dma_intr	= 0;
+-		u8 dma_mask	= (hwif->channel) ? ARTTIM23_INTR_CH1 :
+-						    CFR_INTR_CH0;
+-		u8 dma_reg	= (hwif->channel) ? ARTTIM2 : CFR;
+-		(void) pci_read_config_byte(dev, dma_reg, &dma_intr);
+-		/* clear the INTR bit */
+-		(void) pci_write_config_byte(dev, dma_reg, dma_intr|dma_mask);
+-	}
+-	/* purge DMA mappings */
+-	ide_destroy_dmatable(drive);
+-	/* verify good DMA status */
+-	return (dma_stat & 7) != 4;
++	(void) pci_read_config_byte(dev, irq_reg, &irq_stat);
++	/* clear the interrupt bit */
++	(void) pci_write_config_byte(dev, irq_reg, irq_stat | irq_mask);
++
++	return err;
++}
++
++static int cmd648_ide_dma_test_irq (ide_drive_t *drive)
++{
++	ide_hwif_t *hwif	= HWIF(drive);
++	u8 irq_mask		= hwif->channel ? MRDMODE_INTR_CH1 :
++						  MRDMODE_INTR_CH0;
++	u8 dma_stat		= inb(hwif->dma_status);
++	u8 mrdmode		= inb(hwif->dma_master + 0x01);
++
++#ifdef DEBUG
++	printk("%s: dma_stat: 0x%02x mrdmode: 0x%02x irq_mask: 0x%02x\n",
++	       drive->name, dma_stat, mrdmode, irq_mask);
++#endif
++	if (!(mrdmode & irq_mask))
++		return 0;
++
++	/* return 1 if INTR asserted */
++	if (dma_stat & 4)
++		return 1;
++
++	return 0;
+ }
+ 
+ static int cmd64x_ide_dma_test_irq (ide_drive_t *drive)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
+  	struct pci_dev *dev	= hwif->pci_dev;
+-	u8 irq_reg		= hwif->channel ? ARTTIM23 : CFR;
+-	u8 irq_stat = 0, mask	= hwif->channel ? ARTTIM23_INTR_CH1 : CFR_INTR_CH0;
+-	u8 dma_stat		= inb(hwif->dma_status);
++	int irq_reg		= hwif->channel ? ARTTIM23 : CFR;
++	u8  irq_mask		= hwif->channel ? ARTTIM23_INTR_CH1 :
++						  CFR_INTR_CH0;
++	u8  dma_stat		= inb(hwif->dma_status);
++	u8  irq_stat		= 0;
+ 
+ 	(void) pci_read_config_byte(dev, irq_reg, &irq_stat);
+ 
+ #ifdef DEBUG
+-	printk("%s: dma_stat: 0x%02x irq_stat: 0x%02x mask: 0x%02x\n",
+-	       drive->name, dma_stat, irq_stat, mask);
++	printk("%s: dma_stat: 0x%02x irq_stat: 0x%02x irq_mask: 0x%02x\n",
++	       drive->name, dma_stat, irq_stat, irq_mask);
+ #endif
+-	if (!(irq_stat & mask))
++	if (!(irq_stat & irq_mask))
+ 		return 0;
+ 
+ 	/* return 1 if INTR asserted */
+-	if ((dma_stat & 4) == 4)
++	if (dma_stat & 4)
+ 		return 1;
+ 
+ 	return 0;
+@@ -677,17 +690,25 @@ static void __devinit init_hwif_cmd64x(i
+ 	if (!(hwif->udma_four))
+ 		hwif->udma_four = ata66_cmd64x(hwif);
+ 
+-	if (dev->device == PCI_DEVICE_ID_CMD_646) {
++	switch(dev->device) {
++	case PCI_DEVICE_ID_CMD_648:
++	case PCI_DEVICE_ID_CMD_649:
++	alt_irq_bits:
++		hwif->ide_dma_end	= &cmd648_ide_dma_end;
++		hwif->ide_dma_test_irq	= &cmd648_ide_dma_test_irq;
++		break;
++	case PCI_DEVICE_ID_CMD_646:
+ 		hwif->chipset = ide_cmd646;
+ 		if (class_rev == 0x01) {
+ 			hwif->ide_dma_end = &cmd646_1_ide_dma_end;
+-		} else {
+-			hwif->ide_dma_end = &cmd64x_ide_dma_end;
+-			hwif->ide_dma_test_irq = &cmd64x_ide_dma_test_irq;
+-		}
+-	} else {
+-		hwif->ide_dma_end = &cmd64x_ide_dma_end;
+-		hwif->ide_dma_test_irq = &cmd64x_ide_dma_test_irq;
++			break;
++		} else if (class_rev >= 0x03)
++			goto alt_irq_bits;
++		/* fall thru */
++	default:
++		hwif->ide_dma_end	= &cmd64x_ide_dma_end;
++		hwif->ide_dma_test_irq	= &cmd64x_ide_dma_test_irq;
++		break;
+ 	}
+ 
+ 
+Index: linux-2.6.10/mvl_patches/pro-1533.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1533.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1533);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

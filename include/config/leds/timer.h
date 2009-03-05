@@ -1,0 +1,1 @@
+#undef CONFIG_LEDS_TIMER

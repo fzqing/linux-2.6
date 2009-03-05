@@ -1,0 +1,529 @@
+#! /usr/bin/env bash
+# Patch: -ppc32_85xx_add_arcadia_31_fixup
+# Date: Tue May  1 12:59:27 2007
+# Source: MontaVista Software, Inc.
+# MR: 22701
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Randy Vinson <rvinson@mvista.com>
+# Description:
+#   Arcadia Rev 3.1 Followup
+# 
+# The patch which updated the MPC8555CDS and MPC8548CDS LSPs to handle the new
+# Rev 3.1 Arcadia board inadvertently broke the MPC8540ADS and MPC8560ADS LSPs.
+# The previous patch re-used a PCI-Express fixup routine used to handle
+# mis-configured Local Access Windows (LAWs) left by some versions of U-Boot.
+# However, some symbols used by the fixup routine are not available for the 8540
+# and 8560 LSPs which broke the build for those LSPs. This patch moves the fixup
+# routine to the mpc85xx_cds_common.c file to fix the problem. However, in
+# testing with PCI-Express, another omission in the original patch was
+# illuminated. The various PCI device fixup routines used to handle oddities in
+# the VIA Super South Bridge were not properly excluded when building with
+# PCI-Express enabled. This patch corrects all these problems.
+# 
+
+PATCHNUM=1307
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 22701
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Randy Vinson <rvinson@mvista.com>
+Description:
+  Arcadia Rev 3.1 Followup
+
+The patch which updated the MPC8555CDS and MPC8548CDS LSPs to handle the new
+Rev 3.1 Arcadia board inadvertently broke the MPC8540ADS and MPC8560ADS LSPs.
+The previous patch re-used a PCI-Express fixup routine used to handle
+mis-configured Local Access Windows (LAWs) left by some versions of U-Boot.
+However, some symbols used by the fixup routine are not available for the 8540
+and 8560 LSPs which broke the build for those LSPs. This patch moves the fixup
+routine to the mpc85xx_cds_common.c file to fix the problem. However, in
+testing with PCI-Express, another omission in the original patch was
+illuminated. The various PCI device fixup routines used to handle oddities in
+the VIA Super South Bridge were not properly excluded when building with
+PCI-Express enabled. This patch corrects all these problems.
+
+Index: linux-2.6.10/arch/ppc/platforms/85xx/mpc85xx_cds_common.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/85xx/mpc85xx_cds_common.c
++++ linux-2.6.10/arch/ppc/platforms/85xx/mpc85xx_cds_common.c
+@@ -115,7 +115,7 @@ unsigned char __res[sizeof (bd_t)];
+ static int cds_pci_slot = 2;
+ static volatile u8 * cadmus;
+ 
+-#ifdef CONFIG_PCI
++#if defined(CONFIG_PCI) && !defined(CONFIG_PEX)
+ static int Tundra_found = 0;
+ static int Tundra_bus = 0;
+ static int Tundra_devfn = 0;
+@@ -412,6 +412,7 @@ mpc85xx_map_irq(struct pci_dev *dev, uns
+ #define ARCADIA_X2_2ND_BRIDGE_IDSEL	3
+ #define ARCADIA_X3_2ND_BRIDGE_IDSEL	1
+ 
++#ifndef CONFIG_PEX
+ #ifdef CONFIG_PPC_INDIRECT_PCI_BE
+ #define PCI_CFG_OUT out_be32
+ #else
+@@ -435,6 +436,7 @@ mpc85xx_private_read_config_word(struct 
+ 	cfg_data = hose->cfg_data + (offset & 3);
+ 	*val = in_le16((u16 *)cfg_data);
+ }
++#endif /* CONFIG_PEX */
+ 
+ int
+ mpc85xx_exclude_device(u_char bus, u_char devfn)
+@@ -501,6 +503,7 @@ mpc85xx_exclude_device(u_char bus, u_cha
+ #endif /* CONFIG_PEX */
+ }
+ 
++#ifndef CONFIG_PEX
+ static void __init
+ mpc85xx_cds_fixup_arc(struct pci_dev *dev)
+ {
+@@ -692,6 +695,7 @@ mpc85xx_cds_fixup_via_ac97(struct pci_de
+ }
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C686_6,
+ 			mpc85xx_cds_fixup_via_ac97);
++#endif /* CONFIG_PEX */
+ 
+ void __init
+ mpc85xx_cds_pcibios_fixup(void)
+@@ -731,6 +735,91 @@ mpc85xx_cds_pcibios_fixup(void)
+                 pci_write_config_byte(dev, PCI_INTERRUPT_LINE, 11);
+         }
+ }
++
++static void __init
++mpc85xx_pci_law_fixup(void)
++{
++	int i, number, empty = 0;
++	u32 *lawbase, lawar, target;
++	int map[3] = {0, 0, 0};
++	struct local_window {
++		int number;
++		int target;
++		u32 base;
++		u32 size; } lw[3][2] = {
++			{{
++				 .number = -1,
++				 .target = 0,
++				 .base = MPC85XX_PCI1_LOWER_MEM,
++				 .size = (__ilog2(MPC85XX_PCI1_UPPER_MEM - MPC85XX_PCI1_LOWER_MEM + 1) - 1),
++			 },
++			{
++				.number = -1,
++				.target = 0,
++				.base = MPC85XX_PCI1_IO_BASE,
++				.size = (__ilog2(MPC85XX_PCI1_IO_SIZE) - 1),
++			},},
++			{ {
++				  .number = -1,
++				  .target = 1,
++				  .base = MPC85XX_PCI2_LOWER_MEM,
++				  .size = (__ilog2(MPC85XX_PCI2_UPPER_MEM - MPC85XX_PCI2_LOWER_MEM + 1) - 1),
++			  },
++			{
++				.number = -1,
++				.target = 1,
++				.base = MPC85XX_PCI2_IO_BASE,
++				.size = (__ilog2(MPC85XX_PCI2_IO_SIZE) - 1),
++			},},
++			{ {
++				  .number = -1,
++				  .target = 2,
++				  .base = MPC85XX_PEX_LOWER_MEM,
++				  .size = (__ilog2(MPC85XX_PEX_UPPER_MEM - MPC85XX_PEX_LOWER_MEM + 1) - 1),
++			  },
++			{
++				.number = -1,
++				.target = 2,
++				.base = MPC85XX_PEX_IO_BASE,
++				.size = (__ilog2(MPC85XX_PEX_IO_SIZE) - 1),
++			} }
++		};
++	struct local_window *lwp;
++
++	/* Search each LAW, detemine whether the bootloader
++	 * open memory window for PCI1, PCI2, PEX. If not, define
++	 * it. If yes, fix window size.
++	 */
++	lawbase = (uint32_t *)ioremap((get_ccsrbar() + 0xc00), 0x1000);
++
++	for(i=1; i<=7; i++) {
++		lawar = in_be32(lawbase + 0x4 + (i * 0x8));
++		target = (lawar & 0x00f00000) >> 20;
++
++		if ((lawar & 0x80000000) == 0) {
++			empty = i;
++			break;
++		}
++		if (target > 2)
++			continue;
++		lw[target][map[target]].number = i;
++		map[target]++;
++	}
++
++	lwp = &lw[0][0];
++	for (i=0; i<6; i++, lwp++) {
++		number = lwp->number;
++		if (number == -1)
++			number = empty++;
++
++		out_be32(lawbase + 0x2 + (number * 0x8), (lwp->base)>>12);
++		out_be32(lawbase + 0x4 + (number * 0x8),
++			 0x80000000 | (lwp->target)<<20 | (lwp->size));
++	}
++
++	iounmap(lawbase);
++	return;
++}
+ #endif /* CONFIG_PCI */
+ 
+ void
+@@ -834,6 +923,9 @@ mpc85xx_cds_setup_arch(void)
+  	/* VIA IDE configuration */
+          ppc_md.pcibios_fixup = mpc85xx_cds_pcibios_fixup;
+ 
++	/* fixup local access windows */
++	 mpc85xx_pci_law_fixup();
++
+         /* setup PCI host bridges */
+         mpc85xx_setup_hose();
+ #endif
+Index: linux-2.6.10/arch/ppc/syslib/ppc85xx_setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc85xx_setup.c
++++ linux-2.6.10/arch/ppc/syslib/ppc85xx_setup.c
+@@ -277,94 +277,6 @@ mpc85xx_setup_pci2(struct pci_controller
+ #endif /* CONFIG_85xx_PCI2 */
+ #endif
+ 
+-struct local_window {
+-	int number;
+-	int target;
+-	u32 base;
+-	u32 size;
+-};
+-
+-static void __init
+-mpc85xx_pci_law_fixup(void)
+-{
+-	int i, number, empty = 0;
+-	u32 *lawbase, lawar, target;
+-	int map[3] = {0, 0, 0};
+-	struct local_window lw[3][2] = {
+-		{{
+-			.number = -1,
+-			.target = 0,
+-			.base = MPC85XX_PCI1_LOWER_MEM,
+-			.size = (__ilog2(MPC85XX_PCI1_UPPER_MEM - MPC85XX_PCI1_LOWER_MEM + 1) - 1),
+-		},
+-		{
+-			.number = -1,
+-			.target = 0,
+-			.base = MPC85XX_PCI1_IO_BASE,
+-			.size = (__ilog2(MPC85XX_PCI1_IO_SIZE) - 1),
+-		},},
+-		{ {
+-			.number = -1,
+-			.target = 1,
+-			.base = MPC85XX_PCI2_LOWER_MEM,
+-			.size = (__ilog2(MPC85XX_PCI2_UPPER_MEM - MPC85XX_PCI2_LOWER_MEM + 1) - 1),
+-		},
+-		{
+-			.number = -1,
+-			.target = 1,
+-			.base = MPC85XX_PCI2_IO_BASE,
+-			.size = (__ilog2(MPC85XX_PCI2_IO_SIZE) - 1),
+-		},},
+-		{ {
+-			.number = -1,
+-			.target = 2,
+-			.base = MPC85XX_PEX_LOWER_MEM,
+-			.size = (__ilog2(MPC85XX_PEX_UPPER_MEM - MPC85XX_PEX_LOWER_MEM + 1) - 1),
+-		},
+-		{
+-			.number = -1,
+-			.target = 2,
+-			.base = MPC85XX_PEX_IO_BASE,
+-			.size = (__ilog2(MPC85XX_PEX_IO_SIZE) - 1),
+-		} }
+-	};
+-	struct local_window *lwp;
+-
+-	/* Search each LAW, detemine whether the bootloader
+-	 * open memory window for PCI1, PCI2, PEX. If not, define
+-	 * it. If yes, fix window size.
+-	 */
+-	lawbase = (uint32_t *)ioremap((get_ccsrbar() + 0xc00), 0x1000);
+-
+-	for(i=1; i<=7; i++) {
+-		lawar = in_be32(lawbase + 0x4 + (i * 0x8));
+-		target = (lawar & 0x00f00000) >> 20;
+-
+-		if ((lawar & 0x80000000) == 0) {
+-			empty = i;
+-			break;
+-		}
+-		if (target > 2)
+-			continue;
+-		lw[target][map[target]].number = i;
+-		map[target]++;
+-	}
+-
+-	lwp = &lw[0][0];
+-	for (i=0; i<6; i++, lwp++) {
+-		number = lwp->number;
+-		if (number == -1)
+-			number = empty++;
+-
+-		out_be32(lawbase + 0x2 + (number * 0x8), (lwp->base)>>12);
+-		out_be32(lawbase + 0x4 + (number * 0x8),
+-			 0x80000000 | (lwp->target)<<20 | (lwp->size));
+-	}
+-
+-	iounmap(lawbase);
+-	return;
+-}
+-
+ #ifdef CONFIG_PEX
+ static void __init
+ mpc85xx_setup_pex(struct pci_controller *hose)
+@@ -411,10 +323,9 @@ mpc85xx_setup_pex(struct pci_controller 
+ 	pex->pexiwbar1 = 0x00000000;
+ 	pex->pexiwar1 = 0xa0f5501e;	/* Enable, Prefetch, Local
+ 	Mem, Snoop R/W, 2G */
+-
+-	mpc85xx_pci_law_fixup();
+ }
+-#endif
++
++#else /* ifdef CONFIG_PEX */
+ 
+ #ifdef CONFIG_PPC_INDIRECT_PCI_BE
+ #define PCI_CFG_OUT out_be32
+@@ -509,6 +420,7 @@ static struct pci_ops mpc85xx_cds_indire
+ 	mpc85xx_cds_indirect_read_config,
+ 	mpc85xx_cds_indirect_write_config
+ };
++#endif /* CONFIG_PEX */
+ 
+ void __init
+ mpc85xx_setup_hose(void)
+@@ -569,8 +481,6 @@ mpc85xx_setup_hose(void)
+ #endif
+ 	bd_t *binfo = (bd_t *) __res;
+ 
+-	mpc85xx_pci_law_fixup();
+-
+ 	hose_a = pcibios_alloc_controller();
+ 
+ 	if (!hose_a)
+Index: linux-2.6.10/mvl_patches/pro-1307.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1307.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1307);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

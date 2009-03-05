@@ -1,0 +1,335 @@
+#! /usr/bin/env bash
+# Patch: -jbd_fix_BUG_in_journal_commit_transaction
+# Date: Sun Apr  8 23:15:14 2007
+# MR: 22232, 22366
+# 
+# From 9ada7340987aa24395809570840c7c6847044f52 Mon Sep 17 00:00:00 2001
+# From: Jan Kara <jack@suse.cz>
+# Date: Fri, 23 Jun 2006 02:05:25 -0700
+# Subject: [PATCH] [PATCH] jbd: fix BUG in journal_commit_transaction()
+# 
+# Fix possible assertion failure in journal_commit_transaction() on
+# jh->b_next_transaction == NULL (when we are processing BJ_Forget list and
+# buffer is not jbddirty).
+# 
+# !jbddirty buffers can be placed on BJ_Forget list for example by
+# journal_forget() or by __dispose_buffer() - generally such buffer means
+# that it has been freed by this transaction.
+# 
+# Freed buffers should not be reallocated until the transaction has committed
+# (that's why we have the assertion there) but they *can* be reallocated when
+# the transaction has already been committed to disk and we are just
+# processing the BJ_Forget list (as soon as we remove b_committed_data from
+# the bitmap bh, ext3 will be able to reallocate buffers freed by the
+# committing transaction).  So we have to also count with the case that the
+# buffer has been reallocated and b_next_transaction has been already set.
+# 
+# And one more subtle point: it can happen that we manage to reallocate the
+# buffer and also mark it jbddirty.  Then we also add the freed buffer to the
+# checkpoint list of the committing trasaction.  But that should do no harm.
+# 
+# Non-jbddirty buffers should be filed to BJ_Reserved and not BJ_Metadata
+# list.  It can actually happen that we refile such buffers during the commit
+# phase when we reallocate in the running transaction blocks deleted in
+# committing transaction (and that can happen if the committing transaction
+# already wrote all the data and is just cleaning up BJ_Forget list).
+# 
+# Signed-off-by: Jan Kara <jack@suse.cz>
+# Acked-by: "Stephen C. Tweedie" <sct@redhat.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1294
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 22232, 22366
+
+From 9ada7340987aa24395809570840c7c6847044f52 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Fri, 23 Jun 2006 02:05:25 -0700
+Subject: [PATCH] [PATCH] jbd: fix BUG in journal_commit_transaction()
+
+Fix possible assertion failure in journal_commit_transaction() on
+jh->b_next_transaction == NULL (when we are processing BJ_Forget list and
+buffer is not jbddirty).
+
+!jbddirty buffers can be placed on BJ_Forget list for example by
+journal_forget() or by __dispose_buffer() - generally such buffer means
+that it has been freed by this transaction.
+
+Freed buffers should not be reallocated until the transaction has committed
+(that's why we have the assertion there) but they *can* be reallocated when
+the transaction has already been committed to disk and we are just
+processing the BJ_Forget list (as soon as we remove b_committed_data from
+the bitmap bh, ext3 will be able to reallocate buffers freed by the
+committing transaction).  So we have to also count with the case that the
+buffer has been reallocated and b_next_transaction has been already set.
+
+And one more subtle point: it can happen that we manage to reallocate the
+buffer and also mark it jbddirty.  Then we also add the freed buffer to the
+checkpoint list of the committing trasaction.  But that should do no harm.
+
+Non-jbddirty buffers should be filed to BJ_Reserved and not BJ_Metadata
+list.  It can actually happen that we refile such buffers during the commit
+phase when we reallocate in the running transaction blocks deleted in
+committing transaction (and that can happen if the committing transaction
+already wrote all the data and is just cleaning up BJ_Forget list).
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Acked-by: "Stephen C. Tweedie" <sct@redhat.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/fs/jbd/commit.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/commit.c
++++ linux-2.6.10/fs/jbd/commit.c
+@@ -792,11 +792,22 @@ restart_loop:
+ 			jbd_unlock_bh_state(bh);
+ 		} else {
+ 			J_ASSERT_BH(bh, !buffer_dirty(bh));
+-			J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
+-			__journal_unfile_buffer(jh);
+-			jbd_unlock_bh_state(bh);
+-			journal_remove_journal_head(bh);  /* needs a brelse */
+-			release_buffer_page(bh);
++			/* The buffer on BJ_Forget list and not jbddirty means
++			 * it has been freed by this transaction and hence it
++			 * could not have been reallocated until this
++			 * transaction has committed. *BUT* it could be
++			 * reallocated once we have written all the data to
++			 * disk and before we process the buffer on BJ_Forget
++			 * list. */
++			JBUFFER_TRACE(jh, "refile or unfile freed buffer");
++			__journal_refile_buffer(jh);
++			if (!jh->b_transaction) {
++				jbd_unlock_bh_state(bh);
++				 /* needs a brelse */
++				journal_remove_journal_head(bh);
++				release_buffer_page(bh);
++			} else
++				jbd_unlock_bh_state(bh);
+ 		}
+ 		cond_resched_lock(&journal->j_list_lock);
+ 	}
+Index: linux-2.6.10/fs/jbd/transaction.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/transaction.c
++++ linux-2.6.10/fs/jbd/transaction.c
+@@ -2044,7 +2044,8 @@ void __journal_refile_buffer(struct jour
+ 	__journal_temp_unlink_buffer(jh);
+ 	jh->b_transaction = jh->b_next_transaction;
+ 	jh->b_next_transaction = NULL;
+-	__journal_file_buffer(jh, jh->b_transaction, BJ_Metadata);
++	__journal_file_buffer(jh, jh->b_transaction,
++				was_dirty ? BJ_Metadata : BJ_Reserved);
+ 	J_ASSERT_JH(jh, jh->b_transaction->t_state == T_RUNNING);
+ 
+ 	if (was_dirty)
+Index: linux-2.6.10/mvl_patches/pro-1294.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1294.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1294);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

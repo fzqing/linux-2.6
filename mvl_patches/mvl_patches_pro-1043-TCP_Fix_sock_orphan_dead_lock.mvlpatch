@@ -1,0 +1,354 @@
+#! /usr/bin/env bash
+# Patch: -TCP_Fix_sock_orphan_dead_lock
+# Date: Tue Feb  6 08:14:04 2007
+# MR: 18658
+# 
+# commit 75c2d9077c63ac21488129cc23561d4f4fd0f5e5
+# Author: Herbert Xu <herbert@gondor.apana.org.au>
+# Date:   Wed May 3 23:31:35 2006 -0700
+# 
+#     [TCP]: Fix sock_orphan dead lock
+#     
+#     Calling sock_orphan inside bh_lock_sock in tcp_close can lead to dead
+#     locks.  For example, the inet_diag code holds sk_callback_lock without
+#     disabling BH.  If an inbound packet arrives during that admittedly tiny
+#     window, it will cause a dead lock on bh_lock_sock.  Another possible
+#     path would be through sock_wfree if the network device driver frees the
+#     tx skb in process context with BH enabled.
+#     
+#     We can fix this by moving sock_orphan out of bh_lock_sock.
+#     
+#     The tricky bit is to work out when we need to destroy the socket
+#     ourselves and when it has already been destroyed by someone else.
+#     
+#     By moving sock_orphan before the release_sock we can solve this
+#     problem.  This is because as long as we own the socket lock its
+#     state cannot change.
+#     
+#     So we simply record the socket state before the release_sock
+#     and then check the state again after we regain the socket lock.
+#     If the socket state has transitioned to TCP_CLOSE in the time being,
+#     we know that the socket has been destroyed.  Otherwise the socket is
+#     still ours to keep.
+#     
+#     Note that I've also moved the increment on the orphan count forward.
+#     This may look like a problem as we're increasing it even if the socket
+#     is just about to be destroyed where it'll be decreased again.  However,
+#     this simply enlarges a window that already exists.  This also changes
+#     the orphan count test by one.
+#     
+#     Considering what the orphan count is meant to do this is no big deal.
+#     
+#     This problem was discoverd by Ingo Molnar using his lock validator.
+#     
+#     Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+#     Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1043
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18658
+
+commit 75c2d9077c63ac21488129cc23561d4f4fd0f5e5
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Wed May 3 23:31:35 2006 -0700
+
+    [TCP]: Fix sock_orphan dead lock
+    
+    Calling sock_orphan inside bh_lock_sock in tcp_close can lead to dead
+    locks.  For example, the inet_diag code holds sk_callback_lock without
+    disabling BH.  If an inbound packet arrives during that admittedly tiny
+    window, it will cause a dead lock on bh_lock_sock.  Another possible
+    path would be through sock_wfree if the network device driver frees the
+    tx skb in process context with BH enabled.
+    
+    We can fix this by moving sock_orphan out of bh_lock_sock.
+    
+    The tricky bit is to work out when we need to destroy the socket
+    ourselves and when it has already been destroyed by someone else.
+    
+    By moving sock_orphan before the release_sock we can solve this
+    problem.  This is because as long as we own the socket lock its
+    state cannot change.
+    
+    So we simply record the socket state before the release_sock
+    and then check the state again after we regain the socket lock.
+    If the socket state has transitioned to TCP_CLOSE in the time being,
+    we know that the socket has been destroyed.  Otherwise the socket is
+    still ours to keep.
+    
+    Note that I've also moved the increment on the orphan count forward.
+    This may look like a problem as we're increasing it even if the socket
+    is just about to be destroyed where it'll be decreased again.  However,
+    this simply enlarges a window that already exists.  This also changes
+    the orphan count test by one.
+    
+    Considering what the orphan count is meant to do this is no big deal.
+    
+    This problem was discoverd by Ingo Molnar using his lock validator.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 87f68e7..e2b7b80 100644
+
+Index: linux-2.6.10/net/ipv4/tcp.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/tcp.c
++++ linux-2.6.10/net/ipv4/tcp.c
+@@ -1614,6 +1614,7 @@ void tcp_close(struct sock *sk, long tim
+ {
+ 	struct sk_buff *skb;
+ 	int data_was_unread = 0;
++	int state;
+ 
+ 	lock_sock(sk);
+ 	sk->sk_shutdown = SHUTDOWN_MASK;
+@@ -1690,6 +1691,11 @@ void tcp_close(struct sock *sk, long tim
+ 	sk_stream_wait_close(sk, timeout);
+ 
+ adjudge_to_death:
++	state = sk->sk_state;
++	sock_hold(sk);
++	sock_orphan(sk);
++	atomic_inc(&tcp_orphan_count);
++
+ 	/* It is the last release_sock in its life. It will remove backlog. */
+ 	release_sock(sk);
+ 
+@@ -1701,8 +1707,9 @@ adjudge_to_death:
+ 	bh_lock_sock(sk);
+ 	BUG_TRAP(!sock_owned_by_user(sk));
+ 
+-	sock_hold(sk);
+-	sock_orphan(sk);
++	/* Have we already been destroyed by a softirq or backlog? */
++	if (state != TCP_CLOSE && sk->sk_state == TCP_CLOSE)
++		goto out;
+ 
+ 	/*	This is a (useful) BSD violating of the RFC. There is a
+ 	 *	problem with TCP as specified in that the other end could
+@@ -1730,7 +1737,6 @@ adjudge_to_death:
+ 			if (tmo > TCP_TIMEWAIT_LEN) {
+ 				tcp_reset_keepalive_timer(sk, tcp_fin_time(tp));
+ 			} else {
+-				atomic_inc(&tcp_orphan_count);
+ 				tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);
+ 				goto out;
+ 			}
+@@ -1749,7 +1755,6 @@ adjudge_to_death:
+ 			NET_INC_STATS_BH(LINUX_MIB_TCPABORTONMEMORY);
+ 		}
+ 	}
+-	atomic_inc(&tcp_orphan_count);
+ 
+ 	if (sk->sk_state == TCP_CLOSE)
+ 		tcp_destroy_sock(sk);
+Index: linux-2.6.10/mvl_patches/pro-1043.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1043.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1043);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

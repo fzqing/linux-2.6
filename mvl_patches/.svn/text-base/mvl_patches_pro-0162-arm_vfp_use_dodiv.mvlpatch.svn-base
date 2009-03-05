@@ -1,0 +1,314 @@
+#! /usr/bin/env bash
+# Patch: -arm_vfp_use_dodiv
+# Date: Wed Dec 28 14:59:55 2005
+# [PATCH] ARM: Fix VFP to use do_div()
+# 
+# VFP used __divdi3 64-bit division needlessly.  Convert it to use
+# our 64-bit by 32-bit division instead.
+# 
+# Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+# 
+
+PATCHNUM=162
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+[PATCH] ARM: Fix VFP to use do_div()
+
+VFP used __divdi3 64-bit division needlessly.  Convert it to use
+our 64-bit by 32-bit division instead.
+
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+
+Index: linux-2.6.10/arch/arm/vfp/vfp.h
+===================================================================
+--- linux-2.6.10.orig/arch/arm/vfp/vfp.h
++++ linux-2.6.10/arch/arm/vfp/vfp.h
+@@ -117,7 +117,13 @@ static inline u64 vfp_estimate_div128to6
+ 	if (nh >= m)
+ 		return ~0ULL;
+ 	mh = m >> 32;
+-	z = (mh << 32 <= nh) ? 0xffffffff00000000ULL : (nh / mh) << 32;
++	if (mh << 32 <= nh) {
++		z = 0xffffffff00000000ULL;
++	} else {
++		z = nh;
++		do_div(z, mh);
++		z <<= 32;
++	}
+ 	mul64to128(&termh, &terml, m, z);
+ 	sub128(&remh, &reml, nh, nl, termh, terml);
+ 	ml = m << 32;
+@@ -126,7 +132,12 @@ static inline u64 vfp_estimate_div128to6
+ 		add128(&remh, &reml, remh, reml, mh, ml);
+ 	}
+ 	remh = (remh << 32) | (reml >> 32);
+-	z |= (mh << 32 <= remh) ? 0xffffffff : remh / mh;
++	if (mh << 32 <= remh) {
++		z |= 0xffffffff;
++	} else {
++		do_div(remh, mh);
++		z |= remh;
++	}
+ 	return z;
+ }
+ 
+Index: linux-2.6.10/arch/arm/vfp/vfpdouble.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/vfp/vfpdouble.c
++++ linux-2.6.10/arch/arm/vfp/vfpdouble.c
+@@ -32,6 +32,8 @@
+  */
+ #include <linux/kernel.h>
+ #include <linux/bitops.h>
++
++#include <asm/div64.h>
+ #include <asm/ptrace.h>
+ #include <asm/vfp.h>
+ 
+Index: linux-2.6.10/arch/arm/vfp/vfpsingle.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/vfp/vfpsingle.c
++++ linux-2.6.10/arch/arm/vfp/vfpsingle.c
+@@ -32,6 +32,8 @@
+  */
+ #include <linux/kernel.h>
+ #include <linux/bitops.h>
++
++#include <asm/div64.h>
+ #include <asm/ptrace.h>
+ #include <asm/vfp.h>
+ 
+@@ -303,7 +305,11 @@ u32 vfp_estimate_sqrt_significand(u32 ex
+ 		if (z <= a)
+ 			return (s32)a >> 1;
+ 	}
+-	return (u32)(((u64)a << 31) / z) + (z >> 1);
++	{
++		u64 v = (u64)a << 31;
++		do_div(v, z);
++		return v + (z >> 1);
++	}
+ }
+ 
+ static u32 vfp_single_fsqrt(int sd, int unused, s32 m, u32 fpscr)
+@@ -1107,7 +1113,11 @@ static u32 vfp_single_fdiv(int sd, int s
+ 		vsn.significand >>= 1;
+ 		vsd.exponent++;
+ 	}
+-	vsd.significand = ((u64)vsn.significand << 32) / vsm.significand;
++	{
++		u64 significand = (u64)vsn.significand << 32;
++		do_div(significand, vsm.significand);
++		vsd.significand = significand;
++	}
+ 	if ((vsd.significand & 0x3f) == 0)
+ 		vsd.significand |= ((u64)vsm.significand * vsd.significand != (u64)vsn.significand << 32);
+ 
+Index: linux-2.6.10/mvl_patches/pro-0162.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0162.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(162);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,447 @@
+#! /usr/bin/env bash
+# Patch: -common_ppc64_bootwrap_fix
+# Date: Tue Mar  6 15:49:29 2007
+# MR:20989
+# Source: Paul Mackerras <paulus@samba.org>
+# Type: Defect Fix
+# Disposition: local
+# 
+# 	The patch prevents using of 'ls' tool to generating image size
+# 	varilables. All image parameters taken from ELF header of booting
+# 	image.
+# 
+# 	The main idea and functionality taken from patch:
+# 
+# Commit: 94b212c29f685ca54b5689a8e89ac7671c43d651
+# Author: Paul Mackerras <paulus@samba.org> Wed, 16 Nov 2005 13:38:21 +1100
+# 
+#     powerpc: Move ppc64 boot wrapper code over to arch/powerpc
+# 
+#     This also extends the code to handle 32-bit ELF vmlinux files as well
+#     as 64-bit ones.  This is sufficient for booting on new-world 32-bit
+#     powermacs (i.e. all recent machines).
+# 
+#     Signed-off-by: Paul Mackerras <paulus@samba.org>
+# 
+
+PATCHNUM=1177
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR:20989
+Source: Paul Mackerras <paulus@samba.org>
+Type: Defect Fix
+Disposition: local
+
+	The patch prevents using of 'ls' tool to generating image size
+	varilables. All image parameters taken from ELF header of booting
+	image.
+
+	The main idea and functionality taken from patch:
+
+Commit: 94b212c29f685ca54b5689a8e89ac7671c43d651
+Author: Paul Mackerras <paulus@samba.org> Wed, 16 Nov 2005 13:38:21 +1100
+
+    powerpc: Move ppc64 boot wrapper code over to arch/powerpc
+
+    This also extends the code to handle 32-bit ELF vmlinux files as well
+    as 64-bit ones.  This is sufficient for booting on new-world 32-bit
+    powermacs (i.e. all recent machines).
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+Index: linux-2.6.10/arch/ppc64/boot/main.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc64/boot/main.c
++++ linux-2.6.10/arch/ppc64/boot/main.c
+@@ -48,8 +48,6 @@ extern char _vmlinux_start[];
+ extern char _vmlinux_end[];
+ extern char _initrd_start[];
+ extern char _initrd_end[];
+-extern unsigned long vmlinux_filesize;
+-extern unsigned long vmlinux_memsize;
+ 
+ struct addr_range {
+ 	unsigned long addr;
+@@ -97,12 +95,42 @@ static unsigned long try_claim(unsigned 
+ 	return addr;
+ }
+ 
++static unsigned long elfoffset;
++static char elfheader[256];
++
++static int is_elf64(void *hdr)
++{
++	Elf64_Ehdr *elf64 = hdr;
++	Elf64_Phdr *elf64ph;
++	unsigned int i;
++
++	if (!(elf64->e_ident[EI_MAG0]  == ELFMAG0	&&
++	      elf64->e_ident[EI_MAG1]  == ELFMAG1	&&
++	      elf64->e_ident[EI_MAG2]  == ELFMAG2	&&
++	      elf64->e_ident[EI_MAG3]  == ELFMAG3	&&
++	      elf64->e_ident[EI_CLASS] == ELFCLASS64	&&
++	      elf64->e_ident[EI_DATA]  == ELFDATA2MSB	&&
++	      elf64->e_type            == ET_EXEC	&&
++	      elf64->e_machine         == EM_PPC64))
++		return 0;
++
++	elf64ph = (Elf64_Phdr *)((unsigned long)elf64 +
++				 (unsigned long)elf64->e_phoff);
++	for (i = 0; i < (unsigned int)elf64->e_phnum; i++, elf64ph++)
++		if (elf64ph->p_type == PT_LOAD && elf64ph->p_offset != 0)
++			break;
++	if (i >= (unsigned int)elf64->e_phnum)
++		return 0;
++
++	elfoffset = (unsigned long)elf64ph->p_offset;
++	vmlinux.size = (unsigned long)elf64ph->p_filesz + elfoffset;
++	vmlinux.memsize = (unsigned long)elf64ph->p_memsz + elfoffset;
++	return 1;
++}
++
+ void start(unsigned long a1, unsigned long a2, void *promptr)
+ {
+-	unsigned long i;
+ 	kernel_entry_t kernel_entry;
+-	Elf64_Ehdr *elf64;
+-	Elf64_Phdr *elf64ph;
+ 	char *initrd_location;
+ 
+ 	prom = (int (*)(void *)) promptr;
+@@ -136,6 +164,9 @@ void start(unsigned long a1, unsigned lo
+ 		claim_base = PROG_START;
+ #endif
+ 
++	avail_ram = scratch;
++	begin_avail = avail_high = avail_ram;
++	end_avail = scratch + sizeof(scratch);
+ 	/*
+ 	 * Now we try to claim some memory for the kernel itself
+ 	 * our "vmlinux_memsize" is the memory footprint in RAM, _HOWEVER_, what
+@@ -144,17 +175,28 @@ void start(unsigned long a1, unsigned lo
+ 	 * size... In practice we add 1Mb, that is enough, but we should really
+ 	 * consider fixing the Makefile to put a _raw_ kernel in there !
+ 	 */
+-	vmlinux_memsize += ONE_MB;
+-	printf("Allocating 0x%lx bytes for kernel ...\n\r", vmlinux_memsize);
+-	vmlinux.addr = try_claim(vmlinux_memsize);
++	vmlinuz.addr = (unsigned long)_vmlinux_start;
++	vmlinuz.size = (unsigned long)(_vmlinux_end - _vmlinux_start);
++
++	/* gunzip the ELF header of the kernel */
++	if (*(unsigned short *)vmlinuz.addr == 0x1f8b) {
++		int len = vmlinuz.size;
++		gunzip(elfheader, sizeof(elfheader),
++				(unsigned char *)vmlinuz.addr, &len);
++	} else
++		memcpy(elfheader, (const void *)vmlinuz.addr, sizeof(elfheader));
++
++	if (!is_elf64(elfheader)) {
++		printf("Error: not a valid PPC64 ELF file!\n\r");
++		exit();
++	}
++
++	printf("Allocating 0x%lx bytes for kernel ...\n\r", vmlinux.memsize);
++	vmlinux.addr = try_claim(vmlinux.memsize);
+ 	if (vmlinux.addr == 0) {
+ 		printf("Can't allocate memory for kernel image !\n\r");
+ 		exit();
+ 	}
+-	vmlinuz.addr = (unsigned long)_vmlinux_start;
+-	vmlinuz.size = (unsigned long)(_vmlinux_end - _vmlinux_start);
+-	vmlinux.size = PAGE_ALIGN(vmlinux_filesize);
+-	vmlinux.memsize = vmlinux_memsize;
+ 
+ 	/*
+ 	 * Now we try to claim memory for the initrd (and copy it there)
+@@ -187,9 +229,6 @@ void start(unsigned long a1, unsigned lo
+ 	/* Eventually gunzip the kernel */
+ 	if (*(unsigned short *)vmlinuz.addr == 0x1f8b) {
+ 		int len;
+-		avail_ram = scratch;
+-		begin_avail = avail_high = avail_ram;
+-		end_avail = scratch + sizeof(scratch);
+ 		printf("gunzipping (0x%lx <- 0x%lx:0x%0lx)...",
+ 		       vmlinux.addr, vmlinuz.addr, vmlinuz.addr+vmlinuz.size);
+ 		len = vmlinuz.size;
+@@ -202,34 +241,11 @@ void start(unsigned long a1, unsigned lo
+ 		memmove((void *)vmlinux.addr,(void *)vmlinuz.addr,vmlinuz.size);
+ 	}
+ 
+-	/* Skip over the ELF header */
+-	elf64 = (Elf64_Ehdr *)vmlinux.addr;
+-	if ( elf64->e_ident[EI_MAG0]  != ELFMAG0	||
+-	     elf64->e_ident[EI_MAG1]  != ELFMAG1	||
+-	     elf64->e_ident[EI_MAG2]  != ELFMAG2	||
+-	     elf64->e_ident[EI_MAG3]  != ELFMAG3	||
+-	     elf64->e_ident[EI_CLASS] != ELFCLASS64	||
+-	     elf64->e_ident[EI_DATA]  != ELFDATA2MSB	||
+-	     elf64->e_type            != ET_EXEC	||
+-	     elf64->e_machine         != EM_PPC64 )
+-	{
+-		printf("Error: not a valid PPC64 ELF file!\n\r");
+-		exit();
+-	}
+-
+-	elf64ph = (Elf64_Phdr *)((unsigned long)elf64 +
+-				(unsigned long)elf64->e_phoff);
+-	for(i=0; i < (unsigned int)elf64->e_phnum ;i++,elf64ph++) {
+-		if (elf64ph->p_type == PT_LOAD && elf64ph->p_offset != 0)
+-			break;
+-	}
+ #ifdef DEBUG
+ 	printf("... skipping 0x%lx bytes of ELF header\n\r",
+-			(unsigned long)elf64ph->p_offset);
++			elfoffset);
+ #endif
+-	vmlinux.addr += (unsigned long)elf64ph->p_offset;
+-	vmlinux.size -= (unsigned long)elf64ph->p_offset;
+-
++	vmlinux.addr += elfoffset;
+ 	flush_cache((void *)vmlinux.addr, vmlinux.memsize);
+ 
+ 	if (a1)
+Index: linux-2.6.10/arch/ppc64/boot/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc64/boot/Makefile
++++ linux-2.6.10/arch/ppc64/boot/Makefile
+@@ -27,7 +27,7 @@ BOOTAFLAGS	:= -D__ASSEMBLY__ $(BOOTCFLAG
+ BOOTLFLAGS	:= -Ttext 0x00800000 -e _start -T $(srctree)/$(src)/zImage.lds
+ OBJCOPYFLAGS    := contents,alloc,load,readonly,data
+ 
+-src-boot := crt0.S string.S prom.c main.c zlib.c imagesize.c div64.S
++src-boot := crt0.S string.S prom.c main.c zlib.c div64.S
+ src-boot := $(addprefix $(obj)/, $(src-boot))
+ obj-boot := $(addsuffix .o, $(basename $(src-boot)))
+ 
+@@ -53,7 +53,7 @@ src-sec = $(foreach section, $(1), $(pat
+ gz-sec  = $(foreach section, $(1), $(patsubst %,$(obj)/kernel-%.gz, $(section)))
+ 
+ hostprogs-y		:= piggy addnote addRamDisk
+-targets 		+= zImage zImage.initrd imagesize.c \
++targets 		+= zImage zImage.initrd \
+ 			   $(patsubst $(obj)/%,%, $(call obj-sec, $(required) $(initrd))) \
+ 			   $(patsubst $(obj)/%,%, $(call src-sec, $(required) $(initrd))) \
+ 			   $(patsubst $(obj)/%,%, $(call gz-sec, $(required) $(initrd))) \
+@@ -102,15 +102,6 @@ $(obj)/zImage.initrd: obj-boot += $(call
+ $(obj)/zImage.initrd: $(call obj-sec, $(required) $(initrd)) $(obj-boot) $(obj)/addnote FORCE
+ 	$(call if_changed,addnote)
+ 
+-$(obj)/imagesize.c: vmlinux.strip
+-	@echo Generating $@
+-	ls -n vmlinux.strip | \
+-	awk '{printf "/* generated -- do not edit! */\n" \
+-		"unsigned long vmlinux_filesize = %d;\n", $$5}' > $(obj)/imagesize.c
+-	$(CROSS_COMPILE)nm -n vmlinux | tail -n 1 | \
+-	awk '{printf "unsigned long vmlinux_memsize = 0x%s;\n", substr($$1,8)}' \
+-		>> $(obj)/imagesize.c
+-
+ install: $(CONFIGURE) $(obj)/$(BOOTIMAGE)
+ 	sh -x $(srctree)/$(src)/install.sh "$(KERNELRELEASE)" "$(obj)/$(BOOTIMAGE)" "$(INSTALL_PATH)"
+ 
+Index: linux-2.6.10/mvl_patches/pro-1177.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1177.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1177);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

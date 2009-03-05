@@ -1,0 +1,942 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_touchscreen
+# Date: Fri Dec  7 11:53:20 2007
+# Source: Montavista 
+# MR: 23140
+# Type: Enhancement
+# Disposition: Montavista
+# Signed-off-by: Aleksey Makarov <amakarov@ru.mvista.com>
+# Description:
+#         adds support for the touchscreen controller
+# 	wm9713l found on PXA3xx Processor Developer Kiti (Zylonite)
+# 
+
+PATCHNUM=1454
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Montavista 
+MR: 23140
+Type: Enhancement
+Disposition: Montavista
+Signed-off-by: Aleksey Makarov <amakarov@ru.mvista.com>
+Description:
+        adds support for the touchscreen controller
+	wm9713l found on PXA3xx Processor Developer Kiti (Zylonite)
+
+Index: linux-2.6.10/drivers/input/touchscreen/mhn_audio_touch.c
+===================================================================
+--- linux-2.6.10.orig/drivers/input/touchscreen/mhn_audio_touch.c
++++ /dev/null
+@@ -1,373 +0,0 @@
+-/*
+- *  drivers/input/touchscreen/mhn_audio_touch.c.
+- *
+- *  Author:	bridge.wu@marvell.com
+- *  Created:	Nov 17, 2006
+- *  Copyright:	Marvell Corporation.
+- *
+- *  This program is free software; you can redistribute it and/or modify
+- *  it under the terms of the GNU General Public License version 2 as
+- *  published by the Free Software Foundation.
+- */
+-#include <linux/init.h>
+-#include <linux/module.h>
+-#include <linux/kernel.h>
+-#include <linux/device.h>
+-#include <linux/interrupt.h>
+-
+-#include <sound/driver.h>
+-#include <sound/core.h>
+-#include <sound/pcm.h>
+-#include <sound/initval.h>
+-
+-#include <asm/semaphore.h>
+-#include <asm/hardware.h>
+-#include <asm/arch/pxa-regs.h>
+-#include <linux/suspend.h>
+-#include <linux/spinlock.h>
+-
+-#include <asm/arch/codec/acodec.h>
+-#include <asm/arch/mhn_audio_plat.h>
+-
+-static p_zy_acocec_context_t p_zy_codec_ctxt = NULL;
+-
+-#include <linux/input.h>
+-#include <asm/arch/codec/wm9713.h>
+-#define PEN_DOWN 1
+-#define PEN_UP 0
+-typedef struct {
+-	unsigned int is_registered;	/* Is the driver AC97 registered */
+-	int adc_errs;			/* sample read back errors */
+-	spinlock_t lock;
+-	struct input_dev *idev;
+-	struct completion thread_init;
+-	struct completion thread_exit;
+-	struct task_struct *rtask;
+-	struct semaphore  sem;
+-	int (*cont_mode)(void);
+-	int  use_count;
+-	int restart;
+-} codec_zy_ts_t;
+-
+-static codec_zy_ts_t codec_zy_ts;
+-
+-static struct input_dev codec_zy_ts_input;
+-
+-#ifdef CONFIG_PM
+-static int touch_suspend = 0 ;
+-#endif
+-
+-
+-/*
+- * add a touch event
+- */
+-static int codec_zy_ts_evt_add(codec_zy_ts_t* ts, u16 pressure, u16 x, u16 y)
+-{
+-        /* add event and remove adc src bits */
+-        static u16 pre_press = 0;
+-        input_report_abs(ts->idev, ABS_X, x & 0xfff);
+-        input_report_abs(ts->idev, ABS_Y, y & 0xfff);
+-        if (pressure == pre_press)
+-                pressure--;
+-        pre_press = pressure;
+-        input_report_abs(ts->idev, ABS_PRESSURE, pressure & 0xfff);
+-        return 0;
+-}
+-
+-/*
+- * add a pen up event
+- */
+-static void codec_zy_ts_evt_release(codec_zy_ts_t* ts)
+-{
+-	input_report_abs(ts->idev, ABS_PRESSURE, 0);
+-}
+-
+-/*
+- * Kill the touchscreen thread and stop
+- * the touch digitiser.
+- */
+-static void codec_zy_ts_input_close(struct input_dev *idev)
+-{
+-	codec_zy_ts_t *ts = (codec_zy_ts_t *) &codec_zy_ts;
+-	dev_dbg(idev->dev, "close ts input!\n");
+-	spin_lock(&ts->lock);
+-	if (--ts->use_count == 0) {
+-		spin_unlock(&ts->lock);
+-		/* kill thread */
+-		init_completion(&ts->thread_exit);
+-		if (ts->rtask) {
+-			send_sig(SIGKILL, ts->rtask, 1);
+-			wait_for_completion(&ts->thread_exit);
+-		}
+-
+-		/* stop digitiser */
+-		zy_acodec_disable_touch(p_zy_codec_ctxt);
+-	} else
+-		spin_unlock(&ts->lock);
+-}
+-
+-/*
+- * Sample the touchscreen
+- */
+-int ac97_poll_touch(codec_zy_ts_t *ts)
+-{
+-	unsigned short x = 0, y = 0;
+-	int if_down = 0;
+-
+-	/* get x value */
+-	pr_debug("x:0x%x\n",x);
+-	if (ZY_ACODEC_SUCCESS != zy_acodec_get_adc_sample(p_zy_codec_ctxt, &x,
+-		ZY_TOUCH_SAMPLE_X, &if_down))
+-			return -EIO;
+-
+-	/* the pen is up */
+-	if (1 != if_down)
+-		return PEN_UP;
+-
+-	/* get y value */
+-	pr_debug("y:0x%x\n",y);
+-	if( ZY_ACODEC_SUCCESS != zy_acodec_get_adc_sample(p_zy_codec_ctxt, &y,
+-		ZY_TOUCH_SAMPLE_Y, &if_down))
+-			return -EIO;
+-
+-	/* the pen is up */
+-	if (1 != if_down)
+-		return PEN_UP;
+-	/*
+- 	 * the pen is down, can not get the pressure value,
+-	 * so if pen is down, give the max pressure value
+-	 */
+-	codec_zy_ts_evt_add(ts,0xfff, x, y);
+-	return PEN_DOWN;
+-}
+-
+-/*
+- * The touchscreen sample reader thread
+- */
+-static int codec_zy_ts_thread(void *_ts)
+-{
+-	codec_zy_ts_t *ts = (codec_zy_ts_t *)_ts;
+-	struct task_struct *tsk = current;
+-	int valid = 0;
+-	int pen_status = PEN_UP;
+-	ts->rtask = tsk;
+-
+-	/* set up thread context */
+-	daemonize("ktsd");
+-
+-	/* we will die when we receive SIGKILL */
+-	spin_lock_irq(&tsk->proc_lock);
+-	siginitsetinv(&tsk->blocked, sigmask(SIGKILL));
+-	recalc_sigpending();
+-	spin_unlock_irq(&tsk->proc_lock);
+-
+-	/* init is complete */
+-	complete(&ts->thread_init);
+-
+-	/* touch reader loop */
+-	for (;;) {
+-		ts->restart = 0;
+-		if(signal_pending(tsk))
+-			break;
+-
+-		/* get x_y value */
+-		pen_status = ac97_poll_touch(ts);
+-		if (PEN_DOWN == pen_status )
+-			valid = 1;
+-		else if (PEN_UP == pen_status && valid) {
+-			valid = 0;
+-			codec_zy_ts_evt_release(ts);
+-		}
+-
+-		set_task_state(tsk, TASK_INTERRUPTIBLE);
+-		if (HZ >= 100)
+-			schedule_timeout(HZ/100);
+-		else
+-			schedule_timeout(1);
+-#ifdef CONFIG_PM
+-		if(tsk->flags & PF_FREEZE){
+-			refrigerator();
+-		}
+-#endif
+-	}
+-
+-	ts->rtask = NULL;
+-	complete_and_exit(&ts->thread_exit, 0);
+-
+-	return 0;
+-}
+-
+-/*
+- * Start the touchscreen thread and
+- * the touch digitiser.
+- */
+-static int codec_zy_ts_input_open(struct input_dev *idev)
+-{
+-	codec_zy_ts_t *ts = (codec_zy_ts_t *) &codec_zy_ts;
+-	int ret;
+-#ifdef CONFIG_PM
+-	if(touch_suspend){
+-		printk(KERN_INFO "touch is suspended!\n");
+-		return -1;
+-	}
+-#endif
+-
+-	spin_lock(&ts->lock);
+-	if ( ts->use_count++ == 0 ) {
+-		spin_unlock( &ts->lock );
+-		/* start touchscreen thread */
+-		ts->idev = idev;
+-		init_completion(&ts->thread_init);
+-		ret = kernel_thread(codec_zy_ts_thread, ts, 0);
+-		if (ret >= 0)
+-			wait_for_completion(&ts->thread_init);
+-
+-		/* start digitiser */
+-		zy_acodec_enable_touch(p_zy_codec_ctxt);
+-
+-	} else
+-		spin_unlock( &ts->lock );
+-	return 0;
+-}
+-
+-/*
+- * initilze the pxa touch screen
+- */
+- static int alsa_ts_init( void )
+-{
+-	codec_zy_ts_t* ts = &codec_zy_ts;
+-
+-	memset(ts, 0, sizeof(codec_zy_ts_t));
+-
+-	/* tell input system what we events we accept and register */
+-	codec_zy_ts_input.name = "codec zy touchscreen";
+-	codec_zy_ts_input.open = codec_zy_ts_input_open;
+-	codec_zy_ts_input.close = codec_zy_ts_input_close;
+-	__set_bit(EV_ABS, codec_zy_ts_input.evbit);
+-	__set_bit(ABS_X, codec_zy_ts_input.absbit);
+-	__set_bit(ABS_Y, codec_zy_ts_input.absbit);
+-	__set_bit(ABS_PRESSURE, codec_zy_ts_input.absbit);
+-	input_register_device(&codec_zy_ts_input);
+-	spin_lock_init(&ts->lock);
+-	init_MUTEX(&ts->sem);
+-
+-	return 0;
+-}
+-
+-#ifdef CONFIG_PM
+-static int touch_codec_zy_suspend(struct device *_dev, pm_message_t state, u32 level)
+-{
+-	int ret=0;
+-	if(level == SUSPEND_DISABLE) {
+-		zy_acodec_suspend(p_zy_codec_ctxt);
+-		pxa_set_cken(CKEN_AC97, 0);
+-		pxa_set_cken(CKEN_SSP3, 0);
+-		printk(KERN_INFO "alsa touch suspend!\n");
+-	}
+-	touch_suspend = 1;
+-	return ret;
+-}
+-
+-static int touch_codec_zy_resume(struct device *_dev, u32 level)
+-{
+-	int ret = 0;
+-	if (level == RESUME_ENABLE){
+-		pxa_set_cken(CKEN_AC97, 1);
+-		zy_acodec_resume(p_zy_codec_ctxt);
+-		printk(KERN_INFO "alsa touch resume!\n");
+-	}
+-	touch_suspend = 0 ;
+-	return ret;
+-}
+-#else
+-#define touch_codec_zy_suspend	NULL
+-#define touch_codec_zy_resume	NULL
+-#endif
+-
+-static int __devinit touch_codec_zy_probe(struct device *dev)
+-{
+-	snd_card_t *card = NULL;
+-	int ret;
+-	zy_acodec_error_t status;
+-
+-	ret = alsa_prepare_for_zy(&p_zy_codec_ctxt);
+-	if (ret)
+-		goto err;
+-
+-	status = zy_acodec_init(p_zy_codec_ctxt, 1);
+-	if (ZY_ACODEC_SUCCESS != status) {
+-		ret = -EIO;
+-		goto err;
+-	}
+-	/* power down the units of the acodec, sleep the acodec, zy_acodec_init()
+-	 * will open all the units' power of the codec while ALSA need all the codec
+-	 * units power down and the codec should sleep if it can.
+-	 * So on the zylonite platform we call below function to power down and sleep
+-	 * wm9713 codec.
+-	 */
+-	p_zy_codec_ctxt->g_pfn_codec_specific_dinit(p_zy_codec_ctxt);
+-
+-	alsa_ts_init();
+-
+-	return 0;
+-err:
+-	if (p_zy_codec_ctxt) {
+-		zy_acodec_deinit(p_zy_codec_ctxt);
+-		pxa_set_cken(CKEN_AC97, 0);
+-		kfree(p_zy_codec_ctxt);
+-		p_zy_codec_ctxt = NULL;
+-	}
+-
+-	if (card)
+-		snd_card_free(card);
+-
+-	return ret;
+-}
+-
+-static int __devexit touch_codec_zy_remove(struct device *dev)
+-{
+-	snd_card_t *card = dev_get_drvdata(dev);
+-
+-	input_unregister_device(&codec_zy_ts_input);
+-
+-	if (p_zy_codec_ctxt) {
+-		alsa_zy_codec_put(p_zy_codec_ctxt);
+-		kfree(p_zy_codec_ctxt);
+-		p_zy_codec_ctxt = NULL;
+-	}
+-
+-	if (card) {
+-		snd_card_free(card);
+-		dev_set_drvdata(dev, NULL);
+-	}
+-
+-	return 0;
+-}
+-
+-static struct device_driver touch_codec_zy_driver = {
+-	.name 	= 	"pxa2xx-touch",
+-	.bus 	=	&platform_bus_type,
+-	.probe 	= 	touch_codec_zy_probe,
+-	.remove = 	__devexit_p(touch_codec_zy_remove),
+-	.suspend= 	touch_codec_zy_suspend,
+-	.resume = 	touch_codec_zy_resume,
+-};
+-
+-static int __init touch_codec_zy_init(void)
+-{
+-	return driver_register(&touch_codec_zy_driver);
+-}
+-
+-static void __exit touch_code_zy_exit(void)
+-{
+-	driver_unregister(&touch_codec_zy_driver);
+-}
+-module_init(touch_codec_zy_init);
+-module_exit(touch_code_zy_exit);
+-
+-EXPORT_SYMBOL(p_zy_codec_ctxt);
+-
+-MODULE_AUTHOR("bridge.wu@marvell.com");
+-MODULE_DESCRIPTION("zylonite audio touch codec driver on ALSA");
+-MODULE_LICENSE("GPL");
+-
+Index: linux-2.6.10/sound/arm/pxa3xx-wm9713l.c
+===================================================================
+--- linux-2.6.10.orig/sound/arm/pxa3xx-wm9713l.c
++++ linux-2.6.10/sound/arm/pxa3xx-wm9713l.c
+@@ -32,6 +32,15 @@
+ #define WM9713L_AUDIO_ADC_RATE                 0x32
+ #define WM9713L_POWER_DOWN_1                   0x3C
+ #define WM9713L_POWER_DOWN_2                   0x3E
++#define WM9713L_GPIO_PIN_CFG		       0x4C
++#define WM9713L_GPIO_PIN_STICKY		       0x50
++#define WM9713L_GPIO_PIN_WAKEUP		       0x52
++#define WM9713L_GPIO_PIN_STATUS		       0x54
++#define WM9713L_GPIO_PIN_SHARING	       0x56
++#define WM9713L_DIGITIZER_1_WM13               0x74
++#define WM9713L_DIGITIZER_2_WM13               0x76
++#define WM9713L_DIGITIZER_3_WM13               0x78
++#define WM9713L_DIGITIZER_READ_BACK	       0x7a
+ 
+ /*
+  * Vendor IDs (registers 0x7c, 0x7e)
+@@ -302,6 +311,49 @@ void pxa3xx_wm9713l_snd_resume(void)
+  * Touchscreen
+  */
+ 
++static unsigned short ts_get_sample_1(unsigned short reg)
++{
++        unsigned long wait;
++	unsigned short v;
++
++        pxa2xx_ac97_write(0, WM9713L_DIGITIZER_1_WM13, reg);
++
++        wait = 0;
++        do {
++                v = pxa2xx_ac97_read(0, WM9713L_DIGITIZER_1_WM13);
++                if ( !(v & 0x200 ) )
++                        break;
++        } while ( 100 > wait++ );
++
++        return pxa2xx_ac97_read(0, WM9713L_DIGITIZER_READ_BACK);
++}
++
++/*
++ * returns 0 if ok
++ *         1 if pen up
++ */
++int pxa3xx_wm9713l_ts_get_sample(unsigned short * x, unsigned short * y)
++{
++	*x = ts_get_sample_1(0x202);
++	if (!(*x & 0x8000))
++		return 1;
++	*x &= 0xfff;
++
++	*y = ts_get_sample_1(0x204);
++	if (!(*y & 0x8000))
++		return 1;
++	*y &= 0xfff;
++
++	return 0;
++}
++
++void pxa3xx_wm9713l_ts_irq_reset(void)
++{
++	unsigned short v;
++	v = pxa2xx_ac97_read(0, WM9713L_GPIO_PIN_STATUS);
++	pxa2xx_ac97_write(0, WM9713L_GPIO_PIN_STATUS, v & ~((1<<13)|(1<<2)));
++}
++
+ static void ts_pw_on(void)
+ {
+ 	pxa2xx_ac97_modify_register(0, WM9713L_POWER_DOWN_1, 0x8000, 0);
+@@ -322,6 +374,14 @@ int pxa3xx_wm9713l_ts_init(void)
+ 
+ 	ts_pw_on();
+ 
++	pxa2xx_ac97_write(0, WM9713L_DIGITIZER_3_WM13, 0xc008);
++
++	pxa2xx_ac97_modify_register(0, WM9713L_GPIO_PIN_CFG, 0x4, 0);
++	pxa2xx_ac97_modify_register(0, WM9713L_GPIO_PIN_SHARING, 0x4, 0);
++
++	pxa2xx_ac97_modify_register(0, WM9713L_GPIO_PIN_WAKEUP, 0, 0x2000);
++	pxa2xx_ac97_modify_register(0, WM9713L_GPIO_PIN_STICKY, 0, 0x2000);
++
+ 	return 0;
+ }
+ 
+@@ -342,4 +402,15 @@ void pxa3xx_wm9713l_ts_resume(void)
+ 	ts_pw_off();
+ }
+ 
++EXPORT_SYMBOL(pxa3xx_wm9713l_ts_resume);
++EXPORT_SYMBOL(pxa3xx_wm9713l_ts_suspend);
+ #endif
++
++EXPORT_SYMBOL(pxa3xx_wm9713l_ts_init);
++EXPORT_SYMBOL(pxa3xx_wm9713l_ts_exit);
++EXPORT_SYMBOL(pxa3xx_wm9713l_ts_irq_reset);
++EXPORT_SYMBOL(pxa3xx_wm9713l_ts_get_sample);
++
++
++
++
+Index: linux-2.6.10/drivers/input/touchscreen/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/input/touchscreen/Kconfig
++++ linux-2.6.10/drivers/input/touchscreen/Kconfig
+@@ -47,11 +47,10 @@ config TOUCHSCREEN_OMAP
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called omap_ts.
+ 
+-config SND_ZYLONITE_TOUCH
+-        bool "Monahans touch screen driver based on AC97"
+-        depends on SND && PXA3xx
++config TOUCHSCREEN_MHN
++        tristate "Monahans touchscreen driver (WM9713L)"
++	depends on INPUT && INPUT_TOUCHSCREEN && SND_PXA3xx_SND
+         default y
+-        select SND_ZYLONITE_CORE
+         help
+           Say Y to enable the touch screen on Monahans Platform Development Kit (Zylonite)
+ 
+Index: linux-2.6.10/include/asm-arm/arch-pxa/pxa3xx-wm9713l.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-pxa/pxa3xx-wm9713l.h
++++ linux-2.6.10/include/asm-arm/arch-pxa/pxa3xx-wm9713l.h
+@@ -38,6 +38,13 @@
+          int pxa3xx_wm9713l_ts_init(void);
+         void pxa3xx_wm9713l_ts_exit(void);
+ 
++	/*
++	 * returns 0 if ok
++	 *         1 if pen up
++	 */
++         int pxa3xx_wm9713l_ts_get_sample(unsigned short * x, unsigned short * y);
++        void pxa3xx_wm9713l_ts_irq_reset(void);
++
+ #ifdef CONFIG_PM
+         void pxa3xx_wm9713l_ts_suspend(void);
+         void pxa3xx_wm9713l_ts_resume(void);
+Index: linux-2.6.10/drivers/input/touchscreen/ts_mhn.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/touchscreen/ts_mhn.c
+@@ -0,0 +1,180 @@
++/*
++ *  drivers/input/touchscreen/ts_mhn.c.
++ *
++ *  Author:	amakarov@ru.mvista.com
++ *  Created:	Jul 16, 2007
++ *  Copyright:	MontaVista
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2 as
++ *  published by the Free Software Foundation.
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/workqueue.h>
++
++#include <asm/arch/zylonite.h>
++#include <asm/arch/mhn_gpio.h>
++
++#include <linux/input.h>
++#include <asm/arch/pxa3xx-wm9713l.h>
++
++static struct input_dev ts_input_dev;
++
++#define TS_IRQ (IRQ_GPIO(MFP2GPIO(MFP_AC97_INT_N_GPIO)))
++
++#define TS_PERIOD (HZ/100) /* 10 ms */
++
++static struct work_struct ts_workqueue;
++
++static void ts_workqueue_func(void * arg)
++{
++
++	unsigned short x;
++	unsigned short y;
++
++	if (pxa3xx_wm9713l_ts_get_sample(&x, &y)) {
++
++		/* pen up */
++
++		input_report_abs(&ts_input_dev, BTN_TOUCH, 0);
++		input_report_abs(&ts_input_dev, ABS_PRESSURE, 0);
++		input_sync(&ts_input_dev);
++
++		enable_irq(TS_IRQ);
++		pxa3xx_wm9713l_ts_irq_reset();
++
++	} else {
++
++		/* pen down */
++
++		input_report_abs(&ts_input_dev, BTN_TOUCH, 1);
++		input_report_abs(&ts_input_dev, ABS_X, x);
++		input_report_abs(&ts_input_dev, ABS_Y, y);
++		input_report_abs(&ts_input_dev, ABS_PRESSURE, 100);
++		input_sync(&ts_input_dev);
++
++		schedule_delayed_work(&ts_workqueue, TS_PERIOD);
++	}
++}
++
++static irqreturn_t ts_irq(int irq, void *dev, struct pt_regs *regs)
++{
++	disable_irq(TS_IRQ);
++	schedule_work(&ts_workqueue);
++
++	return IRQ_HANDLED;
++}
++
++static int __devinit ts_probe(struct device *dev)
++{
++	int err;
++
++	init_input_dev(&ts_input_dev);
++
++	ts_input_dev.evbit[0] = BIT(EV_ABS);
++	ts_input_dev.absbit[0] = BIT(ABS_X) | BIT(ABS_Y) | BIT(ABS_PRESSURE);
++	ts_input_dev.keybit[LONG(BTN_TOUCH)] = BIT(BTN_TOUCH);
++
++	ts_input_dev.absmin[ABS_X] = 0;
++	ts_input_dev.absmin[ABS_Y] = 0;
++	ts_input_dev.absmin[ABS_PRESSURE] = 0;
++	ts_input_dev.absmax[ABS_X] = 0xfff;
++	ts_input_dev.absmax[ABS_Y] = 0xfff;
++	ts_input_dev.absmax[ABS_PRESSURE] = 100;
++
++	ts_input_dev.name = "zylonite touchscreen";
++	ts_input_dev.phys = "input0";
++
++	input_register_device(&ts_input_dev);
++
++	mhn_mfp_set_afds(MFP_AC97_INT_N_GPIO,0,0);
++	mhn_gpio_set_direction(MFP_AC97_INT_N_GPIO, GPIO_DIR_IN);
++
++	mhn_gpio_clear_edge_detect_status(MFP_AC97_INT_N_GPIO);
++	set_irq_type(TS_IRQ, IRQT_RISING);
++
++	err = pxa3xx_wm9713l_ts_init();
++	if (err) {
++		input_unregister_device(&ts_input_dev);
++		return err;
++	}
++
++	pxa3xx_wm9713l_ts_irq_reset();
++
++	err = request_irq(TS_IRQ, ts_irq, 0, "touchscreen", NULL);
++	if (err) {
++		pxa3xx_wm9713l_ts_exit();
++		input_unregister_device(&ts_input_dev);
++		return err;
++	}
++
++	input_report_abs(&ts_input_dev, BTN_TOUCH, 0);
++	input_sync(&ts_input_dev);
++
++	return 0;
++}
++
++static int __devexit ts_remove(struct device *dev)
++{
++	free_irq(IRQ_GPIO(MFP2GPIO(MFP_AC97_INT_N_GPIO)), NULL);
++	pxa3xx_wm9713l_ts_exit();
++        cancel_delayed_work(&ts_workqueue);
++        flush_scheduled_work();
++	input_unregister_device(&ts_input_dev);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int ts_suspend(struct device *_dev, u32 state, u32 level)
++{
++	if (level == SUSPEND_DISABLE)
++		pxa3xx_wm9713l_ts_suspend();
++
++	return 0;
++}
++
++static int ts_resume(struct device *_dev, u32 level)
++{
++	if (level == RESUME_ENABLE)
++		pxa3xx_wm9713l_ts_resume();
++
++	return 0;
++}
++#else
++#define ts_suspend	NULL
++#define ts_resume	NULL
++#endif
++
++static struct device_driver ts_driver = {
++	.name	=	"pxa2xx-touch",
++	.bus	=	&platform_bus_type,
++	.probe	=	ts_probe,
++	.remove =	__devexit_p(ts_remove),
++	.suspend=	ts_suspend,
++	.resume =	ts_resume,
++};
++
++static int __init ts_init(void)
++{
++	INIT_WORK(&ts_workqueue, ts_workqueue_func, NULL);
++	return driver_register(&ts_driver);
++}
++
++static void __exit ts_exit(void)
++{
++	driver_unregister(&ts_driver);
++}
++
++module_init(ts_init);
++module_exit(ts_exit);
++
++MODULE_AUTHOR("amakarov@ru.mvista.com");
++MODULE_DESCRIPTION("Driver for touchscreen Zylonite Dev Board (wm9713l)");
++MODULE_LICENSE("GPL");
++
+Index: linux-2.6.10/drivers/input/touchscreen/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/input/touchscreen/Makefile
++++ linux-2.6.10/drivers/input/touchscreen/Makefile
+@@ -7,4 +7,4 @@
+ obj-$(CONFIG_TOUCHSCREEN_BITSY)	+= h3600_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_GUNZE)	+= gunze.o
+ obj-$(CONFIG_TOUCHSCREEN_OMAP)	+= omap/
+-obj-$(CONFIG_SND_ZYLONITE_TOUCH) += mhn_audio_touch.o
++obj-$(CONFIG_TOUCHSCREEN_MHN)   += ts_mhn.o
+Index: linux-2.6.10/mvl_patches/pro-1454.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1454.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1454);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

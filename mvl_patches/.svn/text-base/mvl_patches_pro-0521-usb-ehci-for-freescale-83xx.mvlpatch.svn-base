@@ -1,0 +1,915 @@
+#! /usr/bin/env bash
+# Patch: -usb-ehci-for-freescale-83xx
+# Date: Fri Apr 28 12:35:35 2006
+# Adding a Host Mode USB driver for the Freescale 83xx.
+# 
+# This driver supports both the Dual-Role (DR) controller and the
+# Multi-Port-Host (MPH) controller present in the Freescale MPC8349. It has
+# been tested with the MPC8349CDS reference system. This driver depends on
+# platform support code for setting up the pins on the device package in a
+# manner appropriate for the board in use. Note that this patch requires
+# selecting the EHCI controller option under the USB Host menu.
+# 
+# Signed-off-by: Randy Vinson <rvinson@mvista.com>
+# Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+# 
+#  drivers/usb/host/Kconfig      |    3 
+#  drivers/usb/host/ehci-fsl.c   |  466 ++++++++++++++++++++++++++++++++++++++++++
+#  drivers/usb/host/ehci-fsl.h   |   37 +++
+#  drivers/usb/host/ehci-hcd.c   |   29 ++
+#  drivers/usb/host/ehci-sched.c |    8 
+#  include/linux/fsl_devices.h   |   27 ++
+#  6 files changed, 565 insertions(+), 5 deletions(-)
+# 
+
+PATCHNUM=521
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Adding a Host Mode USB driver for the Freescale 83xx.
+
+This driver supports both the Dual-Role (DR) controller and the
+Multi-Port-Host (MPH) controller present in the Freescale MPC8349. It has
+been tested with the MPC8349CDS reference system. This driver depends on
+platform support code for setting up the pins on the device package in a
+manner appropriate for the board in use. Note that this patch requires
+selecting the EHCI controller option under the USB Host menu.
+
+Signed-off-by: Randy Vinson <rvinson@mvista.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+ drivers/usb/host/Kconfig      |    3 
+ drivers/usb/host/ehci-fsl.c   |  466 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/ehci-fsl.h   |   37 +++
+ drivers/usb/host/ehci-hcd.c   |   29 ++
+ drivers/usb/host/ehci-sched.c |    8 
+ include/linux/fsl_devices.h   |   27 ++
+ mvl_patches/pro-0521.c        |   16 +
+ 7 files changed, 581 insertions(+), 5 deletions(-)
+
+Index: linux-2.6.10/drivers/usb/host/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/host/Kconfig
++++ linux-2.6.10/drivers/usb/host/Kconfig
+@@ -5,6 +5,7 @@ config USB_ARCH_HAS_HCD
+ 	boolean
+ 	default y if USB_ARCH_HAS_OHCI
+ 	default y if ARM				# SL-811
++	default y if 83xx
+ 	default PCI
+ 
+ # many non-PCI SOC chips embed OHCI
+@@ -32,7 +33,7 @@ comment "USB Host Controller Drivers"
+ 
+ config USB_EHCI_HCD
+ 	tristate "EHCI HCD (USB 2.0) support"
+-	depends on USB && PCI
++	depends on USB && (PCI || 83xx)
+ 	---help---
+ 	  The Enhanced Host Controller Interface (EHCI) is standard for USB 2.0
+ 	  "high speed" (480 Mbit/sec, 60 Mbyte/sec) host controller hardware.
+Index: linux-2.6.10/drivers/usb/host/ehci-fsl.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/host/ehci-fsl.c
+@@ -0,0 +1,466 @@
++/*
++ * (C) Copyright David Brownell 2000-2002
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/device.h>
++#include <linux/fsl_devices.h>
++
++#include "ehci-fsl.h"
++
++/* FIXME: Power Managment is un-ported so temporarily disable it */
++#undef CONFIG_PM
++
++void usb_hcd_fsl_remove (struct platform_device *pdev);
++
++/* PCI-based HCs are normal, but custom bus glue should be ok */
++
++
++/*-------------------------------------------------------------------------*/
++
++/* configure so an HC device and id are always provided */
++/* always called with process context; sleeping is OK */
++
++/**
++ * usb_hcd_pci_probe - initialize FSL-based HCDs
++ * @dev: USB Host Controller being probed
++ * @id: pci hotplug id connecting controller to HCD framework
++ * Context: !in_interrupt()
++ *
++ * Allocates basic resources for this USB host controller, and
++ * then invokes the start() method for the HCD associated with it
++ * through the hotplug entry's driver_data.
++ *
++ * Store this function in the HCD's struct pci_driver as probe().
++ */
++int usb_hcd_fsl_probe(struct hc_driver *driver, struct platform_device *pdev)
++{
++	struct fsl_usb2_platform_data *pdata;
++	struct usb_hcd *hcd;
++	struct resource	*res;
++	int irq;
++	unsigned long		resource, len;
++	void __iomem		*base;
++	int			retval;
++	char			buf [8], *bufp = buf;
++	unsigned int temp;
++
++	pr_debug("initializing FSL-SOC USB Controller\n");
++
++	/* Need platform data for setup */
++	pdata = (struct fsl_usb2_platform_data *)pdev->dev.platform_data;
++	if (!pdata) {
++		dev_err(&pdev->dev,
++			"No platform data for %s.\n", pdev->dev.bus_id);
++		return -ENODEV;
++	}
++
++	/*
++	 * This is a host mode driver, verify that we're supposed to be
++	 * in host mode.
++	 */
++	if (!((pdata->operating_mode == FSL_USB2_DR_HOST) ||
++	      (pdata->operating_mode == FSL_USB2_MPH_HOST))) {
++		dev_err(&pdev->dev,
++			"Non Host Mode configured for %s. Wrong driver linked.\n",
++			pdev->dev.bus_id);
++		return -ENODEV;
++	}
++
++	/* Get the IRQ from platform data */
++	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	if (!res) {
++		dev_err(&pdev->dev,
++			"Found HC with no IRQ. Check %s setup!\n",
++			pdev->dev.bus_id);
++		return -ENODEV;
++	}
++	irq = res->start;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(&pdev->dev,
++			"Found HC with no register addr. Check %s setup!\n",
++			pdev->dev.bus_id);
++		return -ENODEV;
++	}
++	resource = res->start;
++	len = res->end - res->start + 1;
++	if (!request_mem_region (resource, len, driver->description)) {
++		dev_dbg (&pdev->dev, "controller already in use\n");
++		retval = -EBUSY;
++		goto done;
++	}
++	base = ioremap_nocache (resource, len);
++	if (base == NULL) {
++		dev_dbg (&pdev->dev, "error mapping memory\n");
++		retval = -EFAULT;
++clean_1:
++		release_mem_region (resource, len);
++		dev_err (&pdev->dev, "init %s fail, %d\n",
++				pdev->dev.bus_id, retval);
++		goto done;
++	}
++
++	hcd = driver->hcd_alloc ();
++	if (hcd == NULL){
++		dev_dbg (&pdev->dev, "hcd alloc fail\n");
++		retval = -ENOMEM;
++clean_2:
++		iounmap (base);
++		goto clean_1;
++	}
++	// hcd zeroed everything
++	hcd->regs = base;
++
++	/* Enable USB controller */
++	temp = in_be32(hcd->regs + 0x500);
++	out_be32(hcd->regs + 0x500, temp | 0x4);
++
++	/* Set to Host mode */
++	temp = in_le32(hcd->regs + 0x1a8);
++	out_le32(hcd->regs + 0x1a8, temp | 0x3);
++
++
++	dev_set_drvdata(&pdev->dev, hcd);
++	hcd->driver = driver;
++	hcd->description = driver->description;
++	hcd->self.bus_name = pdev->dev.bus_id;
++	hcd->product_desc = "FSL USB Host Controller";
++	hcd->self.controller = &pdev->dev;
++
++	if ((retval = hcd_buffer_create (hcd)) != 0) {
++clean_3:
++		kfree (hcd);
++		goto clean_2;
++	}
++
++	dev_info (hcd->self.controller, "%s\n", hcd->product_desc);
++
++	/* till now HC has been in an indeterminate state ... */
++	if (driver->reset && (retval = driver->reset (hcd)) < 0) {
++		dev_err (hcd->self.controller, "can't reset\n");
++		goto clean_3;
++	}
++	hcd->state = USB_STATE_HALT;
++
++	sprintf (buf, "%d", irq);
++	retval = request_irq (irq, usb_hcd_irq, SA_SHIRQ,
++				hcd->description, hcd);
++	if (retval != 0) {
++		dev_err (hcd->self.controller,
++				"request interrupt %s failed\n", bufp);
++		goto clean_3;
++	}
++	hcd->irq = irq;
++
++	dev_info (hcd->self.controller, "irq %s, %s 0x%lx\n", bufp,
++		(driver->flags & HCD_MEMORY) ? "pci mem" : "io base",
++		resource);
++
++	usb_bus_init (&hcd->self);
++	hcd->self.op = &usb_hcd_operations;
++	hcd->self.release = &usb_hcd_release;
++	hcd->self.hcpriv = (void *) hcd;
++	init_timer (&hcd->rh_timer);
++
++	INIT_LIST_HEAD (&hcd->dev_list);
++
++	usb_register_bus (&hcd->self);
++
++	if ((retval = driver->start (hcd)) < 0) {
++		dev_err (hcd->self.controller, "init error %d\n", retval);
++		usb_hcd_fsl_remove (pdev);
++	}
++
++done:
++	return retval;
++}
++EXPORT_SYMBOL (usb_hcd_fsl_probe);
++
++
++/* may be called without controller electrically present */
++/* may be called with controller, bus, and devices active */
++
++/**
++ * usb_hcd_fsl_remove - shutdown processing for FSL-based HCDs
++ * @dev: USB Host Controller being removed
++ * Context: !in_interrupt()
++ *
++ * Reverses the effect of usb_hcd_pci_probe(), first invoking
++ * the HCD's stop() method.  It is always called from a thread
++ * context, normally "rmmod", "apmd", or something similar.
++ *
++ * Store this function in the HCD's struct pci_driver as remove().
++ */
++void usb_hcd_fsl_remove (struct platform_device *pdev)
++{
++	struct usb_hcd		*hcd;
++	struct fsl_usb2_platform_data *pdata;
++	struct resource *res;
++
++	pdata = (struct fsl_usb2_platform_data *)pdev->dev.platform_data;
++
++	hcd = dev_get_drvdata(&pdev->dev);
++	if (!hcd)
++		return;
++	dev_info (hcd->self.controller, "remove, state %x\n", hcd->state);
++
++	if (in_interrupt ())
++		BUG ();
++
++	if (HCD_IS_RUNNING (hcd->state))
++		hcd->state = USB_STATE_QUIESCING;
++
++	dev_dbg (hcd->self.controller, "roothub graceful disconnect\n");
++	usb_disconnect (&hcd->self.root_hub);
++
++	hcd->driver->stop (hcd);
++	hcd_buffer_destroy (hcd);
++	hcd->state = USB_STATE_HALT;
++	dev_set_drvdata(&pdev->dev, NULL);
++
++	free_irq (hcd->irq, hcd);
++	iounmap (hcd->regs);
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	release_mem_region (res->start, res->end - res->start + 1);
++
++	usb_deregister_bus (&hcd->self);
++
++}
++EXPORT_SYMBOL (usb_hcd_fsl_remove);
++
++static void mpc83xx_setup_phy(struct ehci_hcd *ehci,
++			      enum fsl_usb2_phy_modes phy_mode,
++			      unsigned int port_offset)
++{
++	u32 portsc = readl(&ehci->regs->port_status[port_offset]);
++	portsc &= ~PORT_PTS_MSK;
++	switch (phy_mode) {
++	case FSL_USB2_PHY_ULPI:
++		portsc |= PORT_PTS_ULPI;
++		break;
++	case FSL_USB2_PHY_SERIAL:
++		portsc |= PORT_PTS_SERIAL;
++		break;
++	case FSL_USB2_PHY_UTMI_WIDE:
++		portsc |= PORT_PTS_PTW;
++		/* fall through */
++	case FSL_USB2_PHY_UTMI:
++		portsc |= PORT_PTS_UTMI;
++		break;
++	case FSL_USB2_PHY_NONE:
++		break;
++	}
++	writel(portsc, &ehci->regs->port_status[port_offset]);
++}
++
++static void mpc83xx_usb_setup(struct usb_hcd *hcd)
++{
++	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
++	struct fsl_usb2_platform_data *pdata;
++	void __iomem *non_ehci = hcd->regs;
++
++	pdata =
++	    (struct fsl_usb2_platform_data *)hcd->self.controller->
++	    platform_data;
++	/* Enable PHY interface in the control reg. */
++	out_be32(non_ehci + FSL_SOC_USB_CTRL, 0x00000004);
++	out_be32(non_ehci + FSL_SOC_USB_SNOOP1, 0x0000001b);
++
++	if (pdata->operating_mode == FSL_USB2_DR_HOST)
++		mpc83xx_setup_phy(ehci, pdata->phy_mode, 0);
++
++	if (pdata->operating_mode == FSL_USB2_MPH_HOST) {
++		if (pdata->port_enables & FSL_USB2_PORT0_ENABLED)
++			mpc83xx_setup_phy(ehci, pdata->phy_mode, 0);
++		if (pdata->port_enables & FSL_USB2_PORT1_ENABLED)
++			mpc83xx_setup_phy(ehci, pdata->phy_mode, 1);
++	}
++
++	/* put controller in host mode. */
++	writel(0x00000003, non_ehci + FSL_SOC_USB_USBMODE);
++	out_be32(non_ehci + FSL_SOC_USB_PRICTRL, 0x0000000c);
++	out_be32(non_ehci + FSL_SOC_USB_AGECNTTHRSH, 0x00000040);
++	out_be32(non_ehci + FSL_SOC_USB_SICTRL, 0x00000001);
++}
++
++/* called after powerup, by probe or system-pm "wakeup" */
++static int ehci_fsl_reinit(struct usb_hcd *hcd)
++{
++	mpc83xx_usb_setup(hcd);
++	ehci_port_power(hcd_to_ehci(hcd), 0);
++
++	return 0;
++}
++/* called by khubd or root hub init threads */
++static int ehci_fsl_reset (struct usb_hcd *hcd)
++{
++	int retval;
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++
++	spin_lock_init (&ehci->lock);
++
++	/* EHCI registers start at offset 0x100 */
++	ehci->caps = hcd->regs + 0x100;
++	ehci->regs = hcd->regs + 0x100 +
++	    HC_LENGTH(readl(&ehci->caps->hc_capbase));
++	dbg_hcs_params (ehci, "reset");
++	dbg_hcc_params (ehci, "reset");
++
++	/* cache this readonly data; minimize PCI reads */
++	ehci->hcs_params = readl (&ehci->caps->hcs_params);
++
++	retval =  ehci_halt(ehci);
++	if (retval)
++		return retval;
++
++	ehci->is_arc_rh_tt = 1;
++
++	if (ehci_is_ARC(ehci))
++		ehci_reset(ehci);
++
++	ehci->sbrn = 0x20;
++
++	retval = ehci_fsl_reinit(ehci);
++
++	return retval;
++}
++
++static int ehci_fsl_start (struct usb_hcd *hcd)
++{
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++
++
++	return ehci_run (hcd);
++
++}
++/* always called by thread; normally rmmod */
++
++static void ehci_fsl_stop (struct usb_hcd *hcd)
++{
++	ehci_stop (hcd);
++}
++
++/*-------------------------------------------------------------------------*/
++
++static struct hc_driver ehci_fsl_hc_driver = {
++	.description =		hcd_name,
++
++	/*
++	 * generic hardware linkage
++	 */
++	.irq =			ehci_irq,
++	.flags =		HCD_USB2,
++
++	/*
++	 * basic lifecycle operations
++	 */
++	.reset =		ehci_fsl_reset,
++	.start =		ehci_fsl_start,
++#ifdef	CONFIG_PM
++	.suspend =		ehci_bus_suspend,
++	.resume =		ehci_bus_resume,
++#endif
++	.stop =			ehci_fsl_stop,
++
++#if 1
++	/*
++	 * memory lifecycle (except per-request)
++	 */
++	.hcd_alloc =		ehci_hcd_alloc,
++#endif
++
++	/*
++	 * managing i/o requests and associated device resources
++	 */
++	.urb_enqueue =		ehci_urb_enqueue,
++	.urb_dequeue =		ehci_urb_dequeue,
++	.endpoint_disable =	ehci_endpoint_disable,
++
++	/*
++	 * scheduling support
++	 */
++	.get_frame_number =	ehci_get_frame,
++
++	/*
++	 * root hub support
++	 */
++	.hub_status_data =	ehci_hub_status_data,
++	.hub_control =		ehci_hub_control,
++	.hub_suspend =		ehci_hub_suspend,
++	.hub_resume =		ehci_hub_resume,
++};
++
++/*-------------------------------------------------------------------------*/
++
++static int ehci_fsl_drv_probe(struct device *device)
++{
++	struct platform_device *pdev = to_platform_device(device);
++
++	if (usb_disabled())
++		return -ENODEV;
++
++	return usb_hcd_fsl_probe(&ehci_fsl_hc_driver, pdev);
++}
++
++static int ehci_fsl_drv_remove(struct device *device)
++{
++	struct platform_device *pdev = to_platform_device(device);
++
++	usb_hcd_fsl_remove(pdev);
++
++	return 0;
++}
++
++static struct device_driver ehci_fsl_dr_driver = {
++	.name = "fsl-usb2-dr",
++	.bus = &platform_bus_type,
++	.probe = ehci_fsl_drv_probe,
++	.remove = ehci_fsl_drv_remove,
++};
++
++static struct device_driver ehci_fsl_mph_driver = {
++	.name = "fsl-usb2-mph",
++	.bus = &platform_bus_type,
++	.probe = ehci_fsl_drv_probe,
++	.remove = ehci_fsl_drv_remove,
++};
++
++static int __init ehci_fsl_init(void)
++{
++	int retval;
++
++	pr_debug("%s: block sizes: qh %Zd qtd %Zd itd %Zd sitd %Zd\n",
++		 hcd_name,
++		 sizeof(struct ehci_qh), sizeof(struct ehci_qtd),
++		 sizeof(struct ehci_itd), sizeof(struct ehci_sitd));
++
++	retval = driver_register(&ehci_fsl_dr_driver);
++	if (retval)
++		return retval;
++
++	return driver_register(&ehci_fsl_mph_driver);
++}
++
++static void __exit ehci_fsl_cleanup(void)
++{
++	driver_unregister(&ehci_fsl_mph_driver);
++	driver_unregister(&ehci_fsl_dr_driver);
++}
++
++module_init(ehci_fsl_init);
++module_exit(ehci_fsl_cleanup);
+Index: linux-2.6.10/drivers/usb/host/ehci-fsl.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/host/ehci-fsl.h
+@@ -0,0 +1,37 @@
++/* Copyright (c) 2005 freescale semiconductor
++ * Copyright (c) 2005 MontaVista Software
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the  GNU General Public License along
++ * with this program; if not, write  to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++#ifndef _EHCI_FSL_H
++#define _EHCI_FSL_H
++
++/* offsets for the non-ehci registers in the FSL SOC USB controller */
++#define FSL_SOC_USB_ULPIVP	0x170
++#define FSL_SOC_USB_PORTSC1	0x184
++#define PORT_PTS_MSK		(3<<30)
++#define PORT_PTS_UTMI		(0<<30)
++#define PORT_PTS_ULPI		(2<<30)
++#define	PORT_PTS_SERIAL		(3<<30)
++#define PORT_PTS_PTW		(1<<28)
++#define FSL_SOC_USB_PORTSC2	0x188
++#define FSL_SOC_USB_USBMODE	0x1a8
++#define FSL_SOC_USB_SNOOP1	0x400	/* NOTE: big-endian */
++#define FSL_SOC_USB_SNOOP2	0x404	/* NOTE: big-endian */
++#define FSL_SOC_USB_AGECNTTHRSH	0x408	/* NOTE: big-endian */
++#define FSL_SOC_USB_SICTRL	0x40c	/* NOTE: big-endian */
++#define FSL_SOC_USB_PRICTRL	0x410	/* NOTE: big-endian */
++#define FSL_SOC_USB_CTRL	0x500	/* NOTE: big-endian */
++#endif				/* _EHCI_FSL_H */
+Index: linux-2.6.10/drivers/usb/host/ehci-hcd.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/host/ehci-hcd.c
++++ linux-2.6.10/drivers/usb/host/ehci-hcd.c
+@@ -189,9 +189,20 @@ static int ehci_halt (struct ehci_hcd *e
+ 	return handshake (&ehci->regs->status, STS_HALT, STS_HALT, 16 * 125);
+ }
+ 
++static void arc_reset (struct ehci_hcd *ehci)
++{
++	u32 __iomem	*reg_ptr;
++	u32		tmp;
++
++	reg_ptr = (u32 __iomem *)(((u8 __iomem *)ehci->regs) + 0x68);
++	tmp = readl (reg_ptr);
++	tmp |= 0x3;
++	writel (tmp, reg_ptr);
++}
+ /* reset a non-running (STS_HALT == 1) controller */
+ static int ehci_reset (struct ehci_hcd *ehci)
+ {
++	int	retval;
+ 	u32	command = readl (&ehci->regs->command);
+ 
+ 	command |= CMD_RESET;
+@@ -199,7 +210,15 @@ static int ehci_reset (struct ehci_hcd *
+ 	writel (command, &ehci->regs->command);
+ 	ehci->hcd.state = USB_STATE_HALT;
+ 	ehci->next_statechange = jiffies;
+-	return handshake (&ehci->regs->command, CMD_RESET, 0, 250 * 1000);
++	retval = handshake (&ehci->regs->command, CMD_RESET, 0, 250 * 1000);
++
++	if (retval)
++		return retval;
++
++	if (ehci_is_ARC(ehci))
++		arc_reset (ehci);
++
++	return retval;
+ }
+ 
+ /* idle the controller (from running) */
+@@ -879,7 +898,13 @@ MODULE_LICENSE ("GPL");
+ #include "ehci-pci.c"
+ #endif
+ 
+-#if !defined(CONFIG_PCI)
++#ifdef CONFIG_83xx
++#include "ehci-fsl.c"
++#endif
++
++#if !(defined(CONFIG_PCI) || \
++      defined(CONFIG_83xx) \
++     )
+ #error "missing bus glue for ehci-hcd"
+ #endif
+ 
+Index: linux-2.6.10/include/linux/fsl_devices.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/fsl_devices.h
++++ linux-2.6.10/include/linux/fsl_devices.h
+@@ -83,5 +83,32 @@ struct fsl_i2c_platform_data {
+ #define FSL_I2C_DEV_SEPARATE_DFSRR	0x00000001
+ #define FSL_I2C_DEV_CLOCK_5200		0x00000002
+ 
++
++enum fsl_usb2_operating_modes {
++	FSL_USB2_MPH_HOST,
++	FSL_USB2_DR_HOST,
++	FSL_USB2_DR_DEVICE,
++	FSL_USB2_DR_OTG,
++};
++
++enum fsl_usb2_phy_modes {
++	FSL_USB2_PHY_NONE,
++	FSL_USB2_PHY_ULPI,
++	FSL_USB2_PHY_UTMI,
++	FSL_USB2_PHY_UTMI_WIDE,
++	FSL_USB2_PHY_SERIAL,
++};
++
++struct fsl_usb2_platform_data {
++	/* board specific information */
++	enum fsl_usb2_operating_modes operating_mode;
++	enum fsl_usb2_phy_modes phy_mode;
++	unsigned int port_enables;
++};
++
++/* Flags in fsl_usb2_mph_platform_data */
++#define FSL_USB2_PORT0_ENABLED	0x00000001
++#define FSL_USB2_PORT1_ENABLED	0x00000002
++
+ #endif				/* _FSL_DEVICE_H_ */
+ #endif				/* __KERNEL__ */
+Index: linux-2.6.10/drivers/usb/host/ehci-sched.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/host/ehci-sched.c
++++ linux-2.6.10/drivers/usb/host/ehci-sched.c
+@@ -595,6 +595,7 @@ iso_stream_alloc (int mem_flags)
+ 
+ static void
+ iso_stream_init (
++	struct ehci_hcd		*ehci,
+ 	struct ehci_iso_stream	*stream,
+ 	struct usb_device	*dev,
+ 	int			pipe,
+@@ -647,7 +648,10 @@ iso_stream_init (
+ 		u32		addr;
+ 
+ 		addr = dev->ttport << 24;
+-		addr |= dev->tt->hub->devnum << 16;
++  		if (!ehci_is_ARC(ehci)
++  				|| (dev->tt->hub !=
++					ehci->hcd.self.root_hub))
++  			addr |= dev->tt->hub->devnum << 16;
+ 		addr |= epnum << 8;
+ 		addr |= dev->devnum;
+ 		stream->usecs = HS_USECS_ISO (maxp);
+@@ -765,7 +769,7 @@ iso_stream_find (struct ehci_hcd *ehci, 
+ 		if (likely (stream != 0)) {
+ 			/* dev->ep owns the initial refcount */
+ 			dev->ep[epnum] = stream;
+-			iso_stream_init(stream, urb->dev, urb->pipe,
++			iso_stream_init(ehci, stream, urb->dev, urb->pipe,
+ 					urb->interval);
+ 		}
+ 
+Index: linux-2.6.10/mvl_patches/pro-0521.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0521.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(521);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

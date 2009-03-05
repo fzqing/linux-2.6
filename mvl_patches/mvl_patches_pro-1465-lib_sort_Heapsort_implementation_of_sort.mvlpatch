@@ -1,0 +1,614 @@
+#! /usr/bin/env bash
+# Patch: -lib_sort_Heapsort_implementation_of_sort
+# Date: Fri Dec  7 14:18:30 2007
+# Source: Kernel.org
+# MR: 26053
+# Type: Defect Fix
+# Disposition: backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# This conatains the latest versions of sort.c and sort.h. It seemed silly
+# to bring four more patches to do that.
+# 
+# From 8c63b6d337534a6b5fb111dc27d0850f535118c0 Mon Sep 17 00:00:00 2001
+# From: Matt Mackall <mpm@selenic.com>
+# Date: Mon, 7 Mar 2005 18:04:55 -0800
+# Subject: [PATCH] [PATCH] lib/sort: Heapsort implementation of sort()
+# 
+# This patch adds a generic array sorting library routine. This is meant
+# to replace qsort, which has two problem areas for kernel use.
+# 
+# The first issue is quadratic worst-case performance. While quicksort
+# worst-case datasets are rarely encountered in normal scenarios, it is
+# in fact quite easy to construct worst cases for almost all quicksort
+# algorithms given source or access to an element comparison callback.
+# This could allow attackers to cause sorts that would otherwise take
+# less than a millisecond to take seconds and sorts that should take
+# less than a second to take weeks or months. Fixing this problem
+# requires randomizing pivot selection with a secure random number
+# generator, which is rather expensive.
+# 
+# The second is that quicksort's recursion tracking requires either
+# nontrivial amounts of stack space or dynamic memory allocation and out
+# of memory error handling.
+# 
+# By comparison, heapsort has both O(n log n) average and worst-case
+# performance and practically no extra storage requirements. This
+# version runs within 70-90% of the average performance of optimized
+# quicksort so it should be an acceptable replacement wherever quicksort
+# would be used in the kernel.
+# 
+# Note that this function has an extra parameter for passing in an
+# optimized swapping function. This is worth 10% or more over the
+# typical byte-by-byte exchange functions.
+# 
+# Benchmarks:
+# 
+# qsort:     glibc variant            1189 bytes (+ 256/1024 stack)
+# qsort_3f:  my simplified variant     459 bytes (+ 256/1024 stack)
+# heapsort:  the version below         346 bytes
+# shellsort: an optimized shellsort    196 bytes
+# 
+#                          P4 1.8GHz        Opteron 1.4GHz (32-bit)
+# size   algorithm      cycles relative        cycles relative
+# 100:
+#            qsort:      38682 100.00%	      27631 100.00%
+#         qsort_3f:      36277 106.63%	      22406 123.32%
+#         heapsort:      43574  88.77%	      30301  91.19%
+#        shellsort:      39087  98.97%	      25139 109.91%
+# 200:
+#            qsort:      86468 100.00%	      61148 100.00%
+#         qsort_3f:      78918 109.57%	      48959 124.90%
+#         heapsort:      98040  88.20%	      68235  89.61%
+#        shellsort:      95688  90.36%	      62279  98.18%
+# 400:
+#            qsort:     187720 100.00%	     131313 100.00%
+#         qsort_3f:     174905 107.33%	     107954 121.64%
+#         heapsort:     223896  83.84%	     154241  85.13%
+#        shellsort:     223037  84.17%	     148990  88.14%
+# 800:
+#            qsort:     407060 100.00%	     287460 100.00%
+#         qsort_3f:     385106 105.70%	     239131 120.21%
+#         heapsort:     484662  83.99%	     340099  84.52%
+#        shellsort:     537110  75.79%	     354755  81.03%
+# 1600:
+#            qsort:     879596 100.00%	     621331 100.00%
+#         qsort_3f:     861568 102.09%	     522013 119.03%
+#         heapsort:    1079750  81.46%	     746677  83.21%
+#        shellsort:    1234243  71.27%	     820782  75.70%
+# 3200:
+#            qsort:    1903902 100.00%	    1342126 100.00%
+#         qsort_3f:    1908816  99.74%	    1131496 118.62%
+#         heapsort:    2515493  75.69%	    1630333  82.32%
+#        shellsort:    2985339  63.78%	    1964794  68.31%
+# 6400:
+#            qsort:    4046370 100.00%	    2909215 100.00%
+#         qsort_3f:    4164468  97.16%	    2468393 117.86%
+#         heapsort:    5150659  78.56%	    3533585  82.33%
+#        shellsort:    6650225  60.85%	    4429849  65.67%
+# 12800:
+#            qsort:    8729730 100.00%	    6185097 100.00%
+#         qsort_3f:    8776885  99.46%	    5288826 116.95%
+#         heapsort:   11064224  78.90%	    7603061  81.35%
+#        shellsort:   15487905  56.36%	   10305163  60.02%
+# 25600:
+#            qsort:   18357770 100.00%	   13172205 100.00%
+#         qsort_3f:   18687842  98.23%	   11337115 116.19%
+#         heapsort:   24121241  76.11%	   16612122  79.29%
+#        shellsort:   35552814  51.64%	   24106987  54.64%
+# 51200:
+#            qsort:   38658883 100.00%	   28008505 100.00%
+#         qsort_3f:   39498463  97.87%	   24339675 115.07%
+#         heapsort:   50553552  76.47%	   37013828  75.67%
+#        shellsort:   82602416  46.80%	   56201889  49.84%
+# 102400:
+#            qsort:   81197794 100.00%	   58918933 100.00%
+#         qsort_3f:   84257930  96.37%	   51986219 113.34%
+#         heapsort:  110540577  73.46%	   81419675  72.36%
+#        shellsort:  191303132  42.44%	  129786472  45.40%
+# From: Zou Nan hai <nanhai.zou@intel.com>
+# 
+# The new sort routine only works if there are an even number of entries in
+# the ia64 exception fix-up tables.  If the number of entries is odd the sort
+# fails, and then random get_user/put_user calls can fail.
+# 
+# Signed-off-by: Matt Mackall <mpm@selenic.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1465
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Kernel.org
+MR: 26053
+Type: Defect Fix
+Disposition: backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+This conatains the latest versions of sort.c and sort.h. It seemed silly
+to bring four more patches to do that.
+
+From 8c63b6d337534a6b5fb111dc27d0850f535118c0 Mon Sep 17 00:00:00 2001
+From: Matt Mackall <mpm@selenic.com>
+Date: Mon, 7 Mar 2005 18:04:55 -0800
+Subject: [PATCH] [PATCH] lib/sort: Heapsort implementation of sort()
+
+This patch adds a generic array sorting library routine. This is meant
+to replace qsort, which has two problem areas for kernel use.
+
+The first issue is quadratic worst-case performance. While quicksort
+worst-case datasets are rarely encountered in normal scenarios, it is
+in fact quite easy to construct worst cases for almost all quicksort
+algorithms given source or access to an element comparison callback.
+This could allow attackers to cause sorts that would otherwise take
+less than a millisecond to take seconds and sorts that should take
+less than a second to take weeks or months. Fixing this problem
+requires randomizing pivot selection with a secure random number
+generator, which is rather expensive.
+
+The second is that quicksort's recursion tracking requires either
+nontrivial amounts of stack space or dynamic memory allocation and out
+of memory error handling.
+
+By comparison, heapsort has both O(n log n) average and worst-case
+performance and practically no extra storage requirements. This
+version runs within 70-90% of the average performance of optimized
+quicksort so it should be an acceptable replacement wherever quicksort
+would be used in the kernel.
+
+Note that this function has an extra parameter for passing in an
+optimized swapping function. This is worth 10% or more over the
+typical byte-by-byte exchange functions.
+
+Benchmarks:
+
+qsort:     glibc variant            1189 bytes (+ 256/1024 stack)
+qsort_3f:  my simplified variant     459 bytes (+ 256/1024 stack)
+heapsort:  the version below         346 bytes
+shellsort: an optimized shellsort    196 bytes
+
+                         P4 1.8GHz        Opteron 1.4GHz (32-bit)
+size   algorithm      cycles relative        cycles relative
+100:
+           qsort:      38682 100.00%	      27631 100.00%
+        qsort_3f:      36277 106.63%	      22406 123.32%
+        heapsort:      43574  88.77%	      30301  91.19%
+       shellsort:      39087  98.97%	      25139 109.91%
+200:
+           qsort:      86468 100.00%	      61148 100.00%
+        qsort_3f:      78918 109.57%	      48959 124.90%
+        heapsort:      98040  88.20%	      68235  89.61%
+       shellsort:      95688  90.36%	      62279  98.18%
+400:
+           qsort:     187720 100.00%	     131313 100.00%
+        qsort_3f:     174905 107.33%	     107954 121.64%
+        heapsort:     223896  83.84%	     154241  85.13%
+       shellsort:     223037  84.17%	     148990  88.14%
+800:
+           qsort:     407060 100.00%	     287460 100.00%
+        qsort_3f:     385106 105.70%	     239131 120.21%
+        heapsort:     484662  83.99%	     340099  84.52%
+       shellsort:     537110  75.79%	     354755  81.03%
+1600:
+           qsort:     879596 100.00%	     621331 100.00%
+        qsort_3f:     861568 102.09%	     522013 119.03%
+        heapsort:    1079750  81.46%	     746677  83.21%
+       shellsort:    1234243  71.27%	     820782  75.70%
+3200:
+           qsort:    1903902 100.00%	    1342126 100.00%
+        qsort_3f:    1908816  99.74%	    1131496 118.62%
+        heapsort:    2515493  75.69%	    1630333  82.32%
+       shellsort:    2985339  63.78%	    1964794  68.31%
+6400:
+           qsort:    4046370 100.00%	    2909215 100.00%
+        qsort_3f:    4164468  97.16%	    2468393 117.86%
+        heapsort:    5150659  78.56%	    3533585  82.33%
+       shellsort:    6650225  60.85%	    4429849  65.67%
+12800:
+           qsort:    8729730 100.00%	    6185097 100.00%
+        qsort_3f:    8776885  99.46%	    5288826 116.95%
+        heapsort:   11064224  78.90%	    7603061  81.35%
+       shellsort:   15487905  56.36%	   10305163  60.02%
+25600:
+           qsort:   18357770 100.00%	   13172205 100.00%
+        qsort_3f:   18687842  98.23%	   11337115 116.19%
+        heapsort:   24121241  76.11%	   16612122  79.29%
+       shellsort:   35552814  51.64%	   24106987  54.64%
+51200:
+           qsort:   38658883 100.00%	   28008505 100.00%
+        qsort_3f:   39498463  97.87%	   24339675 115.07%
+        heapsort:   50553552  76.47%	   37013828  75.67%
+       shellsort:   82602416  46.80%	   56201889  49.84%
+102400:
+           qsort:   81197794 100.00%	   58918933 100.00%
+        qsort_3f:   84257930  96.37%	   51986219 113.34%
+        heapsort:  110540577  73.46%	   81419675  72.36%
+       shellsort:  191303132  42.44%	  129786472  45.40%
+From: Zou Nan hai <nanhai.zou@intel.com>
+
+The new sort routine only works if there are an even number of entries in
+the ia64 exception fix-up tables.  If the number of entries is odd the sort
+fails, and then random get_user/put_user calls can fail.
+
+Signed-off-by: Matt Mackall <mpm@selenic.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/include/linux/sort.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/linux/sort.h
+@@ -0,0 +1,11 @@
++#ifndef _LINUX_SORT_H
++#define _LINUX_SORT_H
++
++#include <linux/types.h>
++
++void sort(void *base, size_t num, size_t size,
++      int (*cmp)(const void *, const void *),
++      void (*swap)(void *, void *, int));
++
++#endif
++
+Index: linux-2.6.10/init/Kconfig
+===================================================================
+--- linux-2.6.10.orig/init/Kconfig
++++ linux-2.6.10/init/Kconfig
+@@ -510,6 +510,11 @@ config TINY_SHMEM
+ 	default !SHMEM
+ 	bool
+ 
++config BASE_SMALL
++	int
++	default 0 if BASE_FULL
++	default 1 if !BASE_FULL
++
+ menu "Loadable module support"
+ 
+ config MODULES
+Index: linux-2.6.10/lib/Makefile
+===================================================================
+--- linux-2.6.10.orig/lib/Makefile
++++ linux-2.6.10/lib/Makefile
+@@ -5,7 +5,7 @@
+ lib-y := errno.o ctype.o string.o vsprintf.o cmdline.o \
+ 	 bust_spinlocks.o rbtree.o radix-tree.o dump_stack.o \
+ 	 kobject.o kref.o idr.o div64.o parser.o int_sqrt.o \
+-	 bitmap.o extable.o kobject_uevent.o
++	 bitmap.o extable.o kobject_uevent.o sort.o
+ 
+ lib-$(CONFIG_TOUCH_WATCHDOGS) += touch_watchdogs.o
+ 
+Index: linux-2.6.10/lib/sort.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/lib/sort.c
+@@ -0,0 +1,121 @@
++/*
++ * A fast, small, non-recursive O(nlog n) sort for the Linux kernel
++ *
++ * Jan 23 2005  Matt Mackall <mpm@selenic.com>
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/sort.h>
++#include <linux/slab.h>
++
++static void u32_swap(void *a, void *b, int size)
++{
++	u32 t = *(u32 *)a;
++	*(u32 *)a = *(u32 *)b;
++	*(u32 *)b = t;
++}
++
++static void generic_swap(void *a, void *b, int size)
++{
++	char t;
++
++	do {
++		t = *(char *)a;
++		*(char *)a++ = *(char *)b;
++		*(char *)b++ = t;
++	} while (--size > 0);
++}
++
++/**
++ * sort - sort an array of elements
++ * @base: pointer to data to sort
++ * @num: number of elements
++ * @size: size of each element
++ * @cmp: pointer to comparison function
++ * @swap: pointer to swap function or NULL
++ *
++ * This function does a heapsort on the given array. You may provide a
++ * swap function optimized to your element type.
++ *
++ * Sorting time is O(n log n) both on average and worst-case. While
++ * qsort is about 20% faster on average, it suffers from exploitable
++ * O(n*n) worst-case behavior and extra memory requirements that make
++ * it less suitable for kernel use.
++ */
++
++void sort(void *base, size_t num, size_t size,
++	  int (*cmp)(const void *, const void *),
++	  void (*swap)(void *, void *, int size))
++{
++	/* pre-scale counters for performance */
++	int i = (num/2 - 1) * size, n = num * size, c, r;
++
++	if (!swap)
++		swap = (size == 4 ? u32_swap : generic_swap);
++
++	/* heapify */
++	for ( ; i >= 0; i -= size) {
++		for (r = i; r * 2 + size < n; r  = c) {
++			c = r * 2 + size;
++			if (c < n - size && cmp(base + c, base + c + size) < 0)
++				c += size;
++			if (cmp(base + r, base + c) >= 0)
++				break;
++			swap(base + r, base + c, size);
++		}
++	}
++
++	/* sort */
++	for (i = n - size; i >= 0; i -= size) {
++		swap(base, base + i, size);
++		for (r = 0; r * 2 + size < i; r = c) {
++			c = r * 2 + size;
++			if (c < i - size && cmp(base + c, base + c + size) < 0)
++				c += size;
++			if (cmp(base + r, base + c) >= 0)
++				break;
++			swap(base + r, base + c, size);
++		}
++	}
++}
++
++EXPORT_SYMBOL(sort);
++
++#if 0
++/* a simple boot-time regression test */
++
++int cmpint(const void *a, const void *b)
++{
++	return *(int *)a - *(int *)b;
++}
++
++static int sort_test(void)
++{
++	int *a, i, r = 1;
++
++	a = kmalloc(1000 * sizeof(int), GFP_KERNEL);
++	BUG_ON(!a);
++
++	printk("testing sort()\n");
++
++	for (i = 0; i < 1000; i++) {
++		r = (r * 725861) % 6599;
++		a[i] = r;
++	}
++
++	sort(a, 1000, sizeof(int), cmpint, NULL);
++
++	for (i = 0; i < 999; i++)
++		if (a[i] > a[i+1]) {
++			printk("sort() failed!\n");
++			break;
++		}
++
++	kfree(a);
++
++	return 0;
++}
++
++module_init(sort_test);
++#endif
+Index: linux-2.6.10/mvl_patches/pro-1465.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1465.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1465);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

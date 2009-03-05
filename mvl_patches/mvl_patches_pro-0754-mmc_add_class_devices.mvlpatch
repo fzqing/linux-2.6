@@ -1,0 +1,430 @@
+#! /usr/bin/env bash
+# Patch: -mmc_add_class_devices
+# Date: Thu Jul  6 17:33:00 2006
+# MR: 18881
+# Disposition: merged from kernel.org
+# Description:
+# Commit: 00b137cfda5276b3d2c87d44236fe4c5ee68b405
+# Author: Russell King <rmk@dyn-67.arm.linux.org.uk>
+# Date:   Fri Aug 19 09:41:24 2005 +0100
+# 
+#     [MMC] Add MMC class devices
+#     
+#     Create a mmc_host class to allow enumeration of MMC host controllers
+#     even though they have no card(s) inserted.
+#     
+#     Patch based on work by Pierre Ossman.
+#     
+#     Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+
+PATCHNUM=754
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18881
+Disposition: merged from kernel.org
+Description:
+Commit: 00b137cfda5276b3d2c87d44236fe4c5ee68b405
+Author: Russell King <rmk@dyn-67.arm.linux.org.uk>
+Date:   Fri Aug 19 09:41:24 2005 +0100
+
+    [MMC] Add MMC class devices
+    
+    Create a mmc_host class to allow enumeration of MMC host controllers
+    even though they have no card(s) inserted.
+    
+    Patch based on work by Pierre Ossman.
+    
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+Index: linux-2.6.10/drivers/mmc/mmc.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc.c
++++ linux-2.6.10/drivers/mmc/mmc.c
+@@ -796,17 +796,13 @@ struct mmc_host *mmc_alloc_host(int extr
+ {
+ 	struct mmc_host *host;
+ 
+-	host = kmalloc(sizeof(struct mmc_host) + extra, GFP_KERNEL);
++	host = mmc_alloc_host_sysfs(extra, dev);
+ 	if (host) {
+-		memset(host, 0, sizeof(struct mmc_host) + extra);
+-
+ 		spin_lock_init(&host->lock);
+ 		init_waitqueue_head(&host->wq);
+ 		INIT_LIST_HEAD(&host->cards);
+ 		INIT_WORK(&host->detect, mmc_rescan, host);
+ 
+-		host->dev = dev;
+-
+ 		/*
+ 		 * By default, hosts do not support SGIO or large requests.
+ 		 * They have to set these according to their abilities.
+@@ -828,15 +824,15 @@ EXPORT_SYMBOL(mmc_alloc_host);
+  */
+ int mmc_add_host(struct mmc_host *host)
+ {
+-	static unsigned int host_num;
++	int ret;
+ 
+-	snprintf(host->host_name, sizeof(host->host_name),
+-		 "mmc%d", host_num++);
+-
+-	mmc_power_off(host);
+-	mmc_detect_change(host);
++	ret = mmc_add_host_sysfs(host);
++	if (ret == 0) {
++		mmc_power_off(host);
++		mmc_detect_change(host);
++	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ EXPORT_SYMBOL(mmc_add_host);
+@@ -859,6 +855,7 @@ void mmc_remove_host(struct mmc_host *ho
+ 	}
+ 
+ 	mmc_power_off(host);
++	mmc_remove_host_sysfs(host);
+ }
+ 
+ EXPORT_SYMBOL(mmc_remove_host);
+@@ -872,7 +869,7 @@ EXPORT_SYMBOL(mmc_remove_host);
+ void mmc_free_host(struct mmc_host *host)
+ {
+ 	flush_scheduled_work();
+-	kfree(host);
++	mmc_free_host_sysfs(host);
+ }
+ 
+ EXPORT_SYMBOL(mmc_free_host);
+Index: linux-2.6.10/drivers/mmc/mmc.h
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc.h
++++ linux-2.6.10/drivers/mmc/mmc.h
+@@ -13,4 +13,9 @@
+ void mmc_init_card(struct mmc_card *card, struct mmc_host *host);
+ int mmc_register_card(struct mmc_card *card);
+ void mmc_remove_card(struct mmc_card *card);
++
++struct mmc_host *mmc_alloc_host_sysfs(int extra, struct device *dev);
++int mmc_add_host_sysfs(struct mmc_host *host);
++void mmc_remove_host_sysfs(struct mmc_host *host);
++void mmc_free_host_sysfs(struct mmc_host *host);
+ #endif
+Index: linux-2.6.10/drivers/mmc/mmc_sysfs.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc_sysfs.c
++++ linux-2.6.10/drivers/mmc/mmc_sysfs.c
+@@ -20,6 +20,7 @@
+ 
+ #define dev_to_mmc_card(d)	container_of(d, struct mmc_card, dev)
+ #define to_mmc_driver(d)	container_of(d, struct mmc_driver, drv)
++#define cls_dev_to_mmc_host(d)	container_of(d, struct mmc_host, class_dev)
+ 
+ static void mmc_release_card(struct device *dev)
+ {
+@@ -227,13 +228,82 @@ void mmc_remove_card(struct mmc_card *ca
+ }
+ 
+ 
++static void mmc_host_classdev_release(struct class_device *dev)
++{
++	struct mmc_host *host = cls_dev_to_mmc_host(dev);
++	kfree(host);
++}
++
++static struct class mmc_host_class = {
++	.name		= "mmc_host",
++	.release	= mmc_host_classdev_release,
++};
++
++/*
++ * Internal function. Allocate a new MMC host.
++ */
++struct mmc_host *mmc_alloc_host_sysfs(int extra, struct device *dev)
++{
++	struct mmc_host *host;
++
++	host = kmalloc(sizeof(struct mmc_host) + extra, GFP_KERNEL);
++	if (host) {
++		memset(host, 0, sizeof(struct mmc_host) + extra);
++
++		host->dev = dev;
++		host->class_dev.dev = host->dev;
++		host->class_dev.class = &mmc_host_class;
++		class_device_initialize(&host->class_dev);
++	}
++
++	return host;
++}
++
++/*
++ * Internal function. Register a new MMC host with the MMC class.
++ */
++int mmc_add_host_sysfs(struct mmc_host *host)
++{
++	static unsigned int host_num;
++
++	snprintf(host->host_name, sizeof(host->host_name),
++		 "mmc%d", host_num++);
++
++	strlcpy(host->class_dev.class_id, host->host_name, BUS_ID_SIZE);
++	return class_device_add(&host->class_dev);
++}
++
++/*
++ * Internal function. Unregister a MMC host with the MMC class.
++ */
++void mmc_remove_host_sysfs(struct mmc_host *host)
++{
++	class_device_del(&host->class_dev);
++}
++
++/*
++ * Internal function. Free a MMC host.
++ */
++void mmc_free_host_sysfs(struct mmc_host *host)
++{
++	class_device_put(&host->class_dev);
++}
++
++
+ static int __init mmc_init(void)
+ {
+-	return bus_register(&mmc_bus_type);
++	int ret = bus_register(&mmc_bus_type);
++	if (ret == 0) {
++		ret = class_register(&mmc_host_class);
++		if (ret)
++			bus_unregister(&mmc_bus_type);
++	}
++	return ret;
+ }
+ 
+ static void __exit mmc_exit(void)
+ {
++	class_unregister(&mmc_host_class);
+ 	bus_unregister(&mmc_bus_type);
+ }
+ 
+Index: linux-2.6.10/include/linux/mmc/host.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/host.h
++++ linux-2.6.10/include/linux/mmc/host.h
+@@ -63,6 +63,7 @@ struct device;
+ 
+ struct mmc_host {
+ 	struct device		*dev;
++	struct class_device	class_dev;
+ 	struct mmc_host_ops	*ops;
+ 	unsigned int		f_min;
+ 	unsigned int		f_max;
+Index: linux-2.6.10/mvl_patches/pro-0754.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0754.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(754);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

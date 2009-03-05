@@ -1,0 +1,559 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc_xilinx_temac_fixes
+# Date: Thu Jun 22 21:14:33 2006
+# Source: MontaVista Software, Inc.
+# MR: 18466
+# Type: Defect Fix
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     1) Fixes incorrect flags in dma_unmap_single() and dma_map_single()
+#     calls in SgRecvHandlerBH() (DMA_TO_DEVICE replaced with DMA_FROM_DEVICE).
+# 
+#     2) Adds fragmented skbs support in the driver.
+#     The current TEMAC driver doesn't expect skbs (to transmit) to be
+#     fragmented, and to ensure this is the case doesn't claim to support
+#     NETIF_F_IP_CSUM and NETIF_F_S.
+#     As checksumming in hardware has just been added to the TEMAC IP and this
+#     doubles Tx troughput, it makes sense to add fragmented skbs support in the
+#     driver now. Enabling checksum offloading in hardware is TBD.
+# 
+#     3) Corrects the comment at line 225
+# 
+#     4) Corrects how the counter of transmitted packets is incremented in
+#     FifoSendHandler()
+# 
+
+PATCHNUM=646
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18466
+Type: Defect Fix
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    1) Fixes incorrect flags in dma_unmap_single() and dma_map_single()
+    calls in SgRecvHandlerBH() (DMA_TO_DEVICE replaced with DMA_FROM_DEVICE).
+
+    2) Adds fragmented skbs support in the driver.
+    The current TEMAC driver doesn't expect skbs (to transmit) to be
+    fragmented, and to ensure this is the case doesn't claim to support
+    NETIF_F_IP_CSUM and NETIF_F_S.
+    As checksumming in hardware has just been added to the TEMAC IP and this
+    doubles Tx troughput, it makes sense to add fragmented skbs support in the
+    driver now. Enabling checksum offloading in hardware is TBD.
+
+    3) Corrects the comment at line 225
+
+    4) Corrects how the counter of transmitted packets is incremented in
+    FifoSendHandler()
+
+Index: linux-2.6.10/drivers/net/xilinx_temac/adapter.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/xilinx_temac/adapter.c
++++ linux-2.6.10/drivers/net/xilinx_temac/adapter.c
+@@ -222,13 +222,12 @@ void set_mac_speed(struct net_local *lp)
+ typedef enum DUPLEX { UNKNOWN_DUPLEX, HALF_DUPLEX, FULL_DUPLEX } DUPLEX;
+ 
+ /*
+- * This reset function should handle five different reset request types
++ * This reset function should handle four different reset request types
+  * from other functions. The reset request types include
+  *      1. FIFO error: FifoWrite()/FifoSend()/FifoRecv()/FifoRead() fails
+  *      2. DMA error: SgAlloc()/SgCommit()/SgFree() fails
+  *      3. TX Timeout: Timeout occurs for a TX frame given to this adapter
+  *      4. Error Status: Temac Error interrupt occurs and asks for a reset
+- *
+  */
+ 
+ static void reset(struct net_device *dev, u32 line_num)
+@@ -600,7 +599,6 @@ static void FifoSendHandler(void *Callba
+ 
+ 		dev_kfree_skb_irq(skb);
+ 		lp->deferred_skb = NULL;
+-		lp->stats.tx_packets++;
+ 		lp->stats.tx_bytes += skb->len;
+ 		dev->trans_start = jiffies;
+ 		netif_wake_queue(dev);	/* wake up send queue */
+@@ -612,55 +610,86 @@ static void FifoSendHandler(void *Callba
+ static int xtenet_SgSend(struct sk_buff *skb, struct net_device *ndev)
+ {
+ 	struct net_local *lp = netdev_priv(ndev);
+-	XDmaBdV2 *bd_ptr;
+-	int result;
+-	dma_addr_t skb_dma_handle;
+-
+-	/* Get physical address of data in skb */
+-	skb_dma_handle = dma_map_single(NULL, skb->data, skb->len,
+-					DMA_TO_DEVICE);
+-
+-	/* The following spin_lock protects
+-	 * SgAlloc, SgCommit sequence, which also exists in SgSendHandlerBH Bottom
+-	 * Half, or triggered by other processor in SMP case.
++	int nr_frags = skb_shinfo(skb)->nr_frags;
++	XDmaBdV2 *bd_1st, *bd_cur;
++	dma_addr_t frags_phys[nr_frags + 1];
++	int frags_len[nr_frags + 1];
++	int i, result;
++
++	if (skb->ip_summed == CHECKSUM_HW) {
++		skb_checksum_help(skb, 0);
++	}
++
++	frags_len[0] = skb->len;
++	if (nr_frags != 0) {
++		for (i = 0; i < nr_frags; i++) {
++			struct skb_frag_struct *frag =
++						&skb_shinfo(skb)->frags[i];
++			void * p = (char *)page_address(frag->page)
++						+ frag->page_offset;
++
++			frags_phys[i+1] = dma_map_single(NULL, p, frag->size,
++						       DMA_TO_DEVICE);
++			frags_len[i+1] = frag->size;
++		}
++		frags_len[0] -= skb->data_len;
++	}
++	frags_phys[0] = dma_map_single(NULL, skb->data, frags_len[0],
++				       DMA_TO_DEVICE);
++
++	/*
++	 * The following spin_lock protects SgAlloc, SgCommit sequence,
++	 * which also exists in SgSendHandlerBH Bottom Half,
++	 * or triggered by other processor in SMP case.
+ 	 */
+ 	spin_lock_bh(&XTE_spinlock);
+ 
+-	/* Allocate TxBD */
+-	result = XTemac_SgAlloc(&lp->Emac, XTE_SEND, 1, &bd_ptr);
++	/* Allocate TxBDs */
++	result = XTemac_SgAlloc(&lp->Emac, XTE_SEND, nr_frags + 1, &bd_1st);
+ 	if (result != XST_SUCCESS) {
+-		netif_stop_queue(ndev);	/* stop send queue */
+-		lp->deferred_skb = skb;	/* buffer the sk_buffer and will send
+-					   it in interrupt context */
++		netif_stop_queue(ndev); /* stop send queue */
++		lp->deferred_skb = skb; /* buffer the skb to send it
++					 later from interrupt context */
+ 		goto out;
+ 	}
+ 
+-	/* Setup TxBD  */
+-	XDmaBdV2_mSetSrcAddr(bd_ptr, skb_dma_handle);
+-	XDmaBdV2_mSetLength(bd_ptr, skb->len);
+-	XDmaBdV2_mSetId(bd_ptr, skb);
+-	XDmaBdV2_mSetLast(bd_ptr);
++	/* Setup TxBD */
++	for (i = 0, bd_cur = bd_1st; /* always */; i++) {
++		XDmaBdV2_mSetSrcAddr(bd_cur, frags_phys[i]);
++		XDmaBdV2_mSetLength(bd_cur, frags_len[i]);
++		if (i < nr_frags) {
++			XDmaBdV2_mClearLast(bd_cur);
++			bd_cur = XTemac_mSgSendBdNext(&lp->Emac, bd_cur);
++		} else {
++			XDmaBdV2_mSetLast(bd_cur);
++			XDmaBdV2_mSetId(bd_cur, skb);
++			break;
++		}
++	}
+ 
+ 	/* Enqueue to HW */
+-	result = XTemac_SgCommit(&lp->Emac, XTE_SEND, 1, bd_ptr);
++	result = XTemac_SgCommit(&lp->Emac, XTE_SEND, nr_frags + 1, bd_1st);
+ 	if (result != XST_SUCCESS) {
+ 		netif_stop_queue(ndev);	/* stop send queue */
+ 		dev_kfree_skb(skb);
+-		XDmaBdV2_mSetId(bd_ptr, NULL);
++		XDmaBdV2_mSetId(bd_cur, NULL);
+ 		lp->stats.tx_dropped++;
+ 		printk(KERN_ERR
+ 		       "%s: XTemac could not send commit TX buffer descriptor (%d).\n",
+ 		       ndev->name, result);
+ 		reset(ndev, __LINE__);
+-		goto out_nounmap;
++		goto out;
+ 	}
+ 
+ 	ndev->trans_start = jiffies;
+ 	spin_unlock_bh(&XTE_spinlock);
+ 	return 0;
+-      out:
+-	dma_unmap_single(NULL, skb_dma_handle, skb->len, DMA_TO_DEVICE);
+-      out_nounmap:
++
++out:
++	for (i = 0; i < nr_frags + 1; i++) {
++		dma_unmap_single(NULL, frags_phys[i],
++				 frags_len[i], DMA_TO_DEVICE);
++	}
+ 	spin_unlock_bh(&XTE_spinlock);
+ 	return 0;
+ }
+@@ -739,7 +768,7 @@ static void SgSendHandlerBH(unsigned lon
+ 					lp->stats.tx_errors++;
+ 				} else {
+ 					lp->stats.tx_bytes += len;
+-					lp->stats.tx_packets++;
++					if (skb) lp->stats.tx_packets++;
+ 				}
+ 
+ 				BdCurPtr =
+@@ -763,46 +792,81 @@ static void SgSendHandlerBH(unsigned lon
+ 
+ 		/* Send out the deferred skb if it exists */
+ 		if (bd_processed_save && (lp->deferred_skb)) {
+-			dma_addr_t skb_dma_handle;
++			XDmaBdV2 *bd_1st, *bd_cur;
++			int nr_frags = skb_shinfo(lp->deferred_skb)->nr_frags;
++			dma_addr_t frags_phys[nr_frags + 1];
++			int frags_len[nr_frags + 1];
++			int i;
+ 
+ 			skb = lp->deferred_skb;
+ 			lp->deferred_skb = NULL;
+ 
+-			/* Allocate TxBD */
+-			result = XTemac_SgAlloc(&lp->Emac, XTE_SEND, 1, &BdPtr);
+-			if (result != XST_SUCCESS) {	/* This should not happen */
+-				netif_stop_queue(dev);	/* stop send queue */
++			/* Allocate TxBDs */
++			result = XTemac_SgAlloc(&lp->Emac, XTE_SEND,
++						nr_frags + 1, &bd_1st);
++			if (unlikely(result != XST_SUCCESS)) {
++				netif_stop_queue(dev); /* stop send queue */
+ 				dev_kfree_skb_any(skb);
+ 				reset(dev, __LINE__);
+ 				spin_unlock(&XTE_spinlock);
+ 				continue;
+ 			}
+ 
+-			/* Get physical address of data in skb */
+-			skb_dma_handle = dma_map_single(NULL, skb->data,
+-							skb->len,
+-							DMA_TO_DEVICE);
+-			/* Setup TxBD  */
+-			XDmaBdV2_mSetSrcAddr(BdPtr, skb_dma_handle);
+-			XDmaBdV2_mSetLength(BdPtr, skb->len);
+-			XDmaBdV2_mSetId(BdPtr, skb);
+-			XDmaBdV2_mSetLast(BdPtr);
++			frags_len[0] = skb->len;
++			if (nr_frags != 0) {
++				for (i = 0; i < nr_frags; i++) {
++					struct skb_frag_struct *frag =
++						&skb_shinfo(skb)->frags[i];
++					void * p = (char *)page_address(frag->page)
++						+ frag->page_offset;
++
++					frags_phys[i+1] = dma_map_single(NULL,
++								 p, frag->size,
++							         DMA_TO_DEVICE);
++					frags_len[i+1] = frag->size;
++				}
++				frags_len[0] -= skb->data_len;
++			}
++			frags_phys[0] = dma_map_single(NULL, skb->data,
++						       frags_len[0],
++						       DMA_TO_DEVICE);
++
++			/* Setup TxBD */
++			for (i = 0, bd_cur = bd_1st; /* always */; i++) {
++				XDmaBdV2_mSetSrcAddr(bd_cur, frags_phys[i]);
++				XDmaBdV2_mSetLength(bd_cur, frags_len[i]);
++				if (i < nr_frags) {
++					XDmaBdV2_mClearLast(bd_cur);
++					bd_cur = XTemac_mSgSendBdNext(&lp->Emac,
++								      bd_cur);
++				} else {
++					XDmaBdV2_mSetLast(bd_cur);
++					XDmaBdV2_mSetId(bd_cur, skb);
++					break;
++				}
++			}
+ 
+ 			/* Enqueue to HW */
+-			result = XTemac_SgCommit(&lp->Emac, XTE_SEND, 1, BdPtr);
+-			if (result != XST_SUCCESS) {	/* This should not happen */
++			result = XTemac_SgCommit(&lp->Emac, XTE_SEND,
++						 nr_frags + 1, bd_1st);
++			if (unlikely(result != XST_SUCCESS)) {
+ 				netif_stop_queue(dev);	/* stop send queue */
+ 				dev_kfree_skb_any(skb);
+-				XDmaBdV2_mSetId(BdPtr, NULL);
++				XDmaBdV2_mSetId(bd_cur, NULL);
+ 				lp->stats.tx_dropped++;
++				for (i = 0; i < nr_frags + 1; i++) {
++					dma_unmap_single(NULL, frags_phys[i],
++							 frags_len[i],
++							 DMA_TO_DEVICE);
++				}
+ 				printk(KERN_ERR
+ 				       "%s: XTemac could not send commit TX buffer descriptor (%d).\n",
+ 				       dev->name, result);
+ 				reset(dev, __LINE__);
+ 				spin_unlock(&XTE_spinlock);
+ 				continue;
+-
+ 			}
++
+ 			dev->trans_start = jiffies;
+ 		}
+ 
+@@ -920,7 +984,7 @@ static void FifoRecvHandler(void *Callba
+ 	skb_put(skb, len);	/* Tell the skb how much data we got. */
+ 	skb->dev = ndev;	/* Fill out required meta-data. */
+ 	skb->protocol = eth_type_trans(skb, ndev);
+-	/* skb->ip_summed = CHECKSUM_NONE; */
++	skb->ip_summed = CHECKSUM_NONE;
+ 	netif_rx(skb);		/* Send the packet upstream. */
+ }
+ 
+@@ -966,7 +1030,7 @@ static void SgRecvHandlerBH(unsigned lon
+ 				    XDmaBdV2_mGetDestAddr(BdCurPtr);
+ 				dma_unmap_single(NULL, skb_baddr,
+ 						 lp->max_frame_size,
+-						 DMA_TO_DEVICE);
++						 DMA_FROM_DEVICE);
+ 
+ 				/* reset ID */
+ 				XDmaBdV2_mSetId(BdCurPtr, NULL);
+@@ -975,7 +1039,15 @@ static void SgRecvHandlerBH(unsigned lon
+ 				skb_put(skb, len);	/* Tell the skb how much data we got. */
+ 				skb->dev = dev;
+ 				skb->protocol = eth_type_trans(skb, dev);
+-				skb->ip_summed = CHECKSUM_UNNECESSARY;
++#if 0
++				/* Handle checksum offloading for incoming packets. */
++				if (checksum is OK)
++					skb->ip_summed = CHECKSUM_UNNECESSARY;
++				else
++					skb->ip_summed = CHECKSUM_NONE;
++#else
++				skb->ip_summed = CHECKSUM_NONE;
++#endif
+ 				lp->stats.rx_packets++;
+ 				lp->stats.rx_bytes += len;
+ 				netif_rx(skb);	/* Send the packet upstream. */
+@@ -1040,7 +1112,7 @@ static void SgRecvHandlerBH(unsigned lon
+ 				new_skb_baddr =
+ 				    dma_map_single(NULL, new_skb->data,
+ 						   lp->max_frame_size,
+-						   DMA_TO_DEVICE);
++						   DMA_FROM_DEVICE);
+ 
+ 				XDmaBdV2_mSetDestAddr(BdPtr, new_skb_baddr);
+ 				XDmaBdV2_mSetLength(BdPtr, lp->max_frame_size);
+@@ -1802,6 +1874,7 @@ static int xtenet_probe(struct device *d
+ 		else
+ 			ndev->hard_start_xmit = xtenet_SgSend_NoDRE;
+ 
++		ndev->features |= NETIF_F_IP_CSUM | NETIF_F_SG;
+ 		result = sgdma_descriptor_init(ndev);
+ 		if (result) {
+ 			xtenet_remove_ndev(ndev);
+Index: linux-2.6.10/mvl_patches/pro-0646.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0646.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(646);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

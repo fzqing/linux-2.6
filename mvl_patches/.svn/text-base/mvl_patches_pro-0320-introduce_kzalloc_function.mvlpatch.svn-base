@@ -1,0 +1,387 @@
+#! /usr/bin/env bash
+# Patch: -introduce_kzalloc_function
+# Date: Mon Mar  6 15:01:29 2006
+
+PATCHNUM=320
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree dd3927105b6f65afb7dac17682172cdfb86d3f00 (from 640e803376b9c4072f69fec42e304c974a631298)
+tree 5cf282aff500cad23b9d7e13dc19b2b2d31e1ce6
+parent 640e803376b9c4072f69fec42e304c974a631298
+author Pekka J Enberg <penberg@cs.Helsinki.FI> 1126045111 -0700
+committer Linus Torvalds <torvalds@g5.osdl.org> 1126137465 -0700
+
+    [PATCH] introduce and use kzalloc
+    
+    This patch introduces a kzalloc wrapper and converts kernel/ to use it.  It
+    saves a little program text.
+    
+    Signed-off-by: Pekka Enberg <penberg@cs.helsinki.fi>
+    Signed-off-by: Adrian Bunk <bunk@stusta.de>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 80b2dfd..42a6bea 100644
+ include/linux/slab.h   |   16 +++++++++++++++-
+ kernel/intermodule.c   |    3 +--
+ kernel/params.c        |    4 ++--
+ kernel/power/pm.c      |    3 +--
+ kernel/resource.c      |    3 +--
+ kernel/workqueue.c     |    3 +--
+ mm/slab.c              |   19 ++++++-------------
+ mvl_patches/pro-0320.c |   16 ++++++++++++++++
+ 8 files changed, 43 insertions(+), 24 deletions(-)
+
+Index: linux-2.6.10/include/linux/slab.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/slab.h
++++ linux-2.6.10/include/linux/slab.h
+@@ -105,7 +105,21 @@ found:
+ 	return __kmalloc(size, flags);
+ }
+ 
+-extern void *kcalloc(size_t, size_t, int);
++extern void *kzalloc(size_t, unsigned int);
++
++/**
++ * kcalloc - allocate memory for an array. The memory is set to zero.
++ * @n: number of elements.
++ * @size: element size.
++ * @flags: the type of memory to allocate.
++ */
++static inline void *kcalloc(size_t n, size_t size, unsigned int flags)
++{
++	if (n != 0 && size > INT_MAX / n)
++		return NULL;
++	return kzalloc(n * size, flags);
++}
++
+ extern void kfree(const void *);
+ extern unsigned int ksize(const void *);
+ 
+Index: linux-2.6.10/kernel/intermodule.c
+===================================================================
+--- linux-2.6.10.orig/kernel/intermodule.c
++++ linux-2.6.10/kernel/intermodule.c
+@@ -39,7 +39,7 @@ void inter_module_register(const char *i
+ 	struct list_head *tmp;
+ 	struct inter_module_entry *ime, *ime_new;
+ 
+-	if (!(ime_new = kmalloc(sizeof(*ime), GFP_KERNEL))) {
++	if (!(ime_new = kzalloc(sizeof(*ime), GFP_KERNEL))) {
+ 		/* Overloaded kernel, not fatal */
+ 		printk(KERN_ERR
+ 			"Aiee, inter_module_register: cannot kmalloc entry for '%s'\n",
+@@ -47,7 +47,6 @@ void inter_module_register(const char *i
+ 		kmalloc_failed = 1;
+ 		return;
+ 	}
+-	memset(ime_new, 0, sizeof(*ime_new));
+ 	ime_new->im_name = im_name;
+ 	ime_new->owner = owner;
+ 	ime_new->userdata = userdata;
+Index: linux-2.6.10/kernel/params.c
+===================================================================
+--- linux-2.6.10.orig/kernel/params.c
++++ linux-2.6.10/kernel/params.c
+@@ -601,8 +601,8 @@ static void __init kernel_param_sysfs_se
+ {
+ 	struct module_kobject *mk;
+ 
+-	mk = kmalloc(sizeof(struct module_kobject), GFP_KERNEL);
+-	memset(mk, 0, sizeof(struct module_kobject));
++	mk = kzalloc(sizeof(struct module_kobject), GFP_KERNEL);
++	BUG_ON(!mk);
+ 
+ 	mk->mod = THIS_MODULE;
+ 	kobj_set_kset_s(mk, module_subsys);
+Index: linux-2.6.10/kernel/power/pm.c
+===================================================================
+--- linux-2.6.10.orig/kernel/power/pm.c
++++ linux-2.6.10/kernel/power/pm.c
+@@ -60,9 +60,8 @@ struct pm_dev *pm_register(pm_dev_t type
+ 			   unsigned long id,
+ 			   pm_callback callback)
+ {
+-	struct pm_dev *dev = kmalloc(sizeof(struct pm_dev), GFP_KERNEL);
++	struct pm_dev *dev = kzalloc(sizeof(struct pm_dev), GFP_KERNEL);
+ 	if (dev) {
+-		memset(dev, 0, sizeof(*dev));
+ 		dev->type = type;
+ 		dev->id = id;
+ 		dev->callback = callback;
+Index: linux-2.6.10/kernel/resource.c
+===================================================================
+--- linux-2.6.10.orig/kernel/resource.c
++++ linux-2.6.10/kernel/resource.c
+@@ -430,10 +430,9 @@ EXPORT_SYMBOL(adjust_resource);
+  */
+ struct resource * __request_region(struct resource *parent, unsigned long start, unsigned long n, const char *name)
+ {
+-	struct resource *res = kmalloc(sizeof(*res), GFP_KERNEL);
++	struct resource *res = kzalloc(sizeof(*res), GFP_KERNEL);
+ 
+ 	if (res) {
+-		memset(res, 0, sizeof(*res));
+ 		res->name = name;
+ 		res->start = start;
+ 		res->end = start + n - 1;
+Index: linux-2.6.10/kernel/workqueue.c
+===================================================================
+--- linux-2.6.10.orig/kernel/workqueue.c
++++ linux-2.6.10/kernel/workqueue.c
+@@ -312,10 +312,9 @@ struct workqueue_struct *__create_workqu
+ 
+ 	BUG_ON(strlen(name) > 10);
+ 
+-	wq = kmalloc(sizeof(*wq), GFP_KERNEL);
++	wq = kzalloc(sizeof(*wq), GFP_KERNEL);
+ 	if (!wq)
+ 		return NULL;
+-	memset(wq, 0, sizeof(*wq));
+ 
+ 	wq->name = name;
+ 	/* We don't need the distraction of CPUs appearing and vanishing. */
+Index: linux-2.6.10/mm/slab.c
+===================================================================
+--- linux-2.6.10.orig/mm/slab.c
++++ linux-2.6.10/mm/slab.c
+@@ -2541,25 +2541,18 @@ void kmem_cache_free (kmem_cache_t *cach
+ EXPORT_SYMBOL(kmem_cache_free);
+ 
+ /**
+- * kcalloc - allocate memory for an array. The memory is set to zero.
+- * @n: number of elements.
+- * @size: element size.
++ * kzalloc - allocate memory. The memory is set to zero.
++ * @size: how many bytes of memory are required.
+  * @flags: the type of memory to allocate.
+  */
+-void *kcalloc(size_t n, size_t size, int flags)
++void *kzalloc(size_t size, unsigned int flags)
+ {
+-	void *ret = NULL;
+-
+-	if (n != 0 && size > INT_MAX / n)
+-		return ret;
+-
+-	ret = kmalloc(n * size, flags);
++	void *ret = kmalloc(size, flags);
+ 	if (ret)
+-		memset(ret, 0, n * size);
++		memset(ret, 0, size);
+ 	return ret;
+ }
+-
+-EXPORT_SYMBOL(kcalloc);
++EXPORT_SYMBOL(kzalloc);
+ 
+ /**
+  * kfree - free previously allocated memory
+Index: linux-2.6.10/mvl_patches/pro-0320.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0320.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(320);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

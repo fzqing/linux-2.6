@@ -1,0 +1,1 @@
+#define CONFIG_DAVINCI_ENC_MNGR 1

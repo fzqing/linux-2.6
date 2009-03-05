@@ -1,0 +1,643 @@
+#! /usr/bin/env bash
+# Patch: -ppc_memec_2vpx_lcd
+# Date: Mon Mar  6 15:03:57 2006
+# Source: MontaVista Software, Inc.
+# MR: 16930
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Yuri Frolov <yfrolov@ru.mvista.com>
+# Description:
+# 	Add Insight Memec 2VP4/2VP7 board LCD support.
+# 
+
+PATCHNUM=352
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16930
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Yuri Frolov <yfrolov@ru.mvista.com>
+Description:
+	Add Insight Memec 2VP4/2VP7 board LCD support.
+
+ arch/ppc/platforms/4xx/virtex.c |   21 +++
+ drivers/char/Kconfig            |    7 +
+ drivers/char/Makefile           |    1 
+ drivers/char/xilinx_lcd.c       |  252 ++++++++++++++++++++++++++++++++++++++++
+ drivers/char/xilinx_lcd.h       |   75 +++++++++++
+ mvl_patches/pro-0352.c          |   16 ++
+ 6 files changed, 372 insertions(+)
+
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -1010,6 +1010,13 @@ config XILINX_GPIO
+ 	help
+ 	  This driver supports GPIO IP from Xilinx EDK
+ 
++config XILINX_CHAR_LCD
++	tristate "Xilinx character LCD"
++	depends on MEMEC_2VPX
++	help
++	  Select this if you want to use 16 characters by 2 lines LCD
++	  found on e.g. Memec Virtex-II Pro Development Board.
++
+ config RAW_DRIVER
+ 	tristate "RAW driver (/dev/raw/rawN) (OBSOLETE)"
+ 	help
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -91,6 +91,7 @@ obj-$(CONFIG_NWFLASH) += nwflash.o
+ obj-$(CONFIG_SCx200_GPIO) += scx200_gpio.o
+ obj-$(CONFIG_XILINX_GPIO) += xilinx_gpio/
+ obj-$(CONFIG_XILINX_UARTLITE) += xilinx_uartlite/ generic_serial.o
++obj-$(CONFIG_XILINX_CHAR_LCD) += xilinx_lcd.o
+ 
+ obj-$(CONFIG_WATCHDOG)	+= watchdog/
+ obj-$(CONFIG_MWAVE) += mwave/
+Index: linux-2.6.10/drivers/char/xilinx_lcd.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_lcd.c
+@@ -0,0 +1,252 @@
++/*
++ * xilinx_lcd.c
++ *
++ * Virtex2Pro 2x16 character LCD driver.
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2005 (c) MontaVista, Software, Inc.  This file is licensed under the terms
++ * of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++/*
++ * Based on:
++ *   Simple driver for a memory-mapped 44780-style LCD display.
++ *   Configured for CMB-VR7701/Rockhopper
++ *   2003 (c) MontaVista Software, Inc.
++ * Which is in turn based on:
++ *   Copyright 2001 Bradley D. LaRonde <brad@ltc.com>
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/delay.h>
++#include <linux/xilinx_devices.h>
++#include <asm/io.h>
++
++#include "xilinx_lcd.h"
++
++static u32 phys_addr;
++static u32 remap_size;
++static void __iomem * base_addr;
++static int lcd_position;	/* LCD cursor position, * '-1' means "invalid" */
++static DECLARE_MUTEX(sem);
++
++static inline void lcd_command(unsigned char c)
++{
++	/*
++	 * "Clear Display" and "Return Home" commands
++	 * take more time to complete than others.
++	 */
++	int i = ((c == HD44780_CLR_DISPLAY || c == HD44780_RET_HOME) ? 30 : 1);
++
++	writew(c | HD44780_INSTR, base_addr);
++	do lcd_wait(); while(--i);
++}
++
++static inline void lcd_writechar(unsigned char c)
++{
++	writew(c | HD44780_WR_DATA, base_addr);
++	lcd_wait();
++}
++
++static void lcd_reset(void)
++{
++	lcd_command(HD44780_8BIT_2LINE);
++	lcd_command(HD44780_MODE_INC);
++	lcd_command(HD44780_CLR_DISPLAY);
++	lcd_command(HD44780_DISPLAY_OFF);
++	lcd_command(HD44780_CURSOR_LINE);
++}
++
++static void lcd_seek(int pos)
++{
++	int i, j;
++
++	if (lcd_position == -1)
++		lcd_reset();
++
++	if (pos == lcd_position) {
++		return;
++	}
++
++	lcd_command(HD44780_RET_HOME);
++	for (i = 0; i < pos; i++) {
++		lcd_command(HD44780_RIGHT);
++		if (i == XILINX_LCD_MAX_POS / 2) {
++			for (j = 0; j < (40 - XILINX_LCD_MAX_POS / 2); j++)
++				lcd_command(HD44780_RIGHT);
++		}
++	}
++	lcd_position = pos;
++}
++
++static loff_t lcd_llseek(struct file *file, loff_t pos, int orig)
++{
++	if (orig == 1)		/* SEEK_CUR */
++		pos = file->f_pos + pos;
++	else if (orig != 0)	/* SEEK_SET */
++		return -EINVAL;
++
++	if (pos < XILINX_LCD_MAX_POS && pos >= 0)
++		return pos;
++	else
++		return -EINVAL;
++}
++
++static ssize_t lcd_write(struct file *file, const char *s,
++			 size_t size, loff_t * ppos)
++{
++	int i;
++
++	/* Position the cursor */
++	if (*ppos >= XILINX_LCD_MAX_POS || *ppos < 0)
++		return -EFAULT;
++
++	if(down_interruptible(&sem))
++		return -ERESTARTSYS;
++
++	lcd_seek(*ppos);
++
++	/* Print characters */
++	for (i = 0; i < size; i++) {
++		lcd_writechar(*s++);
++		lcd_position++;
++		if (lcd_position == XILINX_LCD_MAX_POS / 2) {
++			/* skip unvisible positions by writing spaces to them */
++			int j;
++
++			for (j = 0; j < (40 - XILINX_LCD_MAX_POS / 2); j++)
++				lcd_writechar(' ');
++		}
++		if (lcd_position == XILINX_LCD_MAX_POS) {
++			/* do not go beyond the visible area */
++			++i;
++			break;
++		}
++	}
++	*ppos = lcd_position;
++
++	up(&sem);
++	return i;
++}
++
++static int lcd_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static int lcd_release(struct inode *inode, struct file *file)
++{
++	if(down_interruptible(&sem))
++		return -ERESTARTSYS;
++
++	lcd_seek(XILINX_LCD_MAX_POS);
++
++	up(&sem);
++	return 0;
++}
++
++/* Misc device structures */
++static struct file_operations lcd_fops = {
++	.llseek	 = 	lcd_llseek,
++	.write   =	lcd_write,
++	.open    =	lcd_open,
++	.release =	lcd_release,
++};
++
++static struct miscdevice lcd_dev = {
++	XILINX_LCD_MINOR,
++	XILINX_LCD_NAME,
++	&lcd_fops
++};
++
++/******************************
++ * The platform device driver *
++ ******************************/
++
++static int lcd_probe(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct resource *regs_res;
++	loff_t start = 0;
++	int err;
++
++	if (!dev)
++		return -EINVAL;
++
++	regs_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!regs_res) {
++		printk(KERN_ERR "%s: IO resource(s) not found\n",
++		       XILINX_LCD_NAME);
++		return -EFAULT;
++	}
++
++	phys_addr = regs_res->start;
++	remap_size = regs_res->end - regs_res->start + 1;
++	if (!request_mem_region((u32)base_addr, remap_size, XILINX_LCD_NAME)) {
++		printk(KERN_ERR
++		       "%s: Couldn't lock memory region at 0x%08lX\n",
++		       XILINX_LCD_NAME, regs_res->start);
++		return -EBUSY;
++	}
++
++	base_addr  = ioremap(phys_addr, remap_size);
++	if(!base_addr) {
++		release_mem_region(phys_addr, remap_size);
++		return -EFAULT;
++	}
++	printk(KERN_INFO "%s: at 0x%08X (%d bytes) mapped to %p\n",
++	       XILINX_LCD_NAME, phys_addr, remap_size, base_addr);
++
++	lcd_reset();
++	lcd_write(NULL, LCD_GREETING, sizeof (LCD_GREETING) - 1, &start);
++
++	/* Register the lcd driver */
++	err = misc_register(&lcd_dev);
++	if (err != 0) {
++		iounmap(base_addr);
++		release_mem_region(phys_addr, remap_size);
++		printk(KERN_ERR "%s: Could not register driver (error %d).\n",
++		       lcd_dev.name, err);
++	}
++
++	return err;
++}
++
++static int lcd_remove(struct device *dev)
++{
++	misc_deregister(&lcd_dev);
++	lcd_command(HD44780_DISPLAY_OFF);
++	iounmap(base_addr);
++	release_mem_region(phys_addr, remap_size);
++	return 0;	/* success */
++}
++
++static struct device_driver lcd_driver = {
++	.name		= XILINX_LCD_NAME,
++	.bus		= &platform_bus_type,
++	.probe		= lcd_probe,
++	.remove		= lcd_remove
++};
++
++static int __init lcd_init(void)
++{
++	return driver_register(&lcd_driver);
++}
++
++static void __exit lcd_cleanup(void)
++{
++	driver_unregister(&lcd_driver);
++}
++
++module_init(lcd_init);
++module_exit(lcd_cleanup);
++
++MODULE_AUTHOR("MontaVista Software, Inc. <source@mvista.com>");
++MODULE_DESCRIPTION("Xilinx character LCD driver");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/char/xilinx_lcd.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_lcd.h
+@@ -0,0 +1,75 @@
++/*
++ * xilinx_lcd.h
++ *
++ * Virtex2Pro character LCD driver.
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2004-2005 (c) MontaVista, Software, Inc.
++ * This file is licensed under the terms of the GNU General Public License
++ * version 2.  This program is licensed "as is" without any warranty
++ * of any kind, whether express or implied.
++ */
++
++/*
++ * Memec IP provides interface to a HD44780 compatible device
++ * by means of single 10-bit register (big endian notation):
++ *   bit 22 - RS (Register Select) - 0: Instruction register
++ *                                   1: Data register
++ *   bit 23 - R/#W - 0: Write
++ *                   1: Read
++ *   bit 24..bit 31 - LCD_DATA0..LCD_DATA7
++ */
++
++/*
++ * Based on:
++ *   Simple driver for a memory-mapped 44780-style LCD display.
++ *   Configured for CMB-VR7701/Rockhopper
++ *   2003 (c) MontaVista Software, Inc.
++ * Which is in turn based on:
++ *   Copyright 2001 Bradley D. LaRonde <brad@ltc.com>
++ */
++
++#ifndef _XILINX_HD44780_LCD_H
++#define _XILINX_HD44780_LCD_H
++
++/* Instruction/Data register and R/W selection masks */
++#define HD44780_INSTR		0x000	/* WR to Instruction Register */
++#define HD44780_STAT		0x100	/* RD Busy Flag / Address Counter */
++#define HD44780_WR_DATA		0x200	/* WR to Data Register */
++#define HD44780_RD_DATA		0x300	/* RD from Data Register */
++
++/* Command values */
++#define HD44780_CLR_DISPLAY	0x01	/* clears entire display and resets addr counter */
++#define HD44780_RET_HOME	0x02	/* resets addr counter, cancels the shifts */
++#define HD44780_MODE_DEC	0x04
++#define HD44780_MODE_DEC_SHIFT	0x05
++#define HD44780_MODE_INC	0x06
++#define HD44780_MODE_INC_SHIFT	0x07
++#define HD44780_DISPLAY_OFF	0x08
++#define HD44780_CURSOR_NONE	0x0c
++#define HD44780_CURSOR_LINE	0x0e
++#define HD44780_CURSOR_BLOCK	0x0f
++#define HD44780_LEFT		0x10
++#define HD44780_RIGHT		0x14
++#define HD44780_LEFT_SCROLL	0x18
++#define HD44780_RIGHT_SCROLL	0x1e
++#define HD44780_8BIT_1LINE	0x30
++#define HD44780_8BIT_2LINE	0x38
++
++/* These commands to be or'ed with address values */
++#define HD44780_CG_ADDRESS	0x40
++#define HD44780_DD_ADDRESS	0x80
++
++#define LCD_GREETING "MontaVista Linux****************"
++#define XILINX_LCD_MINOR 	200
++#define XILINX_LCD_MAX_POS	32
++#define XILINX_LCD_NAME		"xilinx_char_lcd"
++
++static inline void lcd_wait(void)
++{
++	udelay(200);		/* assuming Fosc > 50kHz */
++}
++
++#endif	/* _XILINX_HD44780_LCD_H */
+Index: linux-2.6.10/arch/ppc/platforms/4xx/virtex.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/4xx/virtex.c
++++ linux-2.6.10/arch/ppc/platforms/4xx/virtex.c
+@@ -379,6 +379,23 @@ static struct platform_device xilinx_gpi
+ 
+ #endif /* XPAR_GPIO_4_BASEADDR */
+ 
++#ifdef XPAR_OPB_LCD_INTERFACE_0_BASEADDR
++
++static struct platform_device xilinx_char_lcd_device = {
++	.name = "xilinx_char_lcd",
++	.id = 0,
++	.num_resources = 1,
++	.resource = (struct resource[]) {
++		{
++			.start	= XPAR_OPB_LCD_INTERFACE_0_BASEADDR,
++			.end	= XPAR_OPB_LCD_INTERFACE_0_HIGHADDR,
++			.flags	= IORESOURCE_MEM
++		}
++	}
++};
++
++#endif /* XPAR_OPB_LCD_INTERFACE_0_BASEADDR */
++
+ static int __init xilinx_platform_init(void)
+ {
+ #ifdef XPAR_EMAC_0_BASEADDR
+@@ -434,6 +451,10 @@ static int __init xilinx_platform_init(v
+ 	platform_device_register(&xilinx_ps2_1_device);
+ #endif /* XPAR_PS2_1_BASEADDR */
+ 
++#ifdef XPAR_OPB_LCD_INTERFACE_0_BASEADDR
++	platform_device_register(&xilinx_char_lcd_device);
++#endif /* XPAR_OPB_LCD_INTERFACE_0_BASEADDR */
++
+ 	return 0;
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-0352.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0352.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(352);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

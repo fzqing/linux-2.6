@@ -1,0 +1,374 @@
+#! /usr/bin/env bash
+# Patch: -pro_hpt366_fix_build_with_modular_ide_disk
+# Date: Mon Nov 26 16:54:48 2007
+# Source: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# MR: 14142
+# Type: Defect Fix
+# Disposition: merged from 2.6.11
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Description:
+# 
+# [ide] fix build for built-in hpt366 and modular ide-disk
+# 
+# * always call __ide_do_rw_disk() in ide_do_rw_disk()
+# * modify ide_hwif_t->rw_disk hook accordingly
+# * update and cleanup hpt372n_rw_disk()
+#   (the only user of ide_hwif_t->rw_disk hook)
+# * make __ide_do_rw_disk() static + fix comment
+# 
+# commit f45fd77542e8f37b11aa57659048f16849ed3028
+# tree 7881804cbcdb56564e02bb5a387d336651e57bcb
+# parent 4c048bd96720fe2ba836a8b84fedea83df5d27f7
+# author Bartlomiej Zolnierkiewicz <bzolnier@trik.(none)> Thu, 24 Feb 2005 13:14:08 +0100
+# committer Bartlomiej Zolnierkiewicz <bzolnier@trik.(none)> Thu, 24 Feb 2005 13:14:08 +0100
+# 
+#  drivers/ide/ide-disk.c   |   10 ++++------
+#  drivers/ide/pci/hpt366.c |   29 +++++++++++------------------
+#  include/linux/ide.h      |    4 ++--
+#  3 files changed, 17 insertions(+), 26 deletions(-)
+# 
+
+PATCHNUM=1381
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+MR: 14142
+Type: Defect Fix
+Disposition: merged from 2.6.11
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Description:
+
+[ide] fix build for built-in hpt366 and modular ide-disk
+
+* always call __ide_do_rw_disk() in ide_do_rw_disk()
+* modify ide_hwif_t->rw_disk hook accordingly
+* update and cleanup hpt372n_rw_disk()
+  (the only user of ide_hwif_t->rw_disk hook)
+* make __ide_do_rw_disk() static + fix comment
+
+commit f45fd77542e8f37b11aa57659048f16849ed3028
+tree 7881804cbcdb56564e02bb5a387d336651e57bcb
+parent 4c048bd96720fe2ba836a8b84fedea83df5d27f7
+author Bartlomiej Zolnierkiewicz <bzolnier@trik.(none)> Thu, 24 Feb 2005 13:14:08 +0100
+committer Bartlomiej Zolnierkiewicz <bzolnier@trik.(none)> Thu, 24 Feb 2005 13:14:08 +0100
+
+ drivers/ide/ide-disk.c   |   10 ++++------
+ drivers/ide/pci/hpt366.c |   29 +++++++++++------------------
+ include/linux/ide.h      |    4 ++--
+ mvl_patches/pro-1381.c   |   16 ++++++++++++++++
+ 4 files changed, 33 insertions(+), 26 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/ide-disk.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/ide-disk.c
++++ linux-2.6.10/drivers/ide/ide-disk.c
+@@ -119,9 +119,8 @@ static int lba_capacity_is_ok (struct hd
+ /*
+  * __ide_do_rw_disk() issues READ and WRITE commands to a disk,
+  * using LBA if supported, or CHS otherwise, to address sectors.
+- * It also takes care of issuing special DRIVE_CMDs.
+  */
+-ide_startstop_t __ide_do_rw_disk (ide_drive_t *drive, struct request *rq, sector_t block)
++static ide_startstop_t __ide_do_rw_disk(ide_drive_t *drive, struct request *rq, sector_t block)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
+ 	unsigned int dma	= drive->using_dma;
+@@ -259,7 +258,6 @@ ide_startstop_t __ide_do_rw_disk (ide_dr
+ 		return ide_started;
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(__ide_do_rw_disk);
+ 
+ /*
+  * 268435455  == 137439 MB or 28bit limit
+@@ -284,9 +282,9 @@ static ide_startstop_t ide_do_rw_disk (i
+ 		 block, rq->nr_sectors, (unsigned long)rq->buffer);
+ 
+ 	if (hwif->rw_disk)
+-		return hwif->rw_disk(drive, rq, block);
+-	else
+-		return __ide_do_rw_disk(drive, rq, block);
++		hwif->rw_disk(drive, rq);
++
++	return __ide_do_rw_disk(drive, rq, block);
+ }
+ 
+ static u8 idedisk_dump_status (ide_drive_t *drive, const char *msg, u8 stat)
+Index: linux-2.6.10/drivers/ide/pci/hpt366.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.c
++++ linux-2.6.10/drivers/ide/pci/hpt366.c
+@@ -1018,32 +1018,25 @@ static void hpt372n_set_clock(ide_drive_
+ }
+ 
+ /**
+- *	hpt372n_rw_disk		-	wrapper for I/O
++ *	hpt372n_rw_disk		-	prepare for I/O
+  *	@drive: drive for command
+  *	@rq: block request structure
+- *	@block: block number
+- *
+- *	This is called when a disk I/O is issued to the 372N instead
+- *	of the default functionality. We need it because of the clock
+- *	switching
+  *
++ *	This is called when a disk I/O is issued to the 372N.
++ *	We need it because of the clock switching.
+  */
+- 
+-static ide_startstop_t hpt372n_rw_disk(ide_drive_t *drive, struct request *rq, sector_t block)
++
++static void hpt372n_rw_disk(ide_drive_t *drive, struct request *rq)
+ {
++	ide_hwif_t *hwif = drive->hwif;
+ 	int wantclock;
+-	
+-	if(rq_data_dir(rq) == READ)
+-		wantclock = 0x21;
+-	else
+-		wantclock = 0x23;
+-		
+-	if(HWIF(drive)->config_data != wantclock)
+-	{
++
++	wantclock = rq_data_dir(rq) ? 0x23 : 0x21;
++
++	if (hwif->config_data != wantclock) {
+ 		hpt372n_set_clock(drive, wantclock);
+-		HWIF(drive)->config_data = wantclock;
++		hwif->config_data = wantclock;
+ 	}
+-	return __ide_do_rw_disk(drive, rq, block);
+ }
+ 
+ /*
+Index: linux-2.6.10/include/linux/ide.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ide.h
++++ linux-2.6.10/include/linux/ide.h
+@@ -802,7 +802,7 @@ typedef struct hwif_s {
+ 	struct pci_dev  *pci_dev;	/* for pci chipsets */
+ 	struct ide_pci_device_s	*cds;	/* chipset device struct */
+ 
+-	ide_startstop_t (*rw_disk)(ide_drive_t *, struct request *, sector_t);
++	void (*rw_disk)(ide_drive_t *, struct request *);
+ 
+ #if 0
+ 	ide_hwif_ops_t	*hwifops;
+@@ -1347,7 +1347,7 @@ extern int set_transfer(ide_drive_t *, i
+ extern int taskfile_lib_get_identify(ide_drive_t *drive, u8 *);
+ 
+ extern int ide_wait_not_busy(ide_hwif_t *hwif, unsigned long timeout);
+-ide_startstop_t __ide_do_rw_disk(ide_drive_t *drive, struct request *rq, sector_t block);
++
+ 
+ /*
+  * ide_stall_queue() can be used by a drive to give excess bandwidth back
+Index: linux-2.6.10/mvl_patches/pro-1381.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1381.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1381);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

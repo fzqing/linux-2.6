@@ -1,0 +1,6 @@
+#ifndef __ASM_MACH_RMI_CPU_FEATURE_OVERRIDES_H
+#define __ASM_MACH_RMI_CPU_FEATURE_OVERRIDES_H
+
+#define cpu_has_llsc	1
+
+#endif /* __ASM_MACH_RMI_CPU_FEATURE_OVERRIDES_H */

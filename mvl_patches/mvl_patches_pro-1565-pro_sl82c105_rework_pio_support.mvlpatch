@@ -1,0 +1,482 @@
+#! /usr/bin/env bash
+# Patch: -pro_sl82c105_rework_pio_support
+# Date: Fri Jan  4 18:42:41 2008
+# Source: MontaVista Software, Inc.
+# MR: 18243
+# Type: Enhancement
+# Disposition: accepted into 2.6.22-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# sl82c105: rework PIO support (take 2)
+# 
+# Get rid of the 'pio_speed' member of 'ide_drive_t' that was only used by this
+# driver by storing the PIO mode timings in the 'drive_data' instead -- this
+# allows us to greatly  simplify the process of "reloading" of the chip's timing
+# register and do it right in sl82c150_dma_off_quietly() and to get rid of two
+# extra arguments to config_for_pio() -- which got renamed to sl82c105_tune_pio()
+# and now returns a PIO mode selected, with ide_config_drive_speed() call moved
+# into the tuneproc() method, now called sl82c105_tune_drive() with the code to
+# set drive's 'io_32bit' and 'unmask' flags in its turn moved to its proper place
+# in the init_hwif() method.
+# Also, while at it, rename get_timing_sl82c105() into get_pio_timings() and get
+# rid of the code in it clamping cycle counts to 32 which was both incorrect and
+# never executed anyway...
+# 
+# The patch is somewhat different from the upstream version due to some IDE clean
+# ups which went into the tree  before the original patch...
+# 
+# commit e93df705af1992dbf5956a8c80fcb9987bc595c0
+# tree 62ceef1f46ecde9782d7ee3f26f0a0e108418b69
+# parent 62ea6d80211ecc88ef516927ecebf64cb505be3f
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:49 +0200
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:49 +0200
+# 
+#  drivers/ide/pci/sl82c105.c |  106 ++++++++++++++++++---------------------------
+#  include/linux/ide.h        |    1 
+#  2 files changed, 43 insertions(+), 64 deletions(-)
+# 
+
+PATCHNUM=1565
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18243
+Type: Enhancement
+Disposition: accepted into 2.6.22-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+sl82c105: rework PIO support (take 2)
+
+Get rid of the 'pio_speed' member of 'ide_drive_t' that was only used by this
+driver by storing the PIO mode timings in the 'drive_data' instead -- this
+allows us to greatly  simplify the process of "reloading" of the chip's timing
+register and do it right in sl82c150_dma_off_quietly() and to get rid of two
+extra arguments to config_for_pio() -- which got renamed to sl82c105_tune_pio()
+and now returns a PIO mode selected, with ide_config_drive_speed() call moved
+into the tuneproc() method, now called sl82c105_tune_drive() with the code to
+set drive's 'io_32bit' and 'unmask' flags in its turn moved to its proper place
+in the init_hwif() method.
+Also, while at it, rename get_timing_sl82c105() into get_pio_timings() and get
+rid of the code in it clamping cycle counts to 32 which was both incorrect and
+never executed anyway...
+
+The patch is somewhat different from the upstream version due to some IDE clean
+ups which went into the tree  before the original patch...
+
+commit e93df705af1992dbf5956a8c80fcb9987bc595c0
+tree 62ceef1f46ecde9782d7ee3f26f0a0e108418b69
+parent 62ea6d80211ecc88ef516927ecebf64cb505be3f
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 05 May 2007 22:03:49 +0200
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 05 May 2007 22:03:49 +0200
+
+ drivers/ide/pci/sl82c105.c |  106 ++++++++++++++++++---------------------------
+ include/linux/ide.h        |    1 
+ mvl_patches/pro-1565.c     |   16 ++++++
+ 3 files changed, 59 insertions(+), 64 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/sl82c105.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/sl82c105.c
++++ linux-2.6.10/drivers/ide/pci/sl82c105.c
+@@ -11,6 +11,8 @@
+  * Merge in Russell's HW workarounds, fix various problems
+  * with the timing registers setup.
+  *  -- Benjamin Herrenschmidt (01/11/03) benh@kernel.crashing.org
++ *
++ * Copyright (C) 2006-2007 MontaVista Software, Inc. <source@mvista.com>
+  */
+ 
+ #include <linux/config.h>
+@@ -48,25 +50,19 @@
+ #define CTRL_P0EN       (1 << 0)
+ 
+ /*
+- * Convert a PIO mode and cycle time to the required on/off
+- * times for the interface.  This has protection against run-away
+- * timings.
++ * Convert a PIO mode and cycle time to the required on/off times
++ * for the interface.  This has protection against runaway timings.
+  */
+-static unsigned int get_timing_sl82c105(ide_pio_data_t *p)
++static unsigned int get_pio_timings(ide_pio_data_t *p)
+ {
+-	unsigned int cmd_on;
+-	unsigned int cmd_off;
++	unsigned int cmd_on, cmd_off;
+ 
+-	cmd_on = (ide_pio_timings[p->pio_mode].active_time + 29) / 30;
++	cmd_on  = (ide_pio_timings[p->pio_mode].active_time + 29) / 30;
+ 	cmd_off = (p->cycle_time - 30 * cmd_on + 29) / 30;
+ 
+-	if (cmd_on > 32)
+-		cmd_on = 32;
+ 	if (cmd_on == 0)
+ 		cmd_on = 1;
+ 
+-	if (cmd_off > 32)
+-		cmd_off = 32;
+ 	if (cmd_off == 0)
+ 		cmd_off = 1;
+ 
+@@ -74,44 +70,34 @@ static unsigned int get_timing_sl82c105(
+ }
+ 
+ /*
+- * Configure the drive and chipset for PIO
++ * Configure the chipset for PIO mode.
+  */
+-static void config_for_pio(ide_drive_t *drive, int pio, int report, int chipset_only)
++static u8 sl82c105_tune_pio(ide_drive_t *drive, u8 pio)
+ {
+-	ide_hwif_t *hwif = HWIF(drive);
+-	struct pci_dev *dev = hwif->pci_dev;
++	struct pci_dev *dev	= HWIF(drive)->pci_dev;
++	int reg			= 0x44 + drive->dn * 4;
+ 	ide_pio_data_t p;
+-	u16 drv_ctrl = 0x909;
+-	unsigned int xfer_mode, reg;
++	u16 drv_ctrl;
+ 
+-	DBG(("config_for_pio(drive:%s, pio:%d, report:%d, chipset_only:%d)\n",
+-		drive->name, pio, report, chipset_only));
+-		
+-	reg = (hwif->channel ? 0x4c : 0x44) + (drive->select.b.unit ? 4 : 0);
++	DBG(("sl82c105_tune_pio(drive:%s, pio:%u)\n", drive->name, pio));
+ 
+ 	pio = ide_get_best_pio_mode(drive, pio, 5, &p);
+ 
+-	xfer_mode = XFER_PIO_0 + pio;
+-
+-	if (chipset_only || ide_config_drive_speed(drive, xfer_mode) == 0) {
+-		drv_ctrl = get_timing_sl82c105(&p);
+-		drive->pio_speed = xfer_mode;
+-	} else
+-		drive->pio_speed = XFER_PIO_0;
++	drive->drive_data = drv_ctrl = get_pio_timings(&p);
+ 
+-	if (drive->using_dma == 0) {
++	if (!drive->using_dma) {
+ 		/*
+ 		 * If we are actually using MW DMA, then we can not
+ 		 * reprogram the interface drive control register.
+ 		 */
+-		pci_write_config_word(dev, reg, drv_ctrl);
+-		pci_read_config_word(dev, reg, &drv_ctrl);
+-
+-		if (report) {
+-			printk("%s: selected %s (%dns) (%04X)\n", drive->name,
+-			       ide_xfer_verbose(xfer_mode), p.cycle_time, drv_ctrl);
+-		}
++		pci_write_config_word(dev, reg,  drv_ctrl);
++		pci_read_config_word (dev, reg, &drv_ctrl);
+ 	}
++
++	printk(KERN_DEBUG "%s: selected %s (%dns) (%04X)\n", drive->name,
++	       ide_xfer_verbose(pio + XFER_PIO_0), p.cycle_time, drv_ctrl);
++
++	return pio;
+ }
+ 
+ /*
+@@ -266,19 +252,16 @@ static int sl82c105_ide_dma_on (ide_driv
+ 	return __ide_dma_on(drive);
+ }
+ 
+-static int sl82c105_ide_dma_off_quietly (ide_drive_t *drive)
++static int sl82c105_ide_dma_off_quietly(ide_drive_t *drive)
+ {
+-	u8 speed = XFER_PIO_0;
+-	int rc;
+-	
++	struct pci_dev *dev	= HWIF(drive)->pci_dev;
++	int reg 		= 0x44 + drive->dn * 4;
++
+ 	DBG(("sl82c105_ide_dma_off_quietly(drive:%s)\n", drive->name));
+ 
+-	rc = __ide_dma_off_quietly(drive);
+-	if (drive->pio_speed)
+-		speed = drive->pio_speed - XFER_PIO_0;
+-	config_for_pio(drive, speed, 0, 1);
++	pci_write_config_word(dev, reg, drive->drive_data);
+ 
+-	return rc;
++	return __ide_dma_off_quietly(drive);
+ }
+ 
+ /*
+@@ -327,18 +310,12 @@ static void sl82c105_resetproc(ide_drive
+  * We only deal with PIO mode here - DMA mode 'using_dma' is not
+  * initialised at the point that this function is called.
+  */
+-static void tune_sl82c105(ide_drive_t *drive, u8 pio)
++static void sl82c105_tune_drive(ide_drive_t *drive, u8 pio)
+ {
+-	DBG(("tune_sl82c105(drive:%s)\n", drive->name));
++	DBG(("sl82c105_tune_drive(drive:%s, pio:%u)\n", drive->name, pio));
+ 
+-	config_for_pio(drive, pio, 1, 0);
+-
+-	/*
+-	 * We support 32-bit I/O on this interface, and it
+-	 * doesn't have problems with interrupts.
+-	 */
+-	drive->io_32bit = 1;
+-	drive->unmask = 1;
++	pio = sl82c105_tune_pio(drive, pio);
++	(void) ide_config_drive_speed(drive, XFER_PIO_0 + pio);
+ }
+ 
+ /*
+@@ -405,19 +382,22 @@ static void __devinit init_hwif_sl82c105
+ 
+ 	DBG(("init_hwif_sl82c105(hwif: ide%d)\n", hwif->index));
+ 
+-	hwif->tuneproc = tune_sl82c105;
+-	hwif->selectproc = sl82c105_selectproc;
+-	hwif->resetproc = sl82c105_resetproc;
++	hwif->tuneproc		= &sl82c105_tune_drive;
++	hwif->selectproc	= &sl82c105_selectproc;
++	hwif->resetproc 	= &sl82c105_resetproc;
++
++	/*
++	 * We support 32-bit I/O on this interface, and
++	 * it doesn't have problems with interrupts.
++	 */
++	hwif->drives[0].io_32bit = hwif->drives[1].io_32bit = 1;
++	hwif->drives[0].unmask   = hwif->drives[1].unmask   = 1;
+ 
+ 	/*
+-	 * Default to PIO 0 for fallback unless tuned otherwise.
+ 	 * We always autotune PIO,  this is done before DMA is checked,
+ 	 * so there's no risk of accidentally disabling DMA
+ 	 */
+-	hwif->drives[0].pio_speed = XFER_PIO_0;
+-	hwif->drives[0].autotune = 1;
+-	hwif->drives[1].pio_speed = XFER_PIO_0;
+-	hwif->drives[1].autotune = 1;
++	hwif->drives[0].autotune = hwif->drives[1].autotune = 1;
+ 
+ 	hwif->atapi_dma = 0;
+ 	hwif->mwdma_mask = 0;
+Index: linux-2.6.10/include/linux/ide.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ide.h
++++ linux-2.6.10/include/linux/ide.h
+@@ -726,7 +726,6 @@ typedef struct ide_drive_s {
+         u8	quirk_list;	/* considered quirky, set for a specific host */
+         u8	suspend_reset;	/* drive suspend mode flag, soft-reset recovers */
+         u8	init_speed;	/* transfer rate set at boot */
+-        u8	pio_speed;      /* unused by core, used by some drivers for fallback from DMA */
+         u8	current_speed;	/* current transfer rate set */
+         u8	dn;		/* now wide spread use */
+         u8	wcache;		/* status of write cache */
+Index: linux-2.6.10/mvl_patches/pro-1565.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1565.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1565);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

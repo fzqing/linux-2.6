@@ -1,0 +1,435 @@
+#! /usr/bin/env bash
+# Patch: -bug_in_futex_unqueue_me
+# Date: Mon Jan 21 22:59:13 2008
+# MR: 25840
+# commit e91467ecd1ef381377fd327c0ded922835ec52ab
+# tree b80a9c5d4b86df9c766c6a9613ae596d19ed0abf
+# parent 72f0b4e2133ba1d65147d06016c0b6d2202235ca
+# author Christian Borntraeger <borntrae@de.ibm.com> 1154805232 -0700
+# committer Linus Torvalds <torvalds@g5.osdl.org> 1154879866 -0700
+# 
+#     [PATCH] bug in futex unqueue_me
+#     
+#     This patch adds a barrier() in futex unqueue_me to avoid aliasing of two
+#     pointers.
+#     
+#     On my s390x system I saw the following oops:
+#     
+#     Unable to handle kernel pointer dereference at virtual kernel address
+#     0000000000000000
+#     Oops: 0004 [#1]
+#     CPU:    0    Not tainted
+#     Process mytool (pid: 13613, task: 000000003ecb6ac0, ksp: 00000000366bdbd8)
+#     Krnl PSW : 0704d00180000000 00000000003c9ac2 (_spin_lock+0xe/0x30)
+#     Krnl GPRS: 00000000ffffffff 000000003ecb6ac0 0000000000000000 0700000000000000
+#                0000000000000000 0000000000000000 000001fe00002028 00000000000c091f
+#                000001fe00002054 000001fe00002054 0000000000000000 00000000366bddc0
+#                00000000005ef8c0 00000000003d00e8 0000000000144f91 00000000366bdcb8
+#     Krnl Code: ba 4e 20 00 12 44 b9 16 00 3e a7 84 00 08 e3 e0 f0 88 00 04
+#     Call Trace:
+#     ([<0000000000144f90>] unqueue_me+0x40/0xe4)
+#      [<0000000000145a0c>] do_futex+0x33c/0xc40
+#      [<000000000014643e>] sys_futex+0x12e/0x144
+#      [<000000000010bb00>] sysc_noemu+0x10/0x16
+#      [<000002000003741c>] 0x2000003741c
+#     
+#     The code in question is:
+#     
+#     static int unqueue_me(struct futex_q *q)
+#     {
+#             int ret = 0;
+#             spinlock_t *lock_ptr;
+#     
+#             /* In the common case we don't take the spinlock, which is nice. */
+#      retry:
+#             lock_ptr = q->lock_ptr;
+#             if (lock_ptr != 0) {
+#                     spin_lock(lock_ptr);
+#     		/*
+#                      * q->lock_ptr can change between reading it and
+#                      * spin_lock(), causing us to take the wrong lock.  This
+#                      * corrects the race condition.
+#     [...]
+#     
+#     and my compiler (gcc 4.1.0) makes the following out of it:
+#     
+#     00000000000003c8 <unqueue_me>:
+#          3c8:       eb bf f0 70 00 24       stmg    %r11,%r15,112(%r15)
+#          3ce:       c0 d0 00 00 00 00       larl    %r13,3ce <unqueue_me+0x6>
+#                             3d0: R_390_PC32DBL      .rodata+0x2a
+#          3d4:       a7 f1 1e 00             tml     %r15,7680
+#          3d8:       a7 84 00 01             je      3da <unqueue_me+0x12>
+#          3dc:       b9 04 00 ef             lgr     %r14,%r15
+#          3e0:       a7 fb ff d0             aghi    %r15,-48
+#          3e4:       b9 04 00 b2             lgr     %r11,%r2
+#          3e8:       e3 e0 f0 98 00 24       stg     %r14,152(%r15)
+#          3ee:       e3 c0 b0 28 00 04       lg      %r12,40(%r11)
+#     		/* write q->lock_ptr in r12 */
+#          3f4:       b9 02 00 cc             ltgr    %r12,%r12
+#          3f8:       a7 84 00 4b             je      48e <unqueue_me+0xc6>
+#     		/* if r12 is zero then jump over the code.... */
+#          3fc:       e3 20 b0 28 00 04       lg      %r2,40(%r11)
+#     		/* write q->lock_ptr in r2 */
+#          402:       c0 e5 00 00 00 00       brasl   %r14,402 <unqueue_me+0x3a>
+#                             404: R_390_PC32DBL      _spin_lock+0x2
+#     		/* use r2 as parameter for spin_lock */
+#     
+#     So the code becomes more or less:
+#     if (q->lock_ptr != 0) spin_lock(q->lock_ptr)
+#     instead of
+#     if (lock_ptr != 0) spin_lock(lock_ptr)
+#     
+#     Which caused the oops from above.
+#     After adding a barrier gcc creates code without this problem:
+#     [...] (the same)
+#          3ee:       e3 c0 b0 28 00 04       lg      %r12,40(%r11)
+#          3f4:       b9 02 00 cc             ltgr    %r12,%r12
+#          3f8:       b9 04 00 2c             lgr     %r2,%r12
+#          3fc:       a7 84 00 48             je      48c <unqueue_me+0xc4>
+#          400:       c0 e5 00 00 00 00       brasl   %r14,400 <unqueue_me+0x38>
+#                             402: R_390_PC32DBL      _spin_lock+0x2
+#     
+#     As a general note, this code of unqueue_me seems a bit fishy. The retry logic
+#     of unqueue_me only works if we can guarantee, that the original value of
+#     q->lock_ptr is always a spinlock (Otherwise we overwrite kernel memory). We
+#     know that q->lock_ptr can change. I dont know what happens with the original
+#     spinlock, as I am not an expert with the futex code.
+#     
+#     Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+#     Cc: Rusty Russell <rusty@rustcorp.com.au>
+#     Acked-by: Ingo Molnar <mingo@redhat.com>
+#     Cc: Thomas Gleixner <tglx@timesys.com>
+#     Signed-off-by: Christian Borntraeger <borntrae@de.ibm.com>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1596
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 25840
+commit e91467ecd1ef381377fd327c0ded922835ec52ab
+tree b80a9c5d4b86df9c766c6a9613ae596d19ed0abf
+parent 72f0b4e2133ba1d65147d06016c0b6d2202235ca
+author Christian Borntraeger <borntrae@de.ibm.com> 1154805232 -0700
+committer Linus Torvalds <torvalds@g5.osdl.org> 1154879866 -0700
+
+    [PATCH] bug in futex unqueue_me
+    
+    This patch adds a barrier() in futex unqueue_me to avoid aliasing of two
+    pointers.
+    
+    On my s390x system I saw the following oops:
+    
+    Unable to handle kernel pointer dereference at virtual kernel address
+    0000000000000000
+    Oops: 0004 [#1]
+    CPU:    0    Not tainted
+    Process mytool (pid: 13613, task: 000000003ecb6ac0, ksp: 00000000366bdbd8)
+    Krnl PSW : 0704d00180000000 00000000003c9ac2 (_spin_lock+0xe/0x30)
+    Krnl GPRS: 00000000ffffffff 000000003ecb6ac0 0000000000000000 0700000000000000
+               0000000000000000 0000000000000000 000001fe00002028 00000000000c091f
+               000001fe00002054 000001fe00002054 0000000000000000 00000000366bddc0
+               00000000005ef8c0 00000000003d00e8 0000000000144f91 00000000366bdcb8
+    Krnl Code: ba 4e 20 00 12 44 b9 16 00 3e a7 84 00 08 e3 e0 f0 88 00 04
+    Call Trace:
+    ([<0000000000144f90>] unqueue_me+0x40/0xe4)
+     [<0000000000145a0c>] do_futex+0x33c/0xc40
+     [<000000000014643e>] sys_futex+0x12e/0x144
+     [<000000000010bb00>] sysc_noemu+0x10/0x16
+     [<000002000003741c>] 0x2000003741c
+    
+    The code in question is:
+    
+    static int unqueue_me(struct futex_q *q)
+    {
+            int ret = 0;
+            spinlock_t *lock_ptr;
+    
+            /* In the common case we don't take the spinlock, which is nice. */
+     retry:
+            lock_ptr = q->lock_ptr;
+            if (lock_ptr != 0) {
+                    spin_lock(lock_ptr);
+    		/*
+                     * q->lock_ptr can change between reading it and
+                     * spin_lock(), causing us to take the wrong lock.  This
+                     * corrects the race condition.
+    [...]
+    
+    and my compiler (gcc 4.1.0) makes the following out of it:
+    
+    00000000000003c8 <unqueue_me>:
+         3c8:       eb bf f0 70 00 24       stmg    %r11,%r15,112(%r15)
+         3ce:       c0 d0 00 00 00 00       larl    %r13,3ce <unqueue_me+0x6>
+                            3d0: R_390_PC32DBL      .rodata+0x2a
+         3d4:       a7 f1 1e 00             tml     %r15,7680
+         3d8:       a7 84 00 01             je      3da <unqueue_me+0x12>
+         3dc:       b9 04 00 ef             lgr     %r14,%r15
+         3e0:       a7 fb ff d0             aghi    %r15,-48
+         3e4:       b9 04 00 b2             lgr     %r11,%r2
+         3e8:       e3 e0 f0 98 00 24       stg     %r14,152(%r15)
+         3ee:       e3 c0 b0 28 00 04       lg      %r12,40(%r11)
+    		/* write q->lock_ptr in r12 */
+         3f4:       b9 02 00 cc             ltgr    %r12,%r12
+         3f8:       a7 84 00 4b             je      48e <unqueue_me+0xc6>
+    		/* if r12 is zero then jump over the code.... */
+         3fc:       e3 20 b0 28 00 04       lg      %r2,40(%r11)
+    		/* write q->lock_ptr in r2 */
+         402:       c0 e5 00 00 00 00       brasl   %r14,402 <unqueue_me+0x3a>
+                            404: R_390_PC32DBL      _spin_lock+0x2
+    		/* use r2 as parameter for spin_lock */
+    
+    So the code becomes more or less:
+    if (q->lock_ptr != 0) spin_lock(q->lock_ptr)
+    instead of
+    if (lock_ptr != 0) spin_lock(lock_ptr)
+    
+    Which caused the oops from above.
+    After adding a barrier gcc creates code without this problem:
+    [...] (the same)
+         3ee:       e3 c0 b0 28 00 04       lg      %r12,40(%r11)
+         3f4:       b9 02 00 cc             ltgr    %r12,%r12
+         3f8:       b9 04 00 2c             lgr     %r2,%r12
+         3fc:       a7 84 00 48             je      48c <unqueue_me+0xc4>
+         400:       c0 e5 00 00 00 00       brasl   %r14,400 <unqueue_me+0x38>
+                            402: R_390_PC32DBL      _spin_lock+0x2
+    
+    As a general note, this code of unqueue_me seems a bit fishy. The retry logic
+    of unqueue_me only works if we can guarantee, that the original value of
+    q->lock_ptr is always a spinlock (Otherwise we overwrite kernel memory). We
+    know that q->lock_ptr can change. I dont know what happens with the original
+    spinlock, as I am not an expert with the futex code.
+    
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Cc: Rusty Russell <rusty@rustcorp.com.au>
+    Acked-by: Ingo Molnar <mingo@redhat.com>
+    Cc: Thomas Gleixner <tglx@timesys.com>
+    Signed-off-by: Christian Borntraeger <borntrae@de.ibm.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/kernel/futex.c b/kernel/futex.c
+index dda2049..c2b2e0b 100644
+ kernel/futex.c         |    1 +
+ mvl_patches/pro-1596.c |   16 ++++++++++++++++
+ 2 files changed, 17 insertions(+)
+
+Index: linux-2.6.10/kernel/futex.c
+===================================================================
+--- linux-2.6.10.orig/kernel/futex.c
++++ linux-2.6.10/kernel/futex.c
+@@ -469,6 +469,7 @@ static int unqueue_me(struct futex_q *q)
+ 	/* In the common case we don't take the spinlock, which is nice. */
+  retry:
+ 	lock_ptr = q->lock_ptr;
++	barrier();
+ 	if (lock_ptr != 0) {
+ 		spin_lock(lock_ptr);
+ 		/*
+Index: linux-2.6.10/mvl_patches/pro-1596.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1596.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1596);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

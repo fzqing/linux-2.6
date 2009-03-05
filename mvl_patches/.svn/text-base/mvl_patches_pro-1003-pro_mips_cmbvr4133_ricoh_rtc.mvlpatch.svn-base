@@ -1,0 +1,667 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_cmbvr4133_ricoh_rtc
+# Date: Tue Nov 28 11:33:30 2006
+# Source: MontaVista Software, Inc.
+# MR: 18842
+# Type: Enhancement
+# Disposition: needs submitting to linux-kernel@vger.kernel.org
+# Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+# Description:
+#     This adds support for the Ricoh RV5C387A I2C RTC on the NEC CMB-VR4133.
+# 
+
+PATCHNUM=1003
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18842
+Type: Enhancement
+Disposition: needs submitting to linux-kernel@vger.kernel.org
+Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+Description:
+    This adds support for the Ricoh RV5C387A I2C RTC on the NEC CMB-VR4133.
+
+Index: linux-2.6.10/drivers/i2c/chips/rv5c387a.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/rv5c387a.c
+@@ -0,0 +1,202 @@
++/*
++ * drivers/char/rv5c387a.c
++ *
++ * I2C client/driver for the Ricoh RV5C387A Real-Time Clock chip.
++ *
++ * Author: Wade Farnsworth <wfarnsworth@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/bcd.h>
++#include <linux/rtc.h>
++
++#include <asm/time.h>
++
++#define RV5C387A_DRV_NAME	"rv5c387a"
++
++static unsigned short ignore [] = { I2C_CLIENT_END };
++static unsigned short normal_addr[] = { 0x32, I2C_CLIENT_END };
++
++static unsigned short rtc_attached = 0;
++
++static struct i2c_driver rv5c387a_driver;
++static struct i2c_client *save_client;
++
++static spinlock_t rv5c387a_lock;
++
++static struct i2c_client_address_data addr_data = {
++	.normal_i2c		= normal_addr,
++	.normal_i2c_range	= ignore,
++	.probe			= ignore,
++	.probe_range		= ignore,
++	.ignore			= ignore,
++	.ignore_range		= ignore,
++	.force			= ignore,
++};
++
++unsigned long rv5c387a_rtc_get_time(void)
++{
++	s32 sec, min, hour, wday, mday, mon, year;
++	u8 buf[7];
++	u8 addr[1] = { 4 }; /* internal addr point 0x0; transmission fmt 0x4 */
++	struct i2c_msg msgs[2] = {
++		{save_client->addr, 0, 1, addr},
++		{save_client->addr, I2C_M_NOSTART | I2C_M_RD, 7, buf},
++	};
++
++	spin_lock_irq(&rv5c387a_lock);
++	i2c_transfer(save_client->adapter, msgs, 2);
++	spin_unlock_irq(&rv5c387a_lock);
++
++	sec = buf[0] & 0x7f;
++	min = buf[1] & 0x7f;
++	hour = buf[2] & 0x3f;
++	wday = buf[3] & 0x7;
++	mday = buf[4] & 0x3f;
++	mon = buf[5];
++	year = buf[6] & 0xff;
++
++	BCD_TO_BIN(sec);
++	BCD_TO_BIN(min);
++	BCD_TO_BIN(hour);
++	BCD_TO_BIN(mday);
++	BCD_TO_BIN(year);
++
++	if (hour == 12)
++		hour = 0;
++	else if (hour == 32)
++		hour = 12;
++	else if (hour >= 21)
++		hour -= 8;
++
++	year += mon & 0x80 ? 2000 : 1900;
++
++	mon = mon & 0x1f;
++	BCD_TO_BIN(mon);
++	return mktime(year, mon, mday, hour, min, sec);
++}
++EXPORT_SYMBOL_GPL(rv5c387a_rtc_get_time);
++
++
++int rv5c387a_rtc_set_time(unsigned long t)
++{
++	struct rtc_time tm;
++	u8 buf[7];
++	u8 addr[1] = { 0 }; /* internal addr point 0x0; transmission fmt 0x0 */
++	struct i2c_msg msgs[2] = {
++		{save_client->addr, 0, 1, addr},
++		{save_client->addr, I2C_M_NOSTART, 7, buf},
++	};
++
++	to_tm(t, &tm);
++
++
++	if(buf[2] == 0)
++		buf[2] = 12;
++	else if(buf[2] == 12)
++		buf[2] = 32;
++	else if(buf[2] >= 13)
++		buf[2] += 8;
++
++	buf[0] = tm.tm_sec & 0x7f;
++	buf[1] = tm.tm_min & 0x7f;
++	buf[2] = tm.tm_hour & 0x3f;
++	buf[3] = tm.tm_wday & 0x7;
++	buf[4] = tm.tm_mday & 0x3f;
++	buf[5] = (tm.tm_mon + 1) & 0x1f;
++
++	BIN_TO_BCD(buf[0]);
++	BIN_TO_BCD(buf[1]);
++	BIN_TO_BCD(buf[2]);
++	BIN_TO_BCD(buf[3]);
++	BIN_TO_BCD(buf[4]);
++	BIN_TO_BCD(buf[5]);
++	buf[5] |= ((tm.tm_year /100) == 20 ? 0x80: 0);
++
++	buf[6] = (tm.tm_year % 100) & 0xff;
++	BIN_TO_BCD(buf[6]);
++
++	spin_lock_irq(&rv5c387a_lock);
++	i2c_transfer(save_client->adapter, msgs, 2);
++	spin_unlock_irq(&rv5c387a_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(rv5c387a_rtc_set_time);
++
++static int rv5c387a_probe(struct i2c_adapter *adap, int addr, int kind)
++{
++	struct i2c_client *client;
++	int rc;
++
++	client = kmalloc(sizeof(struct i2c_client), GFP_KERNEL);
++	if (!client)
++		return -ENOMEM;
++
++	memset(client, 0, sizeof(struct i2c_client));
++	strncpy(client->name, RV5C387A_DRV_NAME, I2C_NAME_SIZE);
++	client->id = rv5c387a_driver.id;
++	client->flags = I2C_DF_NOTIFY;
++	client->addr = addr;
++	client->adapter = adap;
++	client->driver = &rv5c387a_driver;
++
++	if ((rc = i2c_attach_client(client)) != 0) {
++		kfree(client);
++		return rc;
++	}
++
++	save_client = client;
++	rtc_attached = 1;
++	return 0;
++}
++
++static int rv5c387a_attach(struct i2c_adapter *adap)
++{
++	return i2c_probe(adap, &addr_data, rv5c387a_probe);
++}
++
++static int rv5c387a_detach(struct i2c_client *client)
++{
++	int ret;
++
++	rtc_attached = 0;
++	if ((ret = i2c_detach_client(client)) == 0)
++		kfree(i2c_get_clientdata(client));
++	return ret;
++}
++
++static struct i2c_driver rv5c387a_driver = {
++	.owner		= THIS_MODULE,
++	.name		= RV5C387A_DRV_NAME,
++	.id		= I2C_DRIVERID_RV5C387A,
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter	= rv5c387a_attach,
++	.detach_client	= rv5c387a_detach,
++};
++
++static int __init rv5c387a_init(void)
++{
++	spin_lock_init(&rv5c387a_lock);
++	return i2c_add_driver(&rv5c387a_driver);
++}
++
++static void __exit rv5c387a_exit(void)
++{
++	i2c_del_driver(&rv5c387a_driver);
++}
++
++module_init(rv5c387a_init);
++module_exit(rv5c387a_exit);
++
++MODULE_AUTHOR("Wade Farnsworth <wfarnsworth@mvista.com>");
++MODULE_DESCRIPTION("Ricoh RV5C387A RTC I2C Client Driver");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -323,6 +323,17 @@ config SENSORS_DS1338
+ 	  If you say yes here you get support for Dallas Semiconductor
+ 	  DS1338 real-time clock chips. 
+ 
++config SENSORS_RV5C387A
++	tristate "Ricoh RV5C387A Real Time Clock"
++	depends on I2C
++	select I2C_SENSOR
++	help
++	  If you say yes here you get support for the Ricoh RV5C387A real-time
++	  clock chip.
++
++	  This driver can also be built as a module.  If so, the module will
++	  be called rv5c387a.
++
+ config SENSORS_EEPROM
+ 	tristate "EEPROM reader"
+ 	depends on I2C && EXPERIMENTAL
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -42,6 +42,7 @@ obj-$(CONFIG_SENSORS_TLV320AIC23) += tlv
+ obj-$(CONFIG_SENSORS_TLV320AIC33) += tlv320aic33.o
+ obj-$(CONFIG_GPIOEXPANDER_OMAP)	+= gpio_expander_omap.o
+ obj-$(CONFIG_SENSORS_DS1338)	+= ds1338.o
++obj-$(CONFIG_SENSORS_RV5C387A)	+= rv5c387a.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_CHIP),y)
+ EXTRA_CFLAGS += -DDEBUG
+Index: linux-2.6.10/include/linux/i2c-id.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/i2c-id.h
++++ linux-2.6.10/include/linux/i2c-id.h
+@@ -111,6 +111,7 @@
+ #define I2C_DRIVERID_MAX6900	63	/* MAX6900 real-time clock	*/
+ #define I2C_DRIVERID_SAA7114H	64	/* video decoder		*/
+ #define I2C_DRIVERID_DS1374	65	/* DS1374 real time clock	*/
++#define I2C_DRIVERID_RV5C387A	66	/* RV5C387A real time clock	*/
+ 
+ 
+ #define I2C_DRIVERID_EXP0	0xF0	/* experimental use id's	*/
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -862,6 +862,12 @@ config RTC_VR41XX
+ 	tristate "NEC VR4100 series Real Time Clock Support"
+ 	depends on CPU_VR41XX
+ 
++config CMBVR4133_RTC
++	bool "NEC CMB-VR4133 Real Time Clock"
++	depends on NEC_CMBVR4133
++	help
++	  RTC driver for the Ricoh RV5c387A I2C RTC chip on the NEC CMB-VR4133
++
+ config COBALT_LCD
+ 	bool "Support for Cobalt LCD"
+ 	depends on MIPS_COBALT
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -70,6 +70,7 @@ obj-$(CONFIG_DS1302) += ds1302.o
+ obj-$(CONFIG_S3C2410_RTC) += s3c2410-rtc.o
+ obj-$(CONFIG_OMAP_RTC)+= omap-rtc.o
+ obj-$(CONFIG_RTC_VR41XX) += vr41xx_rtc.o
++obj-$(CONFIG_CMBVR4133_RTC) += cmbvr4133-rtc.o
+ ifeq ($(CONFIG_GENERIC_NVRAM),y)
+   obj-$(CONFIG_NVRAM) += generic_nvram.o
+ else
+Index: linux-2.6.10/drivers/char/cmbvr4133-rtc.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/cmbvr4133-rtc.c
+@@ -0,0 +1,151 @@
++/*
++ * drivers/char/cmbvr4133-rtc.c
++ *
++ * Interface for the Ricoh RV5C387A I2C RTC on the NEC CMB-VR4133 board.
++ *
++ * Author: Wade Farnsworth <wfarnsworth@mvista.com>
++ *
++ * 2006(c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/rtc.h>
++#include <linux/miscdevice.h>
++
++#include <asm/io.h>
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/time.h>
++#include <asm/vr41xx/giu.h>
++
++static spinlock_t rtc_lock;
++
++static struct fasync_struct *rtc_async_queue;
++
++typedef enum {
++	RTC_RELEASE,
++	RTC_OPEN,
++} rtc_status_t;
++
++static rtc_status_t rtc_status;
++
++extern unsigned long rv5c387a_rtc_get_time(void);
++extern int rv5c387a_rtc_set_time(unsigned long);
++
++static inline void vr4133_ricoh_rtc_get_time(struct rtc_time *tm)
++{
++	to_tm(rv5c387a_rtc_get_time(), tm);
++	tm->tm_year -= 1900;
++}
++
++static inline void vr4133_ricoh_rtc_set_time(struct rtc_time *tm)
++{
++	rv5c387a_rtc_set_time(mktime(tm->tm_year + 1900 , tm->tm_mon + 1,
++				     tm->tm_mday, tm->tm_hour, tm->tm_min,
++				     tm->tm_sec));
++}
++
++
++static int vr4133_ricoh_rtc_do_ioctl(unsigned int cmd, unsigned long arg)
++{
++	struct rtc_time time;
++
++	switch (cmd) {
++	case RTC_RD_TIME:
++		memset(&time, 0, sizeof(struct rtc_time));
++		vr4133_ricoh_rtc_get_time(&time);
++		if (copy_to_user((void __user *)arg, &time,
++		    sizeof(struct rtc_time)))
++			return -EFAULT;
++		break;
++	case RTC_SET_TIME:
++		if (capable(CAP_SYS_TIME) == 0)
++			return -EACCES;
++
++		if (copy_from_user(&time, (struct rtc_time __user *)arg,
++		    sizeof(struct rtc_time)))
++			return -EFAULT;
++
++		vr4133_ricoh_rtc_set_time(&time);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int vr4133_ricoh_rtc_ioctl(struct inode *inode, struct file *file,
++				  unsigned int cmd, unsigned long arg)
++{
++	return vr4133_ricoh_rtc_do_ioctl(cmd, arg);
++}
++
++static int vr4133_ricoh_rtc_open(struct inode *inode, struct file *file)
++{
++	spin_lock_irq(&rtc_lock);
++
++	if (rtc_status == RTC_OPEN) {
++		spin_unlock_irq(&rtc_lock);
++		return -EBUSY;
++	}
++
++	rtc_status = RTC_OPEN;
++
++	spin_unlock_irq(&rtc_lock);
++
++	return 0;
++}
++
++static int vr4133_ricoh_rtc_release(struct inode *inode, struct file *file)
++{
++	if (file->f_flags & FASYNC)
++		(void)fasync_helper(-1, file, 0, &rtc_async_queue);
++
++	spin_lock_irq(&rtc_lock);
++	rtc_status = RTC_RELEASE;
++	spin_unlock_irq(&rtc_lock);
++											return 0;
++}
++
++static struct file_operations vr4133_ricoh_rtc_fops = {
++	.owner		= THIS_MODULE,
++	.ioctl		= vr4133_ricoh_rtc_ioctl,
++	.open		= vr4133_ricoh_rtc_open,
++	.release	= vr4133_ricoh_rtc_release,
++};
++
++static struct miscdevice vr4133_ricoh_rtc_dev = {
++	.minor	= RTC_MINOR,
++	.name	= "rtc",
++	.fops	= &vr4133_ricoh_rtc_fops,
++};
++
++static int __init vr4133_ricoh_rtc_init(void)
++{
++	int retval;
++
++	printk(KERN_INFO "NEC CMB-VR4133/Ricoh RV5C387A RTC Driver\n");
++
++	retval = misc_register(&vr4133_ricoh_rtc_dev);
++	if (retval < 0)
++		return retval;
++
++	spin_lock_init(&rtc_lock);
++
++	return 0;
++}
++
++static void __exit vr4133_ricoh_rtc_exit(void)
++{
++	misc_deregister(&vr4133_ricoh_rtc_dev);
++}
++
++module_init(vr4133_ricoh_rtc_init);
++module_exit(vr4133_ricoh_rtc_exit);
++
+Index: linux-2.6.10/mvl_patches/pro-1003.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1003.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1003);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

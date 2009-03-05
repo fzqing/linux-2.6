@@ -1,0 +1,505 @@
+#! /usr/bin/env bash
+# Patch: -mips_fpu_and_preemption_fixes
+# Date: Tue Mar 14 08:48:53 2006
+# Source: MontaVista Software, Inc.
+# MR: 15493
+# Type: Defect Fix
+# Disposition: backport from linux-mips.org
+# Signed-off-by: Atsuo Igarashi <aigarashi@mvista.com>
+# Description:
+#     Kernel preemption fixes.
+# 
+
+PATCHNUM=367
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15493
+Type: Defect Fix
+Disposition: backport from linux-mips.org
+Signed-off-by: Atsuo Igarashi <aigarashi@mvista.com>
+Description:
+    Kernel preemption fixes.
+
+ arch/mips/kernel/process.c       |    4 ++++
+ arch/mips/kernel/signal-common.h |    8 ++++++++
+ arch/mips/kernel/signal32.c      |    8 ++++++++
+ arch/mips/kernel/traps.c         |   32 ++++++++++++++++++++++++++++++++
+ arch/mips/mm/c-sb1.c             |   17 +++++++++++++++++
+ mvl_patches/pro-0367.c           |   16 ++++++++++++++++
+ 6 files changed, 85 insertions(+)
+
+Index: linux-2.6.10/arch/mips/kernel/traps.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/traps.c
++++ linux-2.6.10/arch/mips/kernel/traps.c
+@@ -423,6 +423,8 @@ static inline void simulate_ll(struct pt
+ 		goto sig;
+ 	}
+ 
++	preempt_disable();
++
+ 	if (ll_task == NULL || ll_task == current) {
+ 		ll_bit = 1;
+ 	} else {
+@@ -430,6 +432,8 @@ static inline void simulate_ll(struct pt
+ 	}
+ 	ll_task = current;
+ 
++	preempt_enable();
++
+ 	compute_return_epc(regs);
+ 	regs->regs[(opcode & RT) >> 16] = value;
+ 
+@@ -463,12 +467,17 @@ static inline void simulate_sc(struct pt
+ 		goto sig;
+ 	}
+ 
++	preempt_disable();
++
+ 	if (ll_bit == 0 || ll_task != current) {
+ 		compute_return_epc(regs);
+ 		regs->regs[reg] = 0;
++		preempt_enable();
+ 		return;
+ 	}
+ 
++	preempt_enable();
++
+ 	if (put_user(regs->regs[reg], vaddr)) {
+ 		signal = SIGSEGV;
+ 		goto sig;
+@@ -559,6 +568,16 @@ asmlinkage void do_fpe(struct pt_regs *r
+ 	if (fcr31 & FPU_CSR_UNI_X) {
+ 		int sig;
+ 
++		preempt_disable();
++
++#ifdef CONFIG_PREEMPT
++		if (!is_fpu_owner()) {
++			/* We might lose fpu before disabling preempt... */
++			own_fpu();
++			BUG_ON(!current->used_math);
++			restore_fp(current);
++		}
++#endif
+ 		/*
+ 	 	 * Unimplemented operation exception.  If we've got the full
+ 		 * software emulator on-board, let's use it...
+@@ -570,11 +589,18 @@ asmlinkage void do_fpe(struct pt_regs *r
+ 		 * a bit extreme for what should be an infrequent event.
+ 		 */
+ 		save_fp(current);
++		/* Ensure 'resume' not overwrite saved fp context again. */
++		lose_fpu();
++
++		preempt_enable();
+ 
+ 		/* Run the emulator */
+ 		sig = fpu_emulator_cop1Handler (0, regs,
+ 			&current->thread.fpu.soft);
+ 
++		preempt_disable();
++
++		own_fpu();      /* Using the FPU again.  */
+ 		/*
+ 		 * We can't allow the emulated instruction to leave any of
+ 		 * the cause bit set in $fcr31.
+@@ -584,6 +610,8 @@ asmlinkage void do_fpe(struct pt_regs *r
+ 		/* Restore the hardware register state */
+ 		restore_fp(current);
+ 
++		preempt_enable();
++
+ 		/* If something went wrong, signal */
+ 		if (sig)
+ 			force_sig(sig, current);
+@@ -708,6 +736,8 @@ asmlinkage void do_cpu(struct pt_regs *r
+ 		break;
+ 
+ 	case 1:
++		preempt_disable();
++
+ 		own_fpu();
+ 		if (current->used_math) {	/* Using the FPU again.  */
+ 			restore_fp(current);
+@@ -716,6 +746,8 @@ asmlinkage void do_cpu(struct pt_regs *r
+ 			current->used_math = 1;
+ 		}
+ 
++		preempt_enable();
++
+ 		if (!cpu_has_fpu) {
+ 			int sig = fpu_emulator_cop1Handler(0, regs,
+ 						&current->thread.fpu.soft);
+Index: linux-2.6.10/arch/mips/kernel/process.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/process.c
++++ linux-2.6.10/arch/mips/kernel/process.c
+@@ -103,10 +103,14 @@ int copy_thread(int nr, unsigned long cl
+ 
+ 	childksp = (unsigned long)ti + THREAD_SIZE - 32;
+ 
++	preempt_disable();
++
+ 	if (is_fpu_owner()) {
+ 		save_fp(p);
+ 	}
+ 
++	preempt_enable();
++
+ 	/* set up new TSS. */
+ 	childregs = (struct pt_regs *) childksp - 1;
+ 	*childregs = *regs;
+Index: linux-2.6.10/arch/mips/kernel/signal-common.h
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/signal-common.h
++++ linux-2.6.10/arch/mips/kernel/signal-common.h
+@@ -44,12 +44,16 @@ setup_sigcontext(struct pt_regs *regs, s
+ 	 * Save FPU state to signal context.  Signal handler will "inherit"
+ 	 * current FPU state.
+ 	 */
++	preempt_disable();
++
+ 	if (!is_fpu_owner()) {
+ 		own_fpu();
+ 		restore_fp(current);
+ 	}
+ 	err |= save_fp_context(sc);
+ 
++	preempt_enable();
++
+ out:
+ 	return err;
+ }
+@@ -84,6 +88,8 @@ restore_sigcontext(struct pt_regs *regs,
+ 
+ 	err |= __get_user(current->used_math, &sc->sc_used_math);
+ 
++	preempt_disable();
++
+ 	if (current->used_math) {
+ 		/* restore fpu context if we have used it before */
+ 		own_fpu();
+@@ -93,6 +99,8 @@ restore_sigcontext(struct pt_regs *regs,
+ 		lose_fpu();
+ 	}
+ 
++	preempt_enable();
++
+ 	return err;
+ }
+ 
+Index: linux-2.6.10/arch/mips/kernel/signal32.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/kernel/signal32.c
++++ linux-2.6.10/arch/mips/kernel/signal32.c
+@@ -363,6 +363,8 @@ static int restore_sigcontext32(struct p
+ 
+ 	err |= __get_user(current->used_math, &sc->sc_used_math);
+ 
++	preempt_disable();
++
+ 	if (current->used_math) {
+ 		/* restore fpu context if we have used it before */
+ 		own_fpu();
+@@ -372,6 +374,8 @@ static int restore_sigcontext32(struct p
+ 		lose_fpu();
+ 	}
+ 
++	preempt_enable();
++
+ 	return err;
+ }
+ 
+@@ -561,12 +565,16 @@ static inline int setup_sigcontext32(str
+ 	 * Save FPU state to signal context.  Signal handler will "inherit"
+ 	 * current FPU state.
+ 	 */
++	preempt_disable();
++
+ 	if (!is_fpu_owner()) {
+ 		own_fpu();
+ 		restore_fp(current);
+ 	}
+ 	err |= save_fp_context32(sc);
+ 
++	preempt_enable();
++
+ out:
+ 	return err;
+ }
+Index: linux-2.6.10/arch/mips/mm/c-sb1.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/c-sb1.c
++++ linux-2.6.10/arch/mips/mm/c-sb1.c
+@@ -200,10 +200,14 @@ static void sb1_flush_cache_page(struct 
+ 	if (!(vma->vm_flags & VM_EXEC))
+ 		return;
+ 
++	preempt_disable();
++
+ 	addr &= PAGE_MASK;
+ 	args.vma = vma;
+ 	args.addr = addr;
+ 	on_each_cpu(sb1_flush_cache_page_ipi, (void *) &args, 1, 1);
++
++	preempt_enable();
+ }
+ #else
+ void sb1_flush_cache_page(struct vm_area_struct *vma, unsigned long addr)
+@@ -246,7 +250,9 @@ void sb1___flush_cache_all_ipi(void *ign
+ 
+ static void sb1___flush_cache_all(void)
+ {
++	preempt_disable();
+ 	on_each_cpu(sb1___flush_cache_all_ipi, 0, 1, 1);
++	preempt_enable();
+ }
+ #else
+ void sb1___flush_cache_all(void)
+@@ -294,9 +300,13 @@ void sb1_flush_icache_range(unsigned lon
+ {
+ 	struct flush_icache_range_args args;
+ 
++	preempt_disable();
++
+ 	args.start = start;
+ 	args.end = end;
+ 	on_each_cpu(sb1_flush_icache_range_ipi, &args, 1, 1);
++
++	preempt_enable();
+ }
+ #else
+ void sb1_flush_icache_range(unsigned long start, unsigned long end)
+@@ -351,9 +361,14 @@ static void sb1_flush_icache_page(struct
+ 
+ 	if (!(vma->vm_flags & VM_EXEC))
+ 		return;
++
++	preempt_disable();
++
+ 	args.vma = vma;
+ 	args.page = page;
+ 	on_each_cpu(sb1_flush_icache_page_ipi, (void *) &args, 1, 1);
++
++	preempt_enable();
+ }
+ #else
+ void sb1_flush_icache_page(struct vm_area_struct *vma, struct page *page)
+@@ -380,7 +395,9 @@ static void sb1_flush_cache_sigtramp_ipi
+ 
+ static void sb1_flush_cache_sigtramp(unsigned long addr)
+ {
++	preempt_disable();
+ 	on_each_cpu(sb1_flush_cache_sigtramp_ipi, (void *) addr, 1, 1);
++	preempt_enable();
+ }
+ #else
+ void sb1_flush_cache_sigtramp(unsigned long addr)
+Index: linux-2.6.10/mvl_patches/pro-0367.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0367.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(367);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

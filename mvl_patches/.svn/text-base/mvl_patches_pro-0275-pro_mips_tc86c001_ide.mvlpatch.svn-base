@@ -1,0 +1,674 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_tc86c001_ide
+# Date: Wed Dec 28 15:03:53 2005
+#  Source: MontaVista Software, Inc.
+#  MR:13977
+#  Type: Enhancement
+#  Disposition: Needs submitting to linux-mips.org
+#  Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+#  Description:
+#         GOKU-S TC86C001 IDE support in 2.6.
+# 
+
+PATCHNUM=275
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+ Source: MontaVista Software, Inc.
+ MR:13977
+ Type: Enhancement
+ Disposition: Needs submitting to linux-mips.org
+ Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+ Description:
+        GOKU-S TC86C001 IDE support in 2.6.
+
+Index: linux-2.6.10/drivers/ide/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/Kconfig
++++ linux-2.6.10/drivers/ide/Kconfig
+@@ -735,6 +735,11 @@ config BLK_DEV_VIA82CXXX
+ 	  This allows the kernel to change PIO, DMA and UDMA speeds and to
+ 	  configure the chip to optimum performance.
+ 
++config BLK_DEV_TC86C001
++	tristate "Toshiba TC86C001 IDE support"
++	help
++	 This driver adds support for TC86C001 IDE chip.
++
+ endif
+ 
+ config BLK_DEV_IDE_PMAC
+Index: linux-2.6.10/drivers/ide/ide-io.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/ide-io.c
++++ linux-2.6.10/drivers/ide/ide-io.c
+@@ -1243,6 +1243,24 @@ void ide_timer_expiry (unsigned long dat
+ 
+ 	spin_lock_irqsave(&ide_lock, flags);
+ 
++#ifdef CONFIG_BLK_DEV_TC86C001
++#define TC86C001_IDE_VDID	(((u32)PCI_DEVICE_ID_TOSHIBA_TC86C001_IDE << 16) | \
++				(u32)PCI_VENDOR_ID_TOSHIBA_2)
++	{
++		extern void tc86c001_chap14_5 (ide_drive_t*);
++		ide_drive_t *drive = hwgroup->drive;
++		u32 id;
++
++		pci_read_config_dword (HWIF(drive)->pci_dev, 0, &id);
++		if ((id == TC86C001_IDE_VDID) && drive->waiting_for_dma) {
++			tc86c001_chap14_5(drive);
++			mod_timer (&hwgroup->timer, jiffies + WAIT_WORSTCASE);
++			spin_unlock_irqrestore(&ide_lock, flags);
++			return;
++		}
++}
++#endif
++
+ 	if ((handler = hwgroup->handler) == NULL) {
+ 		/*
+ 		 * Either a marginal timeout occurred
+Index: linux-2.6.10/drivers/ide/pci/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/Makefile
++++ linux-2.6.10/drivers/ide/pci/Makefile
+@@ -29,6 +29,7 @@ obj-$(CONFIG_BLK_DEV_TRIFLEX)		+= trifle
+ obj-$(CONFIG_BLK_DEV_TRM290)		+= trm290.o
+ obj-$(CONFIG_BLK_DEV_VIA82CXXX)		+= via82cxxx.o
+ obj-$(CONFIG_BLK_DEV_NEC_VR5701_SG2)	+= nec_vr5701_sg2.o
++obj-$(CONFIG_BLK_DEV_TC86C001)		+= tc86c001.o
+ 
+ # Must appear at the end of the block
+ obj-$(CONFIG_BLK_DEV_GENERIC)          += generic.o
+Index: linux-2.6.10/drivers/ide/pci/tc86c001.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/ide/pci/tc86c001.c
+@@ -0,0 +1,369 @@
++/*
++ * linux/drivers/ide/tc86c001.c	Version 0.00	Aug. 09, 2002
++ *
++ * Copyright (C) 2002 Toshiba Corporation
++ * Copyright (C) 2005 MontaVista Software (source@mvista.com)
++ *
++ * This file is licensed under the terms of the GNU General Public
++ * License version 2.  This program is licensed "as is" without any
++ * warranty of any kind, whether express or implied.
++ */
++
++#include <linux/config.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/ioport.h>
++#include <linux/pci.h>
++#include <linux/hdreg.h>
++#include <linux/ide.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++
++#include <asm/io.h>
++
++/* from ide-cd.h */
++#define CD_FRAMESIZE	2048
++#define SECTOR_BITS			9
++#define SECTORS_PER_FRAME	(CD_FRAMESIZE >> SECTOR_BITS)
++
++static void tc86c001_tune_drive (ide_drive_t *drive, byte pio)	/* PIO */
++{
++	u16 master_data = 0;
++	u16 slave_data = 0;
++	u16 mask_data = 0;
++	byte speed = XFER_PIO_0;
++	int is_slave = (&HWIF(drive)->drives[1] == drive);
++	unsigned long master_port =
++		pci_resource_start(HWIF(drive)->pci_dev, 5);
++	unsigned long slave_port = master_port + 0x02;
++	ide_hwif_t *hwif = HWIF(drive);
++
++	if (!hwif->channel) { /* primary */
++		pio = ide_get_best_pio_mode(drive, pio, 5, NULL);
++		switch (pio) {
++		case 4: mask_data = 0x0400; speed = XFER_PIO_4; break;
++		case 3: mask_data = 0x0300; speed = XFER_PIO_3; break;
++		case 2: mask_data = 0x0200; speed = XFER_PIO_2; break;
++		case 1: mask_data = 0x0100; speed = XFER_PIO_1; break;
++		case 0:
++		default: break;
++		}
++
++		if (is_slave) {
++			/* System Control2 */
++			/* slave_data = inw(slave_port); */
++			slave_data |= mask_data;
++			outw(slave_data, slave_port);
++		} else {	/* master */
++			/* System Control1 */
++			master_data = inw(master_port);
++			master_data &= 0xf80f;	/* PIO(bit4-bit10)clear(???) */
++			master_data |= mask_data;
++			outw(master_data, master_port);
++		}
++	}
++
++	drive->current_speed = speed;
++	ide_config_drive_speed(drive, speed);
++}
++
++static int tc86c001_tune_chipset (ide_drive_t *drive, byte speed)	/* DMA */
++{
++	u16 master_data = 0;
++	u16 slave_data = 0;
++	u16 mask_data = 0;
++	int is_slave = (&HWIF(drive)->drives[1] == drive);
++	unsigned long master_port = pci_resource_start(HWIF(drive)->pci_dev, 5);
++	unsigned long slave_port = master_port + 0x02;
++	ide_hwif_t *hwif = HWIF(drive);
++	int err;
++
++	if (!hwif->channel) {
++		switch (speed) {
++		case XFER_UDMA_4:	mask_data = 0x00c0; break;
++		case XFER_UDMA_3:	mask_data = 0x00b0; break;
++		case XFER_UDMA_2:	mask_data = 0x00a0; break;
++		case XFER_UDMA_1:	mask_data = 0x0090; break;
++		case XFER_UDMA_0:	mask_data = 0x0080; break;
++		case XFER_MW_DMA_2:	mask_data = 0x0070; break;
++		case XFER_MW_DMA_1:	mask_data = 0x0060; break;
++		case XFER_MW_DMA_0:	mask_data = 0x0050; break;
++		default: return -1;
++		}
++
++		if (is_slave) {	/* slave */
++			/* System Control2 */
++			/* slave_data = inw(slave_port); */
++			if (drive->media != ide_cdrom) {
++				slave_data |= mask_data;
++				outw(slave_data, slave_port);
++			} else {
++				outw(0x0400,slave_port);
++			}
++		} else {	/* master */
++			if (drive->media != ide_cdrom) {
++				/* System Control1 */
++			        master_data = inw(master_port);
++				master_data &= 0xf80f;	/* DMA(bit4-bit10)clear(???) */
++				master_data |= mask_data;
++				outw(master_data, master_port);
++			} else {
++				outw(0x0400,master_port);
++			}
++		}
++	}
++
++	if (!drive->init_speed)
++		drive->init_speed = speed;
++
++	err = ide_config_drive_speed(drive, speed);
++	drive->current_speed = speed;
++	return err;
++}
++
++static int tc86c001_config_drive_for_dma (ide_drive_t *drive)
++{
++	struct hd_driveid *id	= drive->id;
++	int ultra		= 1;
++	byte speed		= 0;
++	byte udma_66	= eighty_ninty_three(drive);	/* hwif->udma_four 0:default 1:ATA66 */
++
++	if ((id->dma_ultra & 0x0010) && (ultra)) {
++		speed = (udma_66) ? XFER_UDMA_4 : XFER_UDMA_2;
++	} else if ((id->dma_ultra & 0x0008) && (ultra)) {
++		speed = (udma_66) ? XFER_UDMA_3 : XFER_UDMA_1;
++	} else if ((id->dma_ultra & 0x0004) && (ultra)) {
++		speed = XFER_UDMA_2;
++	} else if ((id->dma_ultra & 0x0002) && (ultra)) {
++		speed = XFER_UDMA_1;
++	} else if ((id->dma_ultra & 0x0001) && (ultra)) {
++		speed = XFER_UDMA_0;
++	} else if (id->dma_mword & 0x0004) {
++		speed = XFER_MW_DMA_2;
++	} else if (id->dma_mword & 0x0002) {
++		speed = XFER_MW_DMA_1;
++	} else if (id->dma_1word & 0x0004) {
++		speed = XFER_SW_DMA_2;
++	} else {
++/*		speed = XFER_PIO_0 + ide_get_best_pio_mode(drive, 255, 5, NULL);*/
++		return HWIF(drive)->ide_dma_off_quietly(drive);
++	}
++
++	(void) tc86c001_tune_chipset(drive, speed);
++
++	return ((int)	((id->dma_ultra >> 11) & 7) ? HWIF(drive)->ide_dma_on(drive) :
++			((id->dma_ultra >> 8) & 7) ? HWIF(drive)->ide_dma_on(drive) :
++			((id->dma_mword >> 8) & 7) ? HWIF(drive)->ide_dma_on(drive) :
++			((id->dma_1word >> 8) & 7) ? HWIF(drive)->ide_dma_on(drive) :
++							  HWIF(drive)->ide_dma_off_quietly(drive));
++}
++
++unsigned int __init pci_init_tc86c001 (struct pci_dev *dev, const char *name)
++{
++	unsigned short	mask_b15 = 0x8000;	/* bit15(Soft Reset) mask */
++	unsigned short	mask_b14 = 0x4000;	/* bit14(FIFO Reset) mask */
++	unsigned short	mask_b11 = 0x0800;	/* bit11(ATA Hard Reset) mask */
++	unsigned long	control_base = pci_resource_start(dev, 5);
++	unsigned long	command_base = pci_resource_start(dev, 0);
++	unsigned short	val;
++	int i = 0;
++
++	/* System Control1 Register bit15(Soft Reset) Set */
++	val = inw(control_base);
++	outw(val | mask_b15, control_base);
++	mdelay(20);
++
++	/* System Control1 Register bit14(FIFO Reset) Set */
++	val = inw(control_base);
++	outw(val | mask_b14, control_base);
++	mdelay(20);
++
++	/* System Control1 Register bit11(ATA Hard Reset) Set */
++	val = inw(control_base);
++	outw(val | mask_b11, control_base);
++	mdelay(40);
++
++	/* System Control1 Register 0x0000(Reset Clear) Set */
++	outw(0x0000, control_base);
++	/* Wait for Status Register bit7(BSY) to be cleared (Timeout: 5s=50ms*100) */
++        while ((inb(command_base + 0x07) & BUSY_STAT) && (i<100)) {
++	       mdelay (50);
++	       i++;
++	}
++
++	return dev->irq;
++}
++
++unsigned int __init ata66_tc86c001 (ide_hwif_t *hwif)
++{
++	unsigned int ata66 = 0;		/* Return */
++	unsigned long control_base = pci_resource_start(hwif->pci_dev, 5);
++
++	if (!hwif->channel) { /* primary */
++		/* System Control1 Register */
++		/* bit13(PDIAGN) = 0:(80pin cable) 1:(40pin cable) */
++		ata66 = (inw(control_base) & 0x2000) ? 0 : 1;
++	}
++	return ata66;
++}
++
++void __init ide_init_tc86c001 (ide_hwif_t *hwif)
++{
++
++	hwif->tuneproc = &tc86c001_tune_drive;	/* routine to tune PIO mode for drives */
++	hwif->speedproc = &tc86c001_tune_chipset;
++
++	hwif->drives[0].autotune = 1;
++	hwif->drives[1].autotune = 1;
++
++	if (!hwif->dma_base){
++		printk("ide_init_tc86c001 :dma_base is not found\n");
++		return;
++	}
++
++	hwif->autodma = 0;
++
++	hwif->atapi_dma = 1;
++	hwif->ultra_mask = 0x07;
++	hwif->mwdma_mask = 0x07;
++	hwif->swdma_mask = 0x07;
++
++	if (!hwif->udma_four) {
++		hwif->udma_four = ata66_tc86c001(hwif);
++	}
++#ifdef CONFIG_BLK_DEV_IDEDMA
++	if (!noautodma){
++		hwif->autodma = 1;
++		hwif->ide_dma_check = &tc86c001_config_drive_for_dma;
++	}
++
++	hwif->drives[0].autodma = hwif->autodma;
++	hwif->drives[1].autodma = hwif->autodma;
++#endif /* CONFIG_BLK_DEV_IDEDMA */
++}
++
++/* called from ide_cdrom_setup */
++void tc86c001_ide_cdrom_setup(ide_drive_t *drive)
++{
++	ide_hwif_t *hwif = HWIF(drive);
++	int is_slave = (&hwif->drives[1] == drive);
++	unsigned long control_base = pci_resource_start(hwif->pci_dev, 5);
++	unsigned short scc;
++
++	if (!hwif->channel) {
++		scc = inw(control_base + 0x0c); /* Sector Count Control */
++		if (is_slave) {
++			scc |= 0x0002;
++			outw(0x0400, control_base + 0x06); /* TransferWordCount2 */
++		} else {
++			scc |= 0x0001;
++			outw(0x0400, control_base + 0x04); /* TransferWordCount1 */
++		}
++		outw(scc, control_base + 0x0c); /* Sector Count Control */
++	}
++}
++
++/* called from cdrom_transfer_packet_command */
++void tc86c001_atapi_output_command (ide_drive_t *drive, void *buffer, unsigned int bytecount)
++{
++	unsigned long port = pci_resource_start(HWIF(drive)->pci_dev, 5) + 0x08;
++	if (bytecount != 12) {
++		printk(KERN_ERR "tc86c001_atapi_output_command: bad count %d",
++		       bytecount);
++		return;
++	}
++	outsw (port, buffer, 12 / 2);
++}
++
++/*
++ * This function is a workaround for a limitation of TC86C001's DMA transfer.
++ * The limitation is described in a chapter 14.5 of TC86C001's data sheet.
++ */
++
++void tc86c001_chap14_5 (ide_drive_t *drive)
++{
++	u32 bm_base = pci_resource_start (HWIF(drive)->pci_dev, 4);
++	u32 sc_base = pci_resource_start (HWIF(drive)->pci_dev, 5);
++	u16 scr, sccr, twcr;
++	u8  cmd;
++	int master;
++
++	master = (drive->select.b.unit == 0 ? 1 : 0);
++
++	/* save register */
++
++	scr  = inw (sc_base + 0x0a);	/* Sector Count Register */
++	sccr = inw (sc_base + 0x0c);	/* Sector Count Control Register */
++	twcr = inw (sc_base + (master ? 0x04 : 0x06));
++					/* Transfer Word Count Register */
++
++	/* stop DMA */
++
++	cmd = inb (bm_base + 0x00);
++	cmd &= ~0x01;	/* clear START_STOPBM bit */
++	outb (cmd, bm_base + 0x00);
++
++	/* setup dummy DMA */
++
++	outw (0, sc_base + 0x0a);
++	outw (master ? 0x0001 : 0x0002, sc_base + 0x0c);
++	outw (0, sc_base + (master ? 0x04 : 0x06));
++
++	/* start dummy DMA */
++
++	outb (0, bm_base + 0x00);	/* clear R_OR_WCTR bit for write */
++	outb (0x01, bm_base + 0x00);	/* set START_STOPBM */
++
++	/* -- generate pending interrupt -- */
++
++	__asm__ __volatile__ ("nop");
++
++	/* stop dummy DMA */
++
++	outb (0, bm_base + 0x00);	/* clear START_STOPBM */
++
++	/* restore register */
++
++	outw (scr,  sc_base + 0x0a);	/* Sector Count Register */
++	outw (sccr, sc_base + 0x0c);	/* Sector Count Control Register */
++	outw (twcr, sc_base + (master ? 0x04 : 0x06));
++					/* Transfer Word Count Register */
++}
++
++static ide_pci_device_t tc86c001_chipset __devinitdata = {
++	.name		= "TC86c001",
++	.init_chipset	= pci_init_tc86c001,
++	.init_hwif	= ide_init_tc86c001,
++	.channels	= 2,
++	.autodma	= NOAUTODMA,
++	.enablebits	= {{0x00,0x00,0x00}, {0x0a,0x00,0xff}},
++	.bootable	= ON_BOARD,
++};
++
++static int __devinit tc86c001_init_one(struct pci_dev *dev, const struct pci_device_id *id)
++{
++	ide_setup_pci_device(dev, &tc86c001_chipset);
++	return 0;
++}
++
++static struct pci_device_id tc86c001_pci_tbl[] = {
++	{ PCI_VENDOR_ID_TOSHIBA_2, PCI_DEVICE_ID_TOSHIBA_TC86C001_IDE, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0},
++	{ 0, },
++};
++MODULE_DEVICE_TABLE(pci, tc86c001_pci_tbl);
++
++static struct pci_driver driver = {
++	.name		= "TC86c001",
++	.id_table	= tc86c001_pci_tbl,
++	.probe		= tc86c001_init_one,
++};
++
++static int tc86c001_ide_init(void)
++{
++	return ide_pci_register_driver(&driver);
++}
++module_init(tc86c001_ide_init);
++
++MODULE_AUTHOR("source@mvista.com");
++MODULE_DESCRIPTION("PCI driver module for TC86C001 IDE");
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/include/linux/pci_ids.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/pci_ids.h
++++ linux-2.6.10/include/linux/pci_ids.h
+@@ -1456,6 +1456,9 @@
+ #define PCI_DEVICE_ID_TOSHIBA_TC35815_NWU      0x0031
+ #define PCI_DEVICE_ID_TOSHIBA_TX4939_ETHER      0x0032
+ #define PCI_DEVICE_ID_TOSHIBA_TX4927	0x0180
++#define PCI_DEVICE_ID_TOSHIBA_TC86C001_IDE	0x0105
++#define PCI_DEVICE_ID_TOSHIBA_TC86C001_USB	0x0106
++#define PCI_DEVICE_ID_TOSHIBA_TC86C001_USBD	0x0107
+ #define PCI_DEVICE_ID_TOSHIBA_TC86C001_MISC	0x0108
+ 
+ #define PCI_VENDOR_ID_RICOH		0x1180
+Index: linux-2.6.10/mvl_patches/pro-0275.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0275.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(275);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

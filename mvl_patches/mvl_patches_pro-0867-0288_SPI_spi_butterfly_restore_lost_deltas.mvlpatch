@@ -1,0 +1,408 @@
+#! /usr/bin/env bash
+# Patch: -0288_SPI_spi_butterfly_restore_lost_deltas
+# Date: Wed Aug 16 10:50:26 2006
+# MR: 19367
+# Commit: 9c1da3cb46316e40bac766ce45556dc4fd8df3ca
+# Author: David Brownell <david-b@pacbell.net>
+# Date:   Sat Jan 21 13:21:43 2006 -0800
+# 
+#     [PATCH] SPI: spi_butterfly, restore lost deltas
+#     
+#     This resolves some minor version skew glitches that accumulated for the AVR
+#     Butterfly adapter driver, which caused among other things the existence of
+#     a duplicate Kconfig entry.  Most of it boils down to comment updates, but in
+#     one case it removes some now-superfluous code that would be better if not
+#     copied into other controller-level drivers.
+#     
+#     Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+# 
+
+PATCHNUM=867
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 19367
+Commit: 9c1da3cb46316e40bac766ce45556dc4fd8df3ca
+Author: David Brownell <david-b@pacbell.net>
+Date:   Sat Jan 21 13:21:43 2006 -0800
+
+    [PATCH] SPI: spi_butterfly, restore lost deltas
+    
+    This resolves some minor version skew glitches that accumulated for the AVR
+    Butterfly adapter driver, which caused among other things the existence of
+    a duplicate Kconfig entry.  Most of it boils down to comment updates, but in
+    one case it removes some now-superfluous code that would be better if not
+    copied into other controller-level drivers.
+    
+    Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+
+diff --git a/Documentation/spi/butterfly b/Documentation/spi/butterfly
+index a2e8c8d..9927af7 100644
+Index: linux-2.6.10/Documentation/spi/butterfly
+===================================================================
+--- linux-2.6.10.orig/Documentation/spi/butterfly
++++ linux-2.6.10/Documentation/spi/butterfly
+@@ -12,13 +12,20 @@ You can make this adapter from an old pr
+ directly to the Butterfly.  Or (if you have the parts and skills) you
+ can come up with something fancier, providing ciruit protection to the
+ Butterfly and the printer port, or with a better power supply than two
+-signal pins from the printer port.
++signal pins from the printer port.  Or for that matter, you can use
++similar cables to talk to many AVR boards, even a breadboard.
++
++This is more powerful than "ISP programming" cables since it lets kernel
++SPI protocol drivers interact with the AVR, and could even let the AVR
++issue interrupts to them.  Later, your protocol driver should work
++easily with a "real SPI controller", instead of this bitbanger.
+ 
+ 
+ The first cable connections will hook Linux up to one SPI bus, with the
+ AVR and a DataFlash chip; and to the AVR reset line.  This is all you
+ need to reflash the firmware, and the pins are the standard Atmel "ISP"
+-connector pins (used also on non-Butterfly AVR boards).
++connector pins (used also on non-Butterfly AVR boards).  On the parport
++side this is like "sp12" programming cables.
+ 
+ 	Signal	  Butterfly	  Parport (DB-25)
+ 	------	  ---------	  ---------------
+@@ -40,10 +47,14 @@ by clearing PORTB.[0-3]); (b) configure 
+ 	SELECT	= J400.PB0/nSS	= pin 17/C3,nSELECT
+ 	GND	= J400.GND	= pin 24/GND
+ 
+-The "USI" controller, using J405, can be used for a second SPI bus.  That
+-would let you talk to the AVR over SPI, running firmware that makes it act
+-as an SPI slave, while letting either Linux or the AVR use the DataFlash.
+-There are plenty of spare parport pins to wire this one up, such as:
++Or you could flash firmware making the AVR into an SPI slave (keeping the
++DataFlash in reset) and tweak the spi_butterfly driver to make it bind to
++the driver for your custom SPI-based protocol.
++
++The "USI" controller, using J405, can also be used for a second SPI bus.
++That would let you talk to the AVR using custom SPI-with-USI firmware,
++while letting either Linux or the AVR use the DataFlash.  There are plenty
++of spare parport pins to wire this one up, such as:
+ 
+ 	Signal	  Butterfly	  Parport (DB-25)
+ 	------	  ---------	  ---------------
+Index: linux-2.6.10/drivers/spi/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/spi/Kconfig
++++ linux-2.6.10/drivers/spi/Kconfig
+@@ -75,16 +75,6 @@ config SPI_BUTTERFLY
+ 	  inexpensive battery powered microcontroller evaluation board.
+ 	  This same cable can be used to flash new firmware.
+ 
+-config SPI_BUTTERFLY
+-	tristate "Parallel port adapter for AVR Butterfly (DEVELOPMENT)"
+-	depends on SPI_MASTER && PARPORT && EXPERIMENTAL
+-	select SPI_BITBANG
+-	help
+-	  This uses a custom parallel port cable to connect to an AVR
+-	  Butterfly <http://www.atmel.com/products/avr/butterfly>, an
+-	  inexpensive battery powered microcontroller evaluation board.
+-	  This same cable can be used to flash new firmware.
+-
+ #
+ # Add new SPI master controllers in alphabetical order above this line
+ #
+Index: linux-2.6.10/drivers/spi/spi_butterfly.c
+===================================================================
+--- linux-2.6.10.orig/drivers/spi/spi_butterfly.c
++++ linux-2.6.10/drivers/spi/spi_butterfly.c
+@@ -163,21 +163,20 @@ static void butterfly_chipselect(struct 
+ 	struct butterfly	*pp = spidev_to_pp(spi);
+ 
+ 	/* set default clock polarity */
+-	if (value)
++	if (value != BITBANG_CS_INACTIVE)
+ 		setsck(spi, spi->mode & SPI_CPOL);
+ 
+ 	/* no chipselect on this USI link config */
+ 	if (is_usidev(spi))
+ 		return;
+ 
+-	/* here, value == "activate or not" */
+-
+-	/* most PARPORT_CONTROL_* bits are negated */
++	/* here, value == "activate or not";
++	 * most PARPORT_CONTROL_* bits are negated, so we must
++	 * morph it to value == "bit value to write in control register"
++	 */
+ 	if (spi_cs_bit == PARPORT_CONTROL_INIT)
+ 		value = !value;
+ 
+-	/* here, value == "bit value to write in control register"  */
+-
+ 	parport_frob_control(pp->port, spi_cs_bit, value ? spi_cs_bit : 0);
+ }
+ 
+@@ -202,7 +201,9 @@ butterfly_txrx_word_mode0(struct spi_dev
+ 
+ /* override default partitioning with cmdlinepart */
+ static struct mtd_partition partitions[] = { {
+-	/* JFFS2 wants partitions of 4*N blocks for this device ... */
++	/* JFFS2 wants partitions of 4*N blocks for this device,
++	 * so sectors 0 and 1 can't be partitions by themselves.
++	 */
+ 
+ 	/* sector 0 = 8 pages * 264 bytes/page (1 block)
+ 	 * sector 1 = 248 pages * 264 bytes/page
+@@ -316,8 +317,9 @@ static void butterfly_attach(struct parp
+ 	if (status < 0)
+ 		goto clean2;
+ 
+-	/* Bus 1 lets us talk to at45db041b (firmware disables AVR)
+-	 * or AVR (firmware resets at45, acts as spi slave)
++	/* Bus 1 lets us talk to at45db041b (firmware disables AVR SPI), AVR
++	 * (firmware resets at45, acts as spi slave) or neither (we ignore
++	 * both, AVR uses AT45).  Here we expect firmware for the first option.
+ 	 */
+ 	pp->info[0].max_speed_hz = 15 * 1000 * 1000;
+ 	strcpy(pp->info[0].modalias, "mtd_dataflash");
+@@ -330,7 +332,9 @@ static void butterfly_attach(struct parp
+ 				pp->dataflash->dev.bus_id);
+ 
+ #ifdef	HAVE_USI
+-	/* even more custom AVR firmware */
++	/* Bus 2 is only for talking to the AVR, and it can work no
++	 * matter who masters bus 1; needs appropriate AVR firmware.
++	 */
+ 	pp->info[1].max_speed_hz = 10 /* ?? */ * 1000 * 1000;
+ 	strcpy(pp->info[1].modalias, "butterfly");
+ 	// pp->info[1].platform_data = ... TBD ... ;
+@@ -378,13 +382,8 @@ static void butterfly_detach(struct parp
+ 	pp = butterfly;
+ 	butterfly = NULL;
+ 
+-#ifdef	HAVE_USI
+-	spi_unregister_device(pp->butterfly);
+-	pp->butterfly = NULL;
+-#endif
+-	spi_unregister_device(pp->dataflash);
+-	pp->dataflash = NULL;
+-
++	/* stop() unregisters child devices too */
++	pdev = to_platform_device(pp->bitbang.master->cdev.dev);
+ 	status = spi_bitbang_stop(&pp->bitbang);
+ 
+ 	/* turn off VCC */
+@@ -394,8 +393,6 @@ static void butterfly_detach(struct parp
+ 	parport_release(pp->pd);
+ 	parport_unregister_device(pp->pd);
+ 
+-	pdev = to_platform_device(pp->bitbang.master->cdev.dev);
+-
+ 	(void) spi_master_put(pp->bitbang.master);
+ 
+ 	platform_device_unregister(pdev);
+@@ -420,4 +417,5 @@ static void __exit butterfly_exit(void)
+ }
+ module_exit(butterfly_exit);
+ 
++MODULE_DESCRIPTION("Parport Adapter driver for AVR Butterfly");
+ MODULE_LICENSE("GPL");
+Index: linux-2.6.10/mvl_patches/pro-0867.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0867.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(867);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

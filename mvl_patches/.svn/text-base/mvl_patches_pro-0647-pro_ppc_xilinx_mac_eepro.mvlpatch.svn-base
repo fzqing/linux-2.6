@@ -1,0 +1,961 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc_xilinx_mac_eepro
+# Date: Thu Jun 22 21:14:40 2006
+# Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+# MR: 18841
+# Type: Defect Fix 
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Description:
+#     Use the mac address from the EEProm on the I2C Bus for Xilinx ML300, ML40x.
+# 
+
+PATCHNUM=647
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+MR: 18841
+Type: Defect Fix 
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Description:
+    Use the mac address from the EEProm on the I2C Bus for Xilinx ML300, ML40x.
+
+Index: linux-2.6.10/arch/ppc/boot/simple/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/boot/simple/Makefile
++++ linux-2.6.10/arch/ppc/boot/simple/Makefile
+@@ -21,6 +21,16 @@
+ # XXX_memory.o file for this to work, as well as editing the
+ # misc-$(CONFIG_MACHINE) variable.
+ 
++ifeq ($(CONFIG_XILINX_ML300),y)
++EXTRA_CFLAGS		+= -Idrivers/i2c/algos/xilinx_iic
++EXTRA_CFLAGS		+= -Idrivers/xilinx_common
++endif
++
++ifeq ($(CONFIG_XILINX_ML40x),y)
++EXTRA_CFLAGS		+= -Idrivers/i2c/algos/xilinx_iic
++EXTRA_CFLAGS		+= -Idrivers/xilinx_common
++endif
++
+ boot				:= arch/ppc/boot
+ common				:= $(boot)/common
+ utils				:= $(boot)/utils
+@@ -171,6 +181,8 @@ boot-$(CONFIG_MBX)		+= iic.o pci.o qspan
+ boot-$(CONFIG_MV64X60)		+= misc-mv64x60.o
+ boot-$(CONFIG_RPXCLASSIC)	+= iic.o pci.o qspan_pci.o
+ boot-$(CONFIG_RPXLITE)		+= iic.o
++boot-$(CONFIG_XILINX_ML300)	+= xiic_l.o
++boot-$(CONFIG_XILINX_ML40x)	+= xiic_l.o
+ # Different boards need different serial implementations.
+ ifeq ($(CONFIG_SERIAL_CPM_CONSOLE),y)
+ boot-$(CONFIG_8xx)		+= m8xx_tty.o
+Index: linux-2.6.10/arch/ppc/boot/simple/embed_config.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/boot/simple/embed_config.c
++++ linux-2.6.10/arch/ppc/boot/simple/embed_config.c
+@@ -745,9 +745,195 @@ embed_config(bd_t **bdp)
+ #if defined(CONFIG_XILINX_ML300) || defined(CONFIG_XILINX_ML40x) \
+     || defined(CONFIG_MEMEC_2VPX)
+ 
++#if defined(CONFIG_MEMEC_2VPX)
++#if !defined(XPAR_FLASH_2MX32_MEM0_BASEADDR)
++int get_cfg_data(unsigned char **cfg_data)
++{
++	/*
++	 * The Memec 2VPx board uses 2Mx32 parallel flash (two flash+SRAM chips
++	 * on the P160 COMM MODULE) to store the Ethernet MAC address.
++	 * But the flash is not in the configuration. If you are in this
++	 * situation you'll need to define an alternative way of storing
++	 * the Ethernet MAC address. To temporarily work around the situation,
++	 * you can simply comment out the following #error and a hard-coded
++	 * MAC address will be used.
++	 */
++#error Paralle flash support needed for obtaining the Ethernet MAC address
++	return 0;	/* no cfg data found */
++}
++#else
++#define CFG_DATA_SIZE 1024
++#define CFG_DATA_START XPAR_FLASH_2MX32_MEM0_BASEADDR
++int get_cfg_data(unsigned char **cfg_data)
++{
++	*cfg_data = (unsigned char *)CFG_DATA_START;
++	return CFG_DATA_SIZE;
++}
++#endif
++#endif /* CONFIG_MEMEC_2VPX */
++
++#if defined(CONFIG_XILINX_ML300) || defined(CONFIG_XILINX_ML40x)
++
++#include <xiic_l.h>
++
++#if !defined(XPAR_IIC_0_BASEADDR) || !defined(XPAR_PERSISTENT_0_IIC_0_BASEADDR)
++int get_cfg_data(unsigned char **cfg_data)
++{
++	/*
++	 * The ML300 uses an I2C SEEPROM to store the Ethernet MAC address, but
++	 * either an I2C interface or the SEEPROM aren't configured in.  If you
++	 * are in this situation, you'll need to define an alternative way of
++	 * storing the Ethernet MAC address.  To temporarily work around the
++	 * situation, you can simply comment out the following #error and a
++	 * hard-coded MAC will be used.
++	 */
++#error I2C needed for obtaining the Ethernet MAC address
++	return 0;	/* no cfg data found */
++}
++#else
++#define CFG_DATA_SIZE \
++ (XPAR_PERSISTENT_0_IIC_0_HIGHADDR - XPAR_PERSISTENT_0_IIC_0_BASEADDR + 1)
++int get_cfg_data(unsigned char **cfg_data)
++{
++	unsigned char sdata[CFG_DATA_SIZE];
++	int i;
++
++	/*
++	 * Fill our SEEPROM data array (sdata) from address
++	 * XPAR_PERSISTENT_0_IIC_0_BASEADDR of the SEEPROM at slave
++	 * address XPAR_PERSISTENT_0_IIC_0_EEPROMADDR.  We'll then parse
++	 * that data looking for a MAC address. */
++	sdata[0] = XPAR_PERSISTENT_0_IIC_0_BASEADDR >> 8;
++	sdata[1] = XPAR_PERSISTENT_0_IIC_0_BASEADDR & 0xFF;
++	i = XIic_Send(XPAR_IIC_0_BASEADDR,
++		      XPAR_PERSISTENT_0_IIC_0_EEPROMADDR>>1, sdata, 2);
++	if (i != 2)
++		return 0;	/* Couldn't send the address.  Return error. */
++	i = XIic_Recv(XPAR_IIC_0_BASEADDR,
++		      XPAR_PERSISTENT_0_IIC_0_EEPROMADDR>>1,
++		      sdata, sizeof(sdata));
++	if (i != sizeof(sdata))
++		return 0;	/* Didn't read all the data.  Return error. */
++	*cfg_data = sdata;
++	return CFG_DATA_SIZE;
++}
++#endif
++#endif /* defined(CONFIG_XILINX_ML300) || defined(CONFIG_XILINX_ML40x) */
++
++static int
++hexdigit(char c)
++{
++	if ('0' <= c && c <= '9')
++		return c - '0';
++	else if ('a' <= c && c <= 'f')
++		return c - 'a' + 10;
++	else if ('A' <= c && c <= 'F')
++		return c - 'A' + 10;
++	else
++		return -1;
++}
++
+ static int get_mac_addr(unsigned char *mac)
+ {
+-	return 1;	/* not implemented yet; use hardcoded value */
++	unsigned char *cp, *cp0, *cksum_val, *enet_val;
++	unsigned char cksum;
++	int done, msn, lsn, cfg_size;
++	enum { BEGIN_KEY, IN_KEY, IN_VALUE } state;
++
++	cfg_size = get_cfg_data(&cp0);
++	if (cfg_size == 0)
++		return 1;	/* Failed to read configuration data */
++	
++	/* The cfg data should contain a series of KEY=VALUE parameters.
++	 * Each KEY=VALUE is followed by a NULL character.  After the
++	 * last one will be an extra NULL character.  Valid characters
++	 * for KEYs are A to Z, 0 to 9 and underscore.  Any character
++	 * other than NULL is valid for VALUEs.  In addition there is a
++	 * checksum.  Do an initial pass to make sure the key/values
++	 * look good and to find the C= (checksum) and E= (ethernet MAC
++	 * address parameters. */
++	cksum_val = enet_val = NULL;
++	cksum = 0;
++	done = 0;
++	state = BEGIN_KEY;
++	cp = cp0;
++	while (!done) {
++		/* Error if we didn't find the end of the data. */
++		if (cp - cp0 >= cfg_size)
++			return 1;
++
++		switch (state) {
++		case BEGIN_KEY:
++			state = IN_KEY;
++			if (*cp == 'C' && *(cp+1) == '=') {
++				cksum_val = cp + 2;
++				break;
++			} else if (*cp == 'E' && *(cp+1) == '=') {
++				enet_val = cp + 2;
++				break;
++			} else if (*cp == '\0') {
++				/* Found the end of the data. */
++				done = 1;
++				break;
++			}
++			/* otherwise, fall through to validate the char. */
++		case IN_KEY:
++			switch (*cp) {
++			case 'A'...'Z':
++			case '0'...'9':
++			case '_':
++				break; /* Valid char.  Do nothing. */
++			case '=':
++				state = IN_VALUE;
++				break;
++			default:
++				return 1; /* Invalid character.  Error. */
++			}
++			break;
++		case IN_VALUE:
++			if (*cp == '\0')
++				state = BEGIN_KEY;
++			break;
++		}
++
++		cksum += *(cp++);
++	}
++
++	/* Error if we couldn't find the checksum and MAC. */
++	if (!cksum_val || !enet_val)
++		return 1;
++
++	/* At this point, we know that the structure of the data was
++	 * correct and we have found where the checksum and MAC address
++	 * values are. */
++
++	/* Validate the checksum. */
++	msn = hexdigit(cksum_val[0]);
++	lsn = hexdigit(cksum_val[1]);
++	if (cksum_val[2] != '\0' || msn < 0 || lsn < 0)
++		return 1;	/* Error because it isn't two hex digits. */
++	/* The sum of all the characters except for the two checksum
++	 * digits should be the value of the two checksum digits.
++	 */
++	cksum -= cksum_val[0];
++	cksum -= cksum_val[1];
++	if (cksum != (msn << 4 | lsn))
++		return 1;	/* Bad checksum. */
++
++	/* Validate and set the MAC. */
++	cp = enet_val;
++	while (cp < enet_val + 12) {
++		msn = hexdigit(*cp++);
++		lsn = hexdigit(*cp++);
++		if (msn < 0 || lsn < 0)
++			return 1;
++		*mac++ = msn << 4 | lsn;
++	}
++	if (*cp != '\0')
++		return 1;
++
++	/* Success */
++	return 0;
+ }
+ 
+ void
+Index: linux-2.6.10/arch/ppc/boot/simple/xiic_l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/boot/simple/xiic_l.c
+@@ -0,0 +1,496 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic_l.c
++*
++* This file contains low-level driver functions that can be used to access the
++* device.  The user should refer to the hardware device specification for more
++* details of the device operation.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- --- -------  -----------------------------------------------
++* 1.01b jhl 5/13/02  First release
++* 1.01b jhl 10/14/02 Corrected bug in the receive function, the setup of the
++* 						 interrupt status mask was not being done in the loop such
++*						 that a read would sometimes fail on the last byte because
++*						 the transmit error which should have been ignored was
++*						 being used.  This would leave an extra byte in the FIFO
++*						 and the bus throttled such that the next operation would
++*						 also fail.  Also updated the receive function to not
++*						 disable the device after the last byte until after the
++*						 bus transitions to not busy which is more consistent
++*						 with the expected behavior.
++* 1.01c ecm  12/05/02 new rev
++* </pre>
++*
++****************************************************************************/
++
++/***************************** Include Files *******************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++#include "xipif_v1_23_b.h"
++#include "xiic_l.h"
++
++/************************** Constant Definitions ***************************/
++
++/**************************** Type Definitions *****************************/
++
++/***************** Macros (Inline Functions) Definitions *******************/
++
++/******************************************************************************
++*
++* This macro clears the specified interrupt in the IPIF interrupt status
++* register.  It is non-destructive in that the register is read and only the
++* interrupt specified is cleared.  Clearing an interrupt acknowledges it.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @param    InterruptMask contains the interrupts to be disabled
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mClearIisr(u32 BaseAddress,
++*                                 u32 InterruptMask);
++*
++******************************************************************************/
++#define XIic_mClearIisr(BaseAddress, InterruptMask)                 \
++    XIIF_V123B_WRITE_IISR((BaseAddress),                            \
++        XIIF_V123B_READ_IISR(BaseAddress) & (InterruptMask))
++
++/******************************************************************************
++*
++* This macro sends the address for a 7 bit address during both read and write
++* operations. It takes care of the details to format the address correctly.
++* This macro is designed to be called internally to the drivers.
++*
++* @param    SlaveAddress contains the address of the slave to send to.
++*
++* @param    Operation indicates XIIC_READ_OPERATION or XIIC_WRITE_OPERATION
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mSend7BitAddr(u16 SlaveAddress, u8 Operation);
++*
++******************************************************************************/
++#define XIic_mSend7BitAddress(BaseAddress, SlaveAddress, Operation)         \
++{                                                                           \
++    u8 LocalAddr = (u8)(SlaveAddress << 1);                         \
++    LocalAddr = (LocalAddr & 0xFE) | (Operation);                           \
++    XIo_Out8(BaseAddress + XIIC_DTR_REG_OFFSET, LocalAddr);                 \
++}
++
++/************************** Function Prototypes ****************************/
++
++static unsigned RecvData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount);
++static unsigned SendData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount);
++
++/************************** Variable Definitions **************************/
++
++/****************************************************************************/
++/**
++* Receive data as a master on the IIC bus.  This function receives the data
++* using polled I/O and blocks until the data has been received.  It only
++* supports 7 bit addressing and non-repeated start modes of operation.  The
++* user is responsible for ensuring the bus is not busy if multiple masters
++* are present on the bus.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    Address contains the 7 bit IIC address of the device to send the
++*           specified data to.
++* @param    BufferPtr points to the data to be sent.
++* @param    ByteCount is the number of bytes to be sent.
++*
++* @return
++*
++* The number of bytes received.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++unsigned XIic_Recv(u32 BaseAddress, u8 Address,
++		   u8 * BufferPtr, unsigned ByteCount)
++{
++	u8 CntlReg;
++	unsigned RemainingByteCount;
++
++	/* Tx error is enabled incase the address (7 or 10) has no device to answer
++	 * with Ack. When only one byte of data, must set NO ACK before address goes
++	 * out therefore Tx error must not be enabled as it will go off immediately
++	 * and the Rx full interrupt will be checked.  If full, then the one byte
++	 * was received and the Tx error will be disabled without sending an error
++	 * callback msg.
++	 */
++	XIic_mClearIisr(BaseAddress,
++			XIIC_INTR_RX_FULL_MASK | XIIC_INTR_TX_ERROR_MASK |
++			XIIC_INTR_ARB_LOST_MASK);
++
++	/* Set receive FIFO occupancy depth for 1 byte (zero based)
++	 */
++	XIo_Out8(BaseAddress + XIIC_RFD_REG_OFFSET, 0);
++
++	/* 7 bit slave address, send the address for a read operation
++	 * and set the state to indicate the address has been sent
++	 */
++	XIic_mSend7BitAddress(BaseAddress, Address, XIIC_READ_OPERATION);
++
++	/* MSMS gets set after putting data in FIFO. Start the master receive
++	 * operation by setting CR Bits MSMS to Master, if the buffer is only one
++	 * byte, then it should not be acknowledged to indicate the end of data
++	 */
++	CntlReg = XIIC_CR_MSMS_MASK | XIIC_CR_ENABLE_DEVICE_MASK;
++	if (ByteCount == 1) {
++		CntlReg |= XIIC_CR_NO_ACK_MASK;
++	}
++
++	/* Write out the control register to start receiving data and call the
++	 * function to receive each byte into the buffer
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET, CntlReg);
++
++	/* Clear the latched interrupt status for the bus not busy bit which must
++	 * be done while the bus is busy
++	 */
++	XIic_mClearIisr(BaseAddress, XIIC_INTR_BNB_MASK);
++
++	/* Try to receive the data from the IIC bus */
++
++	RemainingByteCount = RecvData(BaseAddress, BufferPtr, ByteCount);
++	/*
++	 * The receive is complete, disable the IIC device and return the number of
++	 * bytes that was received
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET, 0);
++
++	/* Return the number of bytes that was received */
++
++	return ByteCount - RemainingByteCount;
++}
++
++/******************************************************************************
++*
++* Receive the specified data from the device that has been previously addressed
++* on the IIC bus.  This function assumes that the 7 bit address has been sent
++* and it should wait for the transmit of the address to complete.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    BufferPtr points to the buffer to hold the data that is received.
++* @param    ByteCount is the number of bytes to be received.
++*
++* @return
++*
++* The number of bytes remaining to be received.
++*
++* @note
++*
++* This function does not take advantage of the receive FIFO because it is
++* designed for minimal code space and complexity.  It contains loops that
++* that could cause the function not to return if the hardware is not working.
++*
++* This function assumes that the calling function will disable the IIC device
++* after this function returns.
++*
++******************************************************************************/
++static unsigned RecvData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount)
++{
++	u8 CntlReg;
++	u32 IntrStatusMask;
++	u32 IntrStatus;
++
++	/* Attempt to receive the specified number of bytes on the IIC bus */
++
++	while (ByteCount > 0) {
++		/* Setup the mask to use for checking errors because when receiving one
++		 * byte OR the last byte of a multibyte message an error naturally
++		 * occurs when the no ack is done to tell the slave the last byte
++		 */
++		if (ByteCount == 1) {
++			IntrStatusMask =
++			    XIIC_INTR_ARB_LOST_MASK | XIIC_INTR_BNB_MASK;
++		} else {
++			IntrStatusMask =
++			    XIIC_INTR_ARB_LOST_MASK | XIIC_INTR_TX_ERROR_MASK |
++			    XIIC_INTR_BNB_MASK;
++		}
++
++		/* Wait for the previous transmit and the 1st receive to complete
++		 * by checking the interrupt status register of the IPIF
++		 */
++		while (1) {
++			IntrStatus = XIIF_V123B_READ_IISR(BaseAddress);
++			if (IntrStatus & XIIC_INTR_RX_FULL_MASK) {
++				break;
++			}
++			/* Check the transmit error after the receive full because when
++			 * sending only one byte transmit error will occur because of the
++			 * no ack to indicate the end of the data
++			 */
++			if (IntrStatus & IntrStatusMask) {
++				return ByteCount;
++			}
++		}
++
++		CntlReg = XIo_In8(BaseAddress + XIIC_CR_REG_OFFSET);
++
++		/* Special conditions exist for the last two bytes so check for them
++		 * Note that the control register must be setup for these conditions
++		 * before the data byte which was already received is read from the
++		 * receive FIFO (while the bus is throttled
++		 */
++		if (ByteCount == 1) {
++			/* For the last data byte, it has already been read and no ack
++			 * has been done, so clear MSMS while leaving the device enabled
++			 * so it can get off the IIC bus appropriately with a stop.
++			 */
++			XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++				 XIIC_CR_ENABLE_DEVICE_MASK);
++		}
++
++		/* Before the last byte is received, set NOACK to tell the slave IIC
++		 * device that it is the end, this must be done before reading the byte
++		 * from the FIFO
++		 */
++		if (ByteCount == 2) {
++			/* Write control reg with NO ACK allowing last byte to
++			 * have the No ack set to indicate to slave last byte read.
++			 */
++			XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++				 CntlReg | XIIC_CR_NO_ACK_MASK);
++		}
++
++		/* Read in data from the FIFO and unthrottle the bus such that the
++		 * next byte is read from the IIC bus
++		 */
++		*BufferPtr++ = XIo_In8(BaseAddress + XIIC_DRR_REG_OFFSET);
++
++		/* Clear the latched interrupt status so that it will be updated with
++		 * the new state when it changes, this must be done after the receive
++		 * register is read
++		 */
++		XIic_mClearIisr(BaseAddress, XIIC_INTR_RX_FULL_MASK |
++				XIIC_INTR_TX_ERROR_MASK |
++				XIIC_INTR_ARB_LOST_MASK);
++		ByteCount--;
++	}
++
++	/* Wait for the bus to transition to not busy before returning, the IIC
++	 * device cannot be disabled until this occurs.  It should transition as
++	 * the MSMS bit of the control register was cleared before the last byte
++	 * was read from the FIFO.
++	 */
++	while (1) {
++		if (XIIF_V123B_READ_IISR(BaseAddress) & XIIC_INTR_BNB_MASK) {
++			break;
++		}
++	}
++
++	return ByteCount;
++}
++
++/****************************************************************************/
++/**
++* Send data as a master on the IIC bus.  This function sends the data
++* using polled I/O and blocks until the data has been sent.  It only supports
++* 7 bit addressing and non-repeated start modes of operation.  The user is
++* responsible for ensuring the bus is not busy if multiple masters are present
++* on the bus.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    Address contains the 7 bit IIC address of the device to send the
++*           specified data to.
++* @param    BufferPtr points to the data to be sent.
++* @param    ByteCount is the number of bytes to be sent.
++*
++* @return
++*
++* The number of bytes sent.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++unsigned XIic_Send(u32 BaseAddress, u8 Address,
++		   u8 * BufferPtr, unsigned ByteCount)
++{
++	unsigned RemainingByteCount;
++
++	/* Put the address into the FIFO to be sent and indicate that the operation
++	 * to be performed on the bus is a write operation
++	 */
++	XIic_mSend7BitAddress(BaseAddress, Address, XIIC_WRITE_OPERATION);
++
++	/* Clear the latched interrupt status so that it will be updated with the
++	 * new state when it changes, this must be done after the address is put
++	 * in the FIFO
++	 */
++	XIic_mClearIisr(BaseAddress, XIIC_INTR_TX_EMPTY_MASK |
++			XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK);
++
++	/* MSMS must be set after putting data into transmit FIFO, indicate the
++	 * direction is transmit, this device is master and enable the IIC device
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++		 XIIC_CR_MSMS_MASK | XIIC_CR_DIR_IS_TX_MASK |
++		 XIIC_CR_ENABLE_DEVICE_MASK);
++
++	/* Clear the latched interrupt
++	 * status for the bus not busy bit which must be done while the bus is busy
++	 */
++	XIic_mClearIisr(BaseAddress, XIIC_INTR_BNB_MASK);
++
++	/* Send the specified data to the device on the IIC bus specified by the
++	 * the address
++	 */
++	RemainingByteCount = SendData(BaseAddress, BufferPtr, ByteCount);
++
++	/*
++	 * The send is complete, disable the IIC device and return the number of
++	 * bytes that was sent
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET, 0);
++
++	return ByteCount - RemainingByteCount;
++}
++
++/******************************************************************************
++*
++* Send the specified buffer to the device that has been previously addressed
++* on the IIC bus.  This function assumes that the 7 bit address has been sent
++* and it should wait for the transmit of the address to complete.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    BufferPtr points to the data to be sent.
++* @param    ByteCount is the number of bytes to be sent.
++*
++* @return
++*
++* The number of bytes remaining to be sent.
++*
++* @note
++*
++* This function does not take advantage of the transmit FIFO because it is
++* designed for minimal code space and complexity.  It contains loops that
++* that could cause the function not to return if the hardware is not working.
++*
++******************************************************************************/
++static unsigned SendData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount)
++{
++	u32 IntrStatus;
++
++	/* Send the specified number of bytes in the specified buffer by polling
++	 * the device registers and blocking until complete
++	 */
++	while (ByteCount > 0) {
++		/* Wait for the transmit to be empty before sending any more data
++		 * by polling the interrupt status register
++		 */
++		while (1) {
++			IntrStatus = XIIF_V123B_READ_IISR(BaseAddress);
++
++			if (IntrStatus & (XIIC_INTR_TX_ERROR_MASK |
++					  XIIC_INTR_ARB_LOST_MASK |
++					  XIIC_INTR_BNB_MASK)) {
++				return ByteCount;
++			}
++
++			if (IntrStatus & XIIC_INTR_TX_EMPTY_MASK) {
++				break;
++			}
++		}
++		/* If there is more than one byte to send then put the next byte to send
++		 * into the transmit FIFO
++		 */
++		if (ByteCount > 1) {
++			XIo_Out8(BaseAddress + XIIC_DTR_REG_OFFSET,
++				 *BufferPtr++);
++		} else {
++			/* Set the stop condition before sending the last byte of data so that
++			 * the stop condition will be generated immediately following the data
++			 * This is done by clearing the MSMS bit in the control register.
++			 */
++			XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++				 XIIC_CR_ENABLE_DEVICE_MASK |
++				 XIIC_CR_DIR_IS_TX_MASK);
++
++			/* Put the last byte to send in the transmit FIFO */
++
++			XIo_Out8(BaseAddress + XIIC_DTR_REG_OFFSET,
++				 *BufferPtr++);
++		}
++
++		/* Clear the latched interrupt status register and this must be done after
++		 * the transmit FIFO has been written to or it won't clear
++		 */
++		XIic_mClearIisr(BaseAddress, XIIC_INTR_TX_EMPTY_MASK);
++
++		/* Update the byte count to reflect the byte sent and clear the latched
++		 * interrupt status so it will be updated for the new state
++		 */
++		ByteCount--;
++	}
++
++	/* Wait for the bus to transition to not busy before returning, the IIC
++	 * device cannot be disabled until this occurs.
++	 * Note that this is different from a receive operation because the stop
++	 * condition causes the bus to go not busy.
++	 */
++	while (1) {
++		if (XIIF_V123B_READ_IISR(BaseAddress) & XIIC_INTR_BNB_MASK) {
++			break;
++		}
++	}
++
++	return ByteCount;
++}
+Index: linux-2.6.10/mvl_patches/pro-0647.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0647.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(647);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,570 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_jtag_cpu_summarize
+# Date: Mon Jan 21 23:01:30 2008
+# MR: 23575
+# Summary: Backport JTAG ID  and cpu_is* framework from DaVinci git tree
+# Source: MontaVista Software, Inc.
+# Type: Enhancement
+# Disposition: backport from DaVinci git tree
+# Description:
+# Backport JTAG ID framework and cpu_is* functions from the DaVinci
+# git tree.  This patch only takes the minimum change required to get
+# everything working.
+# 
+
+PATCHNUM=1620
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 23575
+Summary: Backport JTAG ID  and cpu_is* framework from DaVinci git tree
+Source: MontaVista Software, Inc.
+Type: Enhancement
+Disposition: backport from DaVinci git tree
+Description:
+Backport JTAG ID framework and cpu_is* functions from the DaVinci
+git tree.  This patch only takes the minimum change required to get
+everything working.
+
+Index: linux-2.6.10/arch/arm/mach-davinci/board-evm.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/board-evm.c
++++ linux-2.6.10/arch/arm/mach-davinci/board-evm.c
+@@ -49,7 +49,7 @@
+ #include <asm/mach/arch.h>
+ #include <asm/mach/map.h>
+ #include <asm/mach/flash.h>
+-
++#include <asm/arch/irqs.h>
+ #include <asm/arch/hardware.h>
+ #include "clock.h"
+ 
+@@ -276,18 +276,10 @@ static void board_init(void)
+ 	davinci_clk_init();
+ }
+ 
+-/*
+- * DaVinci IO Mapping
+- */
+-static struct map_desc davinci_io_desc[] __initdata = {
+- { IO_VIRT,      	IO_PHYS,             IO_SIZE,        	   MT_DEVICE },
+- { DAVINCI_IRAM_VIRT,   DAVINCI_IRAM_BASE,   SZ_16K,               MT_DEVICE },
+-};
+-
+ static void __init
+ davinci_map_io(void)
+ {
+-	iotable_init(davinci_io_desc, ARRAY_SIZE(davinci_io_desc));
++	davinci_map_common_io();
+ 
+ 	/* Initialize the DaVinci EVM board settigs */
+ 	board_init ();
+Index: linux-2.6.10/arch/arm/mach-davinci/id.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-davinci/id.c
+@@ -0,0 +1,106 @@
++/*
++ * linux/arch/arm/mach-davinci/id.c
++ *
++ * Davinci CPU identification code
++ *
++ * Copyright (C) 2006 Komal Shah <komal_shah802003@yahoo.com>
++ *
++ * Derived from OMAP1 CPU identification code.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++
++#include <asm/io.h>
++
++#define DAVINCI_DEV_ID		0x01c40028
++
++#define DAVINCI_DM6443_CPU_ID		0x64430000
++#define DAVINCI_DM6467_CPU_ID		0x64670000
++#define DAVINCI_DM350_CPU_ID		0x03500000
++
++struct davinci_id {
++	u16	jtag_id;	/* Device Part No. (Unique JTAG id)*/
++	u8	dev_rev;	/* Processor revision */
++	u32	mfg_jtag_id;	/* Manufacturer JTAP id */
++	u32	type;		/* Cpu id bits [31:08], cpu class bits [07:00] */
++};
++
++/* Register values to detect the DaVinci version */
++static struct davinci_id davinci_ids[] __initdata = {
++	{ .jtag_id = 0xb700, .dev_rev = 0x2, .mfg_jtag_id = 0x017, 
++	  .type = DAVINCI_DM6443_CPU_ID }, /* DaVinci */
++
++	{ .jtag_id = 0xb770, .dev_rev = 0x0, .mfg_jtag_id = 0x017, 
++	  .type = DAVINCI_DM6467_CPU_ID }, /* DaVinci HD */
++
++	{ .jtag_id = 0xb73b, .dev_rev = 0x0, .mfg_jtag_id = 0x00f, 
++	  .type = DAVINCI_DM350_CPU_ID },
++};
++
++/*
++ * Get Device Part No. from DEV_ID.
++ */
++static u16 __init davinci_get_jtag_id(void)
++{
++	u32 dev_id, jtag_id;
++
++	dev_id = davinci_readl(DAVINCI_DEV_ID);
++
++	jtag_id = ((dev_id >> 12) & 0xffff);
++
++	return jtag_id;
++}
++
++/*
++ * Get Device Revision from DEV_ID.
++ */
++static u8 __init davinci_get_dev_rev(void)
++{
++	u32 dev_rev;
++
++	dev_rev = davinci_readl(DAVINCI_DEV_ID);
++
++	dev_rev = (dev_rev >> 28) & 0xf;
++
++	return dev_rev;
++}
++
++void __init davinci_check_revision(void)
++{
++	int i;
++	u16 jtag_id;
++	u8 dev_rev;
++
++	jtag_id = davinci_get_jtag_id();
++	dev_rev = davinci_get_dev_rev();
++
++#ifdef DEBUG
++	printk("JTAG_ID: 0x%04x DEV_REV: %i\n", jtag_id, dev_rev);
++#endif
++
++	/* First check only the major version in a safe way */
++	for (i = 0; i < ARRAY_SIZE(davinci_ids); i++) {
++		if (jtag_id == (davinci_ids[i].jtag_id)) {
++			system_rev = davinci_ids[i].type;
++			break;
++		}
++	}
++
++	/* Check if we can find the dev revision */
++	for (i = 0; i < ARRAY_SIZE(davinci_ids); i++) {
++		if (jtag_id == davinci_ids[i].jtag_id &&
++		    dev_rev == davinci_ids[i].dev_rev) {
++			system_rev = davinci_ids[i].type;
++			break;
++		}
++	}
++
++	printk("DM%04x\n", system_rev >> 16);
++}
++
+Index: linux-2.6.10/arch/arm/mach-davinci/io.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mach-davinci/io.c
+@@ -0,0 +1,65 @@
++/*
++ * linux/arch/arm/mach-davinci/io.c
++ *
++ * DaVinci I/O mapping code
++ *
++ * Copyright (C) 2005-2006 Texas Instruments
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++
++#include <asm/tlb.h>
++#include <asm/io.h>
++
++#include <asm/mach/map.h>
++#include <asm/arch/memory.h>
++
++extern int davinci_clk_init(void);
++extern void davinci_check_revision(void);
++
++/*
++ * The machine specific code may provide the extra mapping besides the
++ * default mapping provided here.
++ */
++static struct map_desc davinci_io_desc[] __initdata = {
++	{
++		.virtual	= IO_VIRT,
++		.physical	= IO_PHYS,
++		.length		= IO_SIZE,
++		.type		= MT_DEVICE
++	},
++	{
++		.virtual	= DAVINCI_IRAM_VIRT,
++		.physical	= DAVINCI_IRAM_BASE,
++		.length		= SZ_16K,
++		.type		= MT_DEVICE
++	},
++};
++
++void __init davinci_map_common_io(void)
++{
++	iotable_init(davinci_io_desc, ARRAY_SIZE(davinci_io_desc));
++
++	/* Normally devicemaps_init() would flush caches and tlb after
++	 * mdesc->map_io(), but we must also do it here because of the CPU
++	 * revision check below.
++	 */
++	flush_tlb_all();
++	flush_cache_all();
++
++	/* We want to check CPU revision early for cpu_is_omapxxxx() macros.
++	 * IO space mapping must be initialized before we can do that.
++	 */
++	davinci_check_revision();
++}
++
++void __init davinci_init_common_hw(void)
++{
++	davinci_clk_init();
++}
+Index: linux-2.6.10/arch/arm/mach-davinci/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-davinci/Makefile
++++ linux-2.6.10/arch/arm/mach-davinci/Makefile
+@@ -5,7 +5,7 @@
+ 
+ 
+ # Common objects
+-obj-y 				:= time.o irq.o dma.o serial.o clock.o
++obj-y 				:= time.o irq.o dma.o serial.o clock.o io.o id.o
+ 
+ # Board specific
+ obj-$(CONFIG_MACH_DAVINCI_EVM)  += board-evm.o i2c-emac.o
+Index: linux-2.6.10/include/asm-arm/arch-davinci/cpu.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-davinci/cpu.h
+@@ -0,0 +1,32 @@
++/*
++ * linux/include/asm-arm/arch-davinci/cpu.h
++ *
++ * Davinci cpu type detection
++ *
++ * Author: Steve Chen <schen@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++#ifndef _ASM_ARCH_CPU_H
++#define _ASM_ARCH_CPU_H
++
++extern unsigned int system_rev;
++
++#define GET_DAVINCI_CPU_TYPE	((system_rev >> 16) & 0xffff)
++
++#define IS_DAVINCI_CPU(type, id)			\
++static inline int cpu_is_davinci_dm ##type (void)		\
++{							\
++        return (GET_DAVINCI_CPU_TYPE == (id)) ? 1 : 0;	\
++}
++
++/* following generates the cpu_is_davinci_dmxxx */
++IS_DAVINCI_CPU(6443, 0x6443)	/* cpu_is_davinci_dm6443() */
++IS_DAVINCI_CPU(6467, 0x6467)	/* cpu_is_davinci_dm6467() */
++IS_DAVINCI_CPU(350, 0x350)	/* cpu_is_davinci_dm350() */
++
++#endif
+Index: linux-2.6.10/include/asm-arm/arch-davinci/io.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-davinci/io.h
++++ linux-2.6.10/include/asm-arm/arch-davinci/io.h
+@@ -28,6 +28,8 @@
+ #ifndef __ASM_ARCH_IO_H
+ #define __ASM_ARCH_IO_H
+ 
++#include <asm/types.h>
++
+ #define IO_SPACE_LIMIT 0xffffffff
+ 
+ /*
+@@ -41,7 +43,6 @@
+ #define io_p2v(pa)   (((pa) & (IO_SIZE-1)) + IO_VIRT)
+ #define io_v2p(va)   (((va) & (IO_SIZE-1)) + IO_PHYS)
+ #define IO_ADDRESS(x) io_p2v(x)
+-#define __REG(x)	(*((volatile unsigned long *)io_p2v(x)))
+ 
+ /*
+  * We don't actually have real ISA nor PCI buses, but there is so many
+@@ -52,6 +53,51 @@
+ #define __mem_pci(a)		(a)
+ #define __mem_isa(a)		(a)
+ 
++#ifndef __ASSEMBLER__
++
++/*
++ * Functions to access the DaVinci IO region
++ *
++ * NOTE: - Use davinci_read/write[bwl] for physical register addresses
++ * 	- Use __raw_read/write[bwl]() for virtual register addresses
++ *	- Use IO_ADDRESS(phys_addr) to convert registers to virtual addresses
++ *	- DO NOT use hardcoded virtual addresses to allow changing the
++ * 	  IO address space again if needed
++ */
++#define davinci_readb(a)	(*(volatile unsigned char  *)IO_ADDRESS(a))
++#define davinci_readw(a)	(*(volatile unsigned short *)IO_ADDRESS(a))
++#define davinci_readl(a)	(*(volatile unsigned int   *)IO_ADDRESS(a))
++
++#define davinci_writeb(v,a)	(*(volatile unsigned char  *)IO_ADDRESS(a) = (v))
++#define davinci_writew(v,a)	(*(volatile unsigned short *)IO_ADDRESS(a) = (v))
++#define davinci_writel(v,a)	(*(volatile unsigned int   *)IO_ADDRESS(a) = (v))
++
++/* 16 bit uses LDRH/STRH, base +/- offset_8 */
++typedef struct { volatile u16 offset[256]; } __regbase16;
++#define __REGV16(vaddr)		((__regbase16 *)((vaddr)&~0xff)) \
++					->offset[((vaddr)&0xff)>>1]
++#define __REG16(paddr)		__REGV16(io_p2v(paddr))
++
++/* 8/32 bit uses LDR/STR, base +/- offset_12 */
++typedef struct { volatile u8 offset[4096]; } __regbase8;
++#define __REGV8(vaddr)		((__regbase8  *)((vaddr)&~4095)) \
++					->offset[((vaddr)&4095)>>0]
++#define __REG8(paddr)		__REGV8(io_p2v(paddr))
++
++typedef struct { volatile u32 offset[4096]; } __regbase32;
++#define __REGV32(vaddr)		((__regbase32 *)((vaddr)&~4095)) \
++					->offset[((vaddr)&4095)>>2]
++/* FIXME: Just for compilation sake changed from __REG32 to __REG */
++#define __REG(paddr)		__REGV32(io_p2v(paddr))
++
++extern void davinci_map_common_io(void);
++extern void davinci_init_common_hw(void);
++#else
++
++#define __REG(x)        (*((volatile unsigned long *)io_p2v(x)))
++
++#endif
++
+ #endif /* __ASM_ARCH_IO_H */
+ 
+ 
+Index: linux-2.6.10/mvl_patches/pro-1620.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1620.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1620);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

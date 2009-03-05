@@ -1,0 +1,779 @@
+#! /usr/bin/env bash
+# Patch: -pro_ppc32_83xx_config_PIBs_bus_switches
+# Date: Thu Jun 21 07:51:34 2007
+# Source: MontaVista Software, Inc.
+# MR: 22562
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Randy Vinson <rvinson@mvista.com>
+# Description:
+# Configure the PIBs PCI bus switches.
+# 
+# Freescale has modified their version of U-Boot and removed the setup
+# of the PCI bus switches on the PIBs base board. This change prevents
+# the MontaVista kernel from booting. This patches adds the missing bus
+# switch setup to the kernel which allows the MontaVista kernel to boot.
+# 
+
+PATCHNUM=1344
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 22562
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Randy Vinson <rvinson@mvista.com>
+Description:
+Configure the PIBs PCI bus switches.
+
+Freescale has modified their version of U-Boot and removed the setup
+of the PCI bus switches on the PIBs base board. This change prevents
+the MontaVista kernel from booting. This patches adds the missing bus
+switch setup to the kernel which allows the MontaVista kernel to boot.
+
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -732,8 +732,7 @@ config MPC834x_SYS
+ 
+ 	  Be aware that PCI buses can only function when SYS board is plugged
+ 	  into the PIB (Platform IO Board) board from Freescale which provide
+-	  3 PCI slots.  The PIBs PCI initialization is the bootloader's
+-	  responsiblilty.
++	  3 PCI slots.
+ 
+ config MPC834x_ITX
+ 	bool "Freescale MPC834x ITX"
+@@ -1275,10 +1274,67 @@ config PCI_DOMAINS
+ 	bool
+ 	default PCI
+ 
++choice
++	prompt "  PMC Bus Assignment"
++	depends on PCI && MPC834x_SYS
++	default PCI_ALL_PCI1
++	help
++	  These selections control the manner in which the PIBs PMC
++	  sites are assigned to PCI busses.
++
++config PCI_64BIT
++	bool "64-bit: PMC2 on PCI1. PCI2 Disabled"
++	help
++	  PCI operates in 64-bit mode using PMC2. Do not use PMC1 or PMC3.
++	  NOTE: For proper operation, the state of this option MUST
++	  match the state of the PCI64 bit in the Hardware Reset
++	  Configuration Words. The Hardware Reset Configuration Words
++	  may read from FLASH or from the BCSR.
++
++config PCI_ALL_PCI1
++	bool "32-bit: PMC1, PMC2 and PMC3 on PCI1. PCI2 disabled"
++	help
++	  PCI1 works in 32bit mode, PCI2 is disabled.
++	  All three PMC slots are attached to PCI1.
++
++config PCI_ONE_PCI1
++	bool "32-bit: PMC1 on PCI1. PMC2 and PMC3 on PCI2"
++	help
++	  PCI1 and PCI2 work as two independent 32-bit busses. PMC1
++	  is attached to PCI1. PMC2 and PMC3 are attached to PCI2.
++
++config PCI_TWO_PCI1
++	bool "32-bit: PMC1 and PMC2 on PCI1. PCI2 disabled"
++	help
++	  PCI1 works in 32-bit mode. PCI2 is disabled. PMC1 and PMC2 are
++	  connected to PCI1. PMC3 is not used.
++endchoice
++
++choice
++	prompt "  CLKIN Divider"
++	depends on PCI && MPC834x
++	default CLK_DIV_DISABLE
++	help
++	  This option is used to inform the kernel about the operational
++	  state of the on-chip CLKIN Divider.
++	  NOTE: For proper operation, the state of this option must
++	  match that of the hardware.
++
++config CLK_DIV_DISABLE
++	bool "CLKIN Divider Disabled"
++	help
++	  If the CLKIN to PCI_SYNC_OUT ratio is 1:1, select this option.
++
++config CLK_DIV_ENABLE
++	bool "CLKIN Divider Enabled"
++	help
++	  If the CLKIN to PCI_SYNC_OUT ratio is 2:1, select this option.
++endchoice
++
+ config MPC83xx_PCI2
+ 	bool "  Support for 2nd PCI host controller"
+-	depends on PCI && MPC834x
+-	default y if MPC834x_SYS
++	depends on PCI && (PCI_ONE_PCI1 || MPC834x_ITX)
++	default y 
+ 
+ config PCI_QSPAN
+ 	bool "QSpan PCI"
+Index: linux-2.6.10/arch/ppc/syslib/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/Makefile
++++ linux-2.6.10/arch/ppc/syslib/Makefile
+@@ -120,7 +120,7 @@ endif
+ obj-$(CONFIG_83xx)		+= ipic.o ppc83xx_setup.o ppc_sys.o \
+ 					mpc83xx_sys.o mpc83xx_devices.o
+ ifeq ($(CONFIG_83xx),y)
+-obj-$(CONFIG_PCI)		+= indirect_pci.o pci_auto.o
++obj-$(CONFIG_PCI)		+= indirect_pci.o pci_auto.o early_i2c.o
+ endif
+ obj-$(CONFIG_QE)		+= qe_ic.o
+ obj-$(CONFIG_MPC8548_CDS)	+= todc_time.o
+Index: linux-2.6.10/arch/ppc/syslib/early_i2c.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/syslib/early_i2c.c
+@@ -0,0 +1,231 @@
++/*******************************************************************
++ * early_i2c.c
++ *
++ * i2c operation while system booting
++ *
++ * Author: Tony Li (r64360@freescale.com)
++ * based on mpc83xx_i2c.c by Dave Liu
++ * based on Hardware I2C driver for mpc107 PCI bridge
++ * 	by Gleb Natapov <gnatapov@mrv.com>
++ * Some bits are taken from linux driver writen by adrian@humboldt.co.uk
++ *
++ * Copyright (C) Freescale Semiconductor, Inc. 2006. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ ********************************************************************/
++
++#include <asm/mpc83xx.h> /* for IMMRBAR */
++#include <asm/io.h>  /* for in_le32() and out_len32 */
++#include <linux/delay.h> /* for mdelay */
++#include <linux/module.h>
++#include "./early_i2c.h"
++
++void early_i2c_init (int speed, int slaveadd)
++{
++	/* stop I2C controller */
++	writel (0x0, I2CCCR);
++	/* set clock */
++	writel (0x3f, I2CFDR);
++	/* set default filter */
++	writel (0x10,I2CDFSRR);
++	/* write slave address */
++	writel (slaveadd, I2CADR);
++	/* clear status register */
++	writel (0x0, I2CCSR);
++	/* start I2C controller */
++	writel (M83xx_CCR_MEN, I2CCCR);
++
++	return;
++}
++
++/* return
++ *	 0 sucess      -1 failed
++ */
++static __inline__ int i2c_wait4bus (void)
++{
++	ulong current_time;
++
++	current_time = 0;
++	while (readl (I2CCSR) & M83xx_CSR_MBB)
++	{
++		mdelay(10);
++		current_time++;
++		if ( current_time > TIMEOUT )
++			return -1;
++	}
++	return 0;
++}
++
++/*
++ * i2c_write(write/read flag)
++ * this function is waiting for the transmite completed
++ * in time limits and without problem
++ * return
++ * 0 success   1 fail
++ */
++static __inline__ int i2c_wait (int write)
++{
++	u32 csr;
++	ulong start_time ;
++
++	start_time = 0;
++
++	do {
++		csr = readl (I2CCSR);
++		/* if no interrupt pending occurs */
++		if (!(csr & M83xx_CSR_MIF))
++		{
++			mdelay(10);
++			start_time++;
++			continue;
++		}
++
++		writel (0x0, I2CCSR);
++
++		/* if arbitration lost*/
++		if (csr & M83xx_CSR_MAL)
++			return -1;
++		/* if transfer isnot completed */
++		if (!(csr & M83xx_CSR_MCF))
++			return -1;
++
++		/* i2c write operation and acknowedge received */
++		if (write == I2C_WRITE && (csr & M83xx_CSR_RXAK))
++			return -1;
++
++		return 0;
++
++	} while (start_time < TIMEOUT);
++
++	return -1;
++}
++
++/* i2c_write_addr(device,  WRITE/READ,  repeat start flag)
++ *  1 success  0 failed
++ */
++static __inline__ int i2c_write_addr (u8 dev, u8 dir, int rsta)
++{
++	/* i2c module enable| generate START | transmit mode | repeat start flag*/
++	writel (M83xx_CCR_MEN | M83xx_CCR_MSTA | M83xx_CCR_MTX |
++			(rsta ? M83xx_CCR_RSTA : 0), I2CCCR);
++
++	writel ((dev << 1) | dir, I2CCDR);
++
++	if (i2c_wait (I2C_WRITE) < 0)
++		return 0;
++
++	return 1;
++}
++
++static __inline__ int __i2c_write (u8 * data, int length)
++{
++	int i;
++
++	/* i2c module enable | generate START| transmit mode */
++	writel (M83xx_CCR_MEN | M83xx_CCR_MSTA | M83xx_CCR_MTX, I2CCCR);
++
++	for (i = 0; i < length; i++) {
++		writel (data[i], I2CCDR);
++
++		if (i2c_wait (I2C_WRITE) < 0)
++			break;
++	}
++
++	return i;
++}
++
++static __inline__ int __i2c_read (u8 * data, int length)
++{
++	int i;
++
++	writel (M83xx_CCR_MEN | M83xx_CCR_MSTA |
++			((length == 1) ? M83xx_CCR_TXAK : 0), I2CCCR);
++
++	/* dummy read */
++	readl (I2CCDR);
++
++	for (i = 0; i < length; i++) {
++		if (i2c_wait (I2C_READ) < 0)
++			break;
++
++		/* Generate ack on last next to last byte */
++		if (i == length - 2)
++			writel (M83xx_CCR_MEN | M83xx_CCR_MSTA |
++					M83xx_CCR_TXAK, I2CCCR);
++
++		/* Generate stop on last byte */
++		if (i == length - 1)
++			writel (M83xx_CCR_MEN | M83xx_CCR_TXAK, I2CCCR);
++
++		data[i] = readl (I2CCDR);
++	}
++
++	return i;
++}
++
++int early_i2c_read (u8 dev, uint addr, int alen, u8 * data, int length)
++{
++	int i = 0;
++	u8 *a = (u8 *) & addr;
++
++	/* wait while i2c bus is busy */
++	if (i2c_wait4bus () < 0)
++		goto exit;
++
++	/* transmite the slave_addr+read/write phase */
++	if (i2c_write_addr (dev, I2C_WRITE, 0) == 0)
++		goto exit;
++
++	/* select the i2c slave internal regs phase */
++	/* because u32 -> u8, and big endian, so if alen is 1, write a[3] */
++	if (__i2c_write (&a[4 - alen], alen) != alen)
++		goto exit;
++	/* dummy read phase */
++	if (i2c_write_addr (dev, I2C_READ, 1) == 0)
++		goto exit;
++
++	/* transmite data phase */
++	i = __i2c_read (data, length);
++
++exit:
++	writel (M83xx_CCR_MEN, I2CCCR);
++
++	return !(i == length);
++}
++
++/* i2c_write(slave addr,
++ *            reg No of this slave,
++ *            reg size, 1 for 8bits, 2 for 16bits..4 for 32bits reg
++ *            date to be write,
++ *            date len as bytes)
++ * 0 success        1 failed
++ */
++int early_i2c_write (u8 dev, uint addr, int alen, u8 * data, int length)
++{
++	int i = 0;
++	u8 *a = (u8 *) & addr;
++
++	/* wait while i2c bus is busy */
++	if (i2c_wait4bus () < 0)
++		goto exit;
++	/* transmite the slave_addr+read/write phase */
++	if (i2c_write_addr (dev, I2C_WRITE, 0) == 0)
++		goto exit;
++	/* select the i2c slave internal regs phase */
++	/* because u32 -> u8, and big endian, so if alen is 1, write a[3] */
++	if (__i2c_write (&a[4 - alen], alen) != alen)
++		goto exit;
++
++	/* transmite data phase */
++	i = __i2c_write (data, length);
++
++exit:
++	writel (M83xx_CCR_MEN, I2CCCR);
++
++	return !(i == length);
++}
++EXPORT_SYMBOL(early_i2c_write);
+Index: linux-2.6.10/arch/ppc/syslib/early_i2c.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/syslib/early_i2c.h
+@@ -0,0 +1,113 @@
++/* arch/ppc/syslib/early_i2c.h
++ *
++ * Copyright (c) Freescale Semiconductor, Inc. 2006. All rights reserved.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the  GNU General Public License along
++ * with this program; if not, write  to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++#ifndef _EARLY_I2C_H
++#define _EARLY_I2C_H
++
++#include <asm/mpc83xx.h>
++
++/**********************************************************************/
++/*
++ * for i2c operation
++ */
++#define CFG_I2C_SPD	400000
++/* used when i2c controller as a a slave */
++#define CFG_I2C_SLV	0x7E
++
++#define TIMEOUT 1000
++#define CFG_M83xx_I2C1	1
++#define CFG_M83xx_I2C2	2
++
++#ifdef CONFIG_MPC832X
++/* for mpc832x board */
++#define CFG_I2C CFG_M83xx_I2C1
++#else
++/* For mpc8349 pilot board */
++#define CFG_I2C	CFG_M83xx_I2C2
++#endif
++
++//#define CFG_IMMR	IMMRBAR
++/* should do ioremap() in fact */
++#define CFG_IMMR	VIRT_IMMRBAR
++
++#if (CFG_I2C == CFG_M83xx_I2C1)
++#define I2C_Addr ((unsigned *)(CFG_IMMR + 0x3000))
++#elif (CFG_I2C == CFG_M83xx_I2C2)
++#define I2C_Addr ((unsigned *)(CFG_IMMR + 0x3100))
++#endif
++
++#define I2CADR  &I2C_Addr[0]
++#define I2CFDR  &I2C_Addr[1]
++#define I2CCCR  &I2C_Addr[2]
++#define I2CCSR  &I2C_Addr[3]
++#define I2CCDR  &I2C_Addr[4]
++#define I2CDFSRR &I2C_Addr[5]
++
++/* bits in I2CnCR */
++/* i2c module is enable */
++#define M83xx_CCR_MEN	0x80
++/* i2c interrupt is enable */
++#define M83xx_CCR_MIEN	0x40
++/*0->1 generate a start, 1->0 generate a stop */
++#define M83xx_CCR_MSTA	0x20
++/*1 receive mode, 0 transmit mode */
++#define M83xx_CCR_MTX	0x10
++/*1 generate an acknowledge signal */
++#define M83xx_CCR_TXAK	0x08
++/* 1 generate repeat start */
++#define M83xx_CCR_RSTA	0x04
++
++/* bits in I2CnSR */
++/*1 - transfer completed */
++#define M83xx_CSR_MCF	0x80
++/*1 -addressed as a slave */
++#define M83xx_CSR_MAAS	0x40
++/* 1- i2c bus is busy */
++#define M83xx_CSR_MBB	0x20
++/* 1- arbitration is lost */
++#define M83xx_CSR_MAL	0x10
++/* 1 -master read from slave 0- master write to slave */
++#define M83xx_CSR_SRW	0x04
++/* 1 - interrupt is pending */
++#define M83xx_CSR_MIF	0x02
++/* 1- acknowledge received */
++#define M83xx_CSR_RXAK	0x01
++
++#define I2C_READ  1
++#define I2C_WRITE 0
++
++extern void early_i2c_init (int speed, int slaveadd);
++extern int early_i2c_write (u8 dev, uint addr, int alen, u8 * data, int length);
++extern int early_i2c_read (u8 dev, uint addr, int alen, u8 * data, int length);
++
++
++#if defined EARLY_I2C_DBG
++#	define EARLY_I2C_PRINTK(fmt, args...) 	printk("\n[%s]:[%s]:[line%d]----"fmt, __FILE__,__FUNCTION__, __LINE__, ## args)
++#	define EARLY_I2C_LOC			printk(KERN_ERR"\nCurrent Location [%s]:[%d]\n", __FILE__, __LINE__)
++#	define EARLY_I2C_FUNC_START		printk(KERN_ERR"\n[%s]:start!\n", __FUNCTION__)
++#	define EARLY_I2C_FUNC_END			printk(KERN_ERR"\n[%s]:end!\n", __FUNCTION__)
++#	define EAELY_I2C_CLUE(arg)		printk(" %s\n",arg)
++
++#else
++#	define EARLY_I2C_PRINTK(fmt, args...)
++#	define EARLY_I2C_LOC
++#	define EARLY_I2C_FUNC_START
++#	define EARLY_I2c_FUNC_END
++#	define EARLY_I2C_CLUE(arg)
++#endif
++#endif /* _EARLY_I2C_H */
+Index: linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc83xx_setup.c
++++ linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.c
+@@ -5,7 +5,7 @@
+  *
+  * Maintainer: Kumar Gala <kumar.gala@freescale.com>
+  *
+- * Copyright 2005 Freescale Semiconductor Inc.
++ * Copyright 2005-2006 Freescale Semiconductor Inc.
+  *
+  * This program is free software; you can redistribute  it and/or modify it
+  * under  the terms of  the GNU General  Public License as published by the
+@@ -45,6 +45,7 @@
+ #if defined(CONFIG_PCI)
+ #include <asm/delay.h>
+ #include <syslib/ppc83xx_pci.h>
++#include <syslib/early_i2c.h>
+ #endif
+ 
+ extern void kgdb8250_add_port(int i, struct uart_port *serial_req);
+@@ -419,16 +420,19 @@ mpc83xx_setup_hose(void)
+ 	struct pci_controller * hose2;
+ #endif
+ 	bd_t * binfo = (bd_t *)__res;
++	u8 val8;
+ 
+ 	clk = ioremap(binfo->bi_immr_base + 0xA00, sizeof(immr_clk_t));
+         pci_law = ioremap(binfo->bi_immr_base + 0x60, sizeof(law_t));
+ 
+-	/*
+-	 * Configure PCI controller and PCI_CLK_OUTPUT both in 66M mode
+-	 */
++	 /* Configure PCI clock drivers */
+ 	val32 = clk->occr;
+ 	udelay(2000);
++#ifdef CONFIG_CLK_DIV_ENABLE
++	clk->occr = 0xffff0003;
++#else
+ 	clk->occr = 0xff000000;
++#endif
+ 	udelay(2000);
+ 
+ 	iounmap(clk);
+@@ -443,6 +447,44 @@ mpc83xx_setup_hose(void)
+ 
+ 	iounmap(pci_law);
+ 
++#ifndef CONFIG_MPC834x_ITX
++	/*
++	 * Configure PMC <-> PCI by I2C bus
++	 */
++	early_i2c_init(CFG_I2C_SPD,CFG_I2C_SLV);
++	val8 = 0;
++	early_i2c_write(0x23,0x6,1,&val8,1);
++	early_i2c_write(0x23,0x7,1,&val8,1);
++	val8 = 0xff;
++	early_i2c_write(0x23,0x2,1,&val8,1);
++	early_i2c_write(0x23,0x3,1,&val8,1);
++	val8 = 0;
++	early_i2c_write(0x26,0x6,1,&val8,1);
++	val8 = 0x34;
++	early_i2c_write(0x26,0x7,1,&val8,1);
++#ifdef CONFIG_PCI_64BIT
++	val8 = 0xf4;	/* 64bit PMC2<->PCI1 */
++#elif defined(CONFIG_PCI_ONE_PCI1) || defined(CONFIG_MPC832XE_MDS)
++	val8 = 0xf9;	/* 32bit PMC1<->PCI1,PMC2<->PCI2,PMC3<->PCI2 */
++#elif defined(CONFIG_PCI_TWO_PCI1) || defined(CONFIG_MPC8360E_PB)
++	val8 = 0xf7;	/* 32bit PMC1<->PCI1,PMC2<->PCI1 PCM3<->PCI2 disabled*/
++#else
++	val8 = 0xf3;	/* 32bit PMC1<->PCI1,PMC2<->PCI1,PMC3<->PCI1 */
++#endif
++	early_i2c_write(0x26,0x2,1,&val8,1);
++	val8 = 0xff;
++	early_i2c_write(0x26,0x3,1,&val8,1);
++
++	val8 = 0;
++	early_i2c_write(0x27,0x6,1,&val8,1);
++	early_i2c_write(0x27,0x7,1,&val8,1);
++	val8 = 0xff;
++	early_i2c_write(0x27,0x2,1,&val8,1);
++	val8 = 0xef;
++	early_i2c_write(0x27,0x3,1,&val8,1);
++	asm("eieio");
++#endif /* CONFIG_MPC834x_ITX */
++
+ 	hose1 = pcibios_alloc_controller();
+ 	if(!hose1)
+ 		return;
+Index: linux-2.6.10/mvl_patches/pro-1344.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1344.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1344);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

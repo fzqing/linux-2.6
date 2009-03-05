@@ -1,0 +1,2337 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_mv_1_0_video_previewer_driver_010
+# Date: Mon Jan 21 23:03:07 2008
+# Source: Texas Instruments , Inc.
+# MR: 23073
+# Type: Enhancement
+# Disposition: local
+# Signed-off-by: Steve Chen <schen@mvista.com>
+# Description:
+# 
+# Comments from TI
+#   This patch provides the Video Previewer support for DaVinci.
+#  
+# 
+
+PATCHNUM=1642
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments , Inc.
+MR: 23073
+Type: Enhancement
+Disposition: local
+Signed-off-by: Steve Chen <schen@mvista.com>
+Description:
+
+Comments from TI
+  This patch provides the Video Previewer support for DaVinci.
+ 
+
+Index: linux-2.6.10/drivers/char/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Kconfig
++++ linux-2.6.10/drivers/char/Kconfig
+@@ -1124,6 +1124,12 @@ config MMTIMER
+ 	  The mmtimer device allows direct userspace access to the
+ 	  Altix system timer.
+ 
++config PREVIEWER
++	tristate "DaVinci Previewer Driver Support"
++	default n
++	help
++		DaVinci Previewer Driver
++
+ config MONAHANS_GCU
+  	tristate "Monahans 2D Graphics Controller Driver"
+  	depends on PXA3xx
+Index: linux-2.6.10/drivers/char/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/char/Makefile
++++ linux-2.6.10/drivers/char/Makefile
+@@ -111,6 +111,9 @@ obj-$(CONFIG_RESIZER) += davinci_rsz_dri
+ obj-$(CONFIG_HANGCHECK_TIMER) += hangcheck-timer.o
+ obj-$(CONFIG_DAVINCI_RTC) += davinci-rtc.o
+ 
++davinci_previewer_driver-objs := davinci_previewer_hw.o davinci_previewer.o
++obj-$(CONFIG_PREVIEWER) += davinci_previewer_driver.o
++
+ obj-$(CONFIG_MONAHANS_GCU) +=m2d_drv.o
+ 
+ 
+Index: linux-2.6.10/drivers/char/davinci_previewer.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/davinci_previewer.c
+@@ -0,0 +1,1207 @@
++/* 
++ * Copyright (C) 2006 Texas Instruments Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option)any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ */
++
++/* davinci_previewer.c file */
++
++/* include Linux files */
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kernel.h>	/* printk() */
++#include <linux/slab.h>		/* kmalloc() */
++#include <linux/fs.h>		/* everything... */
++#include <linux/errno.h>	/* error codes */
++#include <linux/types.h>	/* size_t */
++#include <linux/cdev.h>		/* Used for struct cdev */
++#include <linux/dma-mapping.h>	/* For class_simple_create */
++#include <linux/interrupt.h>	/* For IRQ_HANDLED and irqreturn_t */
++#include <asm/uaccess.h>	/* for VERIFY_READ/VERIFY_WRITE/
++				   copy_from_user */
++#include <linux/devfs_fs_kernel.h>	/* for devfs */
++#include <asm/semaphore.h>
++
++#include <asm/arch/davinci_previewer_hw.h>
++#include <asm/arch/davinci_previewer.h>
++#include <linux/device.h>
++
++#ifdef __KERNEL__
++
++struct device *prev_dev;
++
++/* inline function to free reserver pages  */
++void inline prev_free_pages(unsigned long addr, unsigned long bufsize)
++{
++	unsigned long size, ad = addr;
++	size = PAGE_SIZE << (get_order(bufsize));
++	if (!addr)
++		return;
++	while (size > 0) {
++		ClearPageReserved(virt_to_page(addr));
++		addr += PAGE_SIZE;
++		size -= PAGE_SIZE;
++	}
++	free_pages(ad, get_order(bufsize));
++}
++
++/* prev_calculate_crop: This function is used to calculate frame size 
++   reduction depending on the features enabled by the application. */
++void prev_calculate_crop(struct prev_params *config, struct prev_cropsize *crop)
++{
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	if (!config || !crop) {
++
++		dev_err(prev_dev, "\nErron in argument");
++		return;
++	}
++
++	/* initialize hcrop and vcrop to zero */
++	crop->hcrop = crop->vcrop = 0;
++
++	/* Horizontal medial filter reduces image width by 4 pixels 
++	   2 right and 2 left */
++	if (config->features & PREV_HORZ_MEDIAN_FILTER) {
++		crop->hcrop += 4;
++	}
++	/* Noise filter reduces image height and width 2 pixels from 
++	   top, left, right and bottom */
++	if (config->features & PREV_NOISE_FILTER) {
++		crop->hcrop += 4;
++		crop->vcrop += 4;
++	}
++	/* CFA Interpolation reduces image height and width 2 pixels 
++	   from top, left, right and bottom */
++	if (config->features & PREV_CFA) {
++		crop->hcrop += 4;
++		crop->vcrop += 4;
++	}
++	/* Luma enhancement reduces image width 1 pixels from left, right */
++	if (config->features & (PREV_LUMA_ENHANCE | PREV_CHROMA_SUPPRESS)) {
++		crop->hcrop += 2;
++	}
++	dev_dbg(prev_dev, "prev_calculate_crop L\n");
++}
++
++/* getstatus: This function will return status of the hardware in 
++              prev_status structure.*/
++int get_status(struct prev_status *status)
++{
++	dev_dbg(prev_dev, "get_status E\n");
++	if (!status) {
++		dev_err(prev_dev, "get_status:invalid parameter\n");
++		return -EINVAL;
++	}
++	status->hw_busy = isbusy();
++
++	dev_dbg(prev_dev, "get_status L\n");
++	return 0;
++}
++
++/* previewer_isr: It is interrupt handler for PRVINT interrupt. 
++ It will be called when previewer completes processing of one 
++ frame and writes data to the DDR. It unblocks the PREV_PREVIEWER 
++ ioctl which is waiting for the processing to be completed */
++irqreturn_t previewer_isr(int irq, void *device_id, struct pt_regs * regs)
++{
++	struct prev_device *prevdevice = (struct prev_device *)device_id;
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	/* indicate the completion ofr frame processing */
++	if (prevdevice)
++		complete(&(prevdevice->wfc));
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return IRQ_HANDLED;
++}
++
++int request_buffer(struct prev_device *device, struct prev_reqbufs *reqbufs)
++{
++	struct prev_buffer *buffer = NULL;
++	int count = 0;
++	unsigned long adr;
++	u32 size;
++
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++	if (!reqbufs || !device) {
++		dev_err(prev_dev, "request_buffer: error in argument\n");
++		return -EINVAL;
++	}
++
++	/* if number of buffers requested is more then support return error */
++	if (reqbufs->count > MAX_BUFFER) {
++		dev_err(prev_dev, "request_buffer: invalid buffer count\n");
++		return -EINVAL;
++	}
++
++	/* if buf_type is input then allocate buffers for input */
++	if (reqbufs->buf_type == PREV_BUF_IN) {
++		/*if buffer count is zero, free all the buffers */
++		if (reqbufs->count == 0) {
++			/* free all the buffers */
++			for (count = 0; count < device->in_numbuffers; count++) {
++				/* free memory allocate for the image */
++				if (device->in_buff[count]) {
++					adr =
++					    (unsigned long)device->
++					    in_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->in_buff
++								[count]->size);
++
++					/* free the memory allocated 
++					   to prev_buffer */
++					kfree(device->in_buff[count]);
++
++					device->in_buff[count] = NULL;
++				}
++			}
++			device->in_numbuffers = 0;
++			return 0;
++		}
++
++		/* free the extra buffers */
++		if (device->in_numbuffers > reqbufs->count &&
++		    reqbufs->size == device->in_buff[0]->size) {
++			for (count = reqbufs->count;
++			     count < device->in_numbuffers; count++) {
++				/* free memory allocate for the image */
++				if (device->in_buff[count]) {
++					adr = device->in_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->in_buff
++								[count]->size);
++
++					/* free the memory allocated 
++					   to prev_buffer */
++					kfree(device->in_buff[count]);
++
++					device->in_buff[count] = NULL;
++				}
++			}
++			device->in_numbuffers = reqbufs->count;
++			return 0;
++		}
++		/* if size requested is different from already allocated, 
++		   free memory of all already allocated buffers */
++		if (device->in_numbuffers) {
++			if (reqbufs->size != device->in_buff[0]->size) {
++				for (count = 0;
++				     count < device->in_numbuffers; count++) {
++					if (device->in_buff[count]) {
++						adr =
++						    device->
++						    in_buff[count]->offset;
++						if (adr)
++							prev_free_pages((unsigned long)
++									phys_to_virt
++									(adr),
++									device->
++									in_buff
++									[count]->
++									size);
++
++						kfree(device->in_buff[count]);
++
++						device->in_buff[count] = NULL;
++					}
++				}
++				device->in_numbuffers = 0;
++			}
++		}
++
++		/* allocate the buffer */
++		for (count = device->in_numbuffers; count < reqbufs->count;
++		     count++) {
++			/* Allocate memory for struct prev_buffer */
++			buffer =
++			    kmalloc(sizeof(struct prev_buffer), GFP_KERNEL);
++
++			/* if memory allocation fails then return error */
++			if (!buffer) {
++				/* free all the buffers */
++				while (--count >= device->in_numbuffers) {
++					adr = device->in_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->in_buff
++								[count]->size);
++					kfree(device->in_buff[count]);
++					device->in_buff[count] = NULL;
++				}
++				dev_err(prev_dev, "request_buffer:not \
++					enough memory\n");
++				return -ENOMEM;
++			}
++
++			/* assign buffer's address in configuration */
++			device->in_buff[count] = buffer;
++
++			/* set buffers index and buf_type,size parameters */
++			buffer->index = count;
++			buffer->buf_type = PREV_BUF_IN;
++			buffer->size = reqbufs->size;
++			/* allocate memory for buffer of size passed 
++			   in reqbufs */
++			buffer->offset =
++			    (unsigned long)__get_free_pages(GFP_KERNEL |
++							    GFP_DMA,
++							    get_order
++							    (reqbufs->size));
++
++			/* if memory allocation fails, return error */
++			if (!(buffer->offset)) {
++				/* free all the buffer's space */
++				kfree(buffer);
++				device->in_buff[count] = NULL;
++				while (--count >= device->in_numbuffers) {
++					adr = device->in_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->in_buff
++								[count]->size);
++					kfree(device->in_buff[count]);
++					device->in_buff[count] = NULL;
++				}
++				dev_err(prev_dev, "request_buffer:not \
++					enough memory\n");
++
++				return -ENOMEM;
++			}
++
++			adr = (unsigned long)buffer->offset;
++			size = PAGE_SIZE << (get_order(reqbufs->size));
++			while (size > 0) {
++				/* make sure the frame buffers 
++				   are never swapped out of memory */
++				SetPageReserved(virt_to_page(adr));
++				adr += PAGE_SIZE;
++				size -= PAGE_SIZE;
++			}
++			/* convert vertual address to physical */
++			buffer->offset = (unsigned long)
++			    virt_to_phys((void *)(buffer->offset));
++		}
++		device->in_numbuffers = reqbufs->count;
++	}
++	/* if buf_type is output then allocate buffers for output */
++	else if (reqbufs->buf_type == PREV_BUF_OUT) {
++		if (reqbufs->count == 0) {
++			/* free all the buffers */
++			for (count = 0; count < device->out_numbuffers; count++) {
++				/* free memory allocate for the image */
++				if (device->out_buff[count]) {
++					adr = device->out_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->out_buff
++								[count]->size);
++
++					/* free the memory allocated to 
++					   prev_buffer */
++					kfree(device->out_buff[count]);
++
++					device->out_buff[count] = NULL;
++				}
++			}
++			device->out_numbuffers = 0;
++
++			return 0;
++		}
++		/* free the buffers */
++		if (device->out_numbuffers > reqbufs->count &&
++		    reqbufs->size == device->out_buff[0]->size) {
++			for (count = reqbufs->count;
++			     count < device->out_numbuffers; count++) {
++				/* free memory allocate for the image */
++				if (device->out_buff[count]) {
++					adr = device->out_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->out_buff
++								[count]->size);
++
++					/* free the memory allocated to 
++					   prev_buffer */
++					kfree(device->out_buff[count]);
++
++					device->out_buff[count] = NULL;
++				}
++			}
++			device->out_numbuffers = reqbufs->count;
++
++			return 0;
++		}
++		/* if size requested is different from already allocated, 
++		   free memory of all already allocated buffers */
++		if (device->out_numbuffers) {
++			if (reqbufs->size != device->out_buff[0]->size) {
++				for (count = 0;
++				     count < device->out_numbuffers; count++) {
++					if (device->out_buff[count]) {
++						adr =
++						    device->
++						    out_buff[count]->offset;
++
++						if (adr)
++							prev_free_pages((unsigned long)
++									phys_to_virt
++									(adr),
++									device->
++									out_buff
++									[count]->
++									size);
++
++						kfree(device->out_buff[count]);
++
++						device->out_buff[count] = NULL;
++					}
++				}
++				device->out_numbuffers = 0;
++			}
++		}
++
++		/* allocate the buffer */
++		for (count = device->out_numbuffers;
++		     count < reqbufs->count; count++) {
++			/* Allocate memory for struct prev_buffer */
++			buffer =
++			    kmalloc(sizeof(struct prev_buffer), GFP_KERNEL);
++
++			/* if memory allocation fails then return error */
++			if (!buffer) {
++				/* free all the buffers */
++				while (--count >= device->out_numbuffers) {
++					adr = device->out_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->out_buff
++								[count]->size);
++					kfree(device->out_buff[count]);
++					device->out_buff[count] = NULL;
++				}
++
++				dev_err(prev_dev, "request_buffer:not enough \
++					memory\n");
++
++				return -ENOMEM;
++			}
++
++			/* assign buffer's address out configuration */
++			device->out_buff[count] = buffer;
++
++			/* set buffers outdex and buf_type,size parameters */
++			buffer->index = count;
++			buffer->buf_type = PREV_BUF_OUT;
++			buffer->size = reqbufs->size;
++			/* allocate memory for buffer of size passed 
++			   in reqbufs */
++			buffer->offset =
++			    (unsigned long)__get_free_pages(GFP_KERNEL |
++							    GFP_DMA,
++							    get_order
++							    (reqbufs->size));
++
++			/* if memory allocation fails, return error */
++			if (!(buffer->offset)) {
++				/* free all the buffer's space */
++				kfree(buffer);
++				device->out_buff[count] = NULL;
++				while (--count >= device->out_numbuffers) {
++					adr = device->out_buff[count]->offset;
++					if (adr)
++						prev_free_pages((unsigned long)
++								phys_to_virt
++								(adr),
++								device->out_buff
++								[count]->size);
++					kfree(device->out_buff[count]);
++					device->out_buff[count] = NULL;
++				}
++				dev_err(prev_dev, "request_buffer:not \
++					enough memory\n");
++
++				return -ENOMEM;
++			}
++
++			adr = (unsigned long)buffer->offset;
++			size = PAGE_SIZE << (get_order(reqbufs->size));
++			while (size > 0) {
++				/* make sure the frame buffers 
++				   are never swapped out of memory */
++				SetPageReserved(virt_to_page(adr));
++				adr += PAGE_SIZE;
++				size -= PAGE_SIZE;
++			}
++			/* convert vertual address to physical */
++			buffer->offset = (unsigned long)
++			    virt_to_phys((void *)(buffer->offset));
++		}
++		device->out_numbuffers = reqbufs->count;
++	} else {
++		dev_err(prev_dev, "request_buffer: invalid buffer type\n");
++
++		return -EINVAL;
++	}
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++/* querybuffer: This function will query the buffer’s physical address
++     whose index is passed in prev_buffer. it will store that address 
++	in prev_buffer. */
++int query_buffer(struct prev_device *device, struct prev_buffer *buffer)
++{
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	if (!buffer || !device) {
++		dev_err(prev_dev, "query_buffer: error in argument\n");
++		return -EINVAL;
++	}
++
++	/* if buf_type is input buffer then get offset of input buffer */
++	if (buffer->buf_type == PREV_BUF_IN) {
++		/* error checking for wrong index number */
++		if (buffer->index >= device->in_numbuffers) {
++			dev_err(prev_dev, "query_buffer: invalid index");
++
++			return -EINVAL;
++		}
++
++		/* get the offset and size of the buffer and store 
++		   it in buffer */
++		buffer->offset = device->in_buff[buffer->index]->offset;
++		buffer->size = device->in_buff[buffer->index]->size;
++	}
++	/* if buf_type is output buffer then get offset of output buffer */
++	else if (buffer->buf_type == PREV_BUF_OUT) {
++		/* error checking for wrong index number */
++		if (buffer->index >= device->out_numbuffers) {
++			dev_err(prev_dev, "query_buffer: invalid index\n");
++
++			return -EINVAL;
++		}
++		/* get the offset and size of the buffer and store 
++		   it in buffer */
++		buffer->offset = device->out_buff[buffer->index]->offset;
++		buffer->size = device->out_buff[buffer->index]->size;
++	} else {
++		dev_err(prev_dev, "query_buffer: invalid buffer type\n");
++
++		return -EINVAL;
++	}
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++int validate_params(struct prev_params *params)
++{
++	struct prev_cropsize crop;
++
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	if (!params) {
++		dev_err(prev_dev, "validate_params:error in argument");
++		return -EINVAL;
++	}
++
++	prev_calculate_crop(params, &crop);
++
++	/* check whether down sampling rate is one of the supported */
++	if (params->sample_rate != DOWN_SAMPLE_RATE1
++	    && params->sample_rate != DOWN_SAMPLE_RATE2
++	    && params->sample_rate != DOWN_SAMPLE_RATE3
++	    && params->sample_rate != DOWN_SAMPLE_RATE4)
++		/* if not return error */
++	{
++		return -EINVAL;
++	}
++
++	/* check for valid values of pixel size */
++	if (params->size_params.pixsize != PREV_INWIDTH_8BIT
++	    && params->size_params.pixsize != PREV_INWIDTH_10BIT) {
++		return -EINVAL;
++	}
++
++	/* check whether size of the image is within limit */
++	if ((params->size_params.hsize) > 1280 + crop.hcrop
++	    || (params->size_params.hsize) < 0) {
++		return -EINVAL;
++	}
++
++	if ((params->size_params.vsize) > 1920 + crop.vcrop
++	    || (params->size_params.vsize) < 0) {
++		return -EINVAL;
++	}
++
++	/* check for valid values output pixel format */
++	if (params->pix_fmt != PREV_PIXORDER_YCBYCR &&
++	    PREV_PIXORDER_YCRYCB != params->pix_fmt &&
++	    PREV_PIXORDER_CBYCRY != params->pix_fmt &&
++	    PREV_PIXORDER_CRYCBY != params->pix_fmt) {
++		return -EINVAL;
++	}
++	/* dark frame capture and subtract should not be enabled 
++	   at the same time */
++	if ((params->features & PREV_DARK_FRAME_SUBTRACT) &&
++	    (params->features & PREV_DARK_FRAME_CAPTURE))
++		return -EINVAL;
++	/* check to see dark frame address should not be null */
++	if (params->features & PREV_DARK_FRAME_SUBTRACT)
++		if (!(params->dark_frame_addr)
++		    || (params->dark_frame_pitch % 32)) {
++			return -EINVAL;
++		}
++
++	/* check to see lens shading shift value should not be greater 
++	   than 7 */
++	if (params->features & PREV_LENS_SHADING)
++		if (params->lens_shading_sift > 7 || !(params->dark_frame_addr)
++		    || (params->dark_frame_pitch % 32)) {
++			return -EINVAL;
++		}
++
++	/* if pitch is zero assign it to the width of the image */
++	if (params->size_params.in_pitch <= 0
++	    || params->size_params.in_pitch % 32) {
++		dev_err(prev_dev, "\nvalidate_params:error in pitch");
++		return -EINVAL;
++	}
++
++	if (params->size_params.out_pitch <= 0
++	    || params->size_params.out_pitch % 32) {
++		dev_err(prev_dev, "\nvalidate_params:error in pitch");
++		return -EINVAL;
++	}
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++/* This function is used to free memory allocated to buffers */
++int free_buffers(struct prev_device *device)
++{
++	int i;
++	unsigned long adr;
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++	if (!device) {
++		dev_err(prev_dev, "\nfree_buffers:error in argument");
++		return -EINVAL;
++	}
++	/* free memory allocated to in buffers */
++	for (i = 0; i < device->in_numbuffers; i++) {
++		if (device->in_buff[i]) {
++			adr = device->in_buff[i]->offset;
++			if (adr)
++				prev_free_pages((unsigned long)
++						phys_to_virt(adr),
++						device->in_buff[i]->size);
++
++			kfree(device->in_buff[i]);
++
++			device->in_buff[i] = NULL;
++		}
++	}
++	device->in_numbuffers = 0;
++	/* free memory allocated to out buffers */
++	for (i = 0; i < device->out_numbuffers; i++) {
++		if (device->out_buff[i]) {
++			adr = device->out_buff[i]->offset;
++			if (adr)
++				prev_free_pages((unsigned long)
++						phys_to_virt(adr),
++						device->out_buff[i]->size);
++
++			kfree(device->out_buff[i]);
++
++			device->out_buff[i] = NULL;
++		}
++	}
++
++	device->out_numbuffers = 0;
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++/* preview: This function is used to submit previewing task to the 
++		Previewer hardware */
++int preview(struct prev_device *device, struct prev_convert *convert)
++{
++	int bpp, size, cropsize;
++	unsigned long in_addr, out_addr;
++	struct prev_cropsize crop;
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	/* error checking */
++	if (!convert || !device) {
++		dev_err(prev_dev, "preview: invalid convert parameters\n");
++
++		return -EINVAL;
++	}
++
++	/* Call prev_calculate_crop to calculate size reduction in 
++	   input image */
++	prev_calculate_crop(device->params, &crop);
++
++	/* Calculate bytes per pixel */
++	if (device->params->size_params.pixsize == PREV_INWIDTH_8BIT)
++		bpp = 1;
++	else
++		bpp = 2;
++
++	size = device->params->size_params.hsize *
++	    device->params->size_params.vsize * bpp;
++
++	cropsize =
++	    2 * (crop.vcrop * device->params->size_params.hsize +
++		 crop.hcrop * (device->params->size_params.vsize - crop.vcrop));
++
++	/* configure input buffer's address */
++	/* If index member of in_buff of arg is less than 0 then */
++	if (convert->in_buff.index < 0) {
++		/* If size member of in_buff of arg is less than the size 
++		   specified in size_params member of prev_params */
++		if (convert->in_buff.size < size)
++			return -EINVAL;
++
++		/* Check for 32 byte aligned address */
++		if (convert->in_buff.offset % 32 || !convert->in_buff.offset)
++			return -EINVAL;
++
++		/* Set address in RSDR_ADDR */
++		in_addr = convert->in_buff.offset;
++	} else {
++		/* Check for valid index */
++		if (convert->in_buff.index > device->in_numbuffers) {
++			dev_err(prev_dev, "\ninvalid index");
++			return -EINVAL;
++		}
++
++		/* check for size validity */
++		if (size > device->in_buff[convert->in_buff.index]->size) {
++			dev_err(prev_dev, "\nsize incorrect size = %d", size);
++			return -EINVAL;
++		}
++
++		in_addr =
++		    (unsigned long)device->in_buff[convert->in_buff.
++						   index]->offset;
++	}
++
++	if (convert->out_buff.index < 0) {
++		/* If size member of in_buff of arg is less than the size 
++		   specified in size_params member of prev_params */
++		if (convert->out_buff.size < (2 * size / bpp - cropsize))
++			return -EINVAL;
++
++		/* Check for 32 byte aligned address */
++		if (convert->out_buff.offset % 32 || !convert->out_buff.offset)
++			return -EINVAL;
++
++		/* Set address in WSDR_ADDR */
++		out_addr = convert->out_buff.offset;
++	} else {
++		/* Check for valid index */
++		if (convert->out_buff.index > device->out_numbuffers) {
++			dev_err(prev_dev, "\ninvalid index");
++			return -EINVAL;
++		}
++
++		/* check for size validity */
++		if ((2 * size / bpp - cropsize) >
++		    device->out_buff[convert->out_buff.index]->size) {
++			dev_err(prev_dev, "\nsize incorrect size");
++			return -EINVAL;
++		}
++
++		out_addr =
++		    (unsigned long)device->out_buff[convert->out_buff.
++						    index]->offset;
++	}
++
++	/* Set RADR_OFFSET to width of the image and
++	   Set WADR_OFFSET to height of the image – 2 * hcrop
++	 */
++	set_rsdr_offset(device->params->size_params.in_pitch);
++	set_wsdr_offset(device->params->size_params.out_pitch);
++
++	/* Set register RSDR_ADDR from in_vertref and
++	   Set register WSDR_ADDR from out_vertre */
++	set_size(device->params->size_params.hstart,
++		 device->params->size_params.vstart,
++		 device->params->size_params.hsize,
++		 device->params->size_params.vsize);
++
++	set_address(in_addr, out_addr);
++
++	/* Set input source to DDRAM */
++	set_input_source(1);
++
++	/* Set one shot mode */
++	set_oneshot_mode();
++
++	/* enable previewer which starts previewing */
++	previewer_enable();
++
++	/* wait untill processing is not completed */
++	wait_for_completion_interruptible(&(device->wfc));
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++#endif				/* End of ifdef __KERNEL__ */
++
++#define DRIVERNAME  "DaVinciPreviewer"
++
++/* global object of prev_device structure */
++struct prev_device prevdevice = { 0 };
++
++/* Functions */
++int previewer_open(struct inode *inode, struct file *filp)
++{
++	struct prev_params *config = NULL;
++	struct prev_device *device = &prevdevice;
++
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	if (device->opened || filp->f_flags & O_NONBLOCK) {
++		dev_err
++		    (prev_dev, "previewer_open: device is already openend\n");
++		return -EBUSY;
++	}
++
++	/* allocate memory for a new configuration */
++	if ((config = kmalloc(sizeof(struct prev_params), GFP_KERNEL)) == NULL) {
++		return -ENOMEM;
++	}
++
++	/* store the pointer of prev_params in private_data member of file 
++	   and params member of prev_device */
++	filp->private_data = config;
++
++	/* initialize mutex to 0 */
++	prevdevice.params = config;
++	prevdevice.opened = 1;
++	prevdevice.in_numbuffers = 0;
++	prevdevice.out_numbuffers = 0;
++	init_completion(&(prevdevice.wfc));
++	prevdevice.wfc.done = 0;
++	init_MUTEX(&(prevdevice.sem));
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++int previewer_release(struct inode *inode, struct file *filp)
++{
++	/* get the configuratin from private_date member of file */
++	struct prev_params *config = filp->private_data;
++	struct prev_device *device = &prevdevice;
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	/* call free_buffers to free memory allocated to buffers */
++	free_buffers(device);
++
++	/* free the memory allocated to configuration */
++	if (config)
++		kfree(config);
++
++	/* Assign null to private_data member of file and params 
++	   member of device */
++	filp->private_data = device->params = NULL;
++
++	/* change the device status to available */
++	device->opened = 0;
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++
++int previewer_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	/* get the address of global object of prev_device structure */
++	struct prev_device *device = &prevdevice;
++	int i, flag = 0;
++	/* get the page offset */
++	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	/* page offset passed in mmap should one from input buffers */
++	for (i = 0; i < device->in_numbuffers; i++) {
++		if (device->in_buff[i]->offset == offset) {
++			flag = 1;
++			break;
++		}
++	}
++
++	/* page offset passed in mmap should one from output buffers */
++	if (flag == 0) {
++		for (i = 0; i < device->out_numbuffers; i++) {
++			if (device->out_buff[i]->offset == offset) {
++				flag = 1;
++				break;
++			}
++		}
++	}
++
++	/* if it is not set offset is not available in input/output buffers */
++	if (flag == 0)
++		return -EAGAIN;
++
++	/* map buffers address space from kernel space to user space */
++	if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
++			    vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
++		return -EAGAIN;
++	}
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return 0;
++}
++int previewer_ioctl(struct inode *inode, struct file *file,
++		    unsigned int cmd, unsigned long arg)
++{
++	int ret = 0;
++	struct prev_params params;
++	struct prev_convert conv;
++	/* get the address of global object of prev_device structure */
++	struct prev_device *device = &prevdevice;
++
++	dev_dbg(prev_dev, __FUNCTION__ "E\n");
++
++	/* Before decoding check for correctness of cmd */
++	if (_IOC_TYPE(cmd) != PREV_IOC_BASE) {
++		dev_err(prev_dev, "Bad command Value \n");
++		return -1;
++	}
++	if (_IOC_NR(cmd) > PREV_IOC_MAXNR) {
++		dev_err(prev_dev, "Bad command Value\n");
++		return -1;
++	}
++
++	/* Verify accesses       */
++	if (_IOC_DIR(cmd) & _IOC_READ)
++		ret = !access_ok(VERIFY_WRITE, (void *)arg, _IOC_SIZE(cmd));
++	else if (_IOC_DIR(cmd) & _IOC_WRITE)
++		ret = !access_ok(VERIFY_READ, (void *)arg, _IOC_SIZE(cmd));
++	if (ret) {
++		dev_err(prev_dev, "access denied\n");
++		return -1;	/*error in access */
++	}
++
++	/* switch according value of cmd */
++	switch (cmd) {
++		/* if case is to query for buffer address */
++	case PREV_QUERYBUF:
++		/* call query buffer which will return buffer address */
++		down_interruptible(&(device->sem));
++		ret = query_buffer(device, (struct prev_buffer *)arg);
++		up(&(device->sem));
++		break;
++
++		/* if case is to request buffers */
++	case PREV_REQBUF:
++		/* call request buffer to allocate buffers */
++		down_interruptible(&(device->sem));
++		ret = request_buffer(device, (struct prev_reqbufs *)arg);
++		up(&(device->sem));
++		break;
++
++		/* if case is to set configuration parameters */
++	case PREV_SET_PARAM:
++
++		down_interruptible(&(device->sem));
++		/* copy the parameters to the configuration */
++		if (copy_from_user
++		    (&params, (struct prev_params *)arg,
++		     sizeof(struct prev_params)))
++			/* if it fails return error */
++		{
++			up(&(device->sem));
++			return -EFAULT;
++		}
++		/* check for errors */
++
++		ret = validate_params(&params);
++		if (ret < 0) {
++			up(&(device->sem));
++			return ret;
++		}
++
++		/* copy the values to devce params */
++		if (device->params)
++			memcpy(device->params, &params,
++			       sizeof(struct prev_params));
++		else {
++			dev_err(prev_dev, "\nPreviewer_ioctl:error in \
++					device->params");
++			up(&(device->sem));
++			return -EINVAL;
++		}
++
++		ret = previewer_hw_setup(device->params);
++		up(&(device->sem));
++		break;
++
++		/* if case is to get configuration parameters */
++	case PREV_GET_PARAM:
++
++		/* copy the parameters from the configuration */
++		if (copy_to_user
++		    ((struct prev_params *)arg, (device->params),
++		     sizeof(struct prev_params)))
++			/* if copying fails return error */
++			ret = -EFAULT;
++		break;
++
++		/* if the case is to get status */
++	case PREV_GET_STATUS:
++		/* call getstatus function to get the status in arg */
++		ret = get_status((struct prev_status *)arg);
++		break;
++
++		/* if the case is to do previewing */
++	case PREV_PREVIEW:
++		/* call preview function to do preview */
++		if (copy_from_user(&conv, (struct prev_convert *)arg,
++				   sizeof(struct prev_convert)))
++			return -EFAULT;
++
++		down_interruptible(&(device->sem));
++		ret = preview(device, &conv);
++		up(&(device->sem));
++		break;
++	case PREV_GET_CROPSIZE:
++		prev_calculate_crop(device->params,
++				    (struct prev_cropsize *)arg);
++		break;
++	case PREV_SET_EXP:
++
++		prev_set_exp(*((int *)arg));
++		break;
++
++	default:
++		dev_err(prev_dev, "previewer_ioctl: Invalid Command Value\n");
++		ret = -EINVAL;
++	}
++
++	dev_dbg(prev_dev, __FUNCTION__ "L\n");
++	return ret;
++}
++static void previewer_platform_release(struct device *device)
++{
++	/* This is called when the reference count goes to zero */
++}
++
++static int __init previewer_probe(struct device *device)
++{
++	prev_dev = device;
++	return 0;
++}
++
++static int previewer_remove(struct device *device)
++{
++	return 0;
++}
++
++/* global variable of type file_operations containing function 
++pointers of file operations */
++static struct file_operations prev_fops = {
++	.owner = THIS_MODULE,
++	.open = previewer_open,
++	.release = previewer_release,
++	.mmap = previewer_mmap,
++	.ioctl = previewer_ioctl,
++};
++
++/* global variable of type cdev to register driver to the kernel */
++static struct cdev cdev;
++
++/* global variable which keeps major and minor number of the driver in it */
++static dev_t dev;
++
++static struct class_simple *prev_class = NULL;
++
++static struct platform_device previewer_device = {
++	.name = "davinci_previewer",
++	.id = 2,
++	.dev = {
++		.release = previewer_platform_release,
++		}
++};
++
++static struct device_driver previewer_driver = {
++	.name = "davinci_previewer",
++	.bus = &platform_bus_type,
++	.probe = previewer_probe,
++	.remove = previewer_remove,
++};
++int __init previewer_init(void)
++{
++	int result;
++
++	/* Register the driver in the kernel */
++	/* dynmically get the major number for the driver using 
++	   alloc_chrdev_region function */
++	result = alloc_chrdev_region(&dev, 0, 1, DRIVERNAME);
++
++	/* if it fails return error */
++	if (result < 0) {
++		printk("DaVinciPreviewer: Module intialization \
++                failed. could not register character device\n");
++		return -ENODEV;
++	} else {
++	}
++
++	/* initialize cdev with file operations */
++	cdev_init(&cdev, &prev_fops);
++
++	cdev.owner = THIS_MODULE;
++	cdev.ops = &prev_fops;
++
++	/* add cdev to the kernel */
++	result = cdev_add(&cdev, dev, 1);
++
++	if (result) {
++		unregister_chrdev_region(dev, 1);
++		printk("DaVinciPreviewer: Error adding \
++		DavinciPreviewer .. error no:%d\n", result);
++		return -EINVAL;
++	}
++
++	/* register character driver to the kernel */
++	register_chrdev(MAJOR(dev), DRIVERNAME, &prev_fops);
++
++	/* register driver as a platform driver */
++	if (driver_register(&previewer_driver) != 0) {
++		unregister_chrdev_region(dev, 1);
++		cdev_del(&cdev);
++		return -EINVAL;
++	}
++
++	/* Register the drive as a platform device */
++	if (platform_device_register(&previewer_device) != 0) {
++		driver_unregister(&previewer_driver);
++		unregister_chrdev_region(dev, 1);
++		unregister_chrdev(MAJOR(dev), DRIVERNAME);
++		cdev_del(&cdev);
++		return -EINVAL;
++	}
++
++	prev_class = class_simple_create(THIS_MODULE, "davinci_previewer");
++	if (!prev_class) {
++		printk("previewer_init: error in creating device class\n");
++		driver_unregister(&previewer_driver);
++		platform_device_unregister(&previewer_device);
++		unregister_chrdev_region(dev, 1);
++		unregister_chrdev(MAJOR(dev), DRIVERNAME);
++		cdev_del(&cdev);
++		return -EIO;
++	}
++
++	/* make entry in the devfs */
++	result = devfs_mk_cdev(dev, S_IFCHR | S_IRUGO | S_IWUSR, "%s%d",
++			       "davinci_previewer", 0);
++
++	if (result < 0) {
++		printk("previewer_init: error in devfs_register_chrdev\n");
++		unregister_chrdev_region(dev, 1);
++		class_simple_destroy(prev_class);
++		unregister_chrdev(MAJOR(dev), DRIVERNAME);
++		cdev_del(&cdev);
++		return result;
++	}
++
++	/* register simple device class */
++	class_simple_device_add(prev_class, dev, NULL, "davinci_previewer");
++
++	/* Set up the Interrupt handler for PRVINT interrupt */
++	result = request_irq(IRQ_PRVUINT, previewer_isr, SA_INTERRUPT,
++			     "dm644xpreviewer", (void *)&prevdevice);
++
++	if (result < 0) {
++		printk("previewer_init:cannot get irq\n");
++
++		unregister_chrdev_region(dev, 1);
++		class_simple_device_remove(dev);
++		devfs_remove("%s%d", "davinci_previewer", 0);
++		class_simple_destroy(prev_class);
++		driver_unregister(&previewer_driver);
++		platform_device_unregister(&previewer_device);
++		cdev_del(&cdev);
++		unregister_chrdev(MAJOR(dev), DRIVERNAME);
++		return -EINVAL;
++	}
++
++	prevdevice.opened = 0;
++	prev_set_exp(0x2c0);
++
++	return 0;
++}
++
++void __exit previewer_cleanup(void)
++{
++
++	/* remove major number allocated to this driver */
++	unregister_chrdev_region(dev, 1);
++
++	/* remove simple class device */
++	class_simple_device_remove(dev);
++
++	/* remove prev device from devfs */
++	devfs_remove("%s%d", "davinci_previewer", 0);
++
++	/* destroy simple class */
++	class_simple_destroy(prev_class);
++
++	/* Remove platform driver */
++	driver_unregister(&previewer_driver);
++
++	/* remove platform device */
++	platform_device_unregister(&previewer_device);
++
++	/* disable interrupt */
++	free_irq(IRQ_PRVUINT, &prevdevice);
++
++	cdev_del(&cdev);
++
++	/* unregistering the driver from the kernel */
++	unregister_chrdev(MAJOR(dev), DRIVERNAME);
++
++}
++
++module_init(previewer_init)
++    module_exit(previewer_cleanup)
++    MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/char/davinci_previewer_hw.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/davinci_previewer_hw.c
+@@ -0,0 +1,358 @@
++/*
++ * Copyright (C) 2006 Texas Instruments Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ */
++
++/* davinci_previewer_hw.c file */
++
++#include <linux/errno.h>
++
++#include <asm/arch/davinci_previewer_hw.h>
++#include <asm/arch/davinci_previewer.h>
++
++#include <linux/device.h>
++#ifdef __KERNEL__
++
++extern struct device *prev_dev;
++
++/* previewer_hw_setup:It is used for Hardware Setup */
++int previewer_hw_setup(struct prev_params *config)
++{
++	u32 utemp = 0, pcr = 0;
++	s32 temp = 0;
++	int i, j;
++	/* Setting Down Sampling rate for input averager */
++	if (!config) {
++		dev_err(prev_dev, "\nError in prev_params");
++		return -EINVAL;
++	}
++	/* check whether down sampling rate is one of the supported */
++	if (config->sample_rate != DOWN_SAMPLE_RATE1
++	    && config->sample_rate != DOWN_SAMPLE_RATE2
++	    && config->sample_rate != DOWN_SAMPLE_RATE3
++	    && config->sample_rate != DOWN_SAMPLE_RATE4)
++		/* if not return error */
++		return -EINVAL;
++
++	utemp |= AVE_ODD_PIXEL_DIST;
++	utemp |= AVE_EVEN_PIXEL_DIST;
++
++	switch (config->sample_rate) {
++	case DOWN_SAMPLE_RATE1:
++		utemp |= 0;
++		break;
++	case DOWN_SAMPLE_RATE2:
++		utemp |= 1;
++		break;
++	case DOWN_SAMPLE_RATE3:
++		utemp |= 2;
++		break;
++	case DOWN_SAMPLE_RATE4:
++		utemp |= 3;
++		break;
++	default:
++		utemp |= 0;
++	}
++
++	/* set sampling rate in register */
++	regw(utemp, AVE);
++	utemp = 0;
++
++	/* Setting white balancing parameters */
++
++	/* Set the common gain for white balancing in register */
++	regw(((config->white_balance_params.wb_dgain) & 0x03FF), WB_DGAIN);
++
++	/* Set individual color gains in register for white balancing */
++	utemp = (int)(config->white_balance_params.wb_gain[0]);
++	utemp |= ((int)(config->white_balance_params.wb_gain[1]) << 8);
++	utemp |= ((int)(config->white_balance_params.wb_gain[2]) << 16);
++	utemp |= ((int)(config->white_balance_params.wb_gain[3]) << 24);
++
++	/* Write individual color gains to the register */
++	regw(utemp, WBGAIN);
++
++	/* Setting position of the colors in 4x4 grid */
++	for (utemp = 0, i = 0; i < WB_GAIN_MAX; i++) {
++		for (j = 0; j < WB_GAIN_MAX; j++) {
++			utemp |=
++			    ((config->white_balance_params.
++			      wb_coefmatrix[i][j] & 0x03) << ((i * 8) +
++							      (j * 2)));
++		}
++	}
++	regw(utemp, WBSEL);
++
++	/* setting RGB2RGB blending */
++	temp = 0;
++
++	temp = config->rgbblending_params.blending[0][0] & 0x0FFF;
++	temp |= ((config->rgbblending_params.blending[0][1] & 0x0FFF) << 16);
++
++	regw(temp, RGB_MAT1);
++
++	temp = 0;
++
++	temp = config->rgbblending_params.blending[0][2] & 0x0FFF;
++	temp |= ((config->rgbblending_params.blending[1][0] & 0x0FFF) << 16);
++
++	regw(temp, RGB_MAT2);
++
++	temp = 0;
++
++	temp = config->rgbblending_params.blending[1][1] & 0x0FFF;
++	temp |= ((config->rgbblending_params.blending[1][2] & 0x0FFF) << 16);
++
++	regw(temp, RGB_MAT3);
++
++	temp = 0;
++
++	temp = config->rgbblending_params.blending[2][0] & 0x0FFF;
++	temp |= ((config->rgbblending_params.blending[2][1] & 0x0FFF) << 16);
++
++	regw(temp, RGB_MAT4);
++
++	temp = 0;
++
++	temp = config->rgbblending_params.blending[2][2] & 0x0FFF;
++
++	regw(temp, RGB_MAT5);
++
++	/* Writing offset of RGB2RGB blending */
++
++	temp = 0;
++	temp = config->rgbblending_params.offset[1] & 0x03FF;
++	temp |= ((config->rgbblending_params.offset[0] & 0x03FF) << 16);
++
++	regw(temp, RGB_OFF1);
++
++	temp = 0;
++	temp = config->rgbblending_params.offset[2] & 0x03FF;
++	regw(temp, RGB_OFF2);
++
++	/* Setting RGB 2 YCbCr matrix gains and offsets */
++	temp = 0;
++	temp = ((config->rgb2ycbcr_params.coeff[0][0]) & 0x03FF);
++	temp |= (((config->rgb2ycbcr_params.coeff[0][1]) & 0x03FF) << 10);
++	temp |= (((config->rgb2ycbcr_params.coeff[0][2]) & 0x03FF) << 20);
++	regw(temp, CSC0);
++
++	temp = 0;
++	temp = (config->rgb2ycbcr_params.coeff[1][0] & 0x03FF);
++	temp |= (((config->rgb2ycbcr_params.coeff[1][1]) & 0x03FF) << 10);
++	temp |= (((config->rgb2ycbcr_params.coeff[1][2]) & 0x03FF) << 20);
++	regw(temp, CSC1);
++
++	temp = 0;
++	temp = (config->rgb2ycbcr_params.coeff[2][0] & 0x03FF);
++	temp |= (((config->rgb2ycbcr_params.coeff[2][1]) & 0x03FF) << 10);
++	temp |= (((config->rgb2ycbcr_params.coeff[2][2]) & 0x03FF) << 20);
++	regw(temp, CSC2);
++
++	temp = 0;
++	temp = (config->rgb2ycbcr_params.offset[2] & 0x00FF);
++	temp |= ((config->rgb2ycbcr_params.offset[1] & 0x00FF) << 8);
++	temp |= ((config->rgb2ycbcr_params.offset[0] & 0x00FF) << 16);
++	regw(temp, CSC_OFFSET);
++
++	/* Setting black adjustment offsets */
++	temp = 0;
++	temp = config->black_adjst_params.blueblkadj;
++	temp |= (config->black_adjst_params.greenblkadj << 8);
++	temp |= (config->black_adjst_params.redblkadj << 16);
++	regw(temp, BLKADJOFF);
++
++	temp = (config->contrast & 0x0FF) << 8;
++	temp |= (config->brightness & 0xFF);
++	regw(temp, CNT_BRT);
++
++	/* Enable dark frame capture if it is enabled in configuration */
++	if (config->features & PREV_DARK_FRAME_CAPTURE) {
++		SETBIT(pcr, DARK_FRAME_CAPTURE_BIT);
++	}
++	/* Enable Inverse A-Law if it is enabled in configuration */
++	if (config->features & PREV_INVERSE_ALAW) {
++		SETBIT(pcr, INVALAW_BIT);
++	}
++
++	/* Enable HMF and set its threshold if it is enabled in 
++	   configuration */
++	if (config->features & PREV_HORZ_MEDIAN_FILTER) {
++		SETBIT(pcr, HMF_BIT);
++		regw(((config->hmf_threshold & 0xFF) | 0x300), HMED);
++	}
++
++	/* Enable Noise filter and set its coefficients if it is 
++	   enabled in configuration */
++	if (config->features & PREV_NOISE_FILTER) {
++		SETBIT(pcr, NOISE_FILTER_BIT);
++		/* Set coefficients of NF */
++		/* Set table address */
++		regw(NOISE_FILTER_START_ADDR, SET_TBL_ADDR);
++		/* set data */
++		for (i = NOISE_FILTER_START_ADDR;
++		     i <= NOISE_FILTER_END_ADDR; i++) {
++			regw(config->nf_coeffs.
++			     noise[i - NOISE_FILTER_START_ADDR], SET_TBL_DATA);
++			/* Address is auto incremented */
++		}
++		/* write the strength of the weighted average */
++		regw((config->nf_coeffs.strength & 0x0F), NF);
++	}
++
++	/*  Set CFA Coefficients */
++	if (config->features & PREV_CFA) {
++		/* enable CFA interpolation in pcr */
++		SETBIT(pcr, CFA_BIT);
++
++		/* Set coefficients of Gamma correction */
++		/* Set table address for red gamma */
++		regw(CFA_COEFF_START_ADDR, SET_TBL_ADDR);
++		/* set data */
++		for (i = CFA_COEFF_START_ADDR; i <= CFA_COEFF_END_ADDR; i++) {
++			regw(config->cfa_coeffs.
++			     coeffs[i - CFA_COEFF_START_ADDR], SET_TBL_DATA);
++			/* Address is auto incremented */
++		}
++
++		/* set horizontal and vertical threshold */
++		temp = (config->cfa_coeffs.hthreshold & 0xFF);
++		temp |= ((config->cfa_coeffs.vthreshold & 0xFF) << 8);
++		regw(temp, CFA);
++	}
++
++	/* Set gamma correction Coefficients if it is enabled in 
++	   configuration */
++	if (config->features & PREV_GAMMA) {
++		/* disable gamma bypass in PCR */
++		RESETBIT(pcr, GAMMA_BYPASS_BIT);
++		/* Set coefficients of Gamma correction */
++		/* Set table address for red gamma */
++		regw(RED_GAMMA_START_ADDR, SET_TBL_ADDR);
++		/* set data */
++		for (i = RED_GAMMA_START_ADDR; i <= RED_GAMMA_END_ADDR; i++) {
++			regw(config->gamma_coeffs.
++			     red[i - RED_GAMMA_START_ADDR], SET_TBL_DATA);
++			/* Address is auto incremented */
++		}
++		/* Set table start address for green gamma */
++		regw(GREEN_GAMMA_START_ADDR, SET_TBL_ADDR);
++		/* set data */
++		for (i = GREEN_GAMMA_START_ADDR; i <= GREEN_GAMMA_END_ADDR; i++) {
++			regw(config->gamma_coeffs.
++			     green[i - GREEN_GAMMA_START_ADDR], SET_TBL_DATA);
++			/* Address is auto incremented */
++		}
++		/* Set table address for red gamma */
++		regw(BLUE_GAMMA_START_ADDR, SET_TBL_ADDR);
++		/* set data */
++		for (i = BLUE_GAMMA_START_ADDR; i <= BLUE_GAMMA_END_ADDR; i++) {
++			regw(config->gamma_coeffs.
++			     blue[i - BLUE_GAMMA_START_ADDR], SET_TBL_DATA);
++			/* Address is auto incremented */
++		}
++	} else {
++		/* else enable gamma bypassing */
++		SETBIT(pcr, GAMMA_BYPASS_BIT);
++	}
++
++	/* Set luma enhancement Coefficients if it is enabled in 
++	   configuration */
++	if (config->features & PREV_LUMA_ENHANCE) {
++		/* enable Luma enhancement in PCR */
++		SETBIT(pcr, LUMA_ENHANCE_BIT);
++
++		/* Set the start address for luma enhancement */
++		regw(LUMA_ENHANCE_START_ADDR, SET_TBL_ADDR);
++		/* set data */
++		for (i = LUMA_ENHANCE_START_ADDR;
++		     i <= LUMA_ENHANCE_END_ADDR; i++) {
++			regw(config->
++			     luma_enhance[i - LUMA_ENHANCE_START_ADDR],
++			     SET_TBL_DATA);
++		}
++	}
++
++	/* Set luma enhancement Coefficients if it is enabled in 
++	   configuration */
++	if (config->features & PREV_CHROMA_SUPPRESS) {
++		/* enable Luma enhancement in PCR */
++		SETBIT(pcr, CHROMA_SUPPRESS_BIT);
++		temp = 0;
++		if (config->chroma_suppress_params.hpfy) {
++			SETBIT(temp, CHROMA_HPFY);
++		} else {
++			RESETBIT(temp, CHROMA_HPFY);
++		}
++
++		temp |= (config->chroma_suppress_params.gain & 0x00FF);
++		temp |= (config->chroma_suppress_params.threshold << 8);
++
++		regw(temp, CSUP);
++	}
++
++	/* enable dark frame subtract if it is enabled in configuration */
++	if (config->features & PREV_DARK_FRAME_SUBTRACT) {
++		/* enable dark frame subtract in PCR */
++		SETBIT(pcr, DARK_FRAME_WRITE_BIT);
++
++		/* set the dark frame address and line offset */
++		regw(config->dark_frame_addr, DSDR_ADDR);
++		regw(config->dark_frame_pitch, DRKF_OFFSET);
++	}
++
++	/* enable lens shading if it is enabled in configuration */
++	if (config->features & PREV_LENS_SHADING) {
++		/* enable lens shading in PCR */
++		SETBIT(pcr, SHADECOMP_BIT);
++
++		/* set the dark frame address and line offset */
++		regw(config->dark_frame_addr, DSDR_ADDR);
++		regw(config->dark_frame_pitch, DRKF_OFFSET);
++
++		/* set lens shading shift parameter */
++		pcr |=
++		    (((config->
++		       lens_shading_sift) & 0x7) << (SHADECOMP_BIT + 1));
++	}
++
++	/* Set previewer source to DDRAM */
++	SETBIT(pcr, PREV_SOURCE_BIT);
++	RESETBIT(pcr, PREV_SOURCE_BIT);
++
++	/* Set one shot mode */
++	SETBIT(pcr, PREV_ONESHOT_BIT);
++	RESETBIT(pcr, PREV_ONESHOT_BIT);
++
++	/* Set pixel width */
++	if (config->size_params.pixsize == PREV_INWIDTH_8BIT)
++		SETBIT(pcr, PREV_WIDTH_BIT);
++	else
++		RESETBIT(pcr, PREV_WIDTH_BIT);
++
++	/* Enable writing to DDRAM */
++	SETBIT(pcr, DDRAMPORT_BIT);
++
++	/* set output format in PCR */
++	pcr |= ((config->pix_fmt & 0x3) << PIXEL_ORDER_BIT);
++
++	/* Write PCR register */
++	regw(pcr, PCR);
++
++	return 0;
++}
++
++#endif				/* End of #ifdef __KERNEL__ */
+Index: linux-2.6.10/include/asm-arm/arch-davinci/davinci_previewer.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-davinci/davinci_previewer.h
+@@ -0,0 +1,282 @@
++/*
++ * Copyright (C) 2006 Texas Instruments Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ */
++
++/* davinci_previewer.h file */
++
++#ifndef DAVINCI_PREVIEWER_H
++#define DAVINCI_PREVIEWER_H
++
++#ifdef DEBUG
++#undef DEBUG
++#endif
++
++/*#define DEBUG*/
++
++#include <linux/ioctl.h>
++
++#ifdef __KERNEL__
++
++/* include linux specific header files */
++#include <linux/completion.h>
++#include <linux/interrupt.h>
++#include <asm/semaphore.h>
++
++#endif				/* End of #ifdef __KERNEL__ */
++
++/* Feature lists */
++#define PREV_INPUT_FORMATTER       0x1
++#define PREV_INVERSE_ALAW          0x2
++#define PREV_HORZ_MEDIAN_FILTER    0x4
++#define PREV_NOISE_FILTER          0x8
++#define PREV_CFA                   0x10
++#define PREV_GAMMA                 0x20
++#define PREV_LUMA_ENHANCE          0x40
++#define PREV_CHROMA_SUPPRESS       0x80
++#define PREV_DARK_FRAME_SUBTRACT   0x100
++#define PREV_LENS_SHADING          0x200
++#define PREV_DARK_FRAME_CAPTURE    0x400
++/* -- */
++
++#define DOWN_SAMPLE_RATE1       1	/* Down sampling rate 1 */
++#define DOWN_SAMPLE_RATE2       2	/* Down sampling rate 2 */
++#define DOWN_SAMPLE_RATE3       4	/* Down sampling rate 4 */
++#define DOWN_SAMPLE_RATE4       8	/* Down sampling rate 8 */
++
++#define LUMA_TABLE_SIZE            128
++#define GAMMA_TABLE_SIZE           1024
++#define CFA_COEFF_TABLE_SIZE       576
++#define NOISE_FILTER_TABLE_SIZE    256
++
++#define WB_GAIN_MAX     4
++#define RGB_MAX         3
++
++#define MAX_BUFFER      8
++
++#define MAX_IMAGE_WIDTH   1280
++#define MAX_IMAGE_HEIGHT  1920
++
++#define PREV_BUF_IN     0	/* input buffer */
++#define PREV_BUF_OUT    1	/* output buffer */
++
++#define PREV_INWIDTH_8BIT   0	/* pixel width of 8 bitS */
++#define PREV_INWIDTH_10BIT  1	/* pixel width of 10 bits */
++
++/* list of structures */
++/* structure for request buffer */
++struct prev_reqbufs {
++	int buf_type;		/* type of frame buffer */
++	int size;		/* size of the frame buffer to be allocated */
++	int count;		/* number of frame buffer to be allocated */
++};
++/* structure buffer */
++struct prev_buffer {
++	int index;		/* index number, 0 -> N-1 */
++	int buf_type;		/* buffer type, input or output */
++	int offset;		/* address of the buffer used in the mmap() 
++				   system call */
++	int size;		/* size of the buffer */
++};
++/* structure for size parameters */
++struct prev_size_params {
++	unsigned int hstart;	/* Starting pixel */
++	unsigned int vstart;	/* Starting line */
++	unsigned int hsize;	/* width of input image */
++	unsigned int vsize;	/* height of input image */
++	unsigned char pixsize;	/* pixel size of the image in 
++				   terms of bits */
++	unsigned short in_pitch;	/* line offset of input image */
++	unsigned short out_pitch;	/* line offset of output image */
++};
++/* structure for white balancing parameters */
++struct prev_white_balance {
++	unsigned short wb_dgain;	/* white 
++					   balance common
++					   gain */
++	unsigned char wb_gain[WB_GAIN_MAX];	/* individual 
++						   color gains */
++	unsigned char wb_coefmatrix[WB_GAIN_MAX][WB_GAIN_MAX];	/* 16 position
++								   out of 4 
++								   values */
++};
++/*structure for black adjustment for parameters */
++struct prev_black_adjst {	/* black adjustments for three colors */
++	char redblkadj;		/* black adjustment offset for red color */
++	char greenblkadj;	/* black adjustment offset for green color */
++	char blueblkadj;	/* black adjustment offset for blue color */
++};
++/*structure for RGB2RGB blending parameters */
++struct prev_rgbblending {
++	short blending[RGB_MAX][RGB_MAX];	/* color correlation 3x3 matrix */
++	short offset[RGB_MAX];	/* color correlation offsets */
++};
++/* structure RGB2YCbCr parameters */
++struct prev_rgb2ycbcr_coeffs {
++	short coeff[RGB_MAX][RGB_MAX];	/* color conversion gains in 
++					   3x3 matrix */
++	short offset[RGB_MAX];	/* color conversion offsets */
++};
++/*structure for CFA coefficients */
++struct prev_cfa_coeffs {
++	char hthreshold, vthreshold;	/* horizontal an vertical 
++					   threshold */
++	int coeffs[CFA_COEFF_TABLE_SIZE];	/* cfa coefficients */
++};
++/* structure for Gamma Coefficients */
++struct prev_gamma_coeffs {
++	unsigned char red[GAMMA_TABLE_SIZE];	/* table of gamma correction 
++						   values for red color */
++	unsigned char green[GAMMA_TABLE_SIZE];	/* table of gamma correction 
++						   values for green color */
++	unsigned char blue[GAMMA_TABLE_SIZE];	/* table of gamma correction 
++						   values for blue color */
++};
++/* structure for Nois Filter Coefficients */
++struct prev_noiseflt_coeffs {
++	unsigned char noise[NOISE_FILTER_TABLE_SIZE];	/* noise filter 
++							   table */
++	unsigned char strength;	/* to find out 
++				   weighted average */
++};
++/*structure for Chroma Suppression */
++struct prev_chroma_spr {
++	unsigned char hpfy;	/* whether to use high passed 
++				   version of Y or normal Y */
++	char threshold;		/* threshold for chroma suppress */
++	unsigned char gain;	/* chroma suppression gain */
++};
++/* enum data type for output pixel order */
++enum prev_pixorder {
++	PREV_PIXORDER_CBYCRY = 0,	/* LSB Cb0 Y0 Cr0 Y1 MSB */
++	PREV_PIXORDER_CRYCBY,	/* LSB Cr0 Y0 Cb0 Y1 MSB */
++	PREV_PIXORDER_YCRYCB,	/* LSB Y0 Cb0 Y1 Cr0 MSB */
++	PREV_PIXORDER_YCBYCR,	/* LSB Y0 Cr0 Y1 Cb0 MSB */
++};
++/* -- */
++/* structure for all configuration */
++struct prev_params {
++	unsigned short features;	/* Set of features 
++					   enabled */
++	struct prev_size_params size_params;	/* size parameters */
++	struct prev_white_balance white_balance_params;	/* white balancing 
++							   parameters */
++	struct prev_black_adjst black_adjst_params;	/* black adjustment 
++							   parameters */
++	struct prev_rgbblending rgbblending_params;	/* rgb blending 
++							   parameters */
++	struct prev_rgb2ycbcr_coeffs rgb2ycbcr_params;	/* rgb to ycbcr 
++							   parameters */
++	unsigned char sample_rate;	/* down sampling 
++					   rate for averager */
++	short hmf_threshold;	/* horizontal median 
++				   filter threshold */
++	struct prev_cfa_coeffs cfa_coeffs;	/* CFA coefficients */
++	struct prev_gamma_coeffs gamma_coeffs;	/* gamma 
++						   coefficients */
++	struct prev_noiseflt_coeffs nf_coeffs;	/* noise filter 
++						   coefficients */
++	unsigned int luma_enhance[LUMA_TABLE_SIZE];	/* luma enhancement 
++							   coeffs */
++	struct prev_chroma_spr chroma_suppress_params;	/* chroma suppression 
++							   coefficients */
++	void *dark_frame_addr;	/* dark frame 
++				   address */
++	unsigned short dark_frame_pitch;	/* dark frame 
++						   lineoffset */
++	unsigned char lens_shading_sift;	/* number of bits 
++						   to be        shifted 
++						   for lens shading */
++	enum prev_pixorder pix_fmt;	/* output pixel 
++					   format */
++	int contrast;		/* contrast */
++	int brightness;		/* brightness */
++};
++/* structure for input/output buffer, used while previewing */
++struct prev_convert {
++	struct prev_buffer in_buff;
++	struct prev_buffer out_buff;
++};
++/* structure to know status of the hardware */
++struct prev_status {
++	char hw_busy;
++};
++/* structure to knwo crop size */
++struct prev_cropsize {
++	int hcrop;
++	int vcrop;
++};
++
++#ifdef __KERNEL__
++/* device structure keeps track of global information */
++struct prev_device {
++	struct prev_params *params;
++	unsigned char opened;	/* state of the device */
++	unsigned char in_numbuffers;	/* number of input 
++					   buffers */
++	unsigned char out_numbuffers;	/* number of output 
++					   buffers */
++	struct prev_buffer *in_buff[MAX_BUFFER];	/* pointer to input 
++							   buffers */
++	struct prev_buffer *out_buff[MAX_BUFFER];	/*pointer to output 
++							   buffers */
++	struct completion wfc;	/* used to wait for frame 
++				   precessing to be 
++				   completed */
++	struct semaphore sem;
++};
++
++void calculate_slices(struct prev_params *, int *hslice, int *vslice);
++void prev_calculate_crop(struct prev_params *, struct prev_cropsize *crop);
++int preview(struct prev_device *, struct prev_convert *arg);
++int get_status(struct prev_status *);
++int request_buffer(struct prev_device *, struct prev_reqbufs *);
++int query_buffer(struct prev_device *, struct prev_buffer *);
++irqreturn_t previewer_isr(int, void *, struct pt_regs *);
++int free_buffers(struct prev_device *);
++int validate_params(struct prev_params *);
++
++#endif				/* End of #ifdef __KERNEL__ */
++
++/* ioctls definition */
++#define PREV_IOC_BASE   	'P'
++#define PREV_REQBUF     	_IOW(PREV_IOC_BASE, 1, struct prev_reqbufs)
++#define PREV_QUERYBUF   	_IOR(PREV_IOC_BASE, 2, struct prev_buffer)
++#define PREV_SET_PARAM  	_IOW(PREV_IOC_BASE, 3, struct prev_params)
++#define PREV_GET_PARAM  	_IOR(PREV_IOC_BASE, 4, struct prev_params)
++#define PREV_PREVIEW    	_IOWR(PREV_IOC_BASE,5, struct prev_convert)
++#define PREV_GET_STATUS 	_IOR(PREV_IOC_BASE, 6, char)
++#define PREV_GET_CROPSIZE 	_IOR(PREV_IOC_BASE, 7, struct prev_cropsize)
++#define PREV_SET_EXP		_IOWR(PREV_IOC_BASE,8,int*)
++#define PREV_IOC_MAXNR  8
++/* End of ioctls */
++
++#ifdef __KERNEL__
++struct vm_struct_area;
++struct inode;
++struct file;
++/* function definition for character driver interface functions */
++int previewer_init(void);
++void previewer_cleanup(void);
++int previewer_open(struct inode *inode, struct file *);
++int previewer_release(struct inode *inode, struct file *);
++int previewer_ioctl(struct inode *inode, struct file *, unsigned int,
++		    unsigned long);
++int previewer_mmap(struct file *, struct vm_area_struct *);
++
++#endif				/* End of #ifdef __KERNEL__ */
++
++#endif				/* End of DAVINCI_PREVIEWER_H */
+Index: linux-2.6.10/include/asm-arm/arch-davinci/davinci_previewer_hw.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-arm/arch-davinci/davinci_previewer_hw.h
+@@ -0,0 +1,204 @@
++/*
++ * Copyright (C) 2006 Texas Instruments Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ */
++
++/* davinci_previewer_hw.h file */
++
++#ifndef DAVINCI_PREVIEWER_HW_H
++#define DAVINCI_PREVIEWER_HW_H
++
++#ifdef __KERNEL__
++
++#include <linux/kernel.h>	/* printk() */
++#include <asm/io.h>		/* For IO_ADDRESS */
++
++#define PREVIEWER_IOBASE_VADDR      IO_ADDRESS(0x01C70800)
++
++/* Register Offsets from the base address */
++#define PID               0x0000
++#define PCR               0x0004
++#define HORZ_INFO         0x0008
++#define VERT_INFO         0x000C
++#define RSDR_ADDR         0x0010
++#define RADR_OFFSET       0x0014
++#define DSDR_ADDR         0x0018
++#define DRKF_OFFSET       0x001C
++#define WSDR_ADDR         0x0020
++#define WADD_OFFSET       0x0024
++#define AVE               0x0028
++#define HMED              0x002C
++#define NF                0x0030
++#define WB_DGAIN          0x0034
++#define WBGAIN            0x0038
++#define WBSEL             0x003C
++#define CFA               0x0040
++#define BLKADJOFF         0x0044
++#define RGB_MAT1          0x0048
++#define RGB_MAT2          0x004C
++#define RGB_MAT3          0x0050
++#define RGB_MAT4          0x0054
++#define RGB_MAT5          0x0058
++#define RGB_OFF1          0x005C
++#define RGB_OFF2          0x0060
++#define CSC0              0x0064
++#define CSC1              0x0068
++#define CSC2              0x006C
++#define CSC_OFFSET        0x0070
++#define CNT_BRT           0x0074
++#define CSUP              0x0078
++#define SETUP_YC          0x007C
++#define SET_TBL_ADDR      0x0080
++#define SET_TBL_DATA      0x0084
++/* End of register offsets */
++#define VPSS_PCR          (0x3404-0x0800)
++#define SDR_REQ_EXP       (0x3508-0x0800)
++
++/* Register read/write */
++#define regw(val, reg)    outl(val, (reg)+PREVIEWER_IOBASE_VADDR)
++#define regr(reg)         inl((reg)+PREVIEWER_IOBASE_VADDR)
++/* -- */
++
++/* macro for bit set and clear */
++#define SETBIT(reg, bit)   (reg = ((reg) | ((0x00000001)<<(bit))))
++#define RESETBIT(reg, bit) (reg = ((reg) & (~(0x00000001<<(bit)))))
++/* -- */
++
++/* bit positions of the configurations in PCR register */
++#define PREV_ENABLE_BIT         0
++#define PREV_SOURCE_BIT         2
++#define PREV_ONESHOT_BIT        3
++#define PREV_WIDTH_BIT          4
++#define INVALAW_BIT             5
++#define DARK_FRAME_WRITE_BIT    6
++#define DARK_FRAME_CAPTURE_BIT  7
++#define HMF_BIT                 8
++#define NOISE_FILTER_BIT        9
++#define CFA_BIT                 10
++#define LUMA_ENHANCE_BIT        15
++#define CHROMA_SUPPRESS_BIT     16
++#define RSZPORT_BIT             19
++#define DDRAMPORT_BIT           20
++#define SHADECOMP_BIT           21
++#define GAMMA_BYPASS_BIT        26
++#define PIXEL_ORDER_BIT         17
++
++/* -- */
++
++/* Internal RAM table addresses for NF */
++#define NOISE_FILTER_START_ADDR  0x0C00
++#define NOISE_FILTER_END_ADDR    0x0CFF
++
++/* Internal RAM table addresses for gamma correction */
++#define RED_GAMMA_START_ADDR      0x0000
++#define RED_GAMMA_END_ADDR        0x03FF
++#define GREEN_GAMMA_START_ADDR    0x0400
++#define GREEN_GAMMA_END_ADDR      0x07FF
++#define BLUE_GAMMA_START_ADDR     0x0800
++#define BLUE_GAMMA_END_ADDR       0x0BFF
++/* -- */
++
++/* Internal RAM table addresses for Luma enhancement */
++#define LUMA_ENHANCE_START_ADDR   0x1000
++#define LUMA_ENHANCE_END_ADDR     0x107F
++/* -- */
++
++/* Internal RAM table addresses for CFA Coefficients */
++#define CFA_COEFF_START_ADDR    0x1400
++#define CFA_COEFF_END_ADDR      0x163F
++/* -- */
++
++/* bit position of whether to use high passed version of Y or not */
++#define CHROMA_HPFY           16
++
++#define AVE_ODD_PIXEL_DIST    16	/* (1 << 4)distance between two consecutive 
++					   pixels of same color is 2 in bayer pattern
++					   in odd lines. to be set in 2 and 3 bits 
++					   of AVE */
++#define AVE_EVEN_PIXEL_DIST   4	/*(1 << 2)distance between two consecutive 
++				   pixels of same color is 2 in bayer pattern 
++				   in even lines to be set in 4 and 5 
++				   bits of AVE */
++
++/* inline function to enable previewer */
++static inline void previewer_enable(void)
++{
++	int pcr = regr(PCR);
++	regw((pcr | 0x01), PCR);
++}
++
++/* inline function to set previewer in one shot mode */
++static inline void set_oneshot_mode(void)
++{
++	int pcr = regr(PCR);
++	regw((pcr | (0x01 << 3)), PCR);
++}
++
++/* inline function to set previewer input source to DDRAM */
++static inline void set_input_source(int i)
++{
++	int pcr = regr(PCR);
++	regw((pcr | (i << 2)), PCR);
++}
++
++/* inline function to set read line offset */
++static inline void set_rsdr_offset(int offset)
++{
++	regw(offset, RADR_OFFSET);
++}
++
++/* inline function to set write line offset */
++static inline void set_wsdr_offset(int offset)
++{
++	regw(offset, WADD_OFFSET);
++}
++
++/* inline function to set the size of the input image in register */
++static inline void set_size(int hstart, int vstart, int width, int height)
++{
++	int horz_info = (width - 1 + hstart) & 0x3fff;
++	int vert_info = (height - 1 + vstart) & 0x3fff;
++	horz_info |= ((hstart & 0x3fff) << 16);
++	vert_info |= ((vstart & 0x3fff) << 16);
++	regw(horz_info, HORZ_INFO);
++	regw(vert_info, VERT_INFO);
++}
++
++/* inline function to set input/output addresses in registers */
++static inline void set_address(unsigned long input, unsigned long output)
++{
++	regw(input, RSDR_ADDR);
++	regw(output, WSDR_ADDR);
++
++}
++
++#define isbusy()    ((regr(PCR) & 0x02)>>1)
++static inline void prev_set_exp(int exp)
++{
++	regw(((exp & 0x3ff) << 20), SDR_REQ_EXP);
++}
++
++static inline int prev_writebuffer_status(void)
++{
++	return regr(VPSS_PCR);
++}
++
++/* Forward declaration */
++struct prev_params;
++
++extern int previewer_hw_setup(struct prev_params *);
++#endif				/* End of #ifdef __KERNEL__ */
++#endif				/* End of #ifdef DAVINCI_PREVIEWER_HW_H */
+Index: linux-2.6.10/mvl_patches/pro-1642.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1642.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1642);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

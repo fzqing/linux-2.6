@@ -1,0 +1,954 @@
+#! /usr/bin/env bash
+# Patch: -Avoiding_mmap_fragmentation
+# Date: Mon Mar 12 13:51:40 2007
+# Source: git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+# MR: 22105
+# Type: Defect Fix
+# Disposition: backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# Minor changes to get it apply to our tree
+# 
+# From 1363c3cd8603a913a27e2995dccbd70d5312d8e6 Mon Sep 17 00:00:00 2001
+# From: Wolfgang Wander <wwc@rentec.com>
+# Date: Tue, 21 Jun 2005 17:14:49 -0700
+# Subject: [PATCH 1/1] [PATCH] Avoiding mmap fragmentation
+# 
+# Ingo recently introduced a great speedup for allocating new mmaps using the
+# free_area_cache pointer which boosts the specweb SSL benchmark by 4-5% and
+# causes huge performance increases in thread creation.
+# 
+# The downside of this patch is that it does lead to fragmentation in the
+# mmap-ed areas (visible via /proc/self/maps), such that some applications
+# that work fine under 2.4 kernels quickly run out of memory on any 2.6
+# kernel.
+# 
+# The problem is twofold:
+# 
+#   1) the free_area_cache is used to continue a search for memory where
+#      the last search ended.  Before the change new areas were always
+#      searched from the base address on.
+# 
+#      So now new small areas are cluttering holes of all sizes
+#      throughout the whole mmap-able region whereas before small holes
+#      tended to close holes near the base leaving holes far from the base
+#      large and available for larger requests.
+# 
+#   2) the free_area_cache also is set to the location of the last
+#      munmap-ed area so in scenarios where we allocate e.g.  five regions of
+#      1K each, then free regions 4 2 3 in this order the next request for 1K
+#      will be placed in the position of the old region 3, whereas before we
+#      appended it to the still active region 1, placing it at the location
+#      of the old region 2.  Before we had 1 free region of 2K, now we only
+#      get two free regions of 1K -> fragmentation.
+# 
+# The patch addresses thes issues by introducing yet another cache descriptor
+# cached_hole_size that contains the largest known hole size below the
+# current free_area_cache.  If a new request comes in the size is compared
+# against the cached_hole_size and if the request can be filled with a hole
+# below free_area_cache the search is started from the base instead.
+# 
+# The results look promising: Whereas 2.6.12-rc4 fragments quickly and my
+# (earlier posted) leakme.c test program terminates after 50000+ iterations
+# with 96 distinct and fragmented maps in /proc/self/maps it performs nicely
+# (as expected) with thread creation, Ingo's test_str02 with 20000 threads
+# requires 0.7s system time.
+# 
+# Taking out Ingo's patch (un-patch available per request) by basically
+# deleting all mentions of free_area_cache from the kernel and starting the
+# search for new memory always at the respective bases we observe: leakme
+# terminates successfully with 11 distinctive hardly fragmented areas in
+# /proc/self/maps but thread creating is gringdingly slow: 30+s(!) system
+# time for Ingo's test_str02 with 20000 threads.
+# 
+# Now - drumroll ;-) the appended patch works fine with leakme: it ends with
+# only 7 distinct areas in /proc/self/maps and also thread creation seems
+# sufficiently fast with 0.71s for 20000 threads.
+# 
+# Signed-off-by: Wolfgang Wander <wwc@rentec.com>
+# Credit-to: "Richard Purdie" <rpurdie@rpsys.net>
+# Signed-off-by: Ken Chen <kenneth.w.chen@intel.com>
+# Acked-by: Ingo Molnar <mingo@elte.hu> (partly)
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1195
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux-2.6.git
+MR: 22105
+Type: Defect Fix
+Disposition: backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+Minor changes to get it apply to our tree
+
+From 1363c3cd8603a913a27e2995dccbd70d5312d8e6 Mon Sep 17 00:00:00 2001
+From: Wolfgang Wander <wwc@rentec.com>
+Date: Tue, 21 Jun 2005 17:14:49 -0700
+Subject: [PATCH 1/1] [PATCH] Avoiding mmap fragmentation
+
+Ingo recently introduced a great speedup for allocating new mmaps using the
+free_area_cache pointer which boosts the specweb SSL benchmark by 4-5% and
+causes huge performance increases in thread creation.
+
+The downside of this patch is that it does lead to fragmentation in the
+mmap-ed areas (visible via /proc/self/maps), such that some applications
+that work fine under 2.4 kernels quickly run out of memory on any 2.6
+kernel.
+
+The problem is twofold:
+
+  1) the free_area_cache is used to continue a search for memory where
+     the last search ended.  Before the change new areas were always
+     searched from the base address on.
+
+     So now new small areas are cluttering holes of all sizes
+     throughout the whole mmap-able region whereas before small holes
+     tended to close holes near the base leaving holes far from the base
+     large and available for larger requests.
+
+  2) the free_area_cache also is set to the location of the last
+     munmap-ed area so in scenarios where we allocate e.g.  five regions of
+     1K each, then free regions 4 2 3 in this order the next request for 1K
+     will be placed in the position of the old region 3, whereas before we
+     appended it to the still active region 1, placing it at the location
+     of the old region 2.  Before we had 1 free region of 2K, now we only
+     get two free regions of 1K -> fragmentation.
+
+The patch addresses thes issues by introducing yet another cache descriptor
+cached_hole_size that contains the largest known hole size below the
+current free_area_cache.  If a new request comes in the size is compared
+against the cached_hole_size and if the request can be filled with a hole
+below free_area_cache the search is started from the base instead.
+
+The results look promising: Whereas 2.6.12-rc4 fragments quickly and my
+(earlier posted) leakme.c test program terminates after 50000+ iterations
+with 96 distinct and fragmented maps in /proc/self/maps it performs nicely
+(as expected) with thread creation, Ingo's test_str02 with 20000 threads
+requires 0.7s system time.
+
+Taking out Ingo's patch (un-patch available per request) by basically
+deleting all mentions of free_area_cache from the kernel and starting the
+search for new memory always at the respective bases we observe: leakme
+terminates successfully with 11 distinctive hardly fragmented areas in
+/proc/self/maps but thread creating is gringdingly slow: 30+s(!) system
+time for Ingo's test_str02 with 20000 threads.
+
+Now - drumroll ;-) the appended patch works fine with leakme: it ends with
+only 7 distinct areas in /proc/self/maps and also thread creation seems
+sufficiently fast with 0.71s for 20000 threads.
+
+Signed-off-by: Wolfgang Wander <wwc@rentec.com>
+Credit-to: "Richard Purdie" <rpurdie@rpsys.net>
+Signed-off-by: Ken Chen <kenneth.w.chen@intel.com>
+Acked-by: Ingo Molnar <mingo@elte.hu> (partly)
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/arch/arm/mm/mmap.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/mmap.c
++++ linux-2.6.10/arch/arm/mm/mmap.c
+@@ -73,7 +73,12 @@ arch_get_unmapped_area(struct file *filp
+ 		    (!vma || addr + len <= vma->vm_start))
+ 			return addr;
+ 	}
+-	start_addr = addr = mm->free_area_cache;
++	if (len > mm->cached_hole_size) {
++	        start_addr = addr = mm->free_area_cache;
++	} else {
++	        start_addr = addr = TASK_UNMAPPED_BASE;
++	        mm->cached_hole_size = 0;
++	}
+ 
+ full_search:
+ 	if (do_align)
+@@ -90,6 +95,7 @@ full_search:
+ 			 */
+ 			if (start_addr != TASK_UNMAPPED_BASE) {
+ 				start_addr = addr = TASK_UNMAPPED_BASE;
++				mm->cached_hole_size = 0;
+ 				goto full_search;
+ 			}
+ 			return -ENOMEM;
+@@ -101,6 +107,8 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
+ 		addr = vma->vm_end;
+ 		if (do_align)
+ 			addr = COLOUR_ALIGN(addr, pgoff);
+Index: linux-2.6.10/arch/i386/mm/hugetlbpage.c
+===================================================================
+--- linux-2.6.10.orig/arch/i386/mm/hugetlbpage.c
++++ linux-2.6.10/arch/i386/mm/hugetlbpage.c
+@@ -294,7 +294,12 @@ static unsigned long hugetlb_get_unmappe
+ 	struct vm_area_struct *vma;
+ 	unsigned long start_addr;
+ 
+-	start_addr = mm->free_area_cache;
++	if (len > mm->cached_hole_size) {
++	        start_addr = mm->free_area_cache;
++	} else {
++	        start_addr = TASK_UNMAPPED_BASE;
++	        mm->cached_hole_size = 0;
++	}
+ 
+ full_search:
+ 	addr = ALIGN(start_addr, HPAGE_SIZE);
+@@ -308,6 +313,7 @@ full_search:
+ 			 */
+ 			if (start_addr != TASK_UNMAPPED_BASE) {
+ 				start_addr = TASK_UNMAPPED_BASE;
++				mm->cached_hole_size = 0;
+ 				goto full_search;
+ 			}
+ 			return -ENOMEM;
+@@ -316,6 +322,8 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
+ 		addr = ALIGN(vma->vm_end, HPAGE_SIZE);
+ 	}
+ }
+@@ -327,12 +335,17 @@ static unsigned long hugetlb_get_unmappe
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma, *prev_vma;
+ 	unsigned long base = mm->mmap_base, addr = addr0;
++	unsigned long largest_hole = mm->cached_hole_size;
+ 	int first_time = 1;
+ 
+ 	/* don't allow allocations above current base */
+ 	if (mm->free_area_cache > base)
+ 		mm->free_area_cache = base;
+ 
++	if (len <= largest_hole) {
++	        largest_hole = 0;
++		mm->free_area_cache  = base;
++	}
+ try_again:
+ 	/* make sure it can fit in the remaining address space */
+ 	if (mm->free_area_cache < len)
+@@ -353,13 +366,21 @@ try_again:
+ 		 * vma->vm_start, use it:
+ 		 */
+ 		if (addr + len <= vma->vm_start &&
+-				(!prev_vma || (addr >= prev_vma->vm_end)))
++		            (!prev_vma || (addr >= prev_vma->vm_end))) {
+ 			/* remember the address as a hint for next time */
+-			return (mm->free_area_cache = addr);
+-		else
++		        mm->cached_hole_size = largest_hole;
++		        return (mm->free_area_cache = addr);
++		} else {
+ 			/* pull free_area_cache down to the first hole */
+-			if (mm->free_area_cache == vma->vm_end)
++		        if (mm->free_area_cache == vma->vm_end) {
+ 				mm->free_area_cache = vma->vm_start;
++				mm->cached_hole_size = largest_hole;
++			}
++		}
++
++		/* remember the largest hole we saw so far */
++		if (addr + largest_hole < vma->vm_start)
++		        largest_hole = vma->vm_start - addr;
+ 
+ 		/* try just below the current vma->vm_start */
+ 		addr = (vma->vm_start - len) & HPAGE_MASK;
+@@ -372,6 +393,7 @@ fail:
+ 	 */
+ 	if (first_time) {
+ 		mm->free_area_cache = base;
++		largest_hole = 0;
+ 		first_time = 0;
+ 		goto try_again;
+ 	}
+@@ -382,6 +404,7 @@ fail:
+ 	 * allocations.
+ 	 */
+ 	mm->free_area_cache = TASK_UNMAPPED_BASE;
++	mm->cached_hole_size = ~0UL;
+ 	addr = hugetlb_get_unmapped_area_bottomup(file, addr0,
+ 			len, pgoff, flags);
+ 
+@@ -389,6 +412,7 @@ fail:
+ 	 * Restore the topdown base:
+ 	 */
+ 	mm->free_area_cache = base;
++	mm->cached_hole_size = ~0UL;
+ 
+ 	return addr;
+ }
+Index: linux-2.6.10/arch/ppc64/mm/hugetlbpage.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc64/mm/hugetlbpage.c
++++ linux-2.6.10/arch/ppc64/mm/hugetlbpage.c
+@@ -511,7 +511,12 @@ unsigned long arch_get_unmapped_area(str
+ 		    && !is_hugepage_only_range(mm, addr,len))
+ 			return addr;
+ 	}
+-	start_addr = addr = mm->free_area_cache;
++	if (len > mm->cached_hole_size) {
++	        start_addr = addr = mm->free_area_cache;
++	} else {
++	        start_addr = addr = TASK_UNMAPPED_BASE;
++	        mm->cached_hole_size = 0;
++	}
+ 
+ full_search:
+ 	vma = find_vma(mm, addr);
+@@ -535,6 +540,8 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
+ 		addr = vma->vm_end;
+ 		vma = vma->vm_next;
+ 	}
+@@ -542,6 +549,7 @@ full_search:
+ 	/* Make sure we didn't miss any holes */
+ 	if (start_addr != TASK_UNMAPPED_BASE) {
+ 		start_addr = addr = TASK_UNMAPPED_BASE;
++		mm->cached_hole_size = 0;
+ 		goto full_search;
+ 	}
+ 	return -ENOMEM;
+@@ -563,6 +571,7 @@ arch_get_unmapped_area_topdown(struct fi
+ 	struct vm_area_struct *vma, *prev_vma;
+ 	struct mm_struct *mm = current->mm;
+ 	unsigned long base = mm->mmap_base, addr = addr0;
++	unsigned long largest_hole = mm->cached_hole_size;
+ 	int first_time = 1;
+ 
+ 	/* requested length too big for entire address space */
+@@ -583,6 +592,10 @@ arch_get_unmapped_area_topdown(struct fi
+ 			return addr;
+ 	}
+ 
++	if (len <= largest_hole) {
++	        largest_hole = 0;
++		mm->free_area_cache = base;
++	}
+ try_again:
+ 	/* make sure it can fit in the remaining address space */
+ 	if (mm->free_area_cache < len)
+@@ -611,13 +624,21 @@ hugepage_recheck:
+ 		 * vma->vm_start, use it:
+ 		 */
+ 		if (addr+len <= vma->vm_start &&
+-				(!prev_vma || (addr >= prev_vma->vm_end)))
++		          (!prev_vma || (addr >= prev_vma->vm_end))) {
+ 			/* remember the address as a hint for next time */
+-			return (mm->free_area_cache = addr);
+-		else
++		        mm->cached_hole_size = largest_hole;
++		        return (mm->free_area_cache = addr);
++		} else {
+ 			/* pull free_area_cache down to the first hole */
+-			if (mm->free_area_cache == vma->vm_end)
++		        if (mm->free_area_cache == vma->vm_end) {
+ 				mm->free_area_cache = vma->vm_start;
++				mm->cached_hole_size = largest_hole;
++			}
++		}
++
++		/* remember the largest hole we saw so far */
++		if (addr + largest_hole < vma->vm_start)
++		        largest_hole = vma->vm_start - addr;
+ 
+ 		/* try just below the current vma->vm_start */
+ 		addr = vma->vm_start-len;
+@@ -630,6 +651,7 @@ fail:
+ 	 */
+ 	if (first_time) {
+ 		mm->free_area_cache = base;
++		largest_hole = 0;
+ 		first_time = 0;
+ 		goto try_again;
+ 	}
+@@ -640,11 +662,13 @@ fail:
+ 	 * allocations.
+ 	 */
+ 	mm->free_area_cache = TASK_UNMAPPED_BASE;
++	mm->cached_hole_size = ~0UL;
+ 	addr = arch_get_unmapped_area(filp, addr0, len, pgoff, flags);
+ 	/*
+ 	 * Restore the topdown base:
+ 	 */
+ 	mm->free_area_cache = base;
++	mm->cached_hole_size = ~0UL;
+ 
+ 	return addr;
+ }
+Index: linux-2.6.10/arch/sh/kernel/sys_sh.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/sys_sh.c
++++ linux-2.6.10/arch/sh/kernel/sys_sh.c
+@@ -80,6 +80,10 @@ unsigned long arch_get_unmapped_area(str
+ 		    (!vma || addr + len <= vma->vm_start))
+ 			return addr;
+ 	}
++	if (len <= mm->cached_hole_size) {
++	        mm->cached_hole_size = 0;
++		mm->free_area_cache = TASK_UNMAPPED_BASE;
++	}
+ 	if (flags & MAP_PRIVATE)
+ 		addr = PAGE_ALIGN(mm->free_area_cache);
+ 	else
+@@ -96,6 +100,7 @@ full_search:
+ 			 */
+ 			if (start_addr != TASK_UNMAPPED_BASE) {
+ 				start_addr = addr = TASK_UNMAPPED_BASE;
++				mm->cached_hole_size = 0;
+ 				goto full_search;
+ 			}
+ 			return -ENOMEM;
+@@ -107,6 +112,9 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
++
+ 		addr = vma->vm_end;
+ 		if (!(flags & MAP_PRIVATE))
+ 			addr = COLOUR_ALIGN(addr);
+Index: linux-2.6.10/arch/sparc64/kernel/sys_sparc.c
+===================================================================
+--- linux-2.6.10.orig/arch/sparc64/kernel/sys_sparc.c
++++ linux-2.6.10/arch/sparc64/kernel/sys_sparc.c
+@@ -84,6 +84,10 @@ unsigned long arch_get_unmapped_area(str
+ 			return addr;
+ 	}
+ 
++	if (len <= mm->cached_hole_size) {
++	        mm->cached_hole_size = 0;
++		mm->free_area_cache = TASK_UNMAPPED_BASE;
++	}
+ 	start_addr = addr = mm->free_area_cache;
+ 
+ 	task_size -= len;
+@@ -103,6 +107,7 @@ full_search:
+ 		if (task_size < addr) {
+ 			if (start_addr != TASK_UNMAPPED_BASE) {
+ 				start_addr = addr = TASK_UNMAPPED_BASE;
++				mm->cached_hole_size = 0;
+ 				goto full_search;
+ 			}
+ 			return -ENOMEM;
+@@ -114,6 +119,9 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
++
+ 		addr = vma->vm_end;
+ 		if (do_color_align)
+ 			addr = COLOUR_ALIGN(addr, pgoff);
+Index: linux-2.6.10/arch/x86_64/ia32/ia32_aout.c
+===================================================================
+--- linux-2.6.10.orig/arch/x86_64/ia32/ia32_aout.c
++++ linux-2.6.10/arch/x86_64/ia32/ia32_aout.c
+@@ -311,6 +311,7 @@ static int load_aout_binary(struct linux
+ 	current->mm->brk = ex.a_bss +
+ 		(current->mm->start_brk = N_BSSADDR(ex));
+ 	current->mm->free_area_cache = TASK_UNMAPPED_BASE;
++	current->mm->cached_hole_size = 0;
+ 
+ 	current->mm->rss = 0;
+ 	current->mm->mmap = NULL;
+Index: linux-2.6.10/arch/x86_64/kernel/sys_x86_64.c
+===================================================================
+--- linux-2.6.10.orig/arch/x86_64/kernel/sys_x86_64.c
++++ linux-2.6.10/arch/x86_64/kernel/sys_x86_64.c
+@@ -112,6 +112,11 @@ arch_get_unmapped_area(struct file *filp
+ 		    (!vma || addr + len <= vma->vm_start))
+ 			return addr;
+ 	}
++	if (((flags & MAP_32BIT) || test_thread_flag(TIF_IA32))
++	    && len <= mm->cached_hole_size) {
++	        mm->cached_hole_size = 0;
++		mm->free_area_cache = begin;
++	}
+ 	addr = mm->free_area_cache;
+ 	if (addr < begin) 
+ 		addr = begin; 
+@@ -127,6 +132,7 @@ full_search:
+ 			 */
+ 			if (start_addr != begin) {
+ 				start_addr = addr = begin;
++				mm->cached_hole_size = 0;
+ 				goto full_search;
+ 			}
+ 			return -ENOMEM;
+@@ -138,6 +144,9 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
++
+ 		addr = vma->vm_end;
+ 	}
+ }
+Index: linux-2.6.10/fs/binfmt_aout.c
+===================================================================
+--- linux-2.6.10.orig/fs/binfmt_aout.c
++++ linux-2.6.10/fs/binfmt_aout.c
+@@ -316,6 +316,7 @@ static int load_aout_binary(struct linux
+ 	current->mm->brk = ex.a_bss +
+ 		(current->mm->start_brk = N_BSSADDR(ex));
+ 	current->mm->free_area_cache = current->mm->mmap_base;
++	current->mm->cached_hole_size = 0;
+ 
+ 	current->mm->rss = 0;
+ 	current->mm->mmap = NULL;
+Index: linux-2.6.10/fs/binfmt_elf.c
+===================================================================
+--- linux-2.6.10.orig/fs/binfmt_elf.c
++++ linux-2.6.10/fs/binfmt_elf.c
+@@ -754,6 +754,8 @@ static int load_elf_binary(struct linux_
+ 	   change some of these later */
+ 	current->mm->rss = 0;
+ 	current->mm->free_area_cache = current->mm->mmap_base;
++	current->mm->cached_hole_size = 0;
++
+ 	retval = setup_arg_pages(bprm, executable_stack);
+ 	if (retval < 0) {
+ 		send_sig(SIGKILL, current, 0);
+Index: linux-2.6.10/fs/hugetlbfs/inode.c
+===================================================================
+--- linux-2.6.10.orig/fs/hugetlbfs/inode.c
++++ linux-2.6.10/fs/hugetlbfs/inode.c
+@@ -122,6 +122,9 @@ hugetlb_get_unmapped_area(struct file *f
+ 
+ 	start_addr = mm->free_area_cache;
+ 
++	if (len <= mm->cached_hole_size)
++		start_addr = TASK_UNMAPPED_BASE;
++
+ full_search:
+ 	addr = ALIGN(start_addr, HPAGE_SIZE);
+ 
+Index: linux-2.6.10/include/linux/sched.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/sched.h
++++ linux-2.6.10/include/linux/sched.h
+@@ -334,9 +334,9 @@ extern unsigned long
+ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 			  unsigned long len, unsigned long pgoff,
+ 			  unsigned long flags);
+-extern void arch_unmap_area(struct vm_area_struct *area);
+-extern void arch_unmap_area_topdown(struct vm_area_struct *area);
+ 
++extern void arch_unmap_area(struct mm_struct *, unsigned long);
++extern void arch_unmap_area_topdown(struct mm_struct *, unsigned long);
+ 
+ struct mm_struct {
+ 	struct vm_area_struct * mmap;		/* list of VMAs */
+@@ -345,9 +345,10 @@ struct mm_struct {
+ 	unsigned long (*get_unmapped_area) (struct file *filp,
+ 				unsigned long addr, unsigned long len,
+ 				unsigned long pgoff, unsigned long flags);
+-	void (*unmap_area) (struct vm_area_struct *area);
+-	unsigned long mmap_base;		/* base of mmap area */
+-	unsigned long free_area_cache;		/* first hole */
++	void (*unmap_area) (struct mm_struct *mm, unsigned long addr);
++        unsigned long mmap_base;		/* base of mmap area */
++        unsigned long cached_hole_size;         /* if non-zero, the largest hole below free_area_cache */
++	unsigned long free_area_cache;		/* first hole of size cached_hole_size or larger */
+ 	pgd_t * pgd;
+ 	atomic_t mm_users;			/* How many users with user space? */
+ 	atomic_t mm_count;			/* How many references to "struct mm_struct" (users count as 1) */
+Index: linux-2.6.10/kernel/fork.c
+===================================================================
+--- linux-2.6.10.orig/kernel/fork.c
++++ linux-2.6.10/kernel/fork.c
+@@ -213,6 +213,7 @@ static inline int dup_mmap(struct mm_str
+ 	mm->mmap = NULL;
+ 	mm->mmap_cache = NULL;
+ 	mm->free_area_cache = oldmm->mmap_base;
++	mm->cached_hole_size = ~0UL;
+ 	mm->map_count = 0;
+ 	mm->rss = 0;
+ 	mm->anon_rss = 0;
+@@ -341,6 +342,7 @@ static struct mm_struct * mm_init(struct
+ 	mm->default_kioctx = (struct kioctx)INIT_KIOCTX(mm->default_kioctx, *mm);
+ 	INIT_LIST_HEAD(&mm->delayed_drop);
+ 	mm->free_area_cache = TASK_UNMAPPED_BASE;
++	mm->cached_hole_size = ~0UL;
+ 
+ 	if (likely(!mm_alloc_pgd(mm))) {
+ 		mm->def_flags = 0;
+Index: linux-2.6.10/mm/mmap.c
+===================================================================
+--- linux-2.6.10.orig/mm/mmap.c
++++ linux-2.6.10/mm/mmap.c
+@@ -1069,7 +1069,12 @@ arch_get_unmapped_area(struct file *filp
+ 		    (!vma || addr + len <= vma->vm_start))
+ 			return addr;
+ 	}
+-	start_addr = addr = mm->free_area_cache;
++	if (len > mm->cached_hole_size) {
++	        start_addr = addr = mm->free_area_cache;
++	} else {
++	        start_addr = addr = TASK_UNMAPPED_BASE;
++	        mm->cached_hole_size = 0;
++	}
+ 
+ full_search:
+ 	for (vma = find_vma(mm, addr); ; vma = vma->vm_next) {
+@@ -1080,7 +1085,9 @@ full_search:
+ 			 * some holes.
+ 			 */
+ 			if (start_addr != TASK_UNMAPPED_BASE) {
+-				start_addr = addr = TASK_UNMAPPED_BASE;
++				addr = TASK_UNMAPPED_BASE;
++			        start_addr = addr;
++				mm->cached_hole_size = 0;
+ 				goto full_search;
+ 			}
+ 			return -ENOMEM;
+@@ -1092,19 +1099,22 @@ full_search:
+ 			mm->free_area_cache = addr + len;
+ 			return addr;
+ 		}
++		if (addr + mm->cached_hole_size < vma->vm_start)
++		        mm->cached_hole_size = vma->vm_start - addr;
+ 		addr = vma->vm_end;
+ 	}
+ }
+ #endif	
+ 
+-void arch_unmap_area(struct vm_area_struct *area)
++void arch_unmap_area(struct mm_struct *mm, unsigned long addr)
+ {
+ 	/*
+ 	 * Is this a new hole at the lowest possible address?
+ 	 */
+-	if (area->vm_start >= TASK_UNMAPPED_BASE &&
+-			area->vm_start < area->vm_mm->free_area_cache)
+-		area->vm_mm->free_area_cache = area->vm_start;
++	if (addr >= TASK_UNMAPPED_BASE && addr < mm->free_area_cache) {
++		mm->free_area_cache = addr;
++		mm->cached_hole_size = ~0UL;
++	}
+ }
+ 
+ /*
+@@ -1134,6 +1144,12 @@ arch_get_unmapped_area_topdown(struct fi
+ 			return addr;
+ 	}
+ 
++	/* check if free_area_cache is useful for us */
++	if (len <= mm->cached_hole_size) {
++ 	        mm->cached_hole_size = 0;
++ 		mm->free_area_cache = mm->mmap_base;
++ 	}
++
+ 	/* either no address requested or can't fit in requested address hole */
+ 	addr = mm->free_area_cache;
+ 
+@@ -1158,6 +1174,10 @@ arch_get_unmapped_area_topdown(struct fi
+ 			/* remember the address as a hint for next time */
+ 			return (mm->free_area_cache = addr);
+ 
++		/* remember the largest hole we saw so far */
++		if (addr + mm->cached_hole_size < vma->vm_start)
++			mm->cached_hole_size = vma->vm_start - addr;
++
+ 		/* try just below the current vma->vm_start */
+ 		addr = vma->vm_start-len;
+ 	} while (len <= vma->vm_start);
+@@ -1168,28 +1188,30 @@ arch_get_unmapped_area_topdown(struct fi
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	mm->free_area_cache = TASK_UNMAPPED_BASE;
++	mm->cached_hole_size = ~0UL;
++  	mm->free_area_cache = TASK_UNMAPPED_BASE;
+ 	addr = arch_get_unmapped_area(filp, addr0, len, pgoff, flags);
+ 	/*
+ 	 * Restore the topdown base:
+ 	 */
+ 	mm->free_area_cache = mm->mmap_base;
++	mm->cached_hole_size = ~0UL;
+ 
+ 	return addr;
+ }
+ #endif
+ 
+-void arch_unmap_area_topdown(struct vm_area_struct *area)
++void arch_unmap_area_topdown(struct mm_struct *mm, unsigned long addr)
+ {
+ 	/*
+ 	 * Is this a new hole at the highest possible address?
+ 	 */
+-	if (area->vm_end > area->vm_mm->free_area_cache)
+-		area->vm_mm->free_area_cache = area->vm_end;
++	if (addr > mm->free_area_cache)
++		mm->free_area_cache = addr;
+ 
+ 	/* dont allow allocations above current base */
+-	if (area->vm_mm->free_area_cache > area->vm_mm->mmap_base)
+-		area->vm_mm->free_area_cache = area->vm_mm->mmap_base;
++	if (mm->free_area_cache > mm->mmap_base)
++		mm->free_area_cache = mm->mmap_base;
+ }
+ 
+ unsigned long
+@@ -1549,7 +1571,6 @@ static void unmap_vma(struct mm_struct *
+ 	if (area->vm_flags & VM_LOCKED)
+ 		area->vm_mm->locked_vm -= len >> PAGE_SHIFT;
+ 	vm_stat_unaccount(area);
+-	area->vm_mm->unmap_area(area);
+ 	remove_vm_struct(area);
+ }
+ 
+@@ -1606,6 +1627,7 @@ detach_vmas_to_be_unmapped(struct mm_str
+ {
+ 	struct vm_area_struct **insertion_point;
+ 	struct vm_area_struct *tail_vma = NULL;
++	unsigned long addr;
+ 
+ 	insertion_point = (prev ? &prev->vm_next : &mm->mmap);
+ 	do {
+@@ -1616,6 +1638,11 @@ detach_vmas_to_be_unmapped(struct mm_str
+ 	} while (vma && vma->vm_start < end);
+ 	*insertion_point = vma;
+ 	tail_vma->vm_next = NULL;
++	if (mm->unmap_area == arch_unmap_area)
++		addr = prev ? prev->vm_end : mm->mmap_base;
++	else
++		addr = vma ?  vma->vm_start : mm->mmap_base;
++	mm->unmap_area(mm, addr);
+ 	mm->mmap_cache = NULL;		/* Kill the cache. */
+ }
+ 
+Index: linux-2.6.10/mm/nommu.c
+===================================================================
+--- linux-2.6.10.orig/mm/nommu.c
++++ linux-2.6.10/mm/nommu.c
+@@ -594,7 +594,7 @@ unsigned long arch_get_unmapped_area(str
+ 	return -ENOMEM;
+ }
+ 
+-void arch_unmap_area(struct vm_area_struct *area)
++void arch_unmap_area(struct mm_struct *mm, unsigned long addr)
+ {
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-1195.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1195.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1195);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,396 @@
+#! /usr/bin/env bash
+# Patch: -sd_read_only_switch
+# Date: Thu Jul  6 17:33:16 2006
+# MR: 18881
+# Disposition: merged fromkernel.org
+# Description:
+# Commit: a00fc09029f02ca833cf90e5d5625f08c4ac4f51
+# Author: Pierre Ossman <drzeus-list@drzeus.cx>
+# Date:   Tue Sep 6 15:18:52 2005 -0700
+# 
+#     [PATCH] sd: read-only switch
+# 
+#     Support for the read-only switch on SD cards which must be enforced by the
+#     host.
+# 
+#     Signed-off-by: Pierre Ossman <drzeus@drzeus.cx>
+#     Cc: Russell King <rmk@arm.linux.org.uk>
+#     Cc: David Brownell <david-b@pacbell.net>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=757
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18881
+Disposition: merged fromkernel.org
+Description:
+Commit: a00fc09029f02ca833cf90e5d5625f08c4ac4f51
+Author: Pierre Ossman <drzeus-list@drzeus.cx>
+Date:   Tue Sep 6 15:18:52 2005 -0700
+
+    [PATCH] sd: read-only switch
+
+    Support for the read-only switch on SD cards which must be enforced by the
+    host.
+
+    Signed-off-by: Pierre Ossman <drzeus@drzeus.cx>
+    Cc: Russell King <rmk@arm.linux.org.uk>
+    Cc: David Brownell <david-b@pacbell.net>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/drivers/mmc/mmc.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc.c
++++ linux-2.6.10/drivers/mmc/mmc.c
+@@ -412,8 +412,7 @@ static void mmc_decode_cid(struct mmc_ca
+ 		card->cid.month			= UNSTUFF_BITS(resp, 8, 4);
+ 
+ 		card->cid.year += 2000; /* SD cards year offset */
+-	}
+-	else {
++	} else {
+ 		/*
+ 		 * The selection of the format here is based upon published
+ 		 * specs from sandisk and from what people have reported.
+@@ -494,8 +493,7 @@ static void mmc_decode_csd(struct mmc_ca
+ 		csd->capacity	  = (1 + m) << (e + 2);
+ 
+ 		csd->read_blkbits = UNSTUFF_BITS(resp, 80, 4);
+-	}
+-	else {
++	} else {
+ 		/*
+ 		 * We only understand CSD structure v1.1 and v1.2.
+ 		 * v1.2 has extra information in bits 15, 11 and 10.
+@@ -738,10 +736,20 @@ static void mmc_discover_cards(struct mm
+ 			err = mmc_wait_for_cmd(host, &cmd, CMD_RETRIES);
+ 			if (err != MMC_ERR_NONE)
+ 				mmc_card_set_dead(card);
+-			else
++			else {
+ 				card->rca = cmd.resp[0] >> 16;
+-		}
+-		else {
++
++				if (!host->ops->get_ro) {
++					printk(KERN_WARNING "%s: host does not "
++						"support reading read-only "
++						"switch. assuming write-enable.\n",
++						mmc_hostname(host));
++				} else {
++					if (host->ops->get_ro(host))
++						mmc_card_set_readonly(card);
++				}
++			}
++		} else {
+ 			cmd.opcode = MMC_SET_RELATIVE_ADDR;
+ 			cmd.arg = card->rca << 16;
+ 			cmd.flags = MMC_RSP_R1;
+@@ -833,24 +841,23 @@ static void mmc_setup(struct mmc_host *h
+ 		int err;
+ 		u32 ocr;
+ 
+-		host->mode = MMC_MODE_MMC;
++		host->mode = MMC_MODE_SD;
+ 
+ 		mmc_power_up(host);
+ 		mmc_idle_cards(host);
+ 
+-		err = mmc_send_op_cond(host, 0, &ocr);
++		err = mmc_send_app_op_cond(host, 0, &ocr);
+ 
+ 		/*
+-		 * If we fail to detect any cards then try
+-		 * searching for SD cards.
++		 * If we fail to detect any SD cards then try
++		 * searching for MMC cards.
+ 		 */
+-		if (err != MMC_ERR_NONE)
+-		{
+-			err = mmc_send_app_op_cond(host, 0, &ocr);
++		if (err != MMC_ERR_NONE) {
++			host->mode = MMC_MODE_MMC;
++
++			err = mmc_send_op_cond(host, 0, &ocr);
+ 			if (err != MMC_ERR_NONE)
+ 				return;
+-
+-			host->mode = MMC_MODE_SD;
+ 		}
+ 
+ 		host->ocr = mmc_select_voltage(host, ocr);
+Index: linux-2.6.10/drivers/mmc/mmc_block.c
+===================================================================
+--- linux-2.6.10.orig/drivers/mmc/mmc_block.c
++++ linux-2.6.10/drivers/mmc/mmc_block.c
+@@ -96,6 +96,10 @@ static int mmc_blk_open(struct inode *in
+ 		if (md->usage == 2)
+ 			check_disk_change(inode->i_bdev);
+ 		ret = 0;
++
++		if ((filp->f_mode & FMODE_WRITE) &&
++			mmc_card_readonly(md->queue.card))
++			ret = -EROFS;
+ 	}
+ 
+ 	return ret;
+@@ -410,9 +414,10 @@ static int mmc_blk_probe(struct mmc_card
+ 	if (err)
+ 		goto out;
+ 
+-	printk(KERN_INFO "%s: %s %s %dKiB\n",
++	printk(KERN_INFO "%s: %s %s %dKiB %s\n",
+ 		md->disk->disk_name, mmc_card_id(card), mmc_card_name(card),
+-		(card->csd.capacity << card->csd.read_blkbits) / 1024);
++		(card->csd.capacity << card->csd.read_blkbits) / 1024,
++		mmc_card_readonly(card)?"(ro)":"");
+ 
+ 	mmc_set_drvdata(card, md);
+ 	add_disk(md->disk);
+Index: linux-2.6.10/include/linux/mmc/card.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/card.h
++++ linux-2.6.10/include/linux/mmc/card.h
+@@ -48,6 +48,7 @@ struct mmc_card {
+ #define MMC_STATE_DEAD		(1<<1)		/* device no longer in stack */
+ #define MMC_STATE_BAD		(1<<2)		/* unrecognised device */
+ #define MMC_STATE_SDCARD	(1<<3)		/* is an SD card */
++#define MMC_STATE_READONLY	(1<<4)		/* card is read-only */
+ 	u32			raw_cid[4];	/* raw card CID */
+ 	u32			raw_csd[4];	/* raw card CSD */
+ 	struct mmc_cid		cid;		/* card identification */
+@@ -58,11 +59,13 @@ struct mmc_card {
+ #define mmc_card_dead(c)	((c)->state & MMC_STATE_DEAD)
+ #define mmc_card_bad(c)		((c)->state & MMC_STATE_BAD)
+ #define mmc_card_sd(c)		((c)->state & MMC_STATE_SDCARD)
++#define mmc_card_readonly(c)	((c)->state & MMC_STATE_READONLY)
+ 
+ #define mmc_card_set_present(c)	((c)->state |= MMC_STATE_PRESENT)
+ #define mmc_card_set_dead(c)	((c)->state |= MMC_STATE_DEAD)
+ #define mmc_card_set_bad(c)	((c)->state |= MMC_STATE_BAD)
+ #define mmc_card_set_sd(c)	((c)->state |= MMC_STATE_SDCARD)
++#define mmc_card_set_readonly(c) ((c)->state |= MMC_STATE_READONLY)
+ 
+ #define mmc_card_name(c)	((c)->cid.prod_name)
+ #define mmc_card_id(c)		((c)->dev.bus_id)
+Index: linux-2.6.10/include/linux/mmc/host.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mmc/host.h
++++ linux-2.6.10/include/linux/mmc/host.h
+@@ -62,6 +62,7 @@ struct mmc_ios {
+ struct mmc_host_ops {
+ 	void	(*request)(struct mmc_host *host, struct mmc_request *req);
+ 	void	(*set_ios)(struct mmc_host *host, struct mmc_ios *ios);
++	int	(*get_ro)(struct mmc_host *host);
+ };
+ 
+ struct mmc_card;
+Index: linux-2.6.10/mvl_patches/pro-0757.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0757.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(757);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

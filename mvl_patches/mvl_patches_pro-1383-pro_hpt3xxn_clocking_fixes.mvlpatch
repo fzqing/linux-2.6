@@ -1,0 +1,712 @@
+#! /usr/bin/env bash
+# Patch: -pro_hpt3xxn_clocking_fixes
+# Date: Mon Nov 26 16:54:56 2007
+# Source: MontaVista Software, Inc.
+# MR: 14142
+# Type: Defect Fix
+# Disposition: accepted into 2.6.20-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# Description:
+# 
+# [PATCH] ide: HPT3xxN clocking fixes
+# 
+# Fix serious problems with the HPT372N clock turnaround code:
+# 
+# - the wrong ports were written to when called for the secondary channel;
+# 
+# - it didn't serialize access to the channels;
+# 
+# - turnaround shouldn't be done on 66 MHz PCI;
+# 
+# - caching the clock mode per-channel caused it to get out of sync with the
+#   actual register value.
+# 
+# Additionally, avoid calibrating PLL twice (for each channel) as the second try
+# results in a wrong PCI frequency and thus in the wrong timings.
+# 
+# Make the driver deal with HPT302N and HPT371N correctly -- the clocking and
+# (seemingly) a need for clock tunaround is the same as for HPT372N.  HPT371/N
+# chips have only one, secondary channel, so avoid touching their "pure virtual"
+# primary channel, and disable it if the BIOS haven't done this already.
+# 
+# Also, while at it, disable UltraATA/133 for HPT372 by default -- 50 MHz DPLL
+# clock don't allow for this speed anyway.  And remove the traces of the former
+# bad patch that wasn't even applicable to this version of driver.
+# 
+# Has been tested on HPT370/371N, unfortunately I don't have an instant access
+# to the other chips...
+# 
+# This patch is somewhat different from the community one: I didn't pull in the
+# changes that were due to the changed prototype of ide_setup_pci_device[s]()
+# (they seemed too intrusive) and due to the conversion of kmalloc() calls to
+# kzalloc() (which was useless for me);  the community version also undid the
+# stupid patch not even fit to the current version of driver (which I haven't
+# backported,  of course)...
+# 
+# commit 836c0063c74cc088ffe370d007e1c6cac95e7caa
+# tree 1a8120b43384873a8a77ca8c39d2ec3ea5f0206a
+# parent cd7175edf963a92b2c3cd491d3e34afd357e7284
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 13 Dec 2006 00:35:47 -0800
+# committer Linus Torvalds <torvalds@woody.osdl.org> Wed, 13 Dec 2006 09:05:55 -0800
+# 
+#  drivers/ide/pci/hpt366.c |  219 +++++++++++++++++++++++++++++------------------
+#  1 files changed, 139 insertions(+), 80 deletions(-)
+# 
+
+PATCHNUM=1383
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14142
+Type: Defect Fix
+Disposition: accepted into 2.6.20-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+Description:
+
+[PATCH] ide: HPT3xxN clocking fixes
+
+Fix serious problems with the HPT372N clock turnaround code:
+
+- the wrong ports were written to when called for the secondary channel;
+
+- it didn't serialize access to the channels;
+
+- turnaround shouldn't be done on 66 MHz PCI;
+
+- caching the clock mode per-channel caused it to get out of sync with the
+  actual register value.
+
+Additionally, avoid calibrating PLL twice (for each channel) as the second try
+results in a wrong PCI frequency and thus in the wrong timings.
+
+Make the driver deal with HPT302N and HPT371N correctly -- the clocking and
+(seemingly) a need for clock tunaround is the same as for HPT372N.  HPT371/N
+chips have only one, secondary channel, so avoid touching their "pure virtual"
+primary channel, and disable it if the BIOS haven't done this already.
+
+Also, while at it, disable UltraATA/133 for HPT372 by default -- 50 MHz DPLL
+clock don't allow for this speed anyway.  And remove the traces of the former
+bad patch that wasn't even applicable to this version of driver.
+
+Has been tested on HPT370/371N, unfortunately I don't have an instant access
+to the other chips...
+
+This patch is somewhat different from the community one: I didn't pull in the
+changes that were due to the changed prototype of ide_setup_pci_device[s]()
+(they seemed too intrusive) and due to the conversion of kmalloc() calls to
+kzalloc() (which was useless for me);  the community version also undid the
+stupid patch not even fit to the current version of driver (which I haven't
+backported,  of course)...
+
+commit 836c0063c74cc088ffe370d007e1c6cac95e7caa
+tree 1a8120b43384873a8a77ca8c39d2ec3ea5f0206a
+parent cd7175edf963a92b2c3cd491d3e34afd357e7284
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 13 Dec 2006 00:35:47 -0800
+committer Linus Torvalds <torvalds@woody.osdl.org> Wed, 13 Dec 2006 09:05:55 -0800
+
+ drivers/ide/pci/hpt366.c |  219 +++++++++++++++++++++++++++++------------------
+ mvl_patches/pro-1383.c   |   16 +++
+ 2 files changed, 155 insertions(+), 80 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/hpt366.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.c
++++ linux-2.6.10/drivers/ide/pci/hpt366.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 1999-2003		Andre Hedrick <andre@linux-ide.org>
+  * Portions Copyright (C) 2001	        Sun Microsystems, Inc.
+  * Portions Copyright (C) 2003		Red Hat Inc
++ * Portions Copyright (C) 2005-2006	MontaVista Software, Inc.
+  *
+  * Thanks to HighPoint Technologies for their assistance, and hardware.
+  * Special Thanks to Jon Burchmore in SanDiego for the deep pockets, his
+@@ -11,9 +12,11 @@
+  * development and support.
+  *
+  *
+- * Highpoint have their own driver (source except for the raid part)
+- * available from http://www.highpoint-tech.com/hpt3xx-opensource-v131.tgz
+- * This may be useful to anyone wanting to work on the mainstream hpt IDE.
++ * HighPoint has its own drivers (open source except for the RAID part)
++ * available from http://www.highpoint-tech.com/BIOS%20+%20Driver/.
++ * This may be useful to anyone wanting to work on this driver, however  do not
++ * trust  them too much since the code tends to become less and less meaningful
++ * as the time passes... :-/
+  *
+  * Note that final HPT370 support was done by force extraction of GPL.
+  *
+@@ -52,6 +55,20 @@
+  * keeping me sane. 
+  *		Alan Cox <alan@redhat.com>
+  *
++ * - fix the clock turnaround code: it was writing to the wrong ports when
++ *   called for the secondary channel, caching the current clock mode per-
++ *   channel caused the cached register value to get out of sync with the
++ *   actual one, the channels weren't serialized, the turnaround shouldn't
++ *   be done on 66 MHz PCI bus
++ * - avoid calibrating PLL twice as the second time results in a wrong PCI
++ *   frequency and thus in the wrong timings for the secondary channel
++ * - disable UltraATA/133 for HPT372 by default (50 MHz DPLL clock do not
++ *   allow for this speed anyway)
++ * - add support for HPT302N and HPT371N clocking (the same as for HPT372N)
++ * - HPT371/N are single channel chips, so avoid touching the primary channel
++ *   which exists only virtually (there's no pins for it)
++ *		<source@mvista.com>
++ *
+  */
+ 
+ 
+@@ -77,8 +94,8 @@
+ 
+ /* various tuning parameters */
+ #define HPT_RESET_STATE_ENGINE
+-#undef HPT_DELAY_INTERRUPT
+-#undef HPT_SERIALIZE_IO
++#undef	HPT_DELAY_INTERRUPT
++#define HPT_SERIALIZE_IO	0
+ 
+ static const char *quirk_drives[] = {
+ 	"QUANTUM FIREBALLlct08 08",
+@@ -440,7 +457,7 @@ static struct chipset_bus_clock_list_ent
+ #define HPT374_ALLOW_ATA133_6		0
+ #define HPT371_ALLOW_ATA133_6		0
+ #define HPT302_ALLOW_ATA133_6		0
+-#define HPT372_ALLOW_ATA133_6		1
++#define HPT372_ALLOW_ATA133_6		0
+ #define HPT370_ALLOW_ATA100_5		1
+ #define HPT366_ALLOW_ATA66_4		1
+ #define HPT366_ALLOW_ATA66_3		1
+@@ -462,7 +479,8 @@ struct hpt_info
+ 	int revision;		/* Chipset revision */
+ 	int flags;		/* Chipset properties */
+ #define PLL_MODE	1
+-#define IS_372N		2
++#define IS_3xxN 	2
++#define PCI_66MHZ	4
+ 				/* Speed table */
+ 	struct chipset_bus_clock_list_entry *speed;
+ };
+@@ -957,59 +975,63 @@ static int hpt374_ide_dma_end (ide_drive
+ }
+ 
+ /**
+- *	hpt372n_set_clock	-	perform clock switching dance
+- *	@drive: Drive to switch
+- *	@mode: Switching mode (0x21 for write, 0x23 otherwise)
++ *	hpt3xxn_set_clock	-	perform clock switching dance
++ *	@hwif: hwif to switch
++ *	@mode: clocking mode (0x21 for write, 0x23 otherwise)
+  *
+- *	Switch the DPLL clock on the HPT372N devices. This is a
+- *	right mess.
++ *	Switch the DPLL clock on the HPT3xxN devices. This is a	right mess.
++ *	NOTE: avoid touching the disabled primary channel on HPT371N -- it
++ *	doesn't physically exist anyway...
+  */
+- 
+-static void hpt372n_set_clock(ide_drive_t *drive, int mode)
++
++static void hpt3xxn_set_clock(ide_hwif_t *hwif, u8 mode)
+ {
+-	ide_hwif_t *hwif	= HWIF(drive);
+-	
+-	/* FIXME: should we check for DMA active and BUG() */
++	u8 mcr1, scr2 = hwif->INB(hwif->dma_master + 0x7b);
++
++	if ((scr2 & 0x7f) == mode)
++		return;
++
++	/* MISC. control register 1 has the channel enable bit... */
++	mcr1 = hwif->INB(hwif->dma_master + 0x70);
++
+ 	/* Tristate the bus */
+-	outb(0x80, hwif->dma_base+0x73);
+-	outb(0x80, hwif->dma_base+0x77);
+-	
++	if (mcr1 & 0x04)
++		hwif->OUTB(0x80, hwif->dma_master + 0x73);
++	hwif->OUTB(0x80, hwif->dma_master + 0x77);
++
+ 	/* Switch clock and reset channels */
+-	outb(mode, hwif->dma_base+0x7B);
+-	outb(0xC0, hwif->dma_base+0x79);
+-	
++	hwif->OUTB(mode, hwif->dma_master + 0x7b);
++	hwif->OUTB(0xc0, hwif->dma_master + 0x79);
++
+ 	/* Reset state machines */
+-	outb(0x37, hwif->dma_base+0x70);
+-	outb(0x37, hwif->dma_base+0x74);
+-	
++	if (mcr1 & 0x04)
++		hwif->OUTB(0x37, hwif->dma_master + 0x70);
++	hwif->OUTB(0x37, hwif->dma_master + 0x74);
++
+ 	/* Complete reset */
+-	outb(0x00, hwif->dma_base+0x79);
+-	
++	hwif->OUTB(0x00, hwif->dma_master + 0x79);
++
+ 	/* Reconnect channels to bus */
+-	outb(0x00, hwif->dma_base+0x73);
+-	outb(0x00, hwif->dma_base+0x77);
++	if (mcr1 & 0x04)
++		hwif->OUTB(0x00, hwif->dma_master + 0x73);
++	hwif->OUTB(0x00, hwif->dma_master + 0x77);
+ }
+ 
+ /**
+- *	hpt372n_rw_disk		-	prepare for I/O
++ *	hpt3xxn_rw_disk		-	prepare for I/O
+  *	@drive: drive for command
+  *	@rq: block request structure
+  *
+- *	This is called when a disk I/O is issued to the 372N.
++ *	This is called when a disk I/O is issued to HPT3xxN.
+  *	We need it because of the clock switching.
+  */
+ 
+-static void hpt372n_rw_disk(ide_drive_t *drive, struct request *rq)
++static void hpt3xxn_rw_disk(ide_drive_t *drive, struct request *rq)
+ {
+-	ide_hwif_t *hwif = drive->hwif;
+-	int wantclock;
+-
+-	wantclock = rq_data_dir(rq) ? 0x23 : 0x21;
++	ide_hwif_t *hwif	= HWIF(drive);
++	u8 wantclock		= rq_data_dir(rq) ? 0x23 : 0x21;
+ 
+-	if (hwif->config_data != wantclock) {
+-		hpt372n_set_clock(drive, wantclock);
+-		hwif->config_data = wantclock;
+-	}
++	hpt3xxn_set_clock(hwif, wantclock);
+ }
+ 
+ /*
+@@ -1139,7 +1161,7 @@ static void __devinit hpt37x_clocking(id
+ 	int adjust, i;
+ 	u16 freq;
+ 	u32 pll;
+-	u8 reg5bh;
++	u8 reg5bh = 0, mcr1 = 0;
+ 	
+ 	/*
+ 	 * default to pci clock. make sure MA15/16 are set to output
+@@ -1162,17 +1184,11 @@ static void __devinit hpt37x_clocking(id
+ 	freq &= 0x1FF;
+ 	
+ 	/*
+-	 * The 372N uses different PCI clock information and has
+-	 * some other complications
+-	 *	On PCI33 timing we must clock switch
+-	 *	On PCI66 timing we must NOT use the PCI clock
+-	 *
+-	 * Currently we always set up the PLL for the 372N
++	 * HPT3xxN chips use different PCI clock information.
++	 * Currently we always set up the PLL for them.
+ 	 */
+-	 
+-	if(info->flags & IS_372N)
+-	{
+-		printk(KERN_INFO "hpt: HPT372N detected, using 372N timing.\n");
++
++	if (info->flags & IS_3xxN) {
+ 		if(freq < 0x55)
+ 			pll = F_LOW_PCI_33;
+ 		else if(freq < 0x70)
+@@ -1181,10 +1197,8 @@ static void __devinit hpt37x_clocking(id
+ 			pll = F_LOW_PCI_50;
+ 		else
+ 			pll = F_LOW_PCI_66;
+-			
+-		printk(KERN_INFO "FREQ: %d PLL: %d\n", freq, pll);
+-			
+-		/* We always use the pll not the PCI clock on 372N */
++
++		printk(KERN_INFO "HPT3xxN detected, FREQ: %d, PLL: %d\n", freq, pll);
+ 	}
+ 	else
+ 	{
+@@ -1232,7 +1246,10 @@ static void __devinit hpt37x_clocking(id
+ 			printk(KERN_DEBUG "HPT37X: using 66MHz PCI clock\n");
+ 		}
+ 	}
+-	
++
++	if (pll == F_LOW_PCI_66)
++		info->flags |= PCI_66MHZ;
++
+ 	/*
+ 	 * only try the pll if we don't have a table for the clock
+ 	 * speed that we're running at. NOTE: the internal PLL will
+@@ -1297,11 +1314,16 @@ pll_recal:
+ 
+ init_hpt37X_done:
+ 	if (!info->speed)
+-		printk(KERN_ERR "HPT37X%s: unknown bus timing [%d %d].\n",
+-			(info->flags & IS_372N)?"N":"", pll, freq);
+-	/* reset state engine */
+-	pci_write_config_byte(dev, 0x50, 0x37); 
+-	pci_write_config_byte(dev, 0x54, 0x37); 
++		printk(KERN_ERR "HPT37x%s: unknown bus timing [%d %d].\n",
++		       (info->flags & IS_3xxN) ? "N" : "", pll, freq);
++	/*
++	 * Reset the state engines.
++	 * NOTE: avoid accidentally enabling the primary channel on HPT371N.
++	 */
++	pci_read_config_byte(dev, 0x50, &mcr1);
++	if (mcr1 & 0x04)
++		pci_write_config_byte(dev, 0x50, 0x37);
++	pci_write_config_byte(dev, 0x54, 0x37);
+ 	udelay(100);
+ }
+ 
+@@ -1360,6 +1382,7 @@ static void __devinit init_hwif_hpt366(i
+ 	struct pci_dev *dev		= hwif->pci_dev;
+ 	struct hpt_info *info		= ide_get_hwifdata(hwif);
+ 	u8 ata66 = 0, regmask		= (hwif->channel) ? 0x01 : 0x02;
++	int serialize			= HPT_SERIALIZE_IO;
+ 	
+ 	hwif->tuneproc			= &hpt3xx_tune_drive;
+ 	hwif->speedproc			= &hpt3xx_tune_chipset;
+@@ -1367,8 +1390,20 @@ static void __devinit init_hwif_hpt366(i
+ 	hwif->intrproc			= &hpt3xx_intrproc;
+ 	hwif->maskproc			= &hpt3xx_maskproc;
+ 	
+-	if(info->flags & IS_372N)
+-		hwif->rw_disk = &hpt372n_rw_disk;
++	/*
++	 * HPT3xxN chips have some complications:
++	 *
++	 * - on 33 MHz PCI we must clock switch
++	 * - on 66 MHz PCI we must NOT use the PCI clock
++	 */
++	if ((info->flags & (IS_3xxN | PCI_66MHZ)) == IS_3xxN) {
++		/*
++		 * Clock is shared between the channels,
++		 * so we'll have to serialize them... :-(
++		 */
++		serialize = 1;
++		hwif->rw_disk = &hpt3xxn_rw_disk;
++	}
+ 
+ 	/*
+ 	 * The HPT37x uses the CBLID pins as outputs for MA15/MA16
+@@ -1411,11 +1446,9 @@ static void __devinit init_hwif_hpt366(i
+ 		PCI_FUNC(hwif->pci_dev->devfn));
+ #endif /* DEBUG */
+ 
+-#ifdef HPT_SERIALIZE_IO
+-	/* serialize access to this device */
+-	if (hwif->mate)
++	/* Serialize access to this device */
++	if (serialize && hwif->mate)
+ 		hwif->serialized = hwif->mate->serialized = 1;
+-#endif
+ 
+ 	if (info->revision >= 3) {
+ 		u8 reg5ah = 0;
+@@ -1483,7 +1516,7 @@ static void __devinit init_dma_hpt366(id
+ 		return;
+ 		
+ 	if(info->speed == NULL) {
+-		printk(KERN_WARNING "hpt: no known IDE timings, disabling DMA.\n");
++		printk(KERN_WARNING "hpt366: no known IDE timings, disabling DMA.\n");
+ 		return;
+ 	}
+ 
+@@ -1512,9 +1545,10 @@ static void __devinit init_dma_hpt366(id
+ 
+ static void __devinit init_iops_hpt366(ide_hwif_t *hwif)
+ {
+-	struct hpt_info *info = kmalloc(sizeof(struct hpt_info), GFP_KERNEL);
+-	unsigned long dmabase = pci_resource_start(hwif->pci_dev, 4);
+-	u8 did, rid;
++	struct hpt_info *info	= kmalloc(sizeof(struct hpt_info), GFP_KERNEL);
++	struct pci_dev  *dev	= hwif->pci_dev;
++	u16 did			= dev->device;
++	u8  rid			= 0;
+ 
+ 	if(info == NULL) {
+ 		printk(KERN_WARNING "hpt366: out of memory.\n");
+@@ -1523,15 +1557,22 @@ static void __devinit init_iops_hpt366(i
+ 	memset(info, 0, sizeof(struct hpt_info));
+ 	ide_set_hwifdata(hwif, info);
+ 
+-	if(dmabase) {
+-		did = inb(dmabase + 0x22);
+-		rid = inb(dmabase + 0x28);
+-
+-		if((did == 4 && rid == 6) || (did == 5 && rid > 1))
+-			info->flags |= IS_372N;
++	/* Avoid doing the same thing twice. */
++	if (hwif->channel && hwif->mate) {
++		memcpy(info, ide_get_hwifdata(hwif->mate), sizeof(struct hpt_info));
++		return;
+ 	}
+ 
+-	info->revision = hpt_revision(hwif->pci_dev);
++	pci_read_config_byte(dev, PCI_CLASS_REVISION, &rid);
++
++	if (( did == PCI_DEVICE_ID_TTI_HPT366  && rid == 6) ||
++	    ((did == PCI_DEVICE_ID_TTI_HPT372  ||
++	      did == PCI_DEVICE_ID_TTI_HPT302  ||
++	      did == PCI_DEVICE_ID_TTI_HPT371) && rid > 1) ||
++	      did == PCI_DEVICE_ID_TTI_HPT372N)
++		info->flags |= IS_3xxN;
++
++	info->revision = hpt_revision(dev);
+ 
+ 	if (info->revision >= 3)
+ 		hpt37x_clocking(hwif);
+@@ -1569,6 +1610,23 @@ static void __devinit init_setup_hpt37x(
+ 	ide_setup_pci_device(dev, d);
+ }
+ 
++static void __devinit init_setup_hpt371(struct pci_dev *dev, ide_pci_device_t *d)
++{
++	u8 mcr1 = 0;
++
++	/*
++	 * HPT371 chips physically have only one channel, the secondary one,
++	 * but the primary channel registers do exist!  Go figure...
++	 * So,  we manually disable the non-existing channel here
++	 * (if the BIOS hasn't done this already).
++	 */
++	pci_read_config_byte(dev, 0x50, &mcr1);
++	if (mcr1 & 0x04)
++		pci_write_config_byte(dev, 0x50, (mcr1 & ~0x04));
++
++	ide_setup_pci_device(dev, d);
++}
++
+ static void __devinit init_setup_hpt366(struct pci_dev *dev, ide_pci_device_t *d)
+ {
+ 	struct pci_dev *findev = NULL;
+@@ -1655,13 +1713,14 @@ static ide_pci_device_t hpt366_chipsets[
+ 		.bootable	= OFF_BOARD,
+ 	},{	/* 3 */
+ 		.name		= "HPT371",
+-		.init_setup	= init_setup_hpt37x,
++		.init_setup	= init_setup_hpt371,
+ 		.init_chipset	= init_chipset_hpt366,
+ 		.init_iops	= init_iops_hpt366,
+ 		.init_hwif	= init_hwif_hpt366,
+ 		.init_dma	= init_dma_hpt366,
+ 		.channels	= 2,
+ 		.autodma	= AUTODMA,
++		.enablebits	= {{0x50,0x04,0x04}, {0x54,0x04,0x04}},
+ 		.bootable	= OFF_BOARD,
+ 	},{	/* 4 */
+ 		.name		= "HPT374",
+Index: linux-2.6.10/mvl_patches/pro-1383.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1383.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1383);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,737 @@
+#! /usr/bin/env bash
+# Patch: -pro_mpc8349mIDX_rtc
+# Date: Mon Apr  9 00:18:01 2007
+# Source: MontaVista Software, Inc.
+# MR: 22563
+# Type: Enhancement
+# Disposition: backport of linux-2.6.19, git://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git
+# Signed-off-by: Yuri Shpilevsky <yshpilevsky@ru.mvista.com>
+# Description:
+#     linux-2.6.19 RTC I2C driver is backported to foundation two kernel.
+# 
+
+PATCHNUM=1300
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 22563
+Type: Enhancement
+Disposition: backport of linux-2.6.19, git://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git
+Signed-off-by: Yuri Shpilevsky <yshpilevsky@ru.mvista.com>
+Description:
+    linux-2.6.19 RTC I2C driver is backported to foundation two kernel.
+
+Index: linux-2.6.10/drivers/i2c/chips/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Kconfig
++++ linux-2.6.10/drivers/i2c/chips/Kconfig
+@@ -315,6 +315,17 @@ config SENSORS_DS1374
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called ds1374.
+ 
++config SENSORS_DS1337
++	tristate "Dallas Semiconductor DS1337 and DS1339 Real Time Clock"
++	depends on I2C && EXPERIMENTAL
++	select I2C_SENSOR
++	help
++	  If you say yes here you get support for Dallas Semiconductor
++	  DS1337 and DS1339 real-time clock chips.
++
++	  This driver can also be built as a module.  If so, the module
++	  will be called ds1337.
++
+ config SENSORS_DS1338
+ 	bool "Dallas Semiconductor DS1338 Real Time Clock"
+ 	depends on I2C && EXPERIMENTAL
+Index: linux-2.6.10/drivers/i2c/chips/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/i2c/chips/Makefile
++++ linux-2.6.10/drivers/i2c/chips/Makefile
+@@ -13,6 +13,7 @@ obj-$(CONFIG_SENSORS_ADM1026)	+= adm1026
+ obj-$(CONFIG_SENSORS_ADM1031)	+= adm1031.o
+ obj-$(CONFIG_SENSORS_DS1374)	+= ds1374.o
+ obj-$(CONFIG_SENSORS_DS1621)	+= ds1621.o
++obj-$(CONFIG_SENSORS_DS1337)	+= ds1337.o
+ obj-$(CONFIG_SENSORS_EEPROM)	+= eeprom.o
+ obj-$(CONFIG_SENSORS_FSCHER)	+= fscher.o
+ obj-$(CONFIG_SENSORS_GL518SM)	+= gl518sm.o
+Index: linux-2.6.10/drivers/i2c/chips/ds1337.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/chips/ds1337.c
+@@ -0,0 +1,412 @@
++/*
++ *  linux/drivers/i2c/chips/ds1337.c
++ *
++ *  Copyright (C) 2005 James Chapman <jchapman@katalix.com>
++ *
++ *	based on linux/drivers/acorn/char/pcf8583.c
++ *  Copyright (C) 2000 Russell King
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Driver for Dallas Semiconductor DS1337 and DS1339 real time clock chip
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/i2c-sensor.h>
++#include <linux/string.h>
++#include <linux/rtc.h>		/* get the user-level API */
++#include <linux/bcd.h>
++#include <linux/list.h>
++
++/* Device registers */
++#define DS1337_REG_HOUR		2
++#define DS1337_REG_DAY		3
++#define DS1337_REG_DATE		4
++#define DS1337_REG_MONTH	5
++#define DS1337_REG_CONTROL	14
++#define DS1337_REG_STATUS	15
++
++/* FIXME - how do we export these interface constants? */
++#define DS1337_GET_DATE		0
++#define DS1337_SET_DATE		1
++
++/*
++ * Functions declaration
++ */
++static unsigned short normal_i2c[] = { 0x68, I2C_CLIENT_END };
++static unsigned int normal_isa[] = { I2C_CLIENT_ISA_END };
++
++SENSORS_INSMOD_1(ds1337);
++
++static int ds1337_attach_adapter(struct i2c_adapter *adapter);
++static int ds1337_detect(struct i2c_adapter *adapter, int address, int kind);
++static void ds1337_init_client(struct i2c_client *client);
++static int ds1337_detach_client(struct i2c_client *client);
++static int ds1337_command(struct i2c_client *client, unsigned int cmd,
++			  void *arg);
++
++/*
++ * Driver data (common to all clients)
++ */
++static struct i2c_driver ds1337_driver = {
++	.owner          = THIS_MODULE,
++	.name		= "ds1337",
++	.flags		= I2C_DF_NOTIFY,
++	.attach_adapter	= ds1337_attach_adapter,
++	.detach_client	= ds1337_detach_client,
++	.command	= ds1337_command,
++};
++
++/*
++ * Client data (each client gets its own)
++ */
++struct ds1337_data {
++	struct i2c_client client;
++	struct list_head list;
++};
++
++/*
++ * Internal variables
++ */
++static LIST_HEAD(ds1337_clients);
++
++static inline int ds1337_read(struct i2c_client *client, u8 reg, u8 *value)
++{
++	s32 tmp = i2c_smbus_read_byte_data(client, reg);
++
++	if (tmp < 0)
++		return -EIO;
++
++	*value = tmp;
++
++	return 0;
++}
++
++/*
++ * Chip access functions
++ */
++static int ds1337_get_datetime(struct i2c_client *client, struct rtc_time *dt)
++{
++	int result;
++	u8 buf[7];
++	u8 val;
++	struct i2c_msg msg[2];
++	u8 offs = 0;
++
++	if (!dt) {
++		dev_dbg(&client->dev, "%s: EINVAL: dt=NULL\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	msg[0].addr = client->addr;
++	msg[0].flags = 0;
++	msg[0].len = 1;
++	msg[0].buf = &offs;
++
++	msg[1].addr = client->addr;
++	msg[1].flags = I2C_M_RD;
++	msg[1].len = sizeof(buf);
++	msg[1].buf = &buf[0];
++
++	result = i2c_transfer(client->adapter, msg, 2);
++
++	dev_dbg(&client->dev, "%s: [%d] %02x %02x %02x %02x %02x %02x %02x\n",
++		__FUNCTION__, result, buf[0], buf[1], buf[2], buf[3],
++		buf[4], buf[5], buf[6]);
++
++	if (result == 2) {
++		dt->tm_sec = BCD2BIN(buf[0]);
++		dt->tm_min = BCD2BIN(buf[1]);
++		val = buf[2] & 0x3f;
++		dt->tm_hour = BCD2BIN(val);
++		dt->tm_wday = BCD2BIN(buf[3]) - 1;
++		dt->tm_mday = BCD2BIN(buf[4]);
++		val = buf[5] & 0x7f;
++		dt->tm_mon = BCD2BIN(val) - 1;
++		dt->tm_year = BCD2BIN(buf[6]);
++		if (buf[5] & 0x80)
++			dt->tm_year += 100;
++
++		dev_dbg(&client->dev, "%s: secs=%d, mins=%d, "
++			"hours=%d, mday=%d, mon=%d, year=%d, wday=%d\n",
++			__FUNCTION__, dt->tm_sec, dt->tm_min,
++			dt->tm_hour, dt->tm_mday,
++			dt->tm_mon, dt->tm_year, dt->tm_wday);
++
++		return 0;
++	}
++
++	dev_err(&client->dev, "error reading data! %d\n", result);
++	return -EIO;
++}
++
++static int ds1337_set_datetime(struct i2c_client *client, struct rtc_time *dt)
++{
++	int result;
++	u8 buf[8];
++	u8 val;
++	struct i2c_msg msg[1];
++
++	if (!dt) {
++		dev_dbg(&client->dev, "%s: EINVAL: dt=NULL\n", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	dev_dbg(&client->dev, "%s: secs=%d, mins=%d, hours=%d, "
++		"mday=%d, mon=%d, year=%d, wday=%d\n", __FUNCTION__,
++		dt->tm_sec, dt->tm_min, dt->tm_hour,
++		dt->tm_mday, dt->tm_mon, dt->tm_year, dt->tm_wday);
++
++	buf[0] = 0;		/* reg offset */
++	buf[1] = BIN2BCD(dt->tm_sec);
++	buf[2] = BIN2BCD(dt->tm_min);
++	buf[3] = BIN2BCD(dt->tm_hour);
++	buf[4] = BIN2BCD(dt->tm_wday + 1);
++	buf[5] = BIN2BCD(dt->tm_mday);
++	buf[6] = BIN2BCD(dt->tm_mon + 1);
++	val = dt->tm_year;
++	if (val >= 100) {
++		val -= 100;
++		buf[6] |= (1 << 7);
++	}
++	buf[7] = BIN2BCD(val);
++
++	msg[0].addr = client->addr;
++	msg[0].flags = 0;
++	msg[0].len = sizeof(buf);
++	msg[0].buf = &buf[0];
++
++	result = i2c_transfer(client->adapter, msg, 1);
++	if (result == 1)
++		return 0;
++
++	dev_err(&client->dev, "error writing data! %d\n", result);
++	return -EIO;
++}
++
++static int ds1337_command(struct i2c_client *client, unsigned int cmd,
++			  void *arg)
++{
++	dev_dbg(&client->dev, "%s: cmd=%d\n", __FUNCTION__, cmd);
++
++	switch (cmd) {
++	case DS1337_GET_DATE:
++		return ds1337_get_datetime(client, arg);
++
++	case DS1337_SET_DATE:
++		return ds1337_set_datetime(client, arg);
++
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * Public API for access to specific device. Useful for low-level
++ * RTC access from kernel code.
++ */
++int ds1337_do_command(int bus, int cmd, void *arg)
++{
++	struct list_head *walk;
++	struct list_head *tmp;
++	struct ds1337_data *data;
++
++	list_for_each_safe(walk, tmp, &ds1337_clients) {
++		data = list_entry(walk, struct ds1337_data, list);
++		if (data->client.adapter->nr == bus)
++			return ds1337_command(&data->client, cmd, arg);
++	}
++
++	return -ENODEV;
++}
++
++static int ds1337_attach_adapter(struct i2c_adapter *adapter)
++{
++	return i2c_detect(adapter, &addr_data, ds1337_detect);
++}
++
++/*
++ * The following function does more than just detection. If detection
++ * succeeds, it also registers the new chip.
++ */
++static int ds1337_detect(struct i2c_adapter *adapter, int address, int kind)
++{
++	struct i2c_client *new_client;
++	struct ds1337_data *data;
++	int err = 0;
++	const char *name = "";
++
++	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA |
++				     I2C_FUNC_I2C))
++		goto exit;
++
++	if (!(data = kzalloc(sizeof(struct ds1337_data), GFP_KERNEL))) {
++		err = -ENOMEM;
++		goto exit;
++	}
++	INIT_LIST_HEAD(&data->list);
++
++	/* The common I2C client data is placed right before the
++	 * DS1337-specific data.
++	 */
++	new_client = &data->client;
++	i2c_set_clientdata(new_client, data);
++	new_client->addr = address;
++	new_client->adapter = adapter;
++	new_client->driver = &ds1337_driver;
++	new_client->flags = 0;
++
++	/*
++	 * Now we do the remaining detection. A negative kind means that
++	 * the driver was loaded with no force parameter (default), so we
++	 * must both detect and identify the chip. A zero kind means that
++	 * the driver was loaded with the force parameter, the detection
++	 * step shall be skipped. A positive kind means that the driver
++	 * was loaded with the force parameter and a given kind of chip is
++	 * requested, so both the detection and the identification steps
++	 * are skipped.
++	 *
++	 * For detection, we read registers that are most likely to cause
++	 * detection failure, i.e. those that have more bits with fixed
++	 * or reserved values.
++	 */
++
++	/* Default to an DS1337 if forced */
++	if (kind == 0)
++		kind = ds1337;
++
++	if (kind < 0) {		/* detection and identification */
++		u8 data;
++
++		/* Check that status register bits 6-2 are zero */
++		if ((ds1337_read(new_client, DS1337_REG_STATUS, &data) < 0) ||
++		    (data & 0x7c))
++			goto exit_free;
++
++		/* Check for a valid day register value */
++		if ((ds1337_read(new_client, DS1337_REG_DAY, &data) < 0) ||
++		    (data == 0) || (data & 0xf8))
++			goto exit_free;
++
++		/* Check for a valid date register value */
++		if ((ds1337_read(new_client, DS1337_REG_DATE, &data) < 0) ||
++		    (data == 0) || (data & 0xc0) || ((data & 0x0f) > 9) ||
++		    (data >= 0x32))
++			goto exit_free;
++
++		/* Check for a valid month register value */
++		if ((ds1337_read(new_client, DS1337_REG_MONTH, &data) < 0) ||
++		    (data == 0) || (data & 0x60) || ((data & 0x0f) > 9) ||
++		    ((data >= 0x13) && (data <= 0x19)))
++			goto exit_free;
++
++		/* Check that control register bits 6-5 are zero */
++		if ((ds1337_read(new_client, DS1337_REG_CONTROL, &data) < 0) ||
++		    (data & 0x60))
++			goto exit_free;
++
++		kind = ds1337;
++	}
++
++	if (kind == ds1337)
++		name = "ds1337";
++
++	/* We can fill in the remaining client fields */
++	strlcpy(new_client->name, name, I2C_NAME_SIZE);
++
++	/* Tell the I2C layer a new client has arrived */
++	if ((err = i2c_attach_client(new_client)))
++		goto exit_free;
++
++	/* Initialize the DS1337 chip */
++	ds1337_init_client(new_client);
++
++	/* Add client to local list */
++	list_add(&data->list, &ds1337_clients);
++
++	return 0;
++
++exit_free:
++	kfree(data);
++exit:
++	return err;
++}
++
++static void ds1337_init_client(struct i2c_client *client)
++{
++	u8 status, control;
++
++	/* On some boards, the RTC isn't configured by boot firmware.
++	 * Handle that case by starting/configuring the RTC now.
++	 */
++	status = i2c_smbus_read_byte_data(client, DS1337_REG_STATUS);
++	control = i2c_smbus_read_byte_data(client, DS1337_REG_CONTROL);
++
++	if ((status & 0x80) || (control & 0x80)) {
++		/* RTC not running */
++		u8 buf[1+16];	/* First byte is interpreted as address */
++		struct i2c_msg msg[1];
++
++		dev_dbg(&client->dev, "%s: RTC not running!\n", __FUNCTION__);
++
++		/* Initialize all, including STATUS and CONTROL to zero */
++		memset(buf, 0, sizeof(buf));
++
++		/* Write valid values in the date/time registers */
++		buf[1+DS1337_REG_DAY] = 1;
++		buf[1+DS1337_REG_DATE] = 1;
++		buf[1+DS1337_REG_MONTH] = 1;
++
++		msg[0].addr = client->addr;
++		msg[0].flags = 0;
++		msg[0].len = sizeof(buf);
++		msg[0].buf = &buf[0];
++
++		i2c_transfer(client->adapter, msg, 1);
++	} else {
++		/* Running: ensure that device is set in 24-hour mode */
++		s32 val;
++
++		val = i2c_smbus_read_byte_data(client, DS1337_REG_HOUR);
++		if ((val >= 0) && (val & (1 << 6)))
++			i2c_smbus_write_byte_data(client, DS1337_REG_HOUR,
++						  val & 0x3f);
++	}
++}
++
++static int ds1337_detach_client(struct i2c_client *client)
++{
++	int err;
++	struct ds1337_data *data = i2c_get_clientdata(client);
++
++	if ((err = i2c_detach_client(client)))
++		return err;
++
++	list_del(&data->list);
++	kfree(data);
++	return 0;
++}
++
++static int __init ds1337_init(void)
++{
++	return i2c_add_driver(&ds1337_driver);
++}
++
++static void __exit ds1337_exit(void)
++{
++	i2c_del_driver(&ds1337_driver);
++}
++
++MODULE_AUTHOR("James Chapman <jchapman@katalix.com>");
++MODULE_DESCRIPTION("DS1337 RTC driver");
++MODULE_LICENSE("GPL");
++
++EXPORT_SYMBOL_GPL(ds1337_do_command);
++
++module_init(ds1337_init);
++module_exit(ds1337_exit);
+Index: linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_itx.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/83xx/mpc834x_itx.c
++++ linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_itx.c
+@@ -376,6 +376,52 @@ static int __init mpc834x_rtc_hookup(voi
+ late_initcall(mpc834x_rtc_hookup);
+ #endif
+ 
++#if defined(CONFIG_I2C_MPC) && defined(CONFIG_SENSORS_DS1337)
++#define DS1337_GET_DATE		0
++#define DS1337_SET_DATE		1
++
++extern int ds1337_do_command(int id, int cmd, void *arg);
++
++static unsigned long ds1337_get_rtc_time(void)
++{
++	struct rtc_time date;
++
++	if(ds1337_do_command(1, DS1337_GET_DATE, &date) == -ENODEV)
++		return mktime(2000, 1, 1, 0, 0, 0);
++
++	return mktime(date.tm_year + 1900, date.tm_mon + 1, date.tm_mday, date.tm_hour, date.tm_min, date.tm_sec);
++}
++
++static int ds1337_set_rtc_time(unsigned long t)
++{
++	struct rtc_time tm;
++
++	to_tm(t, &tm);
++	tm.tm_year -= 1900;
++	tm.tm_mon -= 1;
++
++	if(ds1337_do_command(1, DS1337_SET_DATE, &tm) == -ENODEV)
++		return -ENODEV;
++
++	return 0;
++}
++
++static int __init mpc834x_rtc_hookup(void)
++{
++	struct timespec tv;
++
++	ppc_md.get_rtc_time = ds1337_get_rtc_time;
++	ppc_md.set_rtc_time = ds1337_set_rtc_time;
++
++	tv.tv_nsec = 0;
++	tv.tv_sec = (ppc_md.get_rtc_time) ();
++
++	return 0;
++}
++
++late_initcall(mpc834x_rtc_hookup);
++#endif
++
+ static __inline__ void mpc834x_itx_set_bat(void)
+ {
+ 	/* we steal the lowest ioremap addr for virt space */
+Index: linux-2.6.10/mvl_patches/pro-1300.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1300.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1300);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

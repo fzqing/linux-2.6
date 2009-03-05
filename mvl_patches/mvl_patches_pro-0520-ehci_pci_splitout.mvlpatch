@@ -1,0 +1,1248 @@
+#! /usr/bin/env bash
+# Patch: -ehci_pci_splitout
+# Date: Fri Apr 28 12:35:32 2006
+# commit 7ff71d6adf81a43505b7cbaa034e4063d3439182
+# tree ea7edb953d9fb47f6132e52e1e8d422d8bdae06b
+# parent e9b7bd4ee7f6e3ee002dc72c5211cd97c7186d00
+# author Matt Porter <mporter@kernel.crashing.org> Thu, 22 Sep 2005 22:31:15 -0700
+# committer Greg Kroah-Hartman <gregkh@suse.de> Fri, 28 Oct 2005 16:47:39 -0700
+# 
+#     [PATCH] EHCI, split out PCI glue
+# 
+#     This splits BIOS and PCI specific support out of ehci-hcd.c into
+#     ehci-pci.c.  It follows the model already used in the OHCI driver
+#     so support for non-PCI EHCI controllers can be more easily added.
+# 
+#     Signed-off-by: Matt Porter <mporter@kernel.crashing.org>
+#     Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+#     Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+# 
+#  drivers/usb/host/ehci-hcd.c |  532 +++++++++-----------------------------------
+#  drivers/usb/host/ehci-pci.c |  348 ++++++++++++++++++++++++++++
+#  drivers/usb/host/ehci.h     |    1 
+#  3 files changed, 458 insertions(+), 423 deletions(-)
+# 
+
+PATCHNUM=520
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+commit 7ff71d6adf81a43505b7cbaa034e4063d3439182
+tree ea7edb953d9fb47f6132e52e1e8d422d8bdae06b
+parent e9b7bd4ee7f6e3ee002dc72c5211cd97c7186d00
+author Matt Porter <mporter@kernel.crashing.org> Thu, 22 Sep 2005 22:31:15 -0700
+committer Greg Kroah-Hartman <gregkh@suse.de> Fri, 28 Oct 2005 16:47:39 -0700
+
+    [PATCH] EHCI, split out PCI glue
+
+    This splits BIOS and PCI specific support out of ehci-hcd.c into
+    ehci-pci.c.  It follows the model already used in the OHCI driver
+    so support for non-PCI EHCI controllers can be more easily added.
+
+    Signed-off-by: Matt Porter <mporter@kernel.crashing.org>
+    Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+ drivers/usb/host/ehci-hcd.c |  532 +++++++++-----------------------------------
+ drivers/usb/host/ehci-pci.c |  348 ++++++++++++++++++++++++++++
+ drivers/usb/host/ehci.h     |    1 
+ mvl_patches/pro-0520.c      |   16 +
+ 4 files changed, 474 insertions(+), 423 deletions(-)
+
+Index: linux-2.6.10/drivers/usb/host/ehci-hcd.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/host/ehci-hcd.c
++++ linux-2.6.10/drivers/usb/host/ehci-hcd.c
+@@ -274,42 +274,6 @@ static void ehci_watchdog (unsigned long
+ 	spin_unlock_irqrestore (&ehci->lock, flags);
+ }
+ 
+-#ifdef	CONFIG_PCI
+-
+-/* EHCI 0.96 (and later) section 5.1 says how to kick BIOS/SMM/...
+- * off the controller (maybe it can boot from highspeed USB disks).
+- */
+-static int bios_handoff (struct ehci_hcd *ehci, int where, u32 cap)
+-{
+-	if (cap & (1 << 16)) {
+-		int msec = 5000;
+-		struct pci_dev *pdev = to_pci_dev(ehci->hcd.self.controller);
+-
+-		/* request handoff to OS */
+-		cap |= 1 << 24;
+-		pci_write_config_dword(pdev, where, cap);
+-
+-		/* and wait a while for it to happen */
+-		do {
+-			msleep(10);
+-			msec -= 10;
+-			pci_read_config_dword(pdev, where, &cap);
+-		} while ((cap & (1 << 16)) && msec);
+-		if (cap & (1 << 16)) {
+-			ehci_err (ehci, "BIOS handoff failed (%d, %04x)\n",
+-				where, cap);
+-			// some BIOS versions seem buggy...
+-			// return 1;
+-			ehci_warn (ehci, "continuing after BIOS bug...\n");
+-			return 0;
+-		} 
+-		ehci_dbg (ehci, "BIOS handoff succeeded\n");
+-	}
+-	return 0;
+-}
+-
+-#endif
+-
+ /* Reboot notifiers kick in for silicon on any bus (not just pci, etc).
+  * This forcibly disables dma and IRQs, helping kexec and other cases
+  * where the next system software may expect clean state.
+@@ -327,79 +291,102 @@ ehci_reboot (struct notifier_block *self
+ 	return 0;
+ }
+ 
++static void ehci_port_power (struct ehci_hcd *ehci, int is_on)
++{
++	unsigned port;
++
++	if (!HCS_PPC (ehci->hcs_params))
++		return;
++
++	ehci_dbg (ehci, "...power%s ports...\n", is_on ? "up" : "down");
++	for (port = HCS_N_PORTS (ehci->hcs_params); port > 0; )
++		(void) ehci_hub_control(&ehci->hcd,
++				is_on ? SetPortFeature : ClearPortFeature,
++				USB_PORT_FEAT_POWER,
++				port--, NULL, 0);
++	msleep(20);
++}
+ 
+-/* called by khubd or root hub init threads */
++/*-------------------------------------------------------------------------*/
+ 
+-static int ehci_hc_reset (struct usb_hcd *hcd)
++/*
++ * ehci_work is called from some interrupts, timers, and so on.
++ * it calls driver completion functions, after dropping ehci->lock.
++ */
++static void ehci_work (struct ehci_hcd *ehci, struct pt_regs *regs)
++{
++	timer_action_done (ehci, TIMER_IO_WATCHDOG);
++	if (ehci->reclaim_ready)
++		end_unlink_async (ehci, regs);
++
++	/* another CPU may drop ehci->lock during a schedule scan while
++	 * it reports urb completions.  this flag guards against bogus
++	 * attempts at re-entrant schedule scanning.
++	 */
++	if (ehci->scanning)
++		return;
++	ehci->scanning = 1;
++	scan_async (ehci, regs);
++	if (ehci->next_uframe != -1)
++		scan_periodic (ehci, regs);
++	ehci->scanning = 0;
++
++	/* the IO watchdog guards against hardware or driver bugs that
++	 * misplace IRQs, and should let us run completely without IRQs.
++	 * such lossage has been observed on both VT6202 and VT8235.
++	 */
++	if (HCD_IS_RUNNING (ehci->hcd.state) && (ehci->async->qh_next.ptr != 0
++			|| ehci->periodic_sched != 0))
++		timer_action (ehci, TIMER_IO_WATCHDOG);
++}
++
++/* always called by thread; normally rmmod */
++
++static void ehci_stop (struct usb_hcd *hcd)
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+-	u32			temp;
+-	unsigned		count = 256/4;
+ 
+-	spin_lock_init (&ehci->lock);
++	ehci_dbg (ehci, "stop\n");
+ 
+-	ehci->caps = hcd->regs;
+-	ehci->regs = hcd->regs + HC_LENGTH (readl (&ehci->caps->hc_capbase));
+-	dbg_hcs_params (ehci, "reset");
+-	dbg_hcc_params (ehci, "reset");
+-
+-#ifdef	CONFIG_PCI
+-	/* EHCI 0.96 and later may have "extended capabilities" */
+-	if (hcd->self.controller->bus == &pci_bus_type) {
+-		struct pci_dev	*pdev = to_pci_dev(ehci->hcd.self.controller);
+-
+-		/* AMD8111 EHCI doesn't work, according to AMD errata */
+-		if ((pdev->vendor == PCI_VENDOR_ID_AMD)
+-				&& (pdev->device == 0x7463)) {
+-			ehci_info (ehci, "ignoring AMD8111 (errata)\n");
+-			return -EIO;
+-		}
++	/* Turn off port power on all root hub ports. */
++	ehci_port_power (ehci, 0);
+ 
+-		temp = HCC_EXT_CAPS (readl (&ehci->caps->hcc_params));
+-	} else
+-		temp = 0;
+-	while (temp && count--) {
+-		u32		cap;
+-
+-		pci_read_config_dword (to_pci_dev(ehci->hcd.self.controller),
+-				temp, &cap);
+-		ehci_dbg (ehci, "capability %04x at %02x\n", cap, temp);
+-		switch (cap & 0xff) {
+-		case 1:			/* BIOS/SMM/... handoff */
+-			if (bios_handoff (ehci, temp, cap) != 0)
+-				return -EOPNOTSUPP;
+-			break;
+-		case 0:			/* illegal reserved capability */
+-			ehci_warn (ehci, "illegal capability!\n");
+-			cap = 0;
+-			/* FALLTHROUGH */
+-		default:		/* unknown */
+-			break;
+-		}
+-		temp = (cap >> 8) & 0xff;
+-	}
+-	if (!count) {
+-		ehci_err (ehci, "bogus capabilities ... PCI problems!\n");
+-		return -EIO;
+-	}
+-#endif
++	/* no more interrupts ... */
++	del_timer_sync (&ehci->watchdog);
+ 
+-	/* cache this readonly data; minimize PCI reads */
+-	ehci->hcs_params = readl (&ehci->caps->hcs_params);
++	spin_lock_irq(&ehci->lock);
++	if (HCD_IS_RUNNING (ehci->hcd.state))
++		ehci_quiesce (ehci);
+ 
+-	/* at least the Genesys GL880S needs fixup here */
+-	temp = HCS_N_CC(ehci->hcs_params) * HCS_N_PCC(ehci->hcs_params);
+-	temp &= 0x0f;
+-	if (temp && HCS_N_PORTS(ehci->hcs_params) > temp) {
+-		temp |= (ehci->hcs_params & ~0xf);
+-		ehci->hcs_params = temp;
+-	}
++	ehci_reset (ehci);
++	writel (0, &ehci->regs->intr_enable);
++	spin_unlock_irq(&ehci->lock);
++
++	/* let companion controllers work when we aren't */
++	writel (0, &ehci->regs->configured_flag);
++	unregister_reboot_notifier (&ehci->reboot_notifier);
++
++	remove_debug_files (ehci);
++
++	/* root hub is shut down separately (first, when possible) */
++	spin_lock_irq (&ehci->lock);
++	if (ehci->async)
++		ehci_work (ehci, NULL);
++	spin_unlock_irq (&ehci->lock);
++	ehci_mem_cleanup (ehci);
++
++#ifdef	EHCI_STATS
++	ehci_dbg (ehci, "irq normal %ld err %ld reclaim %ld (lost %ld)\n",
++		ehci->stats.normal, ehci->stats.error, ehci->stats.reclaim,
++		ehci->stats.lost_iaa);
++	ehci_dbg (ehci, "complete %ld unlink %ld\n",
++		ehci->stats.complete, ehci->stats.unlink);
++#endif
+ 
+-	/* force HC to halt state */
+-	return ehci_halt (ehci);
++	dbg_status (ehci, "ehci_stop completed", readl (&ehci->regs->status));
+ }
+ 
+-static int ehci_start (struct usb_hcd *hcd)
++static int ehci_run (struct usb_hcd *hcd)
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+ 	u32			temp;
+@@ -407,7 +394,6 @@ static int ehci_start (struct usb_hcd *h
+ 	struct usb_bus		*bus;
+ 	int			retval;
+ 	u32			hcc_params;
+-	u8                      sbrn = 0;
+ 	int			first;
+ 
+ 	/* skip some things on restart paths */
+@@ -446,34 +432,6 @@ static int ehci_start (struct usb_hcd *h
+ 	}
+ 	writel (ehci->periodic_dma, &ehci->regs->frame_list);
+ 
+-#ifdef	CONFIG_PCI
+-	if (hcd->self.controller->bus == &pci_bus_type) {
+-		struct pci_dev		*pdev;
+-		u16			port_wake;
+-
+-		pdev = to_pci_dev(hcd->self.controller);
+-
+-		/* Serial Bus Release Number is at PCI 0x60 offset */
+-		pci_read_config_byte(pdev, 0x60, &sbrn);
+-
+-		/* port wake capability, reported by boot firmware */
+-		pci_read_config_word(pdev, 0x62, &port_wake);
+-		hcd->can_wakeup = (port_wake & 1) != 0;
+-
+-		/* help hc dma work well with cachelines */
+-		pci_set_mwi (pdev);
+-
+-		/* chip-specific init */
+-		switch (pdev->vendor) {
+-		case PCI_VENDOR_ID_ARC:
+-			if (pdev->device == PCI_DEVICE_ID_ARC_EHCI)
+-				ehci->is_arc_rh_tt = 1;
+-			break;
+-		}
+-
+-	}
+-#endif
+-
+ 	/*
+ 	 * dedicate a qh for the async ring head, since we couldn't unlink
+ 	 * a 'real' qh without stopping the async schedule [4.8].  use it
+@@ -518,7 +476,6 @@ static int ehci_start (struct usb_hcd *h
+ 	if (log2_irq_thresh < 0 || log2_irq_thresh > 6)
+ 		log2_irq_thresh = 0;
+ 	temp |= 1 << (16 + log2_irq_thresh);
+-	// if hc can park (ehci >= 0.96), default is 3 packets per async QH 
+ 	if (HCC_PGM_FRAMELISTLEN (hcc_params)) {
+ 		/* periodic schedule size can be smaller than default */
+ 		temp &= ~(3 << 2);
+@@ -530,7 +487,6 @@ static int ehci_start (struct usb_hcd *h
+ 		default:	BUG ();
+ 		}
+ 	}
+-	temp &= ~(CMD_IAAD | CMD_ASE | CMD_PSE),
+ 	// Philips, Intel, and maybe others need CMD_RUN before the
+ 	// root hub will detect new devices (why?); NEC doesn't
+ 	temp |= CMD_RUN;
+@@ -568,7 +524,7 @@ done2:
+ 	temp = HC_VERSION(readl (&ehci->caps->hc_capbase));
+ 	ehci_info (ehci,
+ 		"USB %x.%x %s, EHCI %x.%02x, driver %s\n",
+-		((sbrn & 0xf0)>>4), (sbrn & 0x0f),
++		((ehci->sbrn & 0xf0)>>4), (ehci->sbrn & 0x0f),
+ 		first ? "initialized" : "restarted",
+ 		temp >> 8, temp & 0xff, DRIVER_VERSION);
+ 
+@@ -597,199 +553,6 @@ done2:
+ 
+ 	return 0;
+ }
+-
+-/* always called by thread; normally rmmod */
+-
+-static void ehci_stop (struct usb_hcd *hcd)
+-{
+-	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+-	u8			rh_ports, port;
+-
+-	ehci_dbg (ehci, "stop\n");
+-
+-	/* Turn off port power on all root hub ports. */
+-	rh_ports = HCS_N_PORTS (ehci->hcs_params);
+-	for (port = 1; port <= rh_ports; port++)
+-		(void) ehci_hub_control(hcd,
+-			ClearPortFeature, USB_PORT_FEAT_POWER,
+-			port, NULL, 0);
+-
+-	/* no more interrupts ... */
+-	del_timer_sync (&ehci->watchdog);
+-
+-	spin_lock_irq(&ehci->lock);
+-	if (HCD_IS_RUNNING (ehci->hcd.state))
+-		ehci_quiesce (ehci);
+-
+-	ehci_reset (ehci);
+-	writel (0, &ehci->regs->intr_enable);
+-	spin_unlock_irq(&ehci->lock);
+-
+-	/* let companion controllers work when we aren't */
+-	writel (0, &ehci->regs->configured_flag);
+-	unregister_reboot_notifier (&ehci->reboot_notifier);
+-
+-	remove_debug_files (ehci);
+-
+-	/* root hub is shut down separately (first, when possible) */
+-	spin_lock_irq (&ehci->lock);
+-	if (ehci->async)
+-		ehci_work (ehci, NULL);
+-	spin_unlock_irq (&ehci->lock);
+-	ehci_mem_cleanup (ehci);
+-
+-#ifdef	EHCI_STATS
+-	ehci_dbg (ehci, "irq normal %ld err %ld reclaim %ld (lost %ld)\n",
+-		ehci->stats.normal, ehci->stats.error, ehci->stats.reclaim,
+-		ehci->stats.lost_iaa);
+-	ehci_dbg (ehci, "complete %ld unlink %ld\n",
+-		ehci->stats.complete, ehci->stats.unlink);
+-#endif
+-
+-	dbg_status (ehci, "ehci_stop completed", readl (&ehci->regs->status));
+-}
+-
+-static int ehci_get_frame (struct usb_hcd *hcd)
+-{
+-	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+-	return (readl (&ehci->regs->frame_index) >> 3) % ehci->periodic_size;
+-}
+-
+-/*-------------------------------------------------------------------------*/
+-
+-#ifdef	CONFIG_PM
+-
+-/* suspend/resume, section 4.3 */
+-
+-/* These routines rely on the bus (pci, platform, etc)
+- * to handle powerdown and wakeup, and currently also on
+- * transceivers that don't need any software attention to set up
+- * the right sort of wakeup.  
+- */
+-
+-static int ehci_suspend (struct usb_hcd *hcd, u32 state)
+-{
+-	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+-
+-	if (time_before (jiffies, ehci->next_statechange))
+-		msleep (100);
+-
+-#ifdef	CONFIG_USB_SUSPEND
+-	(void) usb_suspend_device (hcd->self.root_hub, state);
+-#else
+-	usb_lock_device (hcd->self.root_hub);
+-	(void) ehci_hub_suspend (hcd);
+-	usb_unlock_device (hcd->self.root_hub);
+-#endif
+-
+-	// save (PCI) FLADJ in case of Vaux power loss
+-	// ... we'd only use it to handle clock skew
+-
+-	return 0;
+-}
+-
+-static int ehci_resume (struct usb_hcd *hcd)
+-{
+-	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+-	unsigned		port;
+-	struct usb_device	*root = hcd->self.root_hub;
+-	int			retval = -EINVAL;
+-	int			powerup = 0;
+-
+-	// maybe restore (PCI) FLADJ
+-
+-	if (time_before (jiffies, ehci->next_statechange))
+-		msleep (100);
+-
+-	/* If any port is suspended, we know we can/must resume the HC. */
+-	for (port = HCS_N_PORTS (ehci->hcs_params); port > 0; ) {
+-		u32	status;
+-		port--;
+-		status = readl (&ehci->regs->port_status [port]);
+-		if (status & PORT_SUSPEND) {
+-			down (&hcd->self.root_hub->serialize);
+-			retval = ehci_hub_resume (hcd);
+-			up (&hcd->self.root_hub->serialize);
+-			break;
+-		}
+-		if ((status & PORT_POWER) == 0)
+-			powerup = 1;
+-		if (!root->children [port])
+-			continue;
+-		dbg_port (ehci, __FUNCTION__, port + 1, status);
+-		usb_set_device_state (root->children[port],
+-					USB_STATE_NOTATTACHED);
+-	}
+-
+-	/* Else reset, to cope with power loss or flush-to-storage
+-	 * style "resume" having activated BIOS during reboot.
+-	 */
+-	if (port == 0) {
+-		(void) ehci_halt (ehci);
+-		(void) ehci_reset (ehci);
+-		(void) ehci_hc_reset (hcd);
+-
+-		/* emptying the schedule aborts any urbs */
+-		spin_lock_irq (&ehci->lock);
+-		if (ehci->reclaim)
+-			ehci->reclaim_ready = 1;
+-		ehci_work (ehci, NULL);
+-		spin_unlock_irq (&ehci->lock);
+-
+-		/* restart; khubd will disconnect devices */
+-		retval = ehci_start (hcd);
+-
+-		/* here we "know" root ports should always stay powered;
+-		 * but some controllers may lost all power.
+-		 */
+-		if (powerup) {
+-			ehci_dbg (ehci, "...powerup ports...\n");
+-			for (port = HCS_N_PORTS (ehci->hcs_params); port > 0; )
+-				(void) ehci_hub_control(hcd,
+-					SetPortFeature, USB_PORT_FEAT_POWER,
+-						port--, NULL, 0);
+-			msleep(20);
+-		}
+-	}
+-
+-	return retval;
+-}
+-
+-#endif
+-
+-/*-------------------------------------------------------------------------*/
+-
+-/*
+- * ehci_work is called from some interrupts, timers, and so on.
+- * it calls driver completion functions, after dropping ehci->lock.
+- */
+-static void ehci_work (struct ehci_hcd *ehci, struct pt_regs *regs)
+-{
+-	timer_action_done (ehci, TIMER_IO_WATCHDOG);
+-	if (ehci->reclaim_ready)
+-		end_unlink_async (ehci, regs);
+-
+-	/* another CPU may drop ehci->lock during a schedule scan while
+-	 * it reports urb completions.  this flag guards against bogus
+-	 * attempts at re-entrant schedule scanning.
+-	 */
+-	if (ehci->scanning)
+-		return;
+-	ehci->scanning = 1;
+-	scan_async (ehci, regs);
+-	if (ehci->next_uframe != -1)
+-		scan_periodic (ehci, regs);
+-	ehci->scanning = 0;
+-
+-	/* the IO watchdog guards against hardware or driver bugs that
+-	 * misplace IRQs, and should let us run completely without IRQs.
+-	 * such lossage has been observed on both VT6202 and VT8235. 
+-	 */
+-	if (HCD_IS_RUNNING (ehci->hcd.state) && (ehci->async->qh_next.ptr != 0
+-			|| ehci->periodic_sched != 0))
+-		timer_action (ehci, TIMER_IO_WATCHDOG);
+-}
+-
+ /*-------------------------------------------------------------------------*/
+ 
+ static irqreturn_t ehci_irq (struct usb_hcd *hcd, struct pt_regs *regs)
+@@ -872,13 +635,20 @@ static irqreturn_t ehci_irq (struct usb_
+ 
+ 	/* PCI errors [4.15.2.4] */
+ 	if (unlikely ((status & STS_FATAL) != 0)) {
+-		ehci_err (ehci, "fatal error\n");
++		/* bogus "fatal" IRQs appear on some chips... why?  */
++		status = readl (&ehci->regs->status);
++		dbg_cmd (ehci, "fatal", readl (&ehci->regs->command));
++		dbg_status (ehci, "fatal", status);
++		if (status & STS_HALT) {
++			ehci_err (ehci, "fatal error\n");
+ dead:
+-		ehci_reset (ehci);
+-		/* generic layer kills/unlinks all urbs, then
+-		 * uses ehci_stop to clean up the rest
+-		 */
+-		bh = 1;
++			ehci_reset (ehci);
++			writel (0, &ehci->regs->configured_flag);
++			/* generic layer kills/unlinks all urbs, then
++			 * uses ehci_stop to clean up the rest
++			 */
++			bh = 1;
++		}
+ 	}
+ 
+ 	if (bh)
+@@ -1091,109 +861,25 @@ done:
+ 	return;
+ }
+ 
+-/*-------------------------------------------------------------------------*/
+-
+-static const struct hc_driver ehci_driver = {
+-	.description =		hcd_name,
+-
+-	/*
+-	 * generic hardware linkage
+-	 */
+-	.irq =			ehci_irq,
+-	.flags =		HCD_MEMORY | HCD_USB2,
+-
+-	/*
+-	 * basic lifecycle operations
+-	 */
+-	.reset =		ehci_hc_reset,
+-	.start =		ehci_start,
+-#ifdef	CONFIG_PM
+-	.suspend =		ehci_suspend,
+-	.resume =		ehci_resume,
+-#endif
+-	.stop =			ehci_stop,
+-
+-	/*
+-	 * memory lifecycle (except per-request)
+-	 */
+-	.hcd_alloc =		ehci_hcd_alloc,
+-
+-	/*
+-	 * managing i/o requests and associated device resources
+-	 */
+-	.urb_enqueue =		ehci_urb_enqueue,
+-	.urb_dequeue =		ehci_urb_dequeue,
+-	.endpoint_disable =	ehci_endpoint_disable,
+-
+-	/*
+-	 * scheduling support
+-	 */
+-	.get_frame_number =	ehci_get_frame,
+-
+-	/*
+-	 * root hub support
+-	 */
+-	.hub_status_data =	ehci_hub_status_data,
+-	.hub_control =		ehci_hub_control,
+-	.hub_suspend =		ehci_hub_suspend,
+-	.hub_resume =		ehci_hub_resume,
+-};
++static int ehci_get_frame (struct usb_hcd *hcd)
++{
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++	return (readl (&ehci->regs->frame_index) >> 3) % ehci->periodic_size;
++}
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-/* EHCI 1.0 doesn't require PCI */
+-
+-#ifdef	CONFIG_PCI
+-
+-/* PCI driver selection metadata; PCI hotplugging uses this */
+-static const struct pci_device_id pci_ids [] = { {
+-	/* handle any USB 2.0 EHCI controller */
+-	PCI_DEVICE_CLASS(((PCI_CLASS_SERIAL_USB << 8) | 0x20), ~0),
+-	.driver_data =	(unsigned long) &ehci_driver,
+-	},
+-	{ /* end: all zeroes */ }
+-};
+-MODULE_DEVICE_TABLE (pci, pci_ids);
+-
+-/* pci driver glue; this is a "new style" PCI driver module */
+-static struct pci_driver ehci_pci_driver = {
+-	.name =		(char *) hcd_name,
+-	.id_table =	pci_ids,
+-
+-	.probe =	usb_hcd_pci_probe,
+-	.remove =	usb_hcd_pci_remove,
+-
+-#ifdef	CONFIG_PM
+-	.suspend =	usb_hcd_pci_suspend,
+-	.resume =	usb_hcd_pci_resume,
+-#endif
+-};
+-
+-#endif	/* PCI */
+-
+-
+ #define DRIVER_INFO DRIVER_VERSION " " DRIVER_DESC
+ 
+ MODULE_DESCRIPTION (DRIVER_INFO);
+ MODULE_AUTHOR (DRIVER_AUTHOR);
+ MODULE_LICENSE ("GPL");
+ 
+-static int __init init (void) 
+-{
+-	if (usb_disabled())
+-		return -ENODEV;
+-
+-	pr_debug ("%s: block sizes: qh %Zd qtd %Zd itd %Zd sitd %Zd\n",
+-		hcd_name,
+-		sizeof (struct ehci_qh), sizeof (struct ehci_qtd),
+-		sizeof (struct ehci_itd), sizeof (struct ehci_sitd));
++#ifdef CONFIG_PCI
++#include "ehci-pci.c"
++#endif
+ 
+-	return pci_register_driver (&ehci_pci_driver);
+-}
+-module_init (init);
++#if !defined(CONFIG_PCI)
++#error "missing bus glue for ehci-hcd"
++#endif
+ 
+-static void __exit cleanup (void) 
+-{	
+-	pci_unregister_driver (&ehci_pci_driver);
+-}
+-module_exit (cleanup);
+Index: linux-2.6.10/drivers/usb/host/ehci-pci.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/host/ehci-pci.c
+@@ -0,0 +1,348 @@
++/*
++ * EHCI HCD (host Contoller Driver) PCI Bus Glue.
++ *
++ * Copyright (c) 2000-2004 by David Brownell
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#ifndef CONFIG_PCI
++#error "This file is PCI bus glue. CONFIG_PCI must be defined."
++#endif
++
++/*-------------------------------------------------------------------------*/
++
++/* EHCI 0.96 (and later) section 5.1 says how to kick BIOS/SMM/...
++ * off the controller (maybe it can boot from highspeed USB disks).
++ */
++static int bios_handoff (struct ehci_hcd *ehci, int where, u32 cap)
++{
++	if (cap & (1 << 16)) {
++		int msec = 5000;
++		struct pci_dev *pdev = to_pci_dev(ehci->hcd.self.controller);
++
++		/* request handoff to OS */
++		cap |= 1 << 24;
++		pci_write_config_dword(pdev, where, cap);
++
++		/* and wait a while for it to happen */
++		do {
++			msleep(10);
++			msec -= 10;
++			pci_read_config_dword(pdev, where, &cap);
++		} while ((cap & (1 << 16)) && msec);
++		if (cap & (1 << 16)) {
++			ehci_err (ehci, "BIOS handoff failed (%d, %04x)\n",
++				where, cap);
++			// some BIOS versions seem buggy...
++			// return 1;
++			ehci_warn (ehci, "continuing after BIOS bug...\n");
++			return 0;
++		}
++		ehci_dbg (ehci, "BIOS handoff succeeded\n");
++	}
++	return 0;
++}
++
++/* called by khubd or root hub init threads */
++static int ehci_pci_reset (struct usb_hcd *hcd)
++{
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++	u32			temp;
++	unsigned		count = 256/4;
++
++	spin_lock_init (&ehci->lock);
++
++	ehci->caps = hcd->regs;
++	ehci->regs = hcd->regs + HC_LENGTH (readl (&ehci->caps->hc_capbase));
++	dbg_hcs_params (ehci, "reset");
++	dbg_hcc_params (ehci, "reset");
++
++	/* EHCI 0.96 and later may have "extended capabilities" */
++	if (hcd->self.controller->bus == &pci_bus_type) {
++		struct pci_dev	*pdev = to_pci_dev(ehci->hcd.self.controller);
++
++		/* AMD8111 EHCI doesn't work, according to AMD errata */
++		if ((pdev->vendor == PCI_VENDOR_ID_AMD)
++				&& (pdev->device == 0x7463)) {
++			ehci_info (ehci, "ignoring AMD8111 (errata)\n");
++			return -EIO;
++		}
++
++		temp = HCC_EXT_CAPS (readl (&ehci->caps->hcc_params));
++	} else
++		temp = 0;
++	while (temp && count--) {
++		u32		cap;
++
++		pci_read_config_dword (to_pci_dev(ehci->hcd.self.controller),
++				temp, &cap);
++		ehci_dbg (ehci, "capability %04x at %02x\n", cap, temp);
++		switch (cap & 0xff) {
++		case 1:			/* BIOS/SMM/... handoff */
++			if (bios_handoff (ehci, temp, cap) != 0)
++				return -EOPNOTSUPP;
++			break;
++		case 0:			/* illegal reserved capability */
++			ehci_warn (ehci, "illegal capability!\n");
++			cap = 0;
++			/* FALLTHROUGH */
++		default:		/* unknown */
++			break;
++		}
++		temp = (cap >> 8) & 0xff;
++	}
++	if (!count) {
++		ehci_err (ehci, "bogus capabilities ... PCI problems!\n");
++		return -EIO;
++	}
++
++	/* cache this readonly data; minimize PCI reads */
++	ehci->hcs_params = readl (&ehci->caps->hcs_params);
++
++	/* at least the Genesys GL880S needs fixup here */
++	temp = HCS_N_CC(ehci->hcs_params) * HCS_N_PCC(ehci->hcs_params);
++	temp &= 0x0f;
++	if (temp && HCS_N_PORTS(ehci->hcs_params) > temp) {
++		temp |= (ehci->hcs_params & ~0xf);
++		ehci->hcs_params = temp;
++	}
++
++	/* force HC to halt state */
++	return ehci_halt (ehci);
++}
++
++static int ehci_pci_start (struct usb_hcd *hcd)
++{
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++	int result = 0;
++
++	if (hcd->self.controller->bus == &pci_bus_type) {
++		struct pci_dev		*pdev;
++		u16			port_wake;
++
++		pdev = to_pci_dev(hcd->self.controller);
++
++		/* Serial Bus Release Number is at PCI 0x60 offset */
++		pci_read_config_byte(pdev, 0x60, &ehci->sbrn);
++
++		/* port wake capability, reported by boot firmware */
++		pci_read_config_word(pdev, 0x62, &port_wake);
++		hcd->can_wakeup = (port_wake & 1) != 0;
++
++		/* help hc dma work well with cachelines */
++		result = pci_set_mwi(pdev);
++		if (result)
++			ehci_dbg(ehci, "unable to enable MWI - not fatal.\n");
++	}
++
++	return ehci_run (hcd);
++
++}
++
++/* always called by thread; normally rmmod */
++
++static void ehci_pci_stop (struct usb_hcd *hcd)
++{
++	ehci_stop (hcd);
++}
++/*-------------------------------------------------------------------------*/
++
++#ifdef	CONFIG_PM
++
++/* suspend/resume, section 4.3 */
++
++/* These routines rely on the bus (pci, platform, etc)
++ * to handle powerdown and wakeup, and currently also on
++ * transceivers that don't need any software attention to set up
++ * the right sort of wakeup.
++ */
++
++static int ehci_pci_suspend (struct usb_hcd *hcd, u32 state)
++{
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++
++	if (time_before (jiffies, ehci->next_statechange))
++		msleep (100);
++
++#ifdef	CONFIG_USB_SUSPEND
++	(void) usb_suspend_device (hcd->self.root_hub, state);
++#else
++	usb_lock_device (hcd->self.root_hub);
++	(void) ehci_hub_suspend (hcd);
++	usb_unlock_device (hcd->self.root_hub);
++#endif
++
++	// save (PCI) FLADJ in case of Vaux power loss
++	// ... we'd only use it to handle clock skew
++
++	return 0;
++}
++
++static int ehci_pci_resume (struct usb_hcd *hcd)
++{
++	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
++	unsigned		port;
++	struct usb_device	*root = hcd->self.root_hub;
++	int			retval = -EINVAL;
++
++	// maybe restore (PCI) FLADJ
++
++	if (time_before (jiffies, ehci->next_statechange))
++		msleep (100);
++
++	/* If any port is suspended, we know we can/must resume the HC. */
++	for (port = HCS_N_PORTS (ehci->hcs_params); port > 0; ) {
++		u32	status;
++		port--;
++		status = readl (&ehci->regs->port_status [port]);
++		if (!(status & PORT_POWER))
++			continue;
++		if (status & PORT_SUSPEND) {
++			down (&hcd->self.root_hub->serialize);
++			retval = ehci_hub_resume (hcd);
++			up (&hcd->self.root_hub->serialize);
++			break;
++		}
++		if (!root->children [port])
++			continue;
++		dbg_port (ehci, __FUNCTION__, port + 1, status);
++		usb_set_device_state (root->children[port],
++					USB_STATE_NOTATTACHED);
++	}
++
++	/* Else reset, to cope with power loss or flush-to-storage
++	 * style "resume" having activated BIOS during reboot.
++	 */
++	if (port == 0) {
++		(void) ehci_halt (ehci);
++		(void) ehci_reset (ehci);
++		(void) ehci_pci_reset (hcd);
++
++		/* emptying the schedule aborts any urbs */
++		spin_lock_irq (&ehci->lock);
++		if (ehci->reclaim)
++			ehci->reclaim_ready = 1;
++		ehci_work (ehci, NULL);
++		spin_unlock_irq (&ehci->lock);
++
++		/* restart; khubd will disconnect devices */
++		retval = ehci_run (hcd);
++
++		/* here we "know" root ports should always stay powered;
++		 * but some controllers may lost all power.
++		 */
++		ehci_port_power (ehci, 1);
++	}
++
++	return retval;
++}
++
++#endif
++
++
++static const struct hc_driver ehci_pci_hc_driver = {
++	.description =		hcd_name,
++
++	/*
++	 * generic hardware linkage
++	 */
++	.irq =			ehci_irq,
++	.flags =		HCD_MEMORY | HCD_USB2,
++
++	/*
++	 * basic lifecycle operations
++	 */
++	.reset =		ehci_pci_reset,
++	.start =		ehci_pci_start,
++#ifdef	CONFIG_PM
++	.suspend =		ehci_pci_suspend,
++	.resume =		ehci_pci_resume,
++#endif
++	.stop =			ehci_pci_stop,
++
++#if 1
++	/*
++	 * memory lifecycle (except per-request)
++	 */
++	.hcd_alloc =		ehci_hcd_alloc,
++#endif
++
++	/*
++	 * managing i/o requests and associated device resources
++	 */
++	.urb_enqueue =		ehci_urb_enqueue,
++	.urb_dequeue =		ehci_urb_dequeue,
++	.endpoint_disable =	ehci_endpoint_disable,
++
++	/*
++	 * scheduling support
++	 */
++	.get_frame_number =	ehci_get_frame,
++
++	/*
++	 * root hub support
++	 */
++	.hub_status_data =	ehci_hub_status_data,
++	.hub_control =		ehci_hub_control,
++	.hub_suspend =		ehci_hub_suspend,
++	.hub_resume =		ehci_hub_resume,
++};
++
++/*-------------------------------------------------------------------------*/
++
++/* PCI driver selection metadata; PCI hotplugging uses this */
++static const struct pci_device_id pci_ids [] = { {
++	/* handle any USB 2.0 EHCI controller */
++	PCI_DEVICE_CLASS(((PCI_CLASS_SERIAL_USB << 8) | 0x20), ~0),
++	.driver_data =	(unsigned long) &ehci_pci_hc_driver,
++	},
++	{ /* end: all zeroes */ }
++};
++MODULE_DEVICE_TABLE (pci, pci_ids);
++
++/* pci driver glue; this is a "new style" PCI driver module */
++static struct pci_driver ehci_pci_driver = {
++	.name =		(char *) hcd_name,
++	.id_table =	pci_ids,
++
++	.probe =	usb_hcd_pci_probe,
++	.remove =	usb_hcd_pci_remove,
++
++#ifdef	CONFIG_PM
++	.suspend =	usb_hcd_pci_suspend,
++	.resume =	usb_hcd_pci_resume,
++#endif
++};
++static int __init ehci_hcd_pci_init (void)
++{
++	if (usb_disabled())
++		return -ENODEV;
++
++	pr_debug ("%s: block sizes: qh %Zd qtd %Zd itd %Zd sitd %Zd\n",
++		hcd_name,
++		sizeof (struct ehci_qh), sizeof (struct ehci_qtd),
++		sizeof (struct ehci_itd), sizeof (struct ehci_sitd));
++
++	return pci_register_driver (&ehci_pci_driver);
++}
++module_init (ehci_hcd_pci_init);
++
++static void __exit ehci_hcd_pci_cleanup (void)
++{
++	pci_unregister_driver (&ehci_pci_driver);
++}
++module_exit (ehci_hcd_pci_cleanup);
++
+Index: linux-2.6.10/drivers/usb/host/ehci.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/host/ehci.h
++++ linux-2.6.10/drivers/usb/host/ehci.h
+@@ -98,6 +98,7 @@ struct ehci_hcd {			/* one per controlle
+ #else
+ #	define COUNT(x) do {} while (0)
+ #endif
++	u8			sbrn;		/* packed release number */
+ };
+ 
+ /* unwrap an HCD pointer to get an EHCI_HCD pointer */ 
+Index: linux-2.6.10/mvl_patches/pro-0520.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0520.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(520);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

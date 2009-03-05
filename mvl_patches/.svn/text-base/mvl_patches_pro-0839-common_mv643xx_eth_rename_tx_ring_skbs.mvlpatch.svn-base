@@ -1,0 +1,436 @@
+#! /usr/bin/env bash
+# Patch: -common_mv643xx_eth_rename_tx_ring_skbs
+# Date: Tue Aug  8 20:56:27 2006
+# Source: MontaVista Software, Inc.
+# MR: 16579
+# Type: Cleanup
+# Disposition: Submitted to netdev@vger.kernel.org
+# Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+# Description:
+# Rename mp->tx_ring_skbs to mp->tx_desc_count
+# 
+# This field is actually a count of tx descriptors currently in use.
+# Since there may be multiple descriptors per skb, it is not the
+# same as the number of skbs in the ring.
+# 
+# Also change tx_ring_skbs to rx_desc_count to be consistent.
+# 
+# Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+# 
+
+PATCHNUM=839
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16579
+Type: Cleanup
+Disposition: Submitted to netdev@vger.kernel.org
+Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+Description:
+Rename mp->tx_ring_skbs to mp->tx_desc_count
+
+This field is actually a count of tx descriptors currently in use.
+Since there may be multiple descriptors per skb, it is not the
+same as the number of skbs in the ring.
+
+Also change tx_ring_skbs to rx_desc_count to be consistent.
+
+Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -167,11 +167,11 @@ static void mv643xx_eth_rx_task(void *da
+ 	if (test_and_set_bit(0, &mp->rx_task_busy))
+ 		panic("%s: Error in test_set_bit / clear_bit", dev->name);
+ 
+-	while (mp->rx_ring_skbs < (mp->rx_ring_size - 5)) {
++	while (mp->rx_desc_count < (mp->rx_ring_size - 5)) {
+ 		skb = dev_alloc_skb(RX_SKB_SIZE + DMA_ALIGN);
+ 		if (!skb)
+ 			break;
+-		mp->rx_ring_skbs++;
++		mp->rx_desc_count++;
+ 		unaligned = (u32)skb->data & (DMA_ALIGN - 1);
+ 		if (unaligned)
+ 			skb_reserve(skb, DMA_ALIGN - unaligned);
+@@ -192,7 +192,7 @@ static void mv643xx_eth_rx_task(void *da
+ 	 * If RX ring is empty of SKB, set a timer to try allocating
+ 	 * again in a later time .
+ 	 */
+-	if ((mp->rx_ring_skbs == 0) && (mp->rx_timer_flag == 0)) {
++	if ((mp->rx_desc_count == 0) && (mp->rx_timer_flag == 0)) {
+ 		printk(KERN_INFO "%s: Rx ring is empty\n", dev->name);
+ 		/* After 100mSec */
+ 		mp->timeout.expires = jiffies + (HZ / 10);
+@@ -392,7 +392,7 @@ static int mv643xx_eth_receive_queue(str
+ #else
+ 	while (eth_port_receive(mp, &pkt_info) == ETH_OK) {
+ #endif
+-		mp->rx_ring_skbs--;
++		mp->rx_desc_count--;
+ 		received_packets++;
+ 
+ 		/* Update statistics. Note byte count includes 4 byte CRC count */
+@@ -492,7 +492,7 @@ static irqreturn_t mv643xx_eth_int_handl
+ 		/* UDP change : We may need this */
+ 		if ((eth_int_cause_ext & 0x0000ffff) &&
+ 		    (mv643xx_eth_free_tx_queue(dev, eth_int_cause_ext) == 0) &&
+-		    (mp->tx_ring_size > mp->tx_ring_skbs + MAX_DESCS_PER_SKB))
++		    (mp->tx_ring_size > mp->tx_desc_count + MAX_DESCS_PER_SKB))
+ 			netif_wake_queue(dev);
+ #ifdef MV643XX_NAPI
+ 	} else {
+@@ -776,7 +776,7 @@ static int mv643xx_eth_open(struct net_d
+ 	}
+ 
+ 	/* Allocate TX ring */
+-	mp->tx_ring_skbs = 0;
++	mp->tx_desc_count = 0;
+ 	size = mp->tx_ring_size * sizeof(struct eth_tx_desc);
+ 	mp->tx_desc_area_size = size;
+ 
+@@ -801,7 +801,7 @@ static int mv643xx_eth_open(struct net_d
+ 	ether_init_tx_desc_ring(mp);
+ 
+ 	/* Allocate RX ring */
+-	mp->rx_ring_skbs = 0;
++	mp->rx_desc_count = 0;
+ 	size = mp->rx_ring_size * sizeof(struct eth_rx_desc);
+ 	mp->rx_desc_area_size = size;
+ 
+@@ -878,17 +878,17 @@ static void mv643xx_eth_free_tx_rings(st
+ 	mv_write(MV643XX_ETH_TRANSMIT_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
+ 
+ 	/* Free outstanding skb's on TX rings */
+-	for (curr = 0; mp->tx_ring_skbs && curr < mp->tx_ring_size; curr++) {
++	for (curr = 0; mp->tx_desc_count && curr < mp->tx_ring_size; curr++) {
+ 		skb = mp->tx_skb[curr];
+ 		if (skb) {
+-			mp->tx_ring_skbs -= skb_shinfo(skb)->nr_frags;
++			mp->tx_desc_count -= skb_shinfo(skb)->nr_frags;
+ 			dev_kfree_skb(skb);
+-			mp->tx_ring_skbs--;
++			mp->tx_desc_count--;
+ 		}
+ 	}
+-	if (mp->tx_ring_skbs)
++	if (mp->tx_desc_count)
+ 		printk("%s: Error on Tx descriptor free - could not free %d"
+-				" descriptors\n", dev->name, mp->tx_ring_skbs);
++				" descriptors\n", dev->name, mp->tx_desc_count);
+ 
+ 	/* Free TX ring */
+ 	if (mp->tx_sram_size)
+@@ -908,18 +908,18 @@ static void mv643xx_eth_free_rx_rings(st
+ 	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
+ 
+ 	/* Free preallocated skb's on RX rings */
+-	for (curr = 0; mp->rx_ring_skbs && curr < mp->rx_ring_size; curr++) {
++	for (curr = 0; mp->rx_desc_count && curr < mp->rx_ring_size; curr++) {
+ 		if (mp->rx_skb[curr]) {
+ 			dev_kfree_skb(mp->rx_skb[curr]);
+-			mp->rx_ring_skbs--;
++			mp->rx_desc_count--;
+ 		}
+ 	}
+ 
+-	if (mp->rx_ring_skbs)
++	if (mp->rx_desc_count)
+ 		printk(KERN_ERR
+ 			"%s: Error in freeing Rx Ring. %d skb's still"
+ 			" stuck in RX Ring - ignoring them\n", dev->name,
+-			mp->rx_ring_skbs);
++			mp->rx_desc_count);
+ 	/* Free RX ring */
+ 	if (mp->rx_sram_size)
+ 		iounmap(mp->p_rx_desc_area);
+@@ -989,7 +989,8 @@ static void mv643xx_tx(struct net_device
+ 	}
+ 
+ 	if (netif_queue_stopped(dev) &&
+-			mp->tx_ring_size > mp->tx_ring_skbs + MAX_DESCS_PER_SKB)
++			mp->tx_ring_size >
++					mp->tx_desc_count + MAX_DESCS_PER_SKB)
+ 		netif_wake_queue(dev);
+ }
+ 
+@@ -1081,7 +1082,7 @@ static int mv643xx_eth_start_xmit(struct
+ 	}
+ 
+ 	/* This is a hard error, log it. */
+-	if ((mp->tx_ring_size - mp->tx_ring_skbs) <=
++	if ((mp->tx_ring_size - mp->tx_desc_count) <=
+ 					(skb_shinfo(skb)->nr_frags + 1)) {
+ 		netif_stop_queue(dev);
+ 		printk(KERN_ERR
+@@ -1258,7 +1259,7 @@ static int mv643xx_eth_start_xmit(struct
+ 	/* Check if TX queue can handle another skb. If not, then
+ 	 * signal higher layers to stop requesting TX
+ 	 */
+-	if (mp->tx_ring_size <= (mp->tx_ring_skbs + MAX_DESCS_PER_SKB))
++	if (mp->tx_ring_size <= (mp->tx_desc_count + MAX_DESCS_PER_SKB))
+ 		/*
+ 		 * Stop getting skb's from upper layers.
+ 		 * Getting skb's from upper layers will be enabled again after
+@@ -2561,8 +2562,8 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 		return ETH_ERROR;
+ 	}
+ 
+-	mp->tx_ring_skbs++;
+-	BUG_ON(mp->tx_ring_skbs > mp->tx_ring_size);
++	mp->tx_desc_count++;
++	BUG_ON(mp->tx_desc_count > mp->tx_ring_size);
+ 
+ 	/* Get the Tx Desc ring indexes */
+ 	tx_desc_curr = mp->tx_curr_desc_q;
+@@ -2630,8 +2631,8 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 	if (mp->tx_resource_err)
+ 		return ETH_QUEUE_FULL;
+ 
+-	mp->tx_ring_skbs++;
+-	BUG_ON(mp->tx_ring_skbs > mp->tx_ring_size);
++	mp->tx_desc_count++;
++	BUG_ON(mp->tx_desc_count > mp->tx_ring_size);
+ 
+ 	/* Get the Tx Desc ring indexes */
+ 	tx_desc_curr = mp->tx_curr_desc_q;
+@@ -2745,8 +2746,8 @@ static ETH_FUNC_RET_STATUS eth_tx_return
+ 	/* Any Tx return cancels the Tx resource error status */
+ 	mp->tx_resource_err = 0;
+ 
+-	BUG_ON(mp->tx_ring_skbs == 0);
+-	mp->tx_ring_skbs--;
++	BUG_ON(mp->tx_desc_count == 0);
++	mp->tx_desc_count--;
+ 
+ out:
+ 	spin_unlock_irqrestore(&mp->lock, flags);
+Index: linux-2.6.10/drivers/net/mv643xx_eth.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.h
++++ linux-2.6.10/drivers/net/mv643xx_eth.h
+@@ -372,12 +372,12 @@ struct mv643xx_private {
+ 	spinlock_t lock;
+ 	/* Size of Tx Ring per queue */
+ 	unsigned int tx_ring_size;
+-	/* Ammont of SKBs outstanding on Tx queue */
+-	unsigned int tx_ring_skbs;
++	/* Number of tx descriptors in use */
++	unsigned int tx_desc_count;
+ 	/* Size of Rx Ring per queue */
+ 	unsigned int rx_ring_size;
+-	/* Ammount of SKBs allocated to Rx Ring per queue */
+-	unsigned int rx_ring_skbs;
++	/* Number of rx descriptors in use */
++	unsigned int rx_desc_count;
+ 
+ 	/*
+ 	 * rx_task used to fill RX ring out of bottom half context
+Index: linux-2.6.10/mvl_patches/pro-0839.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0839.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(839);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

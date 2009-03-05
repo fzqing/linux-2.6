@@ -1,0 +1,1799 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_emac
+# Date: Mon Mar  6 15:02:19 2006
+# Source: MontaVista Software, Inc.
+# MR: 15265
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov  <akonovalov@ru.mvista.com>
+# Description:
+#     Linux driver (aka "adapter") for 10/100 Mb EMAC IP.
+# 
+
+PATCHNUM=331
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15265
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov  <akonovalov@ru.mvista.com>
+Description:
+    Linux driver (aka "adapter") for 10/100 Mb EMAC IP.
+
+ drivers/net/Kconfig                     |    7 
+ drivers/net/Makefile                    |    1 
+ drivers/net/xilinx_emac/Makefile        |   14 
+ drivers/net/xilinx_emac/adapter.c       |  831 ++++++++++++++++++++++++++++++++
+ drivers/net/xilinx_emac/adapter.h       |  137 +++++
+ drivers/net/xilinx_emac/adapter_fifo.c  |  203 +++++++
+ drivers/net/xilinx_emac/adapter_sgdma.c |  320 ++++++++++++
+ mvl_patches/pro-0331.c                  |   16 
+ 8 files changed, 1529 insertions(+)
+
+Index: linux-2.6.10/drivers/net/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/net/Kconfig
++++ linux-2.6.10/drivers/net/Kconfig
+@@ -1252,6 +1252,13 @@ config IBM_EMAC_TAH
+ 	depends on IBM_EMAC && 440GX
+ 	default y
+ 
++config XILINX_EMAC
++	tristate "Xilinx 10/100 Mbit EMAC support"
++	depends on XILINX_VIRTEX
++	select XILINX_EDK
++	help
++	  This driver supports 10/100 Mbit EMAC IP from Xilinx EDK
++
+ config NET_PCI
+ 	bool "EISA, VLB, PCI and on board controllers"
+ 	depends on NET_ETHERNET && (ISA || EISA || PCI)
+Index: linux-2.6.10/drivers/net/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/net/Makefile
++++ linux-2.6.10/drivers/net/Makefile
+@@ -187,6 +187,7 @@ obj-$(CONFIG_IBMVETH) += ibmveth.o
+ obj-$(CONFIG_S2IO) += s2io.o
+ obj-$(CONFIG_SMC91X) += smc91x.o
+ obj-$(CONFIG_FEC_8XX) += fec_8xx/
++obj-$(CONFIG_XILINX_EMAC) += xilinx_emac/
+ 
+ obj-$(CONFIG_ARM) += arm/
+ obj-$(CONFIG_NET_FC) += fc/
+Index: linux-2.6.10/drivers/net/xilinx_emac/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/xilinx_emac/Makefile
+@@ -0,0 +1,14 @@
++#
++# Makefile for the Xilinx 10/100 Mbit EMAC driver
++#
++
++EXTRA_CFLAGS		+= -Idrivers/xilinx_edk
++
++# The Linux adapter for the Xilinx driver code.
++xilinx_emac-objs	:= adapter.o adapter_fifo.o adapter_sgdma.o
++
++# The Xilinx OS independent code.
++xilinx_emac-objs	+= xemac.o xemac_intr.o xemac_intr_dma.o \
++			   xemac_intr_fifo.o xemac_options.o xemac_phy.o
++
++obj-$(CONFIG_XILINX_EMAC) += xilinx_emac.o
+Index: linux-2.6.10/drivers/net/xilinx_emac/adapter.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/xilinx_emac/adapter.c
+@@ -0,0 +1,831 @@
++/*
++ * adapter.c
++ *
++ * Xilinx Ethernet Adapter component to interface XEmac component to Linux
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2005 (c) MontaVista Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++/*
++ * This driver is a bit unusual in that it is composed of two logical
++ * parts where one part is the OS independent code and the other part is
++ * the OS dependent code.  Xilinx provides their drivers split in this
++ * fashion.  This file represents the Linux OS dependent part known as
++ * the Linux adapter.  The other files in this directory are the OS
++ * independent files as provided by Xilinx with no changes made to them.
++ * The names exported by those files begin with XEmac_.  All functions
++ * in this file that are called by Linux have names that begin with
++ * xenet_.  The functions in this file that have Handler in their name
++ * are registered as callbacks with the underlying Xilinx OS independent
++ * layer.  Any other functions are static helper functions.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/mii.h>
++#include <linux/errno.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/xilinx_devices.h>
++
++#include <asm/io.h>
++
++#include "adapter.h"
++#include "xipif_v1_23_b.h"
++
++#define TX_TIMEOUT (3*HZ)	/* Transmission timeout is 3 seconds. */
++
++#define XEMAC_MAX_DEVICE_ID 4
++static XEmac_Config * xemac_cfgs[XEMAC_MAX_DEVICE_ID];
++
++/*
++ * Lookup the device configuration based on the unique device ID.
++ * Prototyped in xemac.h.
++ */
++inline XEmac_Config * XEmac_LookupConfig(u16 DeviceId)
++{
++	return (DeviceId < XEMAC_MAX_DEVICE_ID) ?
++		xemac_cfgs[DeviceId] : NULL;
++}
++
++/*
++ * Helper function to reset the underlying hardware.  This is called
++ * when we get into such deep trouble that we don't know how to handle
++ * otherwise.
++ */
++void xenet_reset(struct net_device *ndev, DUPLEX duplex)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	struct sk_buff *tskb;
++	u32 Options;
++	u8 IfgPart1;
++	u8 IfgPart2;
++	u8 SendThreshold;
++	u32 SendWaitBound;
++	u8 RecvThreshold;
++	u32 RecvWaitBound;
++	unsigned long flags;
++
++	/* Shouldn't really be necessary, but shouldn't hurt. */
++	netif_stop_queue(ndev);
++
++	/*
++	 * XEmac_Reset puts the device back to the default state.  We need
++	 * to save all the settings we don't already know, reset, restore
++	 * the settings, and then restart the emac.
++	 */
++	XEmac_GetInterframeGap(&lp->Emac, &IfgPart1, &IfgPart2);
++	Options = XEmac_GetOptions(&lp->Emac);
++	switch (duplex) {
++	case HALF_DUPLEX:
++		Options &= ~XEM_FDUPLEX_OPTION;
++		break;
++	case FULL_DUPLEX:
++		Options |= XEM_FDUPLEX_OPTION;
++		break;
++	case UNKNOWN_DUPLEX:
++		break;
++	}
++
++	if (XEmac_mIsSgDma(&lp->Emac)) {
++		/*
++		 * The following four functions will return an error if we are
++		 * not doing scatter-gather DMA.  We just checked that so we
++		 * can safely ignore the return values.  We cast them to void
++		 * to make that explicit.
++		 */
++		(void) XEmac_GetPktThreshold(&lp->Emac, XEM_SEND,
++					     &SendThreshold);
++		(void) XEmac_GetPktWaitBound(&lp->Emac, XEM_SEND,
++					     &SendWaitBound);
++		(void) XEmac_GetPktThreshold(&lp->Emac, XEM_RECV,
++					     &RecvThreshold);
++		(void) XEmac_GetPktWaitBound(&lp->Emac, XEM_RECV,
++					     &RecvWaitBound);
++	}
++
++	XEmac_Reset(&lp->Emac);
++
++	/*
++	 * The following three functions will return an error if the
++	 * EMAC is already started.  We just stopped it by calling
++	 * XEmac_Reset() so we can safely ignore the return values.
++	 * We cast them to void to make that explicit.
++	 */
++	(void) XEmac_SetMacAddress(&lp->Emac, ndev->dev_addr);
++	(void) XEmac_SetInterframeGap(&lp->Emac, IfgPart1, IfgPart2);
++	(void) XEmac_SetOptions(&lp->Emac, Options);
++	if (XEmac_mIsSgDma(&lp->Emac)) {
++		/*
++		 * The following four functions will return an error if
++		 * we are not doing scatter-gather DMA or if the EMAC is
++		 * already started.  We just checked that we are indeed
++		 * doing scatter-gather and we just stopped the EMAC so
++		 * we can safely ignore the return values.  We cast them
++		 * to void to make that explicit.
++		 */
++		(void) XEmac_SetPktThreshold(&lp->Emac, XEM_SEND,
++					     SendThreshold);
++		(void) XEmac_SetPktWaitBound(&lp->Emac, XEM_SEND,
++					     SendWaitBound);
++		(void) XEmac_SetPktThreshold(&lp->Emac, XEM_RECV,
++					     RecvThreshold);
++		(void) XEmac_SetPktWaitBound(&lp->Emac, XEM_RECV,
++					     RecvWaitBound);
++	}
++
++	/*
++	 * XEmac_Start returns an error when: it is already started, the send
++	 * and receive handlers are not set, or a scatter-gather DMA list is
++	 * missing.  None of these can happen at this point, so we cast the
++	 * return to void to make that explicit.
++	 */
++	(void) XEmac_Start(&lp->Emac);
++
++	/* Make sure that the send handler and we don't both free the skb. */
++	spin_lock_irqsave(&lp->skb_lock, flags);
++	tskb = lp->saved_skb;
++	lp->saved_skb = NULL;
++	spin_unlock_irqrestore(&lp->skb_lock, flags);
++	if (tskb)
++		dev_kfree_skb(tskb);
++
++	/* We're all ready to go.  Start the queue in case it was stopped. */
++	netif_wake_queue(ndev);
++}
++
++static int get_phy_status(struct net_device *ndev, DUPLEX * duplex, int *linkup)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	u16 reg;
++	XStatus xs;
++
++	xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_BMCR, &reg);
++	if (xs != XST_SUCCESS) {
++		printk(KERN_ERR
++		       "%s: Could not read PHY control register; error %d\n",
++		       ndev->name, xs);
++		return -1;
++	}
++
++	if (!(reg & BMCR_ANENABLE)) {
++		/*
++		 * Auto-negotiation is disabled so the full duplex bit in
++		 * the control register tells us if the PHY is running
++		 * half or full duplex.
++		 */
++		*duplex = (reg & BMCR_FULLDPLX) ? FULL_DUPLEX : HALF_DUPLEX;
++	} else {
++		/*
++		 * Auto-negotiation is enabled.  Figure out what was
++		 * negotiated by looking for the best mode in the union
++		 * of what we and our partner advertise.
++		 */
++		u16 advertise, partner, negotiated;
++
++		xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr,
++				   MII_ADVERTISE, &advertise);
++		if (xs != XST_SUCCESS) {
++			printk(KERN_ERR
++			       "%s: Could not read PHY advertisement; error %d\n",
++			       ndev->name, xs);
++			return -1;
++		}
++		xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_LPA, &partner);
++		if (xs != XST_SUCCESS) {
++			printk(KERN_ERR
++			       "%s: Could not read PHY LPA; error %d\n",
++			       ndev->name, xs);
++			return -1;
++		}
++
++		negotiated = advertise & partner & ADVERTISE_ALL;
++		if (negotiated & ADVERTISE_100FULL)
++			*duplex = FULL_DUPLEX;
++		else if (negotiated & ADVERTISE_100HALF)
++			*duplex = HALF_DUPLEX;
++		else if (negotiated & ADVERTISE_10FULL)
++			*duplex = FULL_DUPLEX;
++		else
++			*duplex = HALF_DUPLEX;
++	}
++
++	xs = XEmac_PhyRead(&lp->Emac, lp->mii_addr, MII_BMSR, &reg);
++	if (xs != XST_SUCCESS) {
++		printk(KERN_ERR
++		       "%s: Could not read PHY status register; error %d\n",
++		       ndev->name, xs);
++		return -1;
++	}
++
++	*linkup = (reg & BMSR_LSTATUS) != 0;
++
++	return 0;
++}
++
++/*
++ * This routine is used for two purposes.  The first is to keep the
++ * EMAC's duplex setting in sync with the PHY's.  The second is to keep
++ * the system apprised of the state of the link.  Note that this driver
++ * does not configure the PHY.  Either the PHY should be configured for
++ * auto-negotiation or it should be handled by something like mii-tool.
++ */
++static void poll_mii(unsigned long data)
++{
++	struct net_device *ndev = (struct net_device *) data;
++	struct net_local *lp = netdev_priv(ndev);
++	u32 Options;
++	DUPLEX phy_duplex, mac_duplex;
++	int phy_carrier, netif_carrier;
++
++	/* First, find out what's going on with the PHY. */
++	if (get_phy_status(ndev, &phy_duplex, &phy_carrier)) {
++		printk(KERN_ERR "%s: Terminating link monitoring.\n",
++		       ndev->name);
++		return;
++	}
++
++	/* Second, figure out if we have the EMAC in half or full duplex. */
++	Options = XEmac_GetOptions(&lp->Emac);
++	mac_duplex = (Options & XEM_FDUPLEX_OPTION) ? FULL_DUPLEX : HALF_DUPLEX;
++
++	/* Now see if there is a mismatch. */
++	if (mac_duplex != phy_duplex) {
++		/*
++		 * Make sure that no interrupts come in that could cause
++		 * reentrancy problems in reset.
++		 */
++		disable_irq(ndev->irq);
++		xenet_reset(ndev, phy_duplex);
++		enable_irq(ndev->irq);
++	}
++
++	netif_carrier = netif_carrier_ok(ndev) != 0;
++
++	if (phy_carrier != netif_carrier) {
++		if (phy_carrier) {
++			printk(KERN_INFO "%s: Link carrier restored.\n",
++			       ndev->name);
++			netif_carrier_on(ndev);
++		} else {
++			printk(KERN_INFO "%s: Link carrier lost.\n", ndev->name);
++			netif_carrier_off(ndev);
++		}
++	}
++
++	/* Set up the timer so we'll get called again in 2 seconds. */
++	lp->phy_timer.expires = jiffies + 2 * HZ;
++	add_timer(&lp->phy_timer);
++}
++
++static void xenet_tx_timeout(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++
++	printk("%s: Exceeded transmit timeout of %lu ms.  Resetting emac.\n",
++	       ndev->name, TX_TIMEOUT * 1000UL / HZ);
++
++	lp->net_stats.tx_errors++;
++
++	/*
++	 * Make sure that no interrupts come in that could cause reentrancy
++	 * problems in reset.
++	 */
++	disable_irq(ndev->irq);
++	xenet_reset(ndev, UNKNOWN_DUPLEX);
++	enable_irq(ndev->irq);
++}
++
++/*
++ * The callback function for errors.
++ */
++static void ErrorHandler(void *CallbackRef, XStatus Code)
++{
++	struct net_device *ndev = (struct net_device *) CallbackRef;
++	int need_reset;
++	need_reset = status_requires_reset(Code);
++
++	printk(KERN_ERR "%s: device error %d%s\n",
++	       ndev->name, Code, need_reset ? ", resetting device." : "");
++	if (need_reset)
++		xenet_reset(ndev, UNKNOWN_DUPLEX);
++}
++
++/*
++ * This routine is registered with the OS as the function to call when
++ * the EMAC interrupts.  It in turn, calls the Xilinx OS independent
++ * interrupt function.  There are different interrupt functions for FIFO
++ * and scatter-gather so we just set a pointer (Isr) into our private
++ * data so we don't have to figure it out here.  The Xilinx OS
++ * independent interrupt function will in turn call any callbacks that
++ * we have registered for various conditions.
++ */
++static irqreturn_t xenet_interrupt(int irq, void *dev_id, struct pt_regs *regs)
++{
++	struct net_device *ndev = (struct net_device *) dev_id;
++	struct net_local *lp = netdev_priv(ndev);
++
++	/* Call it. */
++	(*(lp->Isr)) (&lp->Emac);
++
++	return IRQ_HANDLED;
++}
++
++/**********************
++ * net_device methods *
++ **********************/
++
++static int xenet_open(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	u32 Options;
++	DUPLEX phy_duplex, mac_duplex;
++	int phy_carrier;
++
++	/*
++	 * Just to be safe, stop the device first.  If the device is already
++	 * stopped, an error will be returned.  In this case, we don't really
++	 * care, so cast it to void to make it explicit.
++	 */
++	(void) XEmac_Stop(&lp->Emac);
++
++	/* Set the MAC address each time opened. */
++	if (XEmac_SetMacAddress(&lp->Emac, ndev->dev_addr) != XST_SUCCESS) {
++		printk(KERN_ERR "%s: Could not set MAC address.\n", ndev->name);
++		return -EIO;
++	}
++
++	/*
++	 * If the device is not configured for polled mode, connect to the
++	 * interrupt controller and enable interrupts.  Currently, there
++	 * isn't any code to set polled mode, so this check is probably
++	 * superfluous.
++	 */
++	Options = XEmac_GetOptions(&lp->Emac);
++	if ((Options & XEM_POLLED_OPTION) == 0) {
++		int retval;
++		/* Grab the IRQ */
++		retval =
++		    request_irq(ndev->irq, &xenet_interrupt, 0, ndev->name, ndev);
++		if (retval) {
++			printk(KERN_ERR
++			       "%s: Could not allocate interrupt %d.\n",
++			       ndev->name, ndev->irq);
++			return retval;
++		}
++	}
++
++	/* Set the EMAC's duplex setting based upon what the PHY says. */
++	if (!get_phy_status(ndev, &phy_duplex, &phy_carrier)) {
++		/* We successfully got the PHY status. */
++		mac_duplex = ((Options & XEM_FDUPLEX_OPTION)
++			      ? FULL_DUPLEX : HALF_DUPLEX);
++		if (mac_duplex != phy_duplex) {
++			switch (phy_duplex) {
++			case HALF_DUPLEX: Options &= ~XEM_FDUPLEX_OPTION; break;
++			case FULL_DUPLEX: Options |=  XEM_FDUPLEX_OPTION; break;
++			case UNKNOWN_DUPLEX: break;
++			}
++			/*
++			 * The following function will return an error
++			 * if the EMAC is already started.  We know it
++			 * isn't started so we can safely ignore the
++			 * return value.  We cast it to void to make
++			 * that explicit.
++			 */
++			(void) XEmac_SetOptions(&lp->Emac, Options);
++		}
++	}
++
++	if (XEmac_Start(&lp->Emac) != XST_SUCCESS) {
++		printk(KERN_ERR "%s: Could not start device.\n", ndev->name);
++		free_irq(ndev->irq, ndev);
++		return -EBUSY;
++	}
++
++	/* We're ready to go. */
++	netif_start_queue(ndev);
++
++	/* Set up the PHY monitoring timer. */
++	lp->phy_timer.expires = jiffies + 2*HZ;
++	lp->phy_timer.data = (unsigned long)ndev;
++	lp->phy_timer.function = &poll_mii;
++	add_timer(&lp->phy_timer);
++
++	return 0;
++}
++
++static int xenet_close(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++
++	/* Shut down the PHY monitoring timer. */
++	del_timer_sync(&lp->phy_timer);
++
++	netif_stop_queue(ndev);
++
++	/*
++	 * If not in polled mode, free the interrupt.  Currently, there
++	 * isn't any code to set polled mode, so this check is probably
++	 * superfluous.
++	 */
++	if ((XEmac_GetOptions(&lp->Emac) & XEM_POLLED_OPTION) == 0)
++		free_irq(ndev->irq, ndev);
++
++	if (XEmac_Stop(&lp->Emac) != XST_SUCCESS) {
++		printk(KERN_ERR "%s: Could not stop device.\n", ndev->name);
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
++static struct net_device_stats * xenet_get_stats(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	return &lp->net_stats;
++}
++
++static void xenet_set_multicast_list(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	u32 Options;
++
++	/*
++	 * XEmac_Start, XEmac_Stop and XEmac_SetOptions are supposed to
++	 * be protected by a semaphore.  This Linux adapter doesn't have
++	 * it as bad as the VxWorks adapter because the sequence of
++	 * requests to us is much more sequential.  However, we do have
++	 * one area in which this is a problem.
++	 *
++	 * xenet_set_multicast_list() is called while the link is up and
++	 * interrupts are enabled, so at any point in time we could get
++	 * an error that causes our reset() to be called.  reset() calls
++	 * the aforementioned functions, and we need to call them from
++	 * here as well.
++	 *
++	 * The solution is to make sure that we don't get interrupts or
++	 * timers popping while we are in this function.
++	 */
++	disable_irq(ndev->irq);
++	local_bh_disable();
++
++	/*
++	 * The dev's set_multicast_list function is only called when
++	 * the device is up.  So, without checking, we know we need to
++	 * Stop and Start the XEmac because it has already been
++	 * started.  XEmac_Stop() will return an error if it is already
++	 * stopped, but in this case we don't care so cast it to void
++	 * to make it explicit
++	 */
++	(void) XEmac_Stop(&lp->Emac);
++
++	Options = XEmac_GetOptions(&lp->Emac);
++
++	/* Clear out the bits we may set. */
++	Options &= ~(XEM_PROMISC_OPTION | XEM_MULTICAST_OPTION);
++
++	if (ndev->flags & IFF_PROMISC)
++		Options |= XEM_PROMISC_OPTION;
++#if 0
++	else {
++		/*
++		 * SAATODO: Xilinx is going to add multicast support to their
++		 * VxWorks adapter and OS independent layer.  After that is
++		 * done, this skeleton code should be fleshed out.  Note that
++		 * IFF_MULTICAST is being masked out from dev->flags in probe,
++		 * so that will need to be removed to actually do multidrop.
++		 */
++		if ((ndev->flags & IFF_ALLMULTI)
++		    || ndev->mc_count > MAX_MULTICAST ? ? ?) {
++			xemac_get_all_multicast ? ? ? ();
++			Options |= XEM_MULTICAST_OPTION;
++		} else if (ndev->mc_count != 0) {
++			struct dev_mc_list *mc;
++
++			XEmac_MulticastClear(&lp->Emac);
++			for (mc = ndev->mc_list; mc; mc = mc->next)
++				XEmac_MulticastAdd(&lp->Emac, mc->dmi_addr);
++			Options |= XEM_MULTICAST_OPTION;
++		}
++	}
++#endif
++
++	/*
++	 * The following function will return an error if the EMAC is already
++	 * started.  We know it isn't started so we can safely ignore the
++	 * return value.  We cast it to void to make that explicit.
++	 */
++	(void) XEmac_SetOptions(&lp->Emac, Options);
++
++	/*
++	 * XEmac_Start returns an error when: it is already started, the send
++	 * and receive handlers are not set, or a scatter-gather DMA list is
++	 * missing.  None of these can happen at this point, so we cast the
++	 * return to void to make that explicit.
++	 */
++	(void) XEmac_Start(&lp->Emac);
++
++	/* All done, get those interrupts and timers going again. */
++	local_bh_enable();
++	enable_irq(ndev->irq);
++}
++
++static int xenet_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	/* mii_ioctl_data has 4 u16 fields: phy_id, reg_num, val_in & val_out */
++	struct mii_ioctl_data *data = (struct mii_ioctl_data *) &ifr->ifr_data;
++
++	XStatus Result;
++
++	switch (cmd) {
++	case SIOCGMIIPHY:	/* Get address of MII PHY in use. */
++		data->phy_id = lp->mii_addr;
++		/* Fall Through */
++
++	case SIOCGMIIREG:	/* Read MII PHY register. */
++		if (data->phy_id > 31 || data->reg_num > 31)
++			return -ENXIO;
++
++		/* Stop the PHY timer to prevent reentrancy. */
++		del_timer_sync(&lp->phy_timer);
++		Result = XEmac_PhyRead(&lp->Emac, data->phy_id,
++				       data->reg_num, &data->val_out);
++		/* Start the PHY timer up again. */
++		lp->phy_timer.expires = jiffies + 2*HZ;
++		add_timer(&lp->phy_timer);
++
++		if (Result != XST_SUCCESS) {
++			printk(KERN_ERR
++			       "%s: Could not read from PHY, error=%d.\n",
++			       ndev->name, Result);
++			return (Result == XST_EMAC_MII_BUSY) ? -EBUSY : -EIO;
++		}
++		return 0;
++
++	case SIOCSMIIREG:	/* Write MII PHY register. */
++		if (!capable(CAP_NET_ADMIN))
++			return -EPERM;
++
++		if (data->phy_id > 31 || data->reg_num > 31)
++			return -ENXIO;
++
++		/* Stop the PHY timer to prevent reentrancy. */
++		del_timer_sync(&lp->phy_timer);
++		Result = XEmac_PhyWrite(&lp->Emac, data->phy_id,
++					data->reg_num, data->val_in);
++		/* Start the PHY timer up again. */
++		lp->phy_timer.expires = jiffies + 2*HZ;
++		add_timer(&lp->phy_timer);
++
++		if (Result != XST_SUCCESS) {
++			printk(KERN_ERR
++			       "%s: Could not write to PHY, error=%d.\n",
++			       ndev->name, Result);
++			return (Result == XST_EMAC_MII_BUSY) ? -EBUSY : -EIO;
++		}
++		return 0;
++
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++/*********************
++ * The device driver *
++ *********************/
++
++static void xenet_remove_ndev(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++
++	iounmap((void *) lp->Emac.BaseAddress);
++
++	/* Free up the memory. */
++	if (lp->saved_skb)
++		dev_kfree_skb(lp->saved_skb);
++	free_netdev(ndev);
++}
++
++#ifdef CONFIG_NET_POLL_CONTROLLER
++static void xenet_netpoll (struct net_device *netdev)
++{
++       disable_irq(netdev->irq);
++       xenet_interrupt(netdev->irq, netdev, NULL );
++       enable_irq(netdev->irq);
++}
++#endif
++
++static int xenet_probe(struct device *dev)
++{
++	struct net_device *ndev;
++	struct net_local *lp;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct xemac_platform_data *pdata;
++	struct resource *r_irq, *r_mem;
++	u32 maddr;
++	int retval;
++
++	pdata = (struct xemac_platform_data *) pdev->dev.platform_data;
++
++	if (pdata == NULL) {
++		printk(KERN_ERR "xemac %d: Couldn't find platform data.\n",
++		       pdev->id);
++
++		return -ENODEV;
++	}
++	r_irq = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	r_mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!r_irq || !r_mem) {
++		printk(KERN_ERR "xemac %d: IO resource(s) not found.\n",
++		       pdev->id);
++
++		return -ENODEV;
++	}
++
++	/* Create an ethernet device instance */
++	ndev = alloc_etherdev(sizeof (struct net_local));
++	if (ndev == NULL) {
++		printk(KERN_ERR "xemac %d: Could not allocate net device.\n",
++			pdev->id);
++		return -ENOMEM;
++	}
++	dev_set_drvdata(dev, ndev);
++	ndev->irq = r_irq->start;
++
++	/* Initialize the private data used by XEmac_LookupConfig().
++	 * The private data are zeroed out by alloc_etherdev() already.
++	 */
++	lp = netdev_priv(ndev);
++	lp->Config.DeviceId = pdev->id;
++	spin_lock_init(&lp->skb_lock);
++	init_timer(&lp->phy_timer);
++
++	/* Initialize the rest of the private data */
++	lp->Config.PhysAddress = r_mem->start;
++	lp->Config.BaseAddress = (u32)ioremap(r_mem->start,
++		 			      r_mem->end - r_mem->start + 1);
++	lp->Config.IpIfDmaConfig = pdata->dma_mode;
++	lp->Config.HasCounters = (pdata->device_flags & XEMAC_HAS_ERR_COUNT) ?
++					1 : 0;
++	lp->Config.HasMii = (pdata->device_flags & XEMAC_HAS_MII) ? 1 : 0;
++	lp->Config.HasCam = (pdata->device_flags & XEMAC_HAS_CAM) ? 1 : 0;
++	lp->Config.HasJumbo = (pdata->device_flags & XEMAC_HAS_JUMBO) ? 1 : 0;
++
++	/* The following line would not be needed if XEmac_Initialize took
++	 * ptr to XEmac_Config instead of DeviceId as the second arg.
++	 */
++	if (lp->Config.DeviceId < XEMAC_MAX_DEVICE_ID)
++		xemac_cfgs[lp->Config.DeviceId] = &lp->Config;
++
++	if (XEmac_Initialize(&lp->Emac, lp->Config.DeviceId) != XST_SUCCESS) {
++		printk(KERN_ERR "%s: Could not initialize device.\n",
++		       ndev->name);
++		xenet_remove_ndev(ndev);
++		return -ENODEV;
++	}
++
++	memcpy(ndev->dev_addr, pdata->mac_addr, 6);
++	if (XEmac_SetMacAddress(&lp->Emac, ndev->dev_addr) != XST_SUCCESS) {
++		/* should not fail right after an initialize */
++		printk(KERN_ERR "%s: Could not set MAC address.\n", ndev->name);
++		xenet_remove_ndev(ndev);
++		return -EIO;
++	}
++
++	if (XEmac_mIsSgDma(&lp->Emac)) {
++		printk(KERN_ERR "%s: using sgDMA mode.\n", ndev->name);
++		XEmac_SetSgRecvHandler(&lp->Emac, ndev, SgRecvHandler);
++		XEmac_SetSgSendHandler(&lp->Emac, ndev, SgSendHandler);
++		ndev->hard_start_xmit = xenet_start_xmit_sgdma;
++		lp->Isr = XEmac_IntrHandlerDma;
++
++		retval = sgdma_descriptor_init(ndev);
++		if (retval) {
++			xenet_remove_ndev(ndev);
++			return -EIO;
++		}
++
++		/* set the packet threshold and timeout */
++		XEmac_SetPktThreshold(&lp->Emac, XEM_SEND,
++				      SGDMA_DEFAULT_THRESHOLD);
++		XEmac_SetPktThreshold(&lp->Emac, XEM_RECV,
++				      SGDMA_DEFAULT_THRESHOLD);
++		(void) XEmac_SetPktWaitBound(&lp->Emac, XEM_SEND,
++					     SGDMA_DEFAULT_WAITBOUND);
++		(void) XEmac_SetPktWaitBound(&lp->Emac, XEM_RECV,
++					     SGDMA_DEFAULT_WAITBOUND);
++
++		/* disable SGEND interrupt */
++		XEmac_SetOptions(&lp->Emac, XEmac_GetOptions(&lp->Emac) |
++				 XEM_NO_SGEND_INT_OPTION);
++	} else {
++		printk(KERN_ERR "xemac %d: using fifo mode.\n", pdev->id);
++		XEmac_SetFifoRecvHandler(&lp->Emac, ndev, FifoRecvHandler);
++		XEmac_SetFifoSendHandler(&lp->Emac, ndev, FifoSendHandler);
++		ndev->hard_start_xmit = xenet_start_xmit_fifo;
++		lp->Isr = XEmac_IntrHandlerFifo;
++	}
++	XEmac_SetErrorHandler(&lp->Emac, ndev, ErrorHandler);
++
++	/* Scan to find the PHY. */
++	lp->mii_addr = 0xFF;
++	for (maddr = 0; maddr < 31; maddr++) {
++		XStatus Result;
++		u16 reg;
++
++		Result = XEmac_PhyRead(&lp->Emac, maddr, MII_BMCR, &reg);
++		/*
++		 * XEmac_PhyRead is currently returning XST_SUCCESS even
++		 * when reading from non-existent addresses.  Work
++		 * around this by doing a primitive validation on the
++		 * control word we get back.
++		 */
++		if (Result == XST_SUCCESS && reg != 0xffff && reg != 0) {
++			lp->mii_addr = maddr;
++			break;
++		}
++	}
++	if (lp->mii_addr == 0xFF) {
++		lp->mii_addr = 0;
++		printk(KERN_WARNING
++		       "%s: No PHY detected.  Assuming a PHY at address %d.\n",
++		       ndev->name, lp->mii_addr);
++	}
++
++	SET_NETDEV_DEV(ndev, dev);
++
++	ndev->open = xenet_open;
++	ndev->stop = xenet_close;
++	ndev->get_stats = xenet_get_stats;
++	ndev->flags &= ~IFF_MULTICAST;
++	ndev->set_multicast_list = xenet_set_multicast_list;
++	ndev->do_ioctl = xenet_ioctl;
++	ndev->tx_timeout = xenet_tx_timeout;
++	ndev->watchdog_timeo = TX_TIMEOUT;
++
++#ifdef CONFIG_NET_POLL_CONTROLLER
++	ndev->poll_controller = xenet_netpoll;
++#endif
++
++	retval = register_netdev(ndev);
++	if (retval) {
++		printk(KERN_ERR
++		       "%s: Cannot register net device, aborting.\n",
++		       ndev->name);
++		xenet_remove_ndev(ndev);
++		return retval;
++	}
++
++	printk(KERN_INFO
++	       "%s: Xilinx EMAC #%d at 0x%08X mapped to 0x%08X, irq=%d\n",
++	       ndev->name, lp->Config.DeviceId,
++	       lp->Config.PhysAddress, lp->Config.BaseAddress, ndev->irq);
++	return 0;
++}
++
++static int xenet_remove(struct device *dev)
++{
++	struct net_device *ndev = dev_get_drvdata(dev);
++
++	unregister_netdev(ndev);
++	xenet_remove_ndev(ndev);
++
++	return 0;	/* success */
++}
++
++
++static struct device_driver xenet_driver = {
++	.name		= DRIVER_NAME,
++	.bus		= &platform_bus_type,
++
++	.probe		= xenet_probe,
++	.remove		= xenet_remove
++};
++
++static int __init xenet_init(void)
++{
++	/*
++	 * No kernel boot options used,
++	 * so we just need to register the driver
++	 */
++	return driver_register(&xenet_driver);
++}
++
++static void __exit xenet_cleanup(void)
++{
++	driver_unregister(&xenet_driver);
++}
++
++module_init(xenet_init);
++module_exit(xenet_cleanup);
++
++MODULE_AUTHOR("MontaVista Software, Inc. <source@mvista.com>");
++MODULE_DESCRIPTION(DRIVER_DESCRIPTION);
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/net/xilinx_emac/adapter.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/xilinx_emac/adapter.h
+@@ -0,0 +1,137 @@
++/*
++ * drivers/net/xilinx_emac/adapter.h
++ *
++ * Include file for Xilinx Ethernet Adapter component
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2005 (c) MontaVista Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#ifdef __KERNEL__
++#ifndef __XEMAC_ADAPTER_H__
++#define __XEMAC_ADAPTER_H__
++
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/list.h>
++#include <asm/atomic.h>
++
++#include "xbasic_types.h"
++#include "xemac.h"
++#include "xemac_i.h"
++
++#define DRIVER_NAME 		"xilinx_emac"
++#define DRIVER_VERSION		"1.0"
++#define DRIVER_DESCRIPTION	"Xilinx Eth MAC driver"
++
++/*
++ * On the OPB, the 10/100 EMAC requires data to be aligned to 4 bytes.
++ * On the PLB, the 10/100 EMAC requires data to be aligned to 8 bytes.
++ * For simplicity, we always align to 8 bytes.
++ */
++#define ALIGNMENT	8
++/*
++ * In the SGDMA case 32-byte alignment is needed.
++ */
++#define SGDMA_ALIGNMENT	32
++/*
++ * BUFFER_ALIGN(adr) calculates the number of bytes to the next alignment.
++ */
++#define BUFFER_ALIGN(adr) ((ALIGNMENT - ((u32) (adr))) % ALIGNMENT)
++#define SGDMA_BUF_ALIGN(adr) ((SGDMA_ALIGNMENT - ((u32) (adr))) % SGDMA_ALIGNMENT)
++
++/*
++ * Most of our defaults are different from the ones set in xemac.h.
++ * Note that XEmac_Reset() sets some options to the xemac.h's defaults.
++ */
++
++#define SGDMA_DEFAULT_THRESHOLD	31
++#define SGDMA_DEFAULT_WAITBOUND	XEM_SGDMA_DFT_WAITBOUND
++#define SGDMA_DEFAULT_RECV_BUFS	256	/* default # of recv buffers */
++#define SGDMA_DEFAULT_SEND_BUFS	64	/* default # of send buffers */
++#define SGDMA_DEFAULT_RECV_DESC	256	/* default # of recv descriptors */
++#define SGDMA_DEFAULT_SEND_DESC	64	/* default # of send descriptors */
++
++/* Common data structures and functions */
++
++typedef enum DUPLEX { UNKNOWN_DUPLEX, HALF_DUPLEX, FULL_DUPLEX } DUPLEX;
++
++struct net_local {
++	struct list_head link;
++	struct net_device_stats net_stats;	/* Statistics for this device */
++	struct timer_list phy_timer;	/* PHY monitoring timer */
++	XInterruptHandler Isr;		/* Pointer to the XEmac ISR routine */
++	struct sk_buff *saved_skb;	/* skb being transmitted */
++	spinlock_t skb_lock;		/* For atomic access to saved_skb */
++	u8 mii_addr;			/* The MII address of the PHY */
++
++	/*
++	 * The underlying OS independent code needs space as well.  A
++	 * pointer to the following XEmac structure will be passed to
++	 * any XEmac_ function that requires it.  However, we treat the
++	 * data as an opaque object in this file (meaning that we never
++	 * reference any of the fields inside of the structure).
++	 */
++	XEmac Emac;
++	/*
++	 * Currently XEmac has a pointer to XEmac_Config structure.
++	 * This pointer is used not only by XEmac_Initialize(), but
++	 * by XEmac_mIsSgDma() et al as well. For this reason the
++	 * XEmac_Config structure must exist as long as the device
++	 * is alive. Otherwise we could drop this structure right
++	 * after XEmac_Initialize() returns.
++	 */
++	XEmac_Config Config;
++
++	/*
++	 * SGDMA stuff
++	 */
++
++	void *desc_space_v;		/* start of the descriptor space */
++	dma_addr_t desc_space_handle;	/* bus addr of the descriptor space */
++	int desc_space_size;
++
++	void *tx_bufs_v;	/* virt addr of the array of tx buffers */
++	int tx_buffs_size;	/* size of the array (bytes) */
++	int tx_bufs_offset;	/* offset to the 1st free buffer (bytes) */
++
++	atomic_t tx_descs_avail;	/* the number of free tx descriptors */
++};
++
++/*
++ * Helper function to determine if a given XEmac error warrants a reset.
++ * Probably there is a better way to handle XST_DMA_SG_LIST_EMPTY error
++ * than just resetting the device.
++ */
++extern inline int status_requires_reset(XStatus s)
++{
++	return (s == XST_DMA_ERROR || s == XST_FIFO_ERROR
++		|| s == XST_RESET_ERROR || XST_DMA_SG_LIST_EMPTY);
++}
++
++/*
++ * Helper function to reset the underlying hardware.  This is called
++ * when we get into such deep trouble that we don't know how to handle
++ * otherwise.
++ */
++void xenet_reset(struct net_device *ndev, DUPLEX duplex);
++
++/* Transmission and receiption in FIFO mode */
++
++void FifoSendHandler(void *CallbackRef);
++void FifoRecvHandler(void *CallbackRef);
++int xenet_start_xmit_fifo(struct sk_buff *skb, struct net_device *ndev);
++
++/* Transmission and receiption in SGDMA mode */
++
++void SgSendHandler(void *CallbackRef, XBufDescriptor * BdPtr, u32 NumBds);
++void SgRecvHandler(void *CallbackRef, XBufDescriptor * BdPtr, u32 NumBds);
++int xenet_start_xmit_sgdma(struct sk_buff *skb, struct net_device *ndev);
++int sgdma_descriptor_init(struct net_device *ndev);
++
++#endif /* __XEMAC_ADAPTER_H__ */
++#endif /* __KERNEL__ */
+Index: linux-2.6.10/drivers/net/xilinx_emac/adapter_fifo.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/xilinx_emac/adapter_fifo.c
+@@ -0,0 +1,203 @@
++/*
++ * drivers/net/xilinx_emac/adapter_fifo.c
++ *
++ * Xilinx Ethernet Adapter component: transmission and receiption in FIFO mode.
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2005 (c) MontaVista Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++
++#include "adapter.h"
++
++static struct sk_buff * align_skb_data(struct sk_buff *skb)
++{
++	struct sk_buff *new_skb;
++	unsigned int len, align;
++
++	len = skb->len;
++	/*
++	 * The packet FIFO requires the buffers to be 32 or 64 bit aligned.
++	 * The sk_buff data is not aligned, so we have to do this copy.
++	 * As you probably well know, this is not optimal.
++	 */
++	if (!(new_skb = dev_alloc_skb(len + ALIGNMENT))) {
++		return NULL;
++	}
++
++	/*
++	 * A new skb should have the data word aligned, but this is
++	 * not enough for PLB EMAC. Calculate how many bytes
++	 * we should reserve to get the data to start on a proper
++	 * boundary.  */
++	align = BUFFER_ALIGN(new_skb->data);
++	if (align)
++		skb_reserve(new_skb, align);
++
++	/* Copy the data from the original skb to the new one. */
++	skb_put(new_skb, len);
++	memcpy(new_skb->data, skb->data, len);
++
++	return new_skb;
++}
++
++/*
++ * The callback function for completed frames sent in FIFO mode.
++ */
++void FifoSendHandler(void *CallbackRef)
++{
++	struct net_device *ndev = (struct net_device *) CallbackRef;
++	struct net_local *lp = netdev_priv(ndev);
++	struct sk_buff *tskb;
++	unsigned long flags;
++
++	/* Make sure that the timeout handler and we don't both free the skb. */
++	spin_lock_irqsave(&lp->skb_lock, flags);
++	tskb = lp->saved_skb;
++	lp->saved_skb = NULL;
++	spin_unlock_irqrestore(&lp->skb_lock, flags);
++
++	if (tskb) {
++		if (XEmac_FifoSend(&lp->Emac, (u8 *) tskb->data, tskb->len)
++		    != XST_SUCCESS) {
++			lp->net_stats.tx_errors++;
++			printk(KERN_ERR "%s: Could not transmit buffer.\n",
++			       ndev->name);
++		}
++		dev_kfree_skb(tskb);
++		netif_wake_queue(ndev);
++	}
++}
++
++int xenet_start_xmit_fifo(struct sk_buff *skb, struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	struct sk_buff *new_skb;
++	unsigned int len;
++	int retval;
++
++	len = skb->len;
++
++	new_skb = align_skb_data(skb);
++	dev_kfree_skb(skb);	/* get rid of the original skb. */
++
++	if (!new_skb) {
++		/* We couldn't get the new, "aligned" skb. */
++		lp->net_stats.tx_dropped++;
++		printk(KERN_ERR "%s: Could not allocate transmit buffer.\n",
++		       ndev->name);
++		netif_wake_queue(ndev);
++		return -EBUSY;
++	}
++
++	retval = XEmac_FifoSend(&lp->Emac, (u8 *) new_skb->data, len);
++	switch (retval) {
++	case XST_FIFO_NO_ROOM:
++		netif_stop_queue(ndev);
++		spin_lock_irq(&lp->skb_lock);
++		if (unlikely(lp->saved_skb))
++			BUG();
++		lp->saved_skb = new_skb;
++		spin_unlock_irq(&lp->skb_lock);
++		break;
++
++	case XST_SUCCESS:
++		/*
++		 * We have to update the counters early as we can't
++		 * track the length of every packet pending transmission.
++		 */
++		dev_kfree_skb(new_skb);
++		lp->net_stats.tx_bytes += len;
++		lp->net_stats.tx_packets++;
++		break;
++
++	default:	/* transmission error */
++		dev_kfree_skb(new_skb);
++		lp->net_stats.tx_errors++;
++		printk(KERN_ERR "%s: Could not transmit buffer.\n", ndev->name);
++		return -EIO;
++	}
++
++	/* reset the transmission timeout */
++	ndev->trans_start = jiffies;
++
++	return 0;
++}
++
++/*
++ * The callback function for frames received when in FIFO mode.
++ */
++
++void FifoRecvHandler(void *CallbackRef)
++{
++	struct net_device *ndev = (struct net_device *) CallbackRef;
++	struct net_local *lp = netdev_priv(ndev);
++	struct sk_buff *skb;
++	unsigned int align;
++	u32 len;
++	XStatus Result;
++
++	/*
++	 * The OS independent Xilinx EMAC code does not provide a
++	 * function to get the length of an incoming packet and a
++	 * separate call to actually get the packet data.  It does this
++	 * because they didn't add any code to keep the hardware's
++	 * receive length and data FIFOs in sync.  Instead, they require
++	 * that you send a maximal length buffer so that they can read
++	 * the length and data FIFOs in a single chunk of code so that
++	 * they can't get out of sync.  So, we need to allocate an skb
++	 * that can hold a maximal sized packet.  The OS independent
++	 * code needs to see the data 32- or 64-bit aligned, so we tack on
++	 * some extra bytes just in case we need to do an skb_reserve to get
++	 * it that way.
++	 */
++	len = XEM_MAX_FRAME_SIZE; /* jumbo and VLAN packets could be bigger */
++	if (!(skb = dev_alloc_skb(len + ALIGNMENT))) {
++		/* Couldn't get memory. */
++		lp->net_stats.rx_dropped++;
++		printk(KERN_ERR "%s: Could not allocate receive buffer.\n",
++		       ndev->name);
++		return;
++	}
++
++	/*
++	 * A new skb should have the data word aligned, but this is
++	 * not enough for PLB EMAC. Calculate how many bytes
++	 * we should reserve to get the data to start on a proper
++	 * boundary.  */
++	align = BUFFER_ALIGN(skb->data);
++	if (align)
++		skb_reserve(skb, align);
++
++	Result = XEmac_FifoRecv(&lp->Emac, (u8 *) skb->data, &len);
++	if (Result != XST_SUCCESS) {
++		int need_reset = status_requires_reset(Result);
++
++		lp->net_stats.rx_errors++;
++		dev_kfree_skb(skb);
++
++		printk(KERN_ERR "%s: Could not receive buffer, error=%d%s\n",
++		       ndev->name, Result,
++		       need_reset ? ", resetting device." : "");
++		if (need_reset)
++			xenet_reset(ndev, UNKNOWN_DUPLEX);
++		return;
++	}
++
++	len -= 4;		/* crop FCS (the last four bytes) */
++	skb_put(skb, len);	/* Tell the skb how much data we got. */
++	skb->dev = ndev;	/* Fill out required meta-data. */
++	skb->protocol = eth_type_trans(skb, ndev);
++        skb->ip_summed = CHECKSUM_NONE;
++
++	lp->net_stats.rx_packets++;
++	lp->net_stats.rx_bytes += len;
++
++	netif_rx(skb);		/* Send the packet upstream. */
++}
+Index: linux-2.6.10/drivers/net/xilinx_emac/adapter_sgdma.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/net/xilinx_emac/adapter_sgdma.c
+@@ -0,0 +1,320 @@
++/*
++ * drivers/net/xilinx_emac/adapter_sgdma.c
++ *
++ * Xilinx Ethernet Adapter component: transmission and receiption in SGDMA mode.
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2005 (c) MontaVista Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/dma-mapping.h>
++#include <linux/pci.h>
++
++#include "adapter.h"
++
++/*
++ * Physical to virtual pointer conversion - for the given DMA channel's
++ * descriptors only.
++ */
++#define P_TO_V(InstancePtr, p) \
++	((p) ? \
++	 ((InstancePtr)->VirtPtr + ((u32)(p) - (u32)(InstancePtr)->PhyPtr)) : \
++	 0)
++
++void free_rx_skbs(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	XBufDescriptor* bd_ptr;
++	struct sk_buff* skb;
++	int i;
++
++	bd_ptr = (XBufDescriptor*)lp->Emac.RecvChannel.VirtPtr;
++	for (i = 0; i < SGDMA_DEFAULT_RECV_DESC != 0; i++) {
++		skb = (struct sk_buff*)XBufDescriptor_GetId(bd_ptr);
++		if (skb == NULL) {
++			/* one can get here if sgdma_descriptor_init() fails */
++			continue;
++		}
++		/*
++		 * The assumption here is that the DestAddress is *not*
++		 * written back into the BufferDescriptor after transfer
++		 * is completed.
++		 * In the contrary, the Length does gets updated to the
++		 * actual number of the received bytes. That's why the
++		 * size arg of dma_unmap_single() is the same XEM_MAX_FRAME_SIZE
++		 * constant that was used with the corresponding
++		 * dma_map_single() (see sgdma_descriptor_init() and
++		 * SgRecvHandler()).
++		 */
++		dma_unmap_single(NULL, XBufDescriptor_GetDestAddress(bd_ptr),
++				 XEM_MAX_FRAME_SIZE, PCI_DMA_FROMDEVICE);
++		dev_kfree_skb(skb);
++		bd_ptr = P_TO_V(&lp->Emac.RecvChannel,
++			       XBufDescriptor_GetNextPtr(bd_ptr));
++	}
++}
++
++/*
++ * This function is assumed to be called after XEmac_Initialize(),
++ * but before XEmac is started with XEmac_Start().
++ * Calling XEmac_SgRecv() if XEmac is not started is just fine.
++ */
++int sgdma_descriptor_init(struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	void *p_v, *p_bus;
++	int i;
++
++	/* Allocate memory for the buffer descriptors */
++	lp->desc_space_size = (SGDMA_DEFAULT_RECV_DESC + SGDMA_DEFAULT_SEND_DESC) *
++		sizeof (XBufDescriptor);
++	lp->desc_space_v = dma_alloc_coherent(NULL,
++		lp->desc_space_size, &lp->desc_space_handle, GFP_KERNEL);
++	if (lp->desc_space_v == NULL) {
++		return -ENOMEM;
++	}
++	memset(lp->desc_space_v, 0, lp->desc_space_size);
++
++	/* Allocate memory for the Tx buffers */
++	lp->tx_buffs_size =  SGDMA_DEFAULT_SEND_DESC *
++		(XEM_MAX_FRAME_SIZE + SGDMA_ALIGNMENT);
++	lp->tx_bufs_v = kmalloc(lp->tx_buffs_size, GFP_KERNEL);
++	lp->tx_bufs_offset = SGDMA_BUF_ALIGN(lp->tx_bufs_v);
++	if (lp->tx_bufs_v == NULL)
++		goto error_free_descs;
++
++	atomic_set(&lp->tx_descs_avail, SGDMA_DEFAULT_SEND_DESC);
++
++	/* Add pointers to descriptor space to the driver */
++	p_v = lp->desc_space_v;
++	p_bus = (void *)lp->desc_space_handle;
++	XEmac_SetSgRecvSpace(&lp->Emac, p_v,
++			     SGDMA_DEFAULT_RECV_DESC * sizeof (XBufDescriptor),
++			     p_bus);
++	p_v = (void *) ((u32) lp->desc_space_v +
++		SGDMA_DEFAULT_RECV_DESC * sizeof (XBufDescriptor));
++	p_bus = (void *) ((u32) lp->desc_space_handle +
++		SGDMA_DEFAULT_RECV_DESC * sizeof (XBufDescriptor));
++	XEmac_SetSgSendSpace(&lp->Emac, p_v,
++			     SGDMA_DEFAULT_SEND_DESC * sizeof (XBufDescriptor),
++			     p_bus);
++
++	/* Allocate skb's and give them to the dma engine */
++	for (i = 0; i < SGDMA_DEFAULT_RECV_DESC; i++) {
++		struct sk_buff *skb;
++		XBufDescriptor bd;
++		int result;
++		u32 skb_bus_addr, align;
++
++		skb = dev_alloc_skb(XEM_MAX_FRAME_SIZE + SGDMA_ALIGNMENT);
++		if (skb == NULL)
++			goto error_free_skbs;
++
++		align = SGDMA_BUF_ALIGN(skb->data);
++		if (align)
++			skb_reserve(skb, align);
++
++		skb_bus_addr = (u32) dma_map_single(NULL, skb->data,
++						    XEM_MAX_FRAME_SIZE,
++						    DMA_FROM_DEVICE);
++
++		/*
++		 * Initialize descriptor, and set buffer address.
++		 * Buffer length gets max frame size
++		 */
++		XBufDescriptor_Initialize(&bd);
++/// Not really used IMO		XBufDescriptor_Lock(&bd);
++		XBufDescriptor_SetDestAddress(&bd, skb_bus_addr);
++		XBufDescriptor_SetLength(&bd, XEM_MAX_FRAME_SIZE);
++		XBufDescriptor_SetId(&bd, skb);
++
++		/*
++		 * Pass descriptor with the attached buffer to the driver and
++		 * let it make it ready for frame reception
++		 */
++		result = XEmac_SgRecv(&lp->Emac, &bd);
++		if (result != XST_SUCCESS)
++			goto error_free_skbs;
++	}
++
++	return 0;	/* success */
++
++error_free_skbs:
++	free_rx_skbs(ndev);
++	kfree(lp->tx_bufs_v);
++error_free_descs:
++	dma_free_coherent(NULL, lp->desc_space_size, lp->desc_space_v,
++			  lp->desc_space_handle);
++
++	return -ENOMEM;
++}
++
++void SgRecvHandler(void *CallbackRef, XBufDescriptor * BdPtr, u32 NumBds)
++{
++	struct net_device *ndev = (struct net_device *) CallbackRef;
++	struct net_local *lp = netdev_priv(ndev);
++	struct sk_buff *skb, *new_skb;
++	u32 len;
++	XBufDescriptor *cur_bd;
++	u32 skb_bus_addr, align;
++	int result;
++
++	while (NumBds != 0) {
++		--NumBds;
++
++		skb = (struct sk_buff *) XBufDescriptor_GetId(BdPtr);
++                len = XBufDescriptor_GetLength(BdPtr);
++		len -= 4; /* crop FCS (the last four bytes) */
++
++		cur_bd = BdPtr;
++		BdPtr = P_TO_V(&lp->Emac.RecvChannel,
++			       XBufDescriptor_GetNextPtr(cur_bd));
++
++		/*
++		 * The assumption here is that the DestAddress is *not*
++		 * written back into the BufferDescriptor after transfer
++		 * is completed.
++		 */
++		dma_unmap_single(NULL, XBufDescriptor_GetDestAddress(cur_bd),
++				 XEM_MAX_FRAME_SIZE, DMA_FROM_DEVICE);
++
++		/* Replace skb with a new one */
++		new_skb = dev_alloc_skb(XEM_MAX_FRAME_SIZE + SGDMA_ALIGNMENT);
++                if (new_skb == 0) {
++                        printk("SgRecvHandler: no mem for new_skb\n");
++                        return;
++                }
++
++		/* Align the new_skb->data */
++		align = SGDMA_BUF_ALIGN(new_skb->data);
++		if (align)
++			skb_reserve(new_skb, align);
++
++		skb_bus_addr = (u32) dma_map_single(NULL, new_skb->data,
++						    XEM_MAX_FRAME_SIZE,
++						    DMA_FROM_DEVICE);
++
++		/*
++		 * Initialize descriptor, and set buffer address.
++		 * Buffer length gets max frame size
++		 */
++		XBufDescriptor_SetDestAddress(cur_bd, skb_bus_addr);
++		XBufDescriptor_SetLength(cur_bd, XEM_MAX_FRAME_SIZE);
++		XBufDescriptor_SetId(cur_bd, new_skb);
++/// Not really used IMO		XBufDescriptor_Unlock(cur_bd);
++
++                /* Give the descriptor back to the driver */
++                result = XEmac_SgRecv(&lp->Emac, cur_bd);
++                if (result != XST_SUCCESS) {
++                        printk("SgRecvHandler: SgRecv unsuccessful\n");
++                        return;
++                }
++
++                /* back to the original skb */
++		skb_put(skb, len);	/* Tell the skb how much data we got. */
++		skb->dev = ndev;	/* Fill out required meta-data. */
++		skb->protocol = eth_type_trans(skb, ndev);
++        	skb->ip_summed = CHECKSUM_NONE;
++
++		lp->net_stats.rx_packets++;
++		lp->net_stats.rx_bytes += len;
++
++		netif_rx(skb);		/* Send the packet upstream. */
++	}
++}
++
++/*
++ * This function is protected from concurrent calls by a spinlock (xmit_lock)
++ * in the net_device structure, and this is enough to protect lp->tx_bufs_offset
++ * manipulations, and to prevent from concurrent XEmac_SgSend() calls. */
++int xenet_start_xmit_sgdma(struct sk_buff *skb, struct net_device *ndev)
++{
++	struct net_local *lp = netdev_priv(ndev);
++	XBufDescriptor bd;
++	u32 data_len;
++	u32 data_bus_addr;
++	u8 *data_v;
++	int result;
++
++	data_len = skb->len;
++	data_v = lp->tx_bufs_v + lp->tx_bufs_offset;
++
++	lp->tx_bufs_offset += data_len + SGDMA_BUF_ALIGN(data_len);
++	if (lp->tx_bufs_offset + XEM_MAX_FRAME_SIZE > lp->tx_buffs_size) {
++		lp->tx_bufs_offset = SGDMA_BUF_ALIGN(lp->tx_bufs_v);
++	}
++
++	/*
++	 * skb->ip_summed is expected to be CHECKSUM_NONE as the driver doesn't
++	 * advertize any checksum calculation capabilities.
++	 */
++	memcpy(data_v, skb->data, data_len);
++        dev_kfree_skb(skb);
++
++	data_bus_addr = dma_map_single(NULL, data_v, data_len, DMA_TO_DEVICE);
++
++	/*
++	 * lock the buffer descriptor to prevent lower layers from reusing
++	 * it before the adapter has a chance to deallocate the buffer
++	 * attached to it. The adapter will unlock it in the callback function
++	 * that handles confirmation of transmits.
++	 */
++	XBufDescriptor_Initialize(&bd);
++	XBufDescriptor_Lock(&bd);
++	XBufDescriptor_SetSrcAddress(&bd, data_bus_addr);
++	XBufDescriptor_SetLength(&bd, data_len);
++	XBufDescriptor_SetLast(&bd);
++
++	result = XEmac_SgSend(&lp->Emac, &bd, XEM_SGDMA_NODELAY);
++	if (result != XST_SUCCESS) {
++		lp->net_stats.tx_dropped++;
++		printk(KERN_ERR
++		       "%s: ERROR, could not send transmit buffer (%d).\n",
++		       ndev->name, result);
++		/*
++		 * We should never get here in the first place, but
++		 * for some reason the kernel doesn't like -EBUSY here,
++		 * so just return 0 and let the stack handle dropped packets.
++		 */
++		return 0;
++	}
++
++	if (atomic_dec_and_test(&lp->tx_descs_avail)) {
++		netif_stop_queue(ndev);
++        }
++
++	ndev->trans_start = jiffies;
++
++	return 0;
++}
++
++void SgSendHandler(void *CallbackRef, XBufDescriptor * BdPtr, u32 NumBds)
++{
++	struct net_device *ndev = (struct net_device *) CallbackRef;
++	struct net_local *lp = netdev_priv(ndev);
++	u32 len;
++	XBufDescriptor *cur_bd;
++
++	atomic_add(NumBds, &lp->tx_descs_avail);
++	while(NumBds-- != 0) {
++		len = XBufDescriptor_GetLength(BdPtr);
++                dma_unmap_single(NULL,
++				 (u32) XBufDescriptor_GetSrcAddress(BdPtr),
++				 len, DMA_TO_DEVICE);
++
++                lp->net_stats.tx_bytes += len;
++                lp->net_stats.tx_packets++;
++
++		cur_bd = BdPtr;
++		BdPtr = P_TO_V(&lp->Emac.SendChannel,
++			       XBufDescriptor_GetNextPtr(BdPtr));
++                XBufDescriptor_Unlock(cur_bd);
++	}
++	netif_wake_queue(ndev);
++}
+Index: linux-2.6.10/mvl_patches/pro-0331.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0331.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(331);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

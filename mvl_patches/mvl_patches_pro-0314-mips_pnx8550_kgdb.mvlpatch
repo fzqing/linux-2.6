@@ -1,0 +1,624 @@
+#! /usr/bin/env bash
+# Patch: -mips_pnx8550_kgdb
+# Date: Mon Mar  6 10:14:29 2006
+# Source: MontaVista Software, Inc.
+# MR: 16189
+# Type: Enhancement
+# Disposition: merged to linux-mips.org | MontaVista
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+#     KGDB support for PNX8550 platform over ip3106 serial port
+#     The code that is merged to linux-mips.org is a gdb_hook.c
+#     that I moved into the drivers/serial/ip3106.c.
+#     The code that adds parsing kgdb options via command-line
+#     and or pick them via Kconfig I marked  with disposition
+#     MotaVista.
+# 
+#  arch/mips/philips/pnx8550/common/Makefile   |    1 
+#  arch/mips/philips/pnx8550/common/gdb_hook.c |  109 ---------------------
+#  arch/mips/philips/pnx8550/common/setup.c    |   11 --
+#  drivers/serial/ip3106_uart.c                |  142 ++++++++++++++++++++++++++++
+#  lib/Kconfig.debug                           |   26 +++++
+#  5 files changed, 168 insertions(+), 121 deletions(-)
+# 
+
+PATCHNUM=314
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16189
+Type: Enhancement
+Disposition: merged to linux-mips.org | MontaVista
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+    KGDB support for PNX8550 platform over ip3106 serial port
+    The code that is merged to linux-mips.org is a gdb_hook.c
+    that I moved into the drivers/serial/ip3106.c.
+    The code that adds parsing kgdb options via command-line
+    and or pick them via Kconfig I marked  with disposition
+    MotaVista.
+
+ arch/mips/philips/pnx8550/common/Makefile   |    1 
+ arch/mips/philips/pnx8550/common/gdb_hook.c |  109 ---------------------
+ arch/mips/philips/pnx8550/common/setup.c    |   11 --
+ drivers/serial/ip3106_uart.c                |  142 ++++++++++++++++++++++++++++
+ lib/Kconfig.debug                           |   26 +++++
+ mvl_patches/pro-0314.c                      |   16 +++
+ 6 files changed, 184 insertions(+), 121 deletions(-)
+
+Index: linux-2.6.10/arch/mips/philips/pnx8550/common/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/mips/philips/pnx8550/common/Makefile
++++ linux-2.6.10/arch/mips/philips/pnx8550/common/Makefile
+@@ -24,4 +24,3 @@
+ 
+ obj-y := setup.o prom.o mipsIRQ.o int.o reset.o time.o proc.o platform.o
+ obj-$(CONFIG_PCI) += pci.o
+-obj-$(CONFIG_KGDB) += gdb_hook.o
+Index: linux-2.6.10/arch/mips/philips/pnx8550/common/gdb_hook.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/philips/pnx8550/common/gdb_hook.c
++++ /dev/null
+@@ -1,109 +0,0 @@
+-/*
+- * Carsten Langgaard, carstenl@mips.com
+- * Copyright (C) 2000 MIPS Technologies, Inc.  All rights reserved.
+- *
+- * ########################################################################
+- *
+- *  This program is free software; you can distribute it and/or modify it
+- *  under the terms of the GNU General Public License (Version 2) as
+- *  published by the Free Software Foundation.
+- *
+- *  This program is distributed in the hope it will be useful, but WITHOUT
+- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- *  for more details.
+- *
+- *  You should have received a copy of the GNU General Public License along
+- *  with this program; if not, write to the Free Software Foundation, Inc.,
+- *  59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+- *
+- * ########################################################################
+- *
+- * This is the interface to the remote debugger stub.
+- *
+- */
+-#include <linux/types.h>
+-#include <linux/serial.h>
+-#include <linux/serialP.h>
+-#include <linux/serial_reg.h>
+-#include <linux/serial_ip3106.h>
+-
+-#include <asm/serial.h>
+-#include <asm/io.h>
+-
+-#include <uart.h>
+-
+-static struct serial_state rs_table[IP3106_NR_PORTS] = {
+-};
+-static struct async_struct kdb_port_info = {0};
+-
+-void rs_kgdb_hook(int tty_no)
+-{
+-	struct serial_state *ser = &rs_table[tty_no];
+-
+-	kdb_port_info.state = ser;
+-	kdb_port_info.magic = SERIAL_MAGIC;
+-	kdb_port_info.port  = tty_no;
+-	kdb_port_info.flags = ser->flags;
+-
+-	/*
+-	 * Clear all interrupts
+-	 */
+-	/* Clear all the transmitter FIFO counters (pointer and status) */
+-	ip3106_lcr(UART_BASE, tty_no) |= IP3106_UART_LCR_TX_RST;
+-	/* Clear all the receiver FIFO counters (pointer and status) */
+-	ip3106_lcr(UART_BASE, tty_no) |= IP3106_UART_LCR_RX_RST;
+-	/* Clear all interrupts */
+-	ip3106_iclr(UART_BASE, tty_no) = IP3106_UART_INT_ALLRX |
+-		IP3106_UART_INT_ALLTX;
+-
+-	/*
+-	 * Now, initialize the UART
+-	 */
+-	ip3106_lcr(UART_BASE, tty_no) = IP3106_UART_LCR_8BIT;
+-	ip3106_baud(UART_BASE, tty_no) = 5; // 38400 Baud
+-}
+-
+-int putDebugChar(char c)
+-{
+-	/* Wait until FIFO not full */
+-	while (((ip3106_fifo(UART_BASE, kdb_port_info.port) & IP3106_UART_FIFO_TXFIFO) >> 16) >= 16)
+-		;
+-	/* Send one char */
+-	ip3106_fifo(UART_BASE, kdb_port_info.port) = c;
+-
+-	return 1;
+-}
+-
+-char getDebugChar(void)
+-{
+-	char ch;
+-
+-	/* Wait until there is a char in the FIFO */
+-	while (!((ip3106_fifo(UART_BASE, kdb_port_info.port) &
+-					IP3106_UART_FIFO_RXFIFO) >> 8))
+-		;
+-	/* Read one char */
+-	ch = ip3106_fifo(UART_BASE, kdb_port_info.port) &
+-		IP3106_UART_FIFO_RBRTHR;
+-	/* Advance the RX FIFO read pointer */
+-	ip3106_lcr(UART_BASE, kdb_port_info.port) |= IP3106_UART_LCR_RX_NEXT;
+-	return (ch);
+-}
+-
+-void rs_disable_debug_interrupts(void)
+-{
+-	ip3106_ien(UART_BASE, kdb_port_info.port) = 0; /* Disable all interrupts */
+-}
+-
+-void rs_enable_debug_interrupts(void)
+-{
+-	/* Clear all the transmitter FIFO counters (pointer and status) */
+-	ip3106_lcr(UART_BASE, kdb_port_info.port) |= IP3106_UART_LCR_TX_RST;
+-	/* Clear all the receiver FIFO counters (pointer and status) */
+-	ip3106_lcr(UART_BASE, kdb_port_info.port) |= IP3106_UART_LCR_RX_RST;
+-	/* Clear all interrupts */
+-	ip3106_iclr(UART_BASE, kdb_port_info.port) = IP3106_UART_INT_ALLRX |
+-		IP3106_UART_INT_ALLTX;
+-	ip3106_ien(UART_BASE, kdb_port_info.port)  = IP3106_UART_INT_ALLRX; /* Enable RX interrupts */
+-}
+Index: linux-2.6.10/drivers/serial/ip3106_uart.c
+===================================================================
+--- linux-2.6.10.orig/drivers/serial/ip3106_uart.c
++++ linux-2.6.10/drivers/serial/ip3106_uart.c
+@@ -33,6 +33,8 @@
+ #include <linux/serial_core.h>
+ #include <linux/serial.h>
+ #include <linux/serial_ip3106.h>
++#include <linux/serialP.h>
++#include <linux/kgdb.h>
+ 
+ #include <asm/io.h>
+ #include <asm/irq.h>
+@@ -69,6 +71,29 @@
+  */
+ #define MCTRL_TIMEOUT	(250*HZ/1000)
+ 
++#ifdef CONFIG_KGDB_IP3106
++/* Speed of the UART. */
++#if defined(CONFIG_KGDB_9600BAUD)
++static int kgdb3106_baud = 9600;
++#elif defined(CONFIG_KGDB_19200BAUD)
++static int kgdb3106_baud = 19200;
++#elif defined(CONFIG_KGDB_57600BAUD)
++static int kgdb3106_baud = 57600;
++#elif defined(CONFIG_KGDB_115200BAUD)
++static int kgdb3106_baud = 115200;
++#else
++static int kgdb3106_baud = 38400;	/* Start with this if not given */
++#endif
++
++#if defined(CONFIG_KGDB_TTYS1)
++int kgdb3106_port = 1;
++#else
++int kgdb3106_port = 0;			/* Start with this if not given */
++#endif
++
++static struct serial_state rs_table[NR_PORTS] = {};
++static struct async_struct kdb_port_info = {0};
++#endif	/*CONFIG_KGDB_IP3106*/
+ 
+ extern struct ip3106_port ip3106_ports[];
+ 
+@@ -615,6 +640,11 @@ static int ip3106_request_port(struct ua
+ {
+ 	struct ip3106_port *sport = (struct ip3106_port *)port;
+ 
++#ifdef CONFIG_KGDB_IP3106
++		/* prevent initialization of the port used for kgdb */
++		if (sport->port.line == kgdb3106_port)
++			return -EBUSY;
++#endif
+ 	return request_mem_region(sport->port.mapbase, UART_PORT_SIZE,
+ 			"ip3106-uart") != NULL ? 0 : -EBUSY;
+ }
+@@ -898,6 +928,118 @@ static void __exit ip3106_serial_exit(vo
+ 	uart_unregister_driver(&ip3106_reg);
+ }
+ 
++#ifdef CONFIG_KGDB_IP3106
++void putDebugChar(int c)
++{
++	/* Wait until FIFO not full */
++	while (((ip3106_fifo(UART_BASE, kdb_port_info.port) &
++		IP3106_UART_FIFO_TXFIFO) >> 16) >= 16);
++	/* Send one char */
++	ip3106_fifo(UART_BASE, kdb_port_info.port) = c;
++}
++
++int getDebugChar(void)
++{
++	char ch;
++
++	/* Wait until there is a char in the FIFO */
++	while (!((ip3106_fifo(UART_BASE, kdb_port_info.port) &
++					IP3106_UART_FIFO_RXFIFO) >> 8))
++		;
++	/* Read one char */
++	ch = ip3106_fifo(UART_BASE, kdb_port_info.port) &
++		IP3106_UART_FIFO_RBRTHR;
++	/* Advance the RX FIFO read pointer */
++	ip3106_lcr(UART_BASE, kdb_port_info.port) |= IP3106_UART_LCR_RX_NEXT;
++	return (ch);
++}
++
++void rs_disable_debug_interrupts(void)
++{
++	/* Disable all interrupts */
++	ip3106_ien(UART_BASE, kdb_port_info.port) = 0;
++}
++
++void rs_enable_debug_interrupts(void)
++{
++	/* Clear all the transmitter FIFO counters (pointer and status) */
++	ip3106_lcr(UART_BASE, kdb_port_info.port) |= IP3106_UART_LCR_TX_RST;
++	/* Clear all the receiver FIFO counters (pointer and status) */
++	ip3106_lcr(UART_BASE, kdb_port_info.port) |= IP3106_UART_LCR_RX_RST;
++	/* Clear all interrupts */
++	ip3106_iclr(UART_BASE, kdb_port_info.port) = IP3106_UART_INT_ALLRX |
++		IP3106_UART_INT_ALLTX;
++	/* Enable RX interrupts */
++	ip3106_ien(UART_BASE, kdb_port_info.port)  = IP3106_UART_INT_ALLRX;
++}
++
++int rs_kgdb_init(void)
++{
++	struct serial_state *ser = &rs_table[kgdb3106_port];
++
++	kdb_port_info.state = ser;
++	kdb_port_info.magic = SERIAL_MAGIC;
++	kdb_port_info.port  = kgdb3106_port;
++	kdb_port_info.flags = ser->flags;
++
++	/*
++	 * Clear all interrupts
++	 */
++	/* Clear all the transmitter FIFO counters (pointer and status) */
++	ip3106_lcr(UART_BASE, kgdb3106_port) |= IP3106_UART_LCR_TX_RST;
++	/* Clear all the receiver FIFO counters (pointer and status) */
++	ip3106_lcr(UART_BASE, kgdb3106_port) |= IP3106_UART_LCR_RX_RST;
++	/* Clear all interrupts */
++	ip3106_iclr(UART_BASE, kgdb3106_port) = IP3106_UART_INT_ALLRX |
++		IP3106_UART_INT_ALLTX;
++
++	/*
++	 * Now, initialize the UART
++	 */
++	ip3106_lcr(UART_BASE, kgdb3106_port) = IP3106_UART_LCR_8BIT;
++	ip3106_baud(UART_BASE, kgdb3106_port) =
++		ip3106_ports[kgdb3106_port].port.uartclk/16/kgdb3106_baud - 1;
++
++	return 0;
++}
++
++struct kgdb_io kgdb_io_ops = {
++	.read_char = getDebugChar,
++	.write_char = putDebugChar,
++	.init = rs_kgdb_init,
++};
++
++/*
++ * Syntax for this cmdline option is "kgdb3106=ttyno,baudrate".
++ */
++static int __init
++kgdb3106_opt(char *str)
++{
++	/* We might have anywhere from 1 to 2 ports. */
++	if (*str < '0' || *str > NR_PORTS + '0')
++                 goto errout;
++	kgdb3106_port = *str - '0';
++	str++;
++	if (*str != ',')
++		goto errout;
++	str++;
++	kgdb3106_baud = simple_strtoul(str, &str, 10);
++	if (kgdb3106_baud != 9600 && kgdb3106_baud != 19200 &&
++	    kgdb3106_baud != 38400 && kgdb3106_baud != 57600 &&
++	    kgdb3106_baud != 115200)
++	    	goto errout;
++
++	return 0;
++errout:
++	printk("Invalid syntax for option kgdb3106: \n"
++	       " The valid one is \"kgdb3106=kgdb_port,kgdb_baud\" , where"
++	       "kgdb_port=0,1 kgdb_baud=9600,19200,38400,57600,115200\n");
++	return 1;
++}
++
++early_param("kgdb3106", kgdb3106_opt);
++#endif
++
+ module_init(ip3106_serial_init);
+ module_exit(ip3106_serial_exit);
+ 
+Index: linux-2.6.10/arch/mips/philips/pnx8550/common/setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/philips/pnx8550/common/setup.c
++++ linux-2.6.10/arch/mips/philips/pnx8550/common/setup.c
+@@ -134,17 +134,6 @@ static int __init plat_setup(void)
+ 		ip3106_baud(UART_BASE, pnx8550_console_port) = 5;
+ 	}
+ 
+-#ifdef CONFIG_KGDB
+-	argptr = prom_getcmdline();
+-	if ((argptr = strstr(argptr, "kgdb=ttyS")) != NULL) {
+-		int line;
+-		argptr += strlen("kgdb=ttyS");
+-		line = *argptr == '0' ? 0 : 1;
+-		rs_kgdb_hook(line);
+-		prom_printf("KGDB: Using ttyS%i for session, "
+-				"please connect your debugger\n", line ? 1 : 0);
+-	}
+-#endif
+ 	return 0;
+ }
+ 
+Index: linux-2.6.10/lib/Kconfig.debug
+===================================================================
+--- linux-2.6.10.orig/lib/Kconfig.debug
++++ linux-2.6.10/lib/Kconfig.debug
+@@ -259,6 +259,7 @@ choice
+ 	default KGDB_MPSC if SERIAL_MPSC
+ 	default KGDB_PXA_SERIAL if ARCH_PXA
+ 	default KGDB_TXX9 if TOSHIBA_RBTX4927 || TOSHIBA_RBTX4938 || TOSHIBA_RBTX4939
++	default KGDB_IP3106 if PNX8550
+ 	default KGDB_CPM_UART if (8xx || 8260)
+ 	default KGDB_8250
+ 	help
+@@ -307,6 +308,18 @@ config KGDB_TXX9
+ 	  Uses TX4927/TX4937/TX4938/TX4939 serial port to communicate with
+ 	  the host GDB.
+ 
++config KGDB_IP3106
++	bool "KGDB: On the IP3106 serial port"
++	depends on PNX8550
++	select SERIAL_IP3106
++	help
++	  Enables th KGDB serial driver for for the PXA8550 platform.
++	  You'll have to pick the baud rate and serial port (ttySA)
++	  that you wish to use for KGDB via Kconfig or via the command-line
++	  passing the option kgdb3106=portnumber,speed _BEFORE_ kgdbwait.
++	  If choosed both then the comman-line options for kgdb override
++	  the Kconfig ones.
++
+ config KGDB_ETH
+ 	bool "KGDB: On ethernet"
+ 	select NETPOLL
+@@ -426,6 +439,19 @@ config KGDB_TTYMM1
+ endchoice
+ 
+ choice
++	prompt "Serial port for KGDB"
++	depends on KGDB_IP3106
++	default KGDB_TTYSA0
++
++config KGDB_TTYSA0
++	bool "ttySA0"
++
++config KGDB_TTYSA1
++	bool "ttySA1"
++
++endchoice
++
++choice
+ 	prompt "PXA serial UART for KGDB"
+ 	depends on KGDB_PXA_SERIAL
+ 	default KGDB_PXA_FFUART
+Index: linux-2.6.10/mvl_patches/pro-0314.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0314.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(314);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

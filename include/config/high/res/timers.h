@@ -1,0 +1,1 @@
+#define CONFIG_HIGH_RES_TIMERS 1

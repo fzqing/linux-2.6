@@ -1,0 +1,648 @@
+#! /usr/bin/env bash
+# Patch: -IPV6_Support_IPV6_RECV_TCLASS_socket_options_ancillary_data
+# Date: Tue Feb  6 08:13:33 2007
+# MR: 20207
+#     There were some modifications made to the original patch to fit
+#     into our tree.  To make it fit without the modifications, several
+#     other large patches would have had to be brought in.
+# 
+# commit 41a1f8ea4fbfcdc4232f023732584aae2220de31
+# Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+# Date:   Thu Sep 8 10:19:03 2005 +0900
+# 
+#     [IPV6]: Support IPV6_{RECV,}TCLASS socket options / ancillary data.
+#     
+#     Based on patch from David L Stevens <dlstevens@us.ibm.com>
+#     
+#     Signed-off-by: David L Stevens <dlstevens@us.ibm.com>
+#     Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+# 
+
+PATCHNUM=1034
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 20207
+    There were some modifications made to the original patch to fit
+    into our tree.  To make it fit without the modifications, several
+    other large patches would have had to be brought in.
+
+commit 41a1f8ea4fbfcdc4232f023732584aae2220de31
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Thu Sep 8 10:19:03 2005 +0900
+
+    [IPV6]: Support IPV6_{RECV,}TCLASS socket options / ancillary data.
+    
+    Based on patch from David L Stevens <dlstevens@us.ibm.com>
+    
+    Signed-off-by: David L Stevens <dlstevens@us.ibm.com>
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+
+Index: linux-2.6.10/include/linux/in6.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/in6.h
++++ linux-2.6.10/include/linux/in6.h
+@@ -198,6 +198,9 @@ struct in6_flowlabel_req
+  * MCAST_MSFILTER		48
+  */
+ 
++#define IPV6_RECVTCLASS		66
++#define IPV6_TCLASS		67
++
+ /* Netfilter */
+ #define IPV6_NF_ORIGINAL_DST 80
+ 
+Index: linux-2.6.10/include/linux/ipv6.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ipv6.h
++++ linux-2.6.10/include/linux/ipv6.h
+@@ -239,7 +239,8 @@ struct ipv6_pinfo {
+ 				rxhlim:1,
+ 				hopopts:1,
+ 				dstopts:1,
+-                                rxflow:1;
++                                rxflow:1,
++                                rxtclass:1;
+ 		} bits;
+ 		__u8		all;
+ 	} rxopt;
+@@ -250,6 +251,7 @@ struct ipv6_pinfo {
+ 	                        sndflow:1,
+ 				pmtudisc:2,
+ 				ipv6only:1;
++	__u8			tclass;
+ 
+ 	struct ipv6_mc_socklist	*ipv6_mc_list;
+ 	struct ipv6_ac_socklist	*ipv6_ac_list;
+@@ -262,6 +264,7 @@ struct ipv6_pinfo {
+ 		struct ipv6_txoptions *opt;
+ 		struct rt6_info	*rt;
+ 		int hop_limit;
++		int tclass;
+ 	} cork;
+ };
+ 
+Index: linux-2.6.10/include/net/ipv6.h
+===================================================================
+--- linux-2.6.10.orig/include/net/ipv6.h
++++ linux-2.6.10/include/net/ipv6.h
+@@ -424,6 +424,7 @@ extern int			ip6_append_data(struct sock
+ 						int length,
+ 						int transhdrlen,
+ 		      				int hlimit,
++						int tclass,
+ 						struct ipv6_txoptions *opt,
+ 						struct flowi *fl,
+ 						struct rt6_info *rt,
+Index: linux-2.6.10/include/net/transp_v6.h
+===================================================================
+--- linux-2.6.10.orig/include/net/transp_v6.h
++++ linux-2.6.10/include/net/transp_v6.h
+@@ -37,7 +37,7 @@ extern int			datagram_recv_ctl(struct so
+ extern int			datagram_send_ctl(struct msghdr *msg,
+ 						  struct flowi *fl,
+ 						  struct ipv6_txoptions *opt,
+-						  int *hlimit);
++						  int *hlimit, int *tclass);
+ 
+ #define		LOOPBACK4_IPV6		__constant_htonl(0x7f000006)
+ 
+Index: linux-2.6.10/net/ipv6/datagram.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/datagram.c
++++ linux-2.6.10/net/ipv6/datagram.c
+@@ -391,6 +391,11 @@ int datagram_recv_ctl(struct sock *sk, s
+ 		put_cmsg(msg, SOL_IPV6, IPV6_HOPLIMIT, sizeof(hlim), &hlim);
+ 	}
+ 
++	if (np->rxopt.bits.rxtclass) {
++		int tclass = (ntohl(*(u32 *)skb->nh.ipv6h) >> 20) & 0xff;
++		put_cmsg(msg, SOL_IPV6, IPV6_TCLASS, sizeof(tclass), &tclass);
++	}
++
+ 	if (np->rxopt.bits.rxflow && (*(u32*)skb->nh.raw & IPV6_FLOWINFO_MASK)) {
+ 		u32 flowinfo = *(u32*)skb->nh.raw & IPV6_FLOWINFO_MASK;
+ 		put_cmsg(msg, SOL_IPV6, IPV6_FLOWINFO, sizeof(flowinfo), &flowinfo);
+@@ -428,7 +433,7 @@ int datagram_recv_ctl(struct sock *sk, s
+ 
+ int datagram_send_ctl(struct msghdr *msg, struct flowi *fl,
+ 		      struct ipv6_txoptions *opt,
+-		      int *hlimit)
++		      int *hlimit, int *tclass)
+ {
+ 	struct in6_pktinfo *src_info;
+ 	struct cmsghdr *cmsg;
+@@ -608,6 +613,24 @@ int datagram_send_ctl(struct msghdr *msg
+ 			*hlimit = *(int *)CMSG_DATA(cmsg);
+ 			break;
+ 
++		case IPV6_TCLASS:
++		    {
++			int tc;
++
++			err = -EINVAL;
++			if (cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
++				goto exit_f;
++			}
++
++			tc = *(int *)CMSG_DATA(cmsg);
++			if (tc < 0 || tc > 0xff)
++				goto exit_f;
++
++			err = 0;
++			*tclass = tc;
++
++			break;
++		    }
+ 		default:
+ 			LIMIT_NETDEBUG(
+ 				printk(KERN_DEBUG "invalid cmsg type: %d\n", cmsg->cmsg_type));
+Index: linux-2.6.10/net/ipv6/icmp.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/icmp.c
++++ linux-2.6.10/net/ipv6/icmp.c
+@@ -323,7 +323,7 @@ void icmpv6_send(struct sk_buff *skb, in
+ 	int iif = 0;
+ 	int addr_type = 0;
+ 	int len;
+-	int hlimit = -1;
++	int hlimit = -1, tclass;
+ 	int err = 0;
+ 
+ 	if ((u8*)hdr < skb->head || (u8*)(hdr+1) > skb->tail)
+@@ -428,6 +428,10 @@ void icmpv6_send(struct sk_buff *skb, in
+ 			hlimit = ipv6_get_hoplimit(dst->dev);
+ 	}
+ 
++	tclass = np->cork.tclass;
++	if (tclass < 0)
++		tclass = 0;
++
+ 	msg.skb = skb;
+ 	msg.offset = skb->nh.raw - skb->data;
+ 
+@@ -444,7 +448,7 @@ void icmpv6_send(struct sk_buff *skb, in
+ 	err = ip6_append_data(sk, icmpv6_getfrag, &msg,
+ 			      len + sizeof(struct icmp6hdr),
+ 			      sizeof(struct icmp6hdr),
+-			      hlimit, NULL, &fl, (struct rt6_info*)dst,
++			      hlimit, tclass, NULL, &fl, (struct rt6_info*)dst,
+ 			      MSG_DONTWAIT);
+ 	if (err) {
+ 		ip6_flush_pending_frames(sk);
+@@ -478,6 +482,7 @@ static void icmpv6_echo_reply(struct sk_
+ 	struct dst_entry *dst;
+ 	int err = 0;
+ 	int hlimit = -1;
++	int tclass;
+ 
+ 	saddr = &skb->nh.ipv6h->daddr;
+ 
+@@ -520,13 +525,17 @@ static void icmpv6_echo_reply(struct sk_
+ 			hlimit = ipv6_get_hoplimit(dst->dev);
+ 	}
+ 
++	tclass = np->cork.tclass;
++	if (tclass < 0)
++		tclass = 0;
++
+ 	idev = in6_dev_get(skb->dev);
+ 
+ 	msg.skb = skb;
+ 	msg.offset = 0;
+ 
+ 	err = ip6_append_data(sk, icmpv6_getfrag, &msg, skb->len + sizeof(struct icmp6hdr),
+-				sizeof(struct icmp6hdr), hlimit, NULL, &fl,
++				sizeof(struct icmp6hdr), hlimit, tclass, NULL, &fl,
+ 				(struct rt6_info*)dst, MSG_DONTWAIT);
+ 
+ 	if (err) {
+Index: linux-2.6.10/net/ipv6/ip6_flowlabel.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/ip6_flowlabel.c
++++ linux-2.6.10/net/ipv6/ip6_flowlabel.c
+@@ -311,7 +311,7 @@ fl_create(struct in6_flowlabel_req *freq
+ 		msg.msg_control = (void*)(fl->opt+1);
+ 		flowi.oif = 0;
+ 
+-		err = datagram_send_ctl(&msg, &flowi, fl->opt, &junk);
++		err = datagram_send_ctl(&msg, &flowi, fl->opt, &junk, &junk);
+ 		if (err)
+ 			goto done;
+ 		err = -EINVAL;
+Index: linux-2.6.10/net/ipv6/ip6_output.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/ip6_output.c
++++ linux-2.6.10/net/ipv6/ip6_output.c
+@@ -270,7 +270,7 @@ int ip6_xmit(struct sock *sk, struct sk_
+ #endif
+ 	u8  proto = fl->proto;
+ 	int seg_len = skb->len;
+-	int hlimit;
++	int hlimit, tclass;
+ 	u32 mtu;
+ 
+ 	skb->h.raw = skb->data;
+@@ -312,7 +312,6 @@ int ip6_xmit(struct sock *sk, struct sk_
+ 	 *	Fill in the IPv6 header
+ 	 */
+ 
+-	*(u32*)hdr = htonl(0x60000000) | fl->fl6_flowlabel;
+ 	hlimit = -1;
+ 	if (np)
+ 		hlimit = np->hop_limit;
+@@ -321,6 +320,14 @@ int ip6_xmit(struct sock *sk, struct sk_
+ 	if (hlimit < 0)
+ 		hlimit = ipv6_get_hoplimit(dst->dev);
+ 
++	tclass = -1;
++	if (np)
++		tclass = np->tclass;
++	if (tclass < 0)
++		tclass = 0;
++
++	*(u32 *)hdr = htonl(0x60000000 | (tclass << 20)) | fl->fl6_flowlabel;
++
+ 	hdr->payload_len = htons(seg_len);
+ 	hdr->nexthdr = proto;
+ 	hdr->hop_limit = hlimit;
+@@ -1090,10 +1097,11 @@ out_err_release:
+ 	return err;
+ }
+ 
+-int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to, int offset, int len, int odd, struct sk_buff *skb),
+-		    void *from, int length, int transhdrlen,
+-		    int hlimit, struct ipv6_txoptions *opt, struct flowi *fl, struct rt6_info *rt,
+-		    unsigned int flags)
++int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
++	int offset, int len, int odd, struct sk_buff *skb),
++	void *from, int length, int transhdrlen,
++	int hlimit, int tclass, struct ipv6_txoptions *opt, struct flowi *fl,
++	struct rt6_info *rt, unsigned int flags)
+ {
+ 	struct inet_opt *inet = inet_sk(sk);
+ 	struct ipv6_pinfo *np = inet6_sk(sk);
+@@ -1134,6 +1142,7 @@ int ip6_append_data(struct sock *sk, int
+ 		np->cork.rt = rt;
+ 		inet->cork.fl = *fl;
+ 		np->cork.hop_limit = hlimit;
++		np->cork.tclass = tclass;
+ 		inet->cork.fragsize = mtu = dst_pmtu(&rt->u.dst);
+ 		inet->cork.length = 0;
+ 		sk->sk_sndmsg_page = NULL;
+@@ -1422,7 +1431,8 @@ int ip6_push_pending_frames(struct sock 
+ 
+ 	skb->nh.ipv6h = hdr = (struct ipv6hdr*) skb_push(skb, sizeof(struct ipv6hdr));
+ 	
+-	*(u32*)hdr = fl->fl6_flowlabel | htonl(0x60000000);
++	*(u32*)hdr = fl->fl6_flowlabel |
++		     htonl(0x60000000 | ((int)np->cork.tclass << 20));
+ 
+ 	if (skb->len <= sizeof(struct ipv6hdr) + IPV6_MAXPLEN)
+ 		hdr->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+Index: linux-2.6.10/net/ipv6/ipv6_sockglue.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/ipv6_sockglue.c
++++ linux-2.6.10/net/ipv6/ipv6_sockglue.c
+@@ -235,6 +235,18 @@ int ipv6_setsockopt(struct sock *sk, int
+ 		retv = 0;
+ 		break;
+ 
++	case IPV6_TCLASS:
++		if (val < 0 || val > 0xff)
++			goto e_inval;
++		np->tclass = val;
++		retv = 0;
++		break;
++		
++	case IPV6_RECVTCLASS:
++		np->rxopt.bits.rxtclass = valbool;
++		retv = 0;
++		break;
++
+ 	case IPV6_FLOWINFO:
+ 		np->rxopt.bits.rxflow = valbool;
+ 		retv = 0;
+@@ -274,7 +286,7 @@ int ipv6_setsockopt(struct sock *sk, int
+ 		msg.msg_controllen = optlen;
+ 		msg.msg_control = (void*)(opt+1);
+ 
+-		retv = datagram_send_ctl(&msg, &fl, opt, &junk);
++		retv = datagram_send_ctl(&msg, &fl, opt, &junk, &junk);
+ 		if (retv)
+ 			goto done;
+ update:
+@@ -658,6 +670,14 @@ int ipv6_getsockopt(struct sock *sk, int
+ 		val = np->rxopt.bits.dstopts;
+ 		break;
+ 
++	case IPV6_TCLASS:
++		val = np->tclass;
++		break;
++
++	case IPV6_RECVTCLASS:
++		val = np->rxopt.bits.rxtclass;
++		break;
++
+ 	case IPV6_FLOWINFO:
+ 		val = np->rxopt.bits.rxflow;
+ 		break;
+Index: linux-2.6.10/net/ipv6/raw.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/raw.c
++++ linux-2.6.10/net/ipv6/raw.c
+@@ -681,6 +681,7 @@ static int rawv6_sendmsg(struct kiocb *i
+ 	struct flowi fl;
+ 	int addr_len = msg->msg_namelen;
+ 	int hlimit = -1;
++	int tclass = -1;
+ 	u16 proto;
+ 	int err;
+ 
+@@ -766,7 +767,7 @@ static int rawv6_sendmsg(struct kiocb *i
+ 		memset(opt, 0, sizeof(struct ipv6_txoptions));
+ 		opt->tot_len = sizeof(struct ipv6_txoptions);
+ 
+-		err = datagram_send_ctl(msg, &fl, opt, &hlimit);
++		err = datagram_send_ctl(msg, &fl, opt, &hlimit, &tclass);
+ 		if (err < 0) {
+ 			fl6_sock_release(flowlabel);
+ 			return err;
+@@ -834,6 +835,12 @@ static int rawv6_sendmsg(struct kiocb *i
+ 			hlimit = ipv6_get_hoplimit(dst->dev);
+ 	}
+ 
++	if (tclass < 0) {
++		tclass = np->cork.tclass;
++		if (tclass < 0)
++			tclass = 0;
++	}
++
+ 	if (msg->msg_flags&MSG_CONFIRM)
+ 		goto do_confirm;
+ 
+@@ -842,8 +849,9 @@ back_from_confirm:
+ 		err = rawv6_send_hdrinc(sk, msg->msg_iov, len, &fl, (struct rt6_info*)dst, msg->msg_flags);
+ 	} else {
+ 		lock_sock(sk);
+-		err = ip6_append_data(sk, ip_generic_getfrag, msg->msg_iov, len, 0,
+-					hlimit, opt, &fl, (struct rt6_info*)dst, msg->msg_flags);
++		err = ip6_append_data(sk, ip_generic_getfrag, msg->msg_iov,
++			len, 0, hlimit, tclass, opt, &fl, (struct rt6_info*)dst,
++			msg->msg_flags);
+ 
+ 		if (err)
+ 			ip6_flush_pending_frames(sk);
+Index: linux-2.6.10/net/ipv6/udp.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/udp.c
++++ linux-2.6.10/net/ipv6/udp.c
+@@ -637,6 +637,7 @@ static int udpv6_sendmsg(struct kiocb *i
+ 	int addr_len = msg->msg_namelen;
+ 	int ulen = len;
+ 	int hlimit = -1;
++	int tclass = -1;
+ 	int corkreq = up->corkflag || msg->msg_flags&MSG_MORE;
+ 	int err;
+ 
+@@ -758,7 +759,7 @@ do_udp_sendmsg:
+ 		memset(opt, 0, sizeof(struct ipv6_txoptions));
+ 		opt->tot_len = sizeof(*opt);
+ 
+-		err = datagram_send_ctl(msg, fl, opt, &hlimit);
++		err = datagram_send_ctl(msg, fl, opt, &hlimit, &tclass);
+ 		if (err < 0) {
+ 			fl6_sock_release(flowlabel);
+ 			return err;
+@@ -823,6 +824,12 @@ do_udp_sendmsg:
+ 			hlimit = ipv6_get_hoplimit(dst->dev);
+ 	}
+ 
++	if (tclass < 0) {
++		tclass = np->tclass;
++		if (tclass < 0)
++			tclass = 0;
++	}
++
+ 	if (msg->msg_flags&MSG_CONFIRM)
+ 		goto do_confirm;
+ back_from_confirm:
+@@ -842,9 +849,10 @@ back_from_confirm:
+ 
+ do_append_data:
+ 	up->len += ulen;
+-	err = ip6_append_data(sk, ip_generic_getfrag, msg->msg_iov, ulen, sizeof(struct udphdr),
+-			      hlimit, opt, fl, (struct rt6_info*)dst,
+-			      corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
++	err = ip6_append_data(sk, ip_generic_getfrag, msg->msg_iov, ulen,
++		sizeof(struct udphdr), hlimit, tclass, opt, fl,
++		(struct rt6_info*)dst,
++		corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
+ 	if (err)
+ 		udp_v6_flush_pending_frames(sk);
+ 	else if (!corkreq)
+Index: linux-2.6.10/mvl_patches/pro-1034.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1034.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1034);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

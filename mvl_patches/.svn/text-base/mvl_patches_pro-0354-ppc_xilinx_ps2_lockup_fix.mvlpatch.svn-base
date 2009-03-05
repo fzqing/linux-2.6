@@ -1,0 +1,321 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_ps2_lockup_fix
+# Date: Mon Mar  6 15:04:07 2006
+# Source: MontaVista Software, Inc.
+# MR: 17015
+# Type: Defect Fix
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     The patch fixes the lock-up inside sxps2_write() when nothing
+#     is connected to the PS/2 port or the connected peripheral is
+#     not operational.
+#     Another fix is to use separate copies of SERIO_* flags for each
+#     port, not the (shared) static variable.
+# 
+
+PATCHNUM=354
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 17015
+Type: Defect Fix
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    The patch fixes the lock-up inside sxps2_write() when nothing
+    is connected to the PS/2 port or the connected peripheral is
+    not operational.
+    Another fix is to use separate copies of SERIO_* flags for each
+    port, not the (shared) static variable.
+
+ drivers/input/serio/xilinx_ps2/adapter.c |   29 ++++++++++++++++++++++-------
+ mvl_patches/pro-0354.c                   |   16 ++++++++++++++++
+ 2 files changed, 38 insertions(+), 7 deletions(-)
+
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/adapter.c
+===================================================================
+--- linux-2.6.10.orig/drivers/input/serio/xilinx_ps2/adapter.c
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/adapter.c
+@@ -49,6 +49,8 @@ struct xps2data{
+ 	struct pt_regs		*saved_regs;
+ 	spinlock_t		lock;
+ 	u8			rxb;	/* Rx buffer */
++	unsigned long		tx_end;
++	unsigned int		dfl;
+ 	/*
+ 	 * The underlying OS independent code needs space as well.  A
+ 	 * pointer to the following XPs2 structure will be passed to
+@@ -113,7 +115,6 @@ static irqreturn_t xps2_interrupt(int ir
+ static void sxps2_handler(void *CallbackRef, u32 Event, unsigned int EventData)
+ {
+ 	struct xps2data *drvdata = (struct xps2data *) CallbackRef;
+-	static unsigned int dfl = 0;
+ 	u8 c;
+ 
+ 	switch (Event) {
+@@ -121,11 +122,11 @@ static void sxps2_handler(void *Callback
+ 		printk(KERN_ERR "%s: receive overrun error.\n",
+ 		       drvdata->serio.name);
+ 	case XPS2_EVENT_RECV_ERROR:
+-		dfl |= SERIO_PARITY;
++		drvdata->dfl |= SERIO_PARITY;
+ 		break;
+ 	case XPS2_EVENT_SENT_NOACK:
+ 	case XPS2_EVENT_TIMEOUT:
+-		dfl |= SERIO_TIMEOUT;
++		drvdata->dfl |= SERIO_TIMEOUT;
+ 		break;
+ 	case XPS2_EVENT_RECV_DATA:
+ 		if (EventData > 0) {
+@@ -137,9 +138,9 @@ static void sxps2_handler(void *Callback
+ 			c = drvdata->rxb;
+ 
+ 			XPs2_Recv(&drvdata->ps2, &drvdata->rxb, 1);
+-			serio_interrupt(&drvdata->serio, c, dfl,
++			serio_interrupt(&drvdata->serio, c, drvdata->dfl,
+ 					drvdata->saved_regs);
+-			dfl = 0;
++			drvdata->dfl = 0;
+ 		}
+ 		break;
+ 	case XPS2_EVENT_SENT_DATA:
+@@ -157,6 +158,15 @@ static void sxps2_handler(void *Callback
+ 
+ /*
+  * sxps2_write() sends a byte out through the PS/2 interface.
++ *
++ * The sole purpose of drvdata->tx_end is to prevent the driver
++ * from locking up in the do {} while; loop when nothing is connected
++ * to the given PS/2 port. That's why we do not try to recover
++ * from the transmission failure.
++ * drvdata->tx_end needs not to be initialized to some "far in the
++ * future" value, as the very first attempt to XPs2_Send() a byte
++ * is always successfull, and drvdata->tx_end will be set to a proper
++ * value at that moment - before the 1st use in the comparison.
+  */
+ static int sxps2_write(struct serio *pserio, unsigned char c)
+ {
+@@ -168,9 +178,14 @@ static int sxps2_write(struct serio *pse
+ 		spin_lock_irqsave(&drvdata->lock, flags);
+ 		retval = XPs2_Send(&drvdata->ps2, &c, 1);
+ 		spin_unlock_irqrestore(&drvdata->lock, flags);
+-	} while (retval != 1);
+ 
+-	return 0;	/* success */
++		if (retval == 1) {
++			drvdata->tx_end = jiffies + HZ;
++			return 0;	/* success */
++		}
++	} while (!time_after(jiffies, drvdata->tx_end));
++
++	return 1;	/* transmission is frozen */
+ }
+ 
+ /*
+Index: linux-2.6.10/mvl_patches/pro-0354.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0354.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(354);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

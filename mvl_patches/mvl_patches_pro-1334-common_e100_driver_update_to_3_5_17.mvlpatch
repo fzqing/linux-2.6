@@ -1,0 +1,2098 @@
+#! /usr/bin/env bash
+# Patch: -common_e100_driver_update_to_3_5_17
+# Date: Tue May  8 14:45:12 2007
+# Source: http://sourceforge.net/projects/e1000 | MontaVista Software, Inc.
+# MR: 19998
+# Type: Enhancement | Integration
+# Disposition: backport
+# Signed-off-by: Tushar Gohad <tgohad@mvista.com>
+# Description:
+# 
+# Update e100 driver to version 3.5.17. Add performance features,
+# ethtool support.
+# 
+# 
+
+PATCHNUM=1334
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: http://sourceforge.net/projects/e1000 | MontaVista Software, Inc.
+MR: 19998
+Type: Enhancement | Integration
+Disposition: backport
+Signed-off-by: Tushar Gohad <tgohad@mvista.com>
+Description:
+
+Update e100 driver to version 3.5.17. Add performance features,
+ethtool support.
+
+
+Index: linux-2.6.10/drivers/net/e100.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/e100.c
++++ linux-2.6.10/drivers/net/e100.c
+@@ -1,27 +1,27 @@
+ /*******************************************************************************
+ 
+-  
+-  Copyright(c) 1999 - 2004 Intel Corporation. All rights reserved.
+-  
+-  This program is free software; you can redistribute it and/or modify it 
+-  under the terms of the GNU General Public License as published by the Free 
+-  Software Foundation; either version 2 of the License, or (at your option) 
+-  any later version.
+-  
+-  This program is distributed in the hope that it will be useful, but WITHOUT 
+-  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or 
+-  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for 
++  Intel PRO/100 Linux driver
++  Copyright(c) 1999 - 2006 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify it
++  under the terms and conditions of the GNU General Public License,
++  version 2, as published by the Free Software Foundation.
++
++  This program is distributed in the hope it will be useful, but WITHOUT
++  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+   more details.
+-  
++
+   You should have received a copy of the GNU General Public License along with
+-  this program; if not, write to the Free Software Foundation, Inc., 59 
+-  Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+-  
+-  The full GNU General Public License is included in this distribution in the
+-  file called LICENSE.
+-  
++  this program; if not, write to the Free Software Foundation, Inc.,
++  51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++
++  The full GNU General Public License is included in this distribution in
++  the file called "COPYING".
++
+   Contact Information:
+   Linux NICS <linux.nics@intel.com>
++  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
+   Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+ 
+ *******************************************************************************/
+@@ -118,12 +118,12 @@
+  *
+  *	V.   Miscellaneous
+  *
+- * 	VLAN offloading of tagging, stripping is supported. Rx Checksum 
+- *	offloading is supported for mac revisions later than 82559 101M. 
+- *	Tx Checksum and Scatter/Gather is supported.  
++ * 	VLAN offloading of tagging, stripping is supported. Rx Checksum
++ *	offloading is supported for mac revisions later than 82559 101M.
++ *	Tx Checksum and Scatter/Gather is supported.
+  *
+- *	Ethtool support added for get/set driver settings, Scatter/Gather, 
+- *	checksum offload, flow control.  
++ *	Ethtool support added for get/set driver settings, Scatter/Gather,
++ *	checksum offload, flow control.
+  *
+  *	NAPI is now truely configurable.
+  *
+@@ -135,11 +135,14 @@
+  * 	TODO:
+  * 	o several entry points race with dev->close
+  * 	o check for tx-no-resources/stop Q races with tx clean/wake Q
++ *
++ *	FIXES:
++ * 2005/12/02 - Michael O'Donnell <Michael.ODonnell at stratus dot com>
++ *	- Stratus87247: protect MDI control register manipulations
+  */
+ 
+ #include <linux/config.h>
+ #include <linux/module.h>
+-#include <linux/moduleparam.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ #include <linux/slab.h>
+@@ -157,19 +160,85 @@
+ #include <linux/string.h>
+ #include <linux/reboot.h>
+ #include <asm/unaligned.h>
+-
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
++#include <linux/in.h>
++#include <linux/ip.h>
+ 
+-#define DRV_NAME		"e100"
+-#ifdef CONFIG_E100_NAPI
+-#define DRV_EXT 		"-NAPI"
++/* The following is a part of kcompat.h from the original community driver */
++#include <linux/version.h>
++
++#ifndef PMSG_SUSPEND
++#define PMSG_SUSPEND 3
++#endif
++
++#ifndef NET_IP_ALIGN
++#define NET_IP_ALIGN 2
++#endif
++
++#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,6,11) )
++#define PCI_D0  	0
++#define PCI_D1		1
++#define PCI_D2		2
++#define PCI_D3hot	3
++#define PCI_D3cold	4
++#define pci_choose_state(pdev,state) state
++#endif
++
++#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,6,14) )
++#define pm_message_t u32
++#endif
++
++#if ( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,12) )
++#define E100_USE_SHUTDOWN_HANDLER
+ #else
++#define E100_USE_REBOOT_NOTIFIER
++#endif
++
++#if ( LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,17) )
++#if ( LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,16) )
++#define IRQF_PROBE_SHARED 0
++#else
++#define IRQF_PROBE_SHARED SA_PROBEIRQ
++#endif /* <= 2.6.16 */
++#define IRQF_SHARED SA_SHIRQ
++
++#ifndef netdev_alloc_skb
++#define netdev_alloc_skb _kc_netdev_alloc_skb
++static inline struct sk_buff *_kc_netdev_alloc_skb(struct net_device *dev,
++                                                   unsigned int length)
++{
++	/* 16 == NET_PAD_SKB */
++	struct sk_buff *skb;
++	skb = alloc_skb(length + 16, GFP_ATOMIC);
++	if (likely(skb != NULL)) {
++		skb_reserve(skb, 16);
++		skb->dev = dev;
++	}
++	return skb;
++}
++#endif
++
++#endif /* <= 2.6.17 */
++/* end kcompat.h */
++
++#ifdef E100_USE_REBOOT_NOTIFIER
++#include <linux/reboot.h>
++#endif
++
++#ifdef ETHTOOL_OPS_COMPAT
++extern int e100_ethtool_ioctl(struct ifreq *ifr);
++#endif
++
++#define DRV_NAME		"e100"
++#ifndef CONFIG_E100_NAPI
+ #define DRV_EXT
++#else
++#define DRV_EXT			"-NAPI"
+ #endif
+-#define DRV_VERSION "3.3.6-k2"DRV_EXT
++#define DRV_VERSION		"3.5.17"DRV_EXT
+ #define DRV_DESCRIPTION		"Intel(R) PRO/100 Network Driver"
+-#define DRV_COPYRIGHT		"Copyright(c) 1999-2005 Intel Corporation"
++#define DRV_COPYRIGHT		"Copyright(c) 1999-2006 Intel Corporation"
+ #define PFX			DRV_NAME ": "
+ 
+ #define E100_WATCHDOG_PERIOD	(2 * HZ)
+@@ -178,9 +247,10 @@
+ MODULE_DESCRIPTION(DRV_DESCRIPTION);
+ MODULE_AUTHOR(DRV_COPYRIGHT);
+ MODULE_LICENSE("GPL");
++MODULE_VERSION(DRV_VERSION);
+ 
+-static int debug = 0;
+-module_param(debug, int, 0);
++static int debug = 3;
++module_param(debug, int, 3);
+ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
+ #define DPRINTK(nlevel, klevel, fmt, args...) \
+ 	(void)((NETIF_MSG_##nlevel & nic->msg_enable) && \
+@@ -286,6 +356,12 @@ enum scb_status {
+ 	rus_mask         = 0x3C,
+ };
+ 
++enum ru_state  {
++	RU_SUSPENDED = 0,
++	RU_RUNNING	 = 1,
++	RU_UNINITIALIZED = -1,
++};
++
+ enum scb_stat_ack {
+ 	stat_ack_not_ours    = 0x00,
+ 	stat_ack_sw_gen      = 0x04,
+@@ -320,7 +396,7 @@ enum cuc_dump {
+ 	cuc_dump_complete       = 0x0000A005,
+ 	cuc_dump_reset_complete = 0x0000A007,
+ };
+-		
++
+ enum port {
+ 	software_reset  = 0x0000,
+ 	selftest        = 0x0001,
+@@ -486,7 +562,6 @@ enum ipcb_ctrl {
+ 	ipcb_insertvlan_enable 		= 0x02,
+ 	ipcb_ip_activation_default      = ipcb_hardwareparsing_enable,
+ };
+-
+ #define UCODE_SIZE			134
+ #define TBD_ARRAY_SIZE			(2+MAX_SKB_FRAGS)
+ struct tbd {
+@@ -510,7 +585,7 @@ struct cb {
+ 			u16 tcb_byte_count;
+ 			u8 threshold;
+ 			u8 tbd_count;
+-			
++
+ 			union {
+ 				struct ipcb ipcb;
+ 				struct tbd tbd[TBD_ARRAY_SIZE];
+@@ -572,7 +647,7 @@ struct nic {
+ 	struct rx *rx_to_use;
+ 	struct rx *rx_to_clean;
+ 	struct rfd blank_rfd;
+-	int ru_running;
++	enum ru_state ru_running;
+ 
+ 	spinlock_t cb_lock			____cacheline_aligned;
+ 	spinlock_t cmd_lock;
+@@ -593,17 +668,17 @@ struct nic {
+ 		wol_magic          = (1 << 3),
+ 		ich_10h_workaround = (1 << 4),
+ 		fc_capable	   = (1 << 5),
+-		fc_tx_only	   = (1 << 6), /* Link partner not FC capable 
++		fc_tx_only	   = (1 << 6), /* Link partner not FC capable
+ 						* but capable of autoneg */
+ 		fc_disabled	   = (1 << 7),
+ 	} flags					____cacheline_aligned;
+ 
+ 	enum {
+ 		use_ipcb	   = (1 << 0), /* 82550/1 */
+-		rx_csum_offload	   = (1 << 1), 
+-		tx_csum_offload	   = (1 << 2), 
++		rx_csum_offload	   = (1 << 1),
++		tx_csum_offload	   = (1 << 2),
+ 		vlan_tagging	   = (1 << 3),
+-	} offload_features			____cacheline_aligned; 
++	} offload_features			____cacheline_aligned;
+ 
+ 	enum mac mac;
+ 	enum phy phy;
+@@ -612,6 +687,7 @@ struct nic {
+ 	struct timer_list watchdog;
+ 	struct timer_list blink_timer;
+ 	struct mii_if_info mii;
++	struct work_struct tx_timeout_task;
+ 	enum loopback loopback;
+ 
+ 	struct mem *mem;
+@@ -632,6 +708,7 @@ struct nic {
+ 	u32 rx_fc_unsupported;
+ 	u32 rx_tco_frames;
+ 	u32 rx_over_length_errors;
++
+ 	u32 rx_intr_frames;
+ 	struct vlan_group *vlangrp;
+ 	u16 rfd_size;
+@@ -639,6 +716,8 @@ struct nic {
+ 	u16 leds;
+ 	u16 eeprom_wc;
+ 	u16 eeprom[256];
++	spinlock_t mdio_lock;
++	u32 pm_state[16];
+ };
+ 
+ static inline void e100_write_flush(struct nic *nic)
+@@ -648,24 +727,24 @@ static inline void e100_write_flush(stru
+ 	(void)readb(&nic->csr->scb.status);
+ }
+ 
+-static inline void e100_enable_irq(struct nic *nic)
++static void e100_enable_irq(struct nic *nic)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&nic->cmd_lock, flags);
+ 	writeb(irq_mask_none, &nic->csr->scb.cmd_hi);
+-	spin_unlock_irqrestore(&nic->cmd_lock, flags);
+ 	e100_write_flush(nic);
++	spin_unlock_irqrestore(&nic->cmd_lock, flags);
+ }
+ 
+-static inline void e100_disable_irq(struct nic *nic)
++static void e100_disable_irq(struct nic *nic)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&nic->cmd_lock, flags);
+ 	writeb(irq_mask_all, &nic->csr->scb.cmd_hi);
+-	spin_unlock_irqrestore(&nic->cmd_lock, flags);
+ 	e100_write_flush(nic);
++	spin_unlock_irqrestore(&nic->cmd_lock, flags);
+ }
+ 
+ static void e100_hw_reset(struct nic *nic)
+@@ -771,10 +850,10 @@ static u16 e100_eeprom_read(struct nic *
+ 		ctrl = (cmd_addr_data & (1 << i)) ? eecs | eedi : eecs;
+ 		writeb(ctrl, &nic->csr->eeprom_ctrl_lo);
+ 		e100_write_flush(nic); udelay(4);
+-		
++
+ 		writeb(ctrl | eesk, &nic->csr->eeprom_ctrl_lo);
+ 		e100_write_flush(nic); udelay(4);
+-		
++
+ 		/* Eeprom drives a dummy zero to EEDO after receiving
+ 		 * complete address.  Use this to adjust addr_len. */
+ 		ctrl = readb(&nic->csr->eeprom_ctrl_lo);
+@@ -782,7 +861,7 @@ static u16 e100_eeprom_read(struct nic *
+ 			*addr_len -= (i - 16);
+ 			i = 17;
+ 		}
+-		
++
+ 		data = (data << 1) | (ctrl & eedo ? 1 : 0);
+ 	}
+ 
+@@ -845,8 +924,9 @@ static int e100_eeprom_save(struct nic *
+ 	return 0;
+ }
+ 
+-#define E100_WAIT_SCB_TIMEOUT 40
+-static inline int e100_exec_cmd(struct nic *nic, u8 cmd, dma_addr_t dma_addr)
++#define E100_WAIT_SCB_TIMEOUT 20000 /* we might have to wait 100ms!!! */
++#define E100_WAIT_SCB_FAST 20       /* delay like the old code */
++static int e100_exec_cmd(struct nic *nic, u8 cmd, dma_addr_t dma_addr)
+ {
+ 	unsigned long flags;
+ 	unsigned int i;
+@@ -859,7 +939,7 @@ static inline int e100_exec_cmd(struct n
+ 		if(likely(!readb(&nic->csr->scb.cmd_lo)))
+ 			break;
+ 		cpu_relax();
+-		if(unlikely(i > (E100_WAIT_SCB_TIMEOUT >> 1)))
++		if(unlikely(i > E100_WAIT_SCB_FAST))
+ 			udelay(5);
+ 	}
+ 	if(unlikely(i == E100_WAIT_SCB_TIMEOUT)) {
+@@ -877,7 +957,7 @@ err_unlock:
+ 	return err;
+ }
+ 
+-static inline int e100_exec_cb(struct nic *nic, struct sk_buff *skb,
++static int e100_exec_cb(struct nic *nic, struct sk_buff *skb,
+ 	void (*cb_prepare)(struct nic *, struct cb *, struct sk_buff *))
+ {
+ 	struct cb *cb;
+@@ -915,6 +995,10 @@ static inline int e100_exec_cb(struct ni
+ 			 * because the controller is too busy, so
+ 			 * let's just queue the command and try again
+ 			 * when another command is scheduled. */
++			if(err == -ENOSPC) {
++				//request a reset
++				schedule_work(&nic->tx_timeout_task);
++			}
+ 			break;
+ 		} else {
+ 			nic->cuc_cmd = cuc_resume;
+@@ -932,15 +1016,35 @@ static u16 mdio_ctrl(struct nic *nic, u3
+ {
+ 	u32 data_out = 0;
+ 	unsigned int i;
++	unsigned long flags;
++
+ 
++	/*
++	 * Stratus87247: we shouldn't be writing the MDI control
++	 * register until the Ready bit shows True.  Also, since
++	 * manipulation of the MDI control registers is a multi-step
++	 * procedure it should be done under lock.
++	 */
++	spin_lock_irqsave(&nic->mdio_lock, flags);
++	for (i = 100; i; --i) {
++		if (readl(&nic->csr->mdi_ctrl) & mdi_ready)
++			break;
++		udelay(20);
++	}
++	if (unlikely(!i)) {
++		printk("e100.mdio_ctrl(%s) won't go Ready\n",
++			nic->netdev->name );
++		spin_unlock_irqrestore(&nic->mdio_lock, flags);
++		return 0;		/* No way to indicate timeout error */
++	}
+ 	writel((reg << 16) | (addr << 21) | dir | data, &nic->csr->mdi_ctrl);
+ 
+-	for(i = 0; i < 100; i++) {
++	for (i = 0; i < 100; i++) {
+ 		udelay(20);
+-		if((data_out = readl(&nic->csr->mdi_ctrl)) & mdi_ready)
++		if ((data_out = readl(&nic->csr->mdi_ctrl)) & mdi_ready)
+ 			break;
+ 	}
+-
++	spin_unlock_irqrestore(&nic->mdio_lock, flags);
+ 	DPRINTK(HW, DEBUG,
+ 		"%s:addr=%d, reg=%d, data_in=0x%04X, data_out=0x%04X\n",
+ 		dir == mdi_read ? "READ" : "WRITE", addr, reg, data, data_out);
+@@ -959,8 +1063,8 @@ static void mdio_write(struct net_device
+ 
+ static void e100_get_defaults(struct nic *nic)
+ {
+-	struct param_range rfds = { .min = 64, .max = 256, .count = 64 };
+-	struct param_range cbs  = { .min = 64, .max = 256, .count = 64 };
++	struct param_range rfds = { .min = 16, .max = 256, .count = 256 };
++	struct param_range cbs  = { .min = 64, .max = 256, .count = 128 };
+ 
+ 	pci_read_config_byte(nic->pdev, PCI_REVISION_ID, &nic->rev_id);
+ 	/* MAC type is encoded as rev ID; exception: ICH is treated as 82559 */
+@@ -976,28 +1080,30 @@ static void e100_get_defaults(struct nic
+ 	nic->offload_features &= ~tx_csum_offload;
+ 	nic->offload_features &= ~vlan_tagging;
+ 
+-	if(nic->mac >= mac_82559_D101M) {		
+-		/* Enable 82559/0/1 Receive Checksum Offload for TCP and UDP by default */		
++	if(nic->mac >= mac_82559_D101M) {
++		/* Enable 82559/0/1 Receive Checksum Offload for TCP and UDP by default */
+ 		nic->offload_features |= rx_csum_offload;
+ 		if(nic->mac >= mac_82550_D102) {
+ 			nic->offload_features |= tx_csum_offload;
+ 			nic->offload_features |= use_ipcb;
+ 
+ 			nic->offload_features |= vlan_tagging;
+-			nic->rfd_size = 32; 
++			nic->rfd_size = 32;
+ 		} else {
+ 			if(nic->pdev->device == 0x1209) {
+ 				nic->offload_features &= ~rx_csum_offload;
+ 			}
+ 			nic->offload_features &= ~use_ipcb;
+-			nic->rfd_size = 16; 
++			nic->rfd_size = 16;
+ 		}
+ 	}
+ 	/* Quadwords to DMA into FIFO before starting frame transmit */
+ 	nic->tx_threshold = 0xE0;
+ 
+-	nic->tx_command = cpu_to_le16(cb_i | cb_tx_sf |
+-		((nic->mac >= mac_82558_D101_A4) ? cb_cid : 0));
++	/* no interrupt for every tx completion, delay = 256us if not 557*/
++	/* nic->tx_command = cpu_to_le16(cb_i | cb_tx_sf | */
++	nic->tx_command = cpu_to_le16(cb_tx_sf |
++		((nic->mac >= mac_82558_D101_A4) ? cb_cid : cb_i));
+ 
+ 	/* Template for a freshly allocated RFD */
+ 	nic->blank_rfd.command = cpu_to_le16(cb_el);
+@@ -1100,7 +1206,8 @@ static void e100_configure(struct nic *n
+ 	if(nic->flags & multicast_all)
+ 		config->multicast_all = 0x1;		/* 1=accept, 0=no */
+ 
+-	if(!(nic->flags & wol_magic))
++	/* disable WoL when up */
++	if(netif_running(nic->netdev) || !(nic->flags & wol_magic))
+ 		config->magic_packet_disable = 0x1;	/* 1=off, 0=on */
+ 
+ 	if(nic->mac >= mac_82558_D101_A4) {
+@@ -1109,10 +1216,9 @@ static void e100_configure(struct nic *n
+ 		else
+ 			config->fc_disable = 0x0;
+ 
+-		/* Configure flow control parameters */		
++		/* Configure flow control parameters */
+ 		if(config->fc_disable == 0x0)
+ 			e100_config_fc(nic, config);
+-
+ 		config->mwi_enable = 0x1;	/* 1=enable, 0=disable */
+ 		config->standard_tcb = 0x0;	/* 1=standard, 0=extended */
+ 		config->rx_long_ok = 0x1;	/* 1=VLANs ok, 0=standard */
+@@ -1122,31 +1228,31 @@ static void e100_configure(struct nic *n
+ 			config->standard_stat_counter = 0x0;
+ 	}
+ 
+-	if(nic->mac >= mac_82559_D101M) {		
++	if(nic->mac >= mac_82559_D101M) {
+ 		if(nic->mac >= mac_82550_D102) {
+ 			nic->offload_features |= use_ipcb;
+-		
++
+ 			nic->offload_features |= vlan_tagging;
+-			nic->rfd_size = 32; 
++			nic->rfd_size = 32;
+ 		} else {
+ 			nic->offload_features &= ~use_ipcb;
+ 			nic->offload_features &= ~vlan_tagging;
+-			nic->rfd_size = 16; 
++			nic->rfd_size = 16;
+ 		}
+ 	}
+ 
+-	if((nic->offload_features & rx_csum_offload) && 
+-		(nic->mac >= mac_82559_D101M) && 
++	if((nic->offload_features & rx_csum_offload) &&
++		(nic->mac >= mac_82559_D101M) &&
+ 		(nic->pdev->device != 0x1209))
+ 			config->rx_tcpudp_checksum = 0x1;
+ 
+ 	/* 82550/1 specific parameters */
+ 	if(nic->mac >= mac_82550_D102) {
+-	
++
+ 		/* Add extra bytes for D102 */
+ 		config->byte_count += ADD_CONFIG_BYTES_D102;
+ 
+-		/* Enable extended RFD. If this is enabled, the 
++		/* Enable extended RFD. If this is enabled, the
+ 		 * immediated receive data buffer starts at offset
+ 		 * 32 from the RFD base address, instead of 16 */
+ 		config->rx_extended_rfd = 0x1;
+@@ -1155,19 +1261,19 @@ static void e100_configure(struct nic *n
+ 		 * for offloading features */
+ 		config->rx_d102_mode = 0x1;
+ 
+-		if(nic->offload_features & tx_csum_offload) {	
++		if(nic->offload_features & tx_csum_offload) {
+ 			nic->netdev->features |= NETIF_F_IP_CSUM;
+-			nic->netdev->features |= NETIF_F_SG; 
++			nic->netdev->features |= NETIF_F_SG;
+ 		} else {
+ 			nic->netdev->features &= ~NETIF_F_IP_CSUM;
+ 		}
+ 	}
+-	
++
+ 	if(nic->offload_features & vlan_tagging) {
+ 		config->rx_vlan_drop = 0x1;
+-		nic->netdev->features |= 
++		nic->netdev->features |=
+ 			NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
+-	} else 
++	} else
+ 		nic->netdev->features &= ~NETIF_F_VLAN_CHALLENGED;
+ 
+ 	DPRINTK(HW, DEBUG, "[00-07]=%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n",
+@@ -1178,27 +1284,299 @@ static void e100_configure(struct nic *n
+ 		c[16], c[17], c[18], c[19], c[20], c[21], c[22], c[23]);
+ }
+ 
+-static void e100_load_ucode(struct nic *nic, struct cb *cb, struct sk_buff *skb)
+-{
+-	int i;
+-	static const u32 ucode[UCODE_SIZE] = {
+-		/* NFS packets are misinterpreted as TCO packets and
+-		 * incorrectly routed to the BMC over SMBus.  This
+-		 * microcode patch checks the fragmented IP bit in the
+-		 * NFS/UDP header to distinguish between NFS and TCO. */
+-		0x0EF70E36, 0x1FFF1FFF, 0x1FFF1FFF, 0x1FFF1FFF, 0x1FFF1FFF,
+-		0x1FFF1FFF, 0x00906E41, 0x00800E3C, 0x00E00E39, 0x00000000,
+-		0x00906EFD, 0x00900EFD,	0x00E00EF8,
+-	};
++/********************************************************/
++/*  Micro code for 8086:1229 Rev 8                      */
++/********************************************************/
++
++/*  Parameter values for the D101M B-step  */
++#define D101M_CPUSAVER_TIMER_DWORD		78
++#define D101M_CPUSAVER_BUNDLE_DWORD		65
++#define D101M_CPUSAVER_MIN_SIZE_DWORD		126
++
++#define D101M_B_RCVBUNDLE_UCODE \
++{\
++0x00550215, 0xFFFF0437, 0xFFFFFFFF, 0x06A70789, 0xFFFFFFFF, 0x0558FFFF, \
++0x000C0001, 0x00101312, 0x000C0008, 0x00380216, \
++0x0010009C, 0x00204056, 0x002380CC, 0x00380056, \
++0x0010009C, 0x00244C0B, 0x00000800, 0x00124818, \
++0x00380438, 0x00000000, 0x00140000, 0x00380555, \
++0x00308000, 0x00100662, 0x00100561, 0x000E0408, \
++0x00134861, 0x000C0002, 0x00103093, 0x00308000, \
++0x00100624, 0x00100561, 0x000E0408, 0x00100861, \
++0x000C007E, 0x00222C21, 0x000C0002, 0x00103093, \
++0x00380C7A, 0x00080000, 0x00103090, 0x00380C7A, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x0010009C, 0x00244C2D, 0x00010004, 0x00041000, \
++0x003A0437, 0x00044010, 0x0038078A, 0x00000000, \
++0x00100099, 0x00206C7A, 0x0010009C, 0x00244C48, \
++0x00130824, 0x000C0001, 0x00101213, 0x00260C75, \
++0x00041000, 0x00010004, 0x00130826, 0x000C0006, \
++0x002206A8, 0x0013C926, 0x00101313, 0x003806A8, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00080600, 0x00101B10, 0x00050004, 0x00100826, \
++0x00101210, 0x00380C34, 0x00000000, 0x00000000, \
++0x0021155B, 0x00100099, 0x00206559, 0x0010009C, \
++0x00244559, 0x00130836, 0x000C0000, 0x00220C62, \
++0x000C0001, 0x00101B13, 0x00229C0E, 0x00210C0E, \
++0x00226C0E, 0x00216C0E, 0x0022FC0E, 0x00215C0E, \
++0x00214C0E, 0x00380555, 0x00010004, 0x00041000, \
++0x00278C67, 0x00040800, 0x00018100, 0x003A0437, \
++0x00130826, 0x000C0001, 0x00220559, 0x00101313, \
++0x00380559, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00130831, 0x0010090B, 0x00124813, \
++0x000CFF80, 0x002606AB, 0x00041000, 0x00010004, \
++0x003806A8, 0x00000000, 0x00000000, 0x00000000, \
++}
++
++/********************************************************/
++/*  Micro code for 8086:1229 Rev 9                      */
++/********************************************************/
++
++/*  Parameter values for the D101S  */
++#define D101S_CPUSAVER_TIMER_DWORD		78
++#define D101S_CPUSAVER_BUNDLE_DWORD		67
++#define D101S_CPUSAVER_MIN_SIZE_DWORD		128
++
++#define D101S_RCVBUNDLE_UCODE \
++{\
++0x00550242, 0xFFFF047E, 0xFFFFFFFF, 0x06FF0818, 0xFFFFFFFF, 0x05A6FFFF, \
++0x000C0001, 0x00101312, 0x000C0008, 0x00380243, \
++0x0010009C, 0x00204056, 0x002380D0, 0x00380056, \
++0x0010009C, 0x00244F8B, 0x00000800, 0x00124818, \
++0x0038047F, 0x00000000, 0x00140000, 0x003805A3, \
++0x00308000, 0x00100610, 0x00100561, 0x000E0408, \
++0x00134861, 0x000C0002, 0x00103093, 0x00308000, \
++0x00100624, 0x00100561, 0x000E0408, 0x00100861, \
++0x000C007E, 0x00222FA1, 0x000C0002, 0x00103093, \
++0x00380F90, 0x00080000, 0x00103090, 0x00380F90, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x0010009C, 0x00244FAD, 0x00010004, 0x00041000, \
++0x003A047E, 0x00044010, 0x00380819, 0x00000000, \
++0x00100099, 0x00206FFD, 0x0010009A, 0x0020AFFD, \
++0x0010009C, 0x00244FC8, 0x00130824, 0x000C0001, \
++0x00101213, 0x00260FF7, 0x00041000, 0x00010004, \
++0x00130826, 0x000C0006, 0x00220700, 0x0013C926, \
++0x00101313, 0x00380700, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00080600, 0x00101B10, 0x00050004, 0x00100826, \
++0x00101210, 0x00380FB6, 0x00000000, 0x00000000, \
++0x002115A9, 0x00100099, 0x002065A7, 0x0010009A, \
++0x0020A5A7, 0x0010009C, 0x002445A7, 0x00130836, \
++0x000C0000, 0x00220FE4, 0x000C0001, 0x00101B13, \
++0x00229F8E, 0x00210F8E, 0x00226F8E, 0x00216F8E, \
++0x0022FF8E, 0x00215F8E, 0x00214F8E, 0x003805A3, \
++0x00010004, 0x00041000, 0x00278FE9, 0x00040800, \
++0x00018100, 0x003A047E, 0x00130826, 0x000C0001, \
++0x002205A7, 0x00101313, 0x003805A7, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00130831, \
++0x0010090B, 0x00124813, 0x000CFF80, 0x00260703, \
++0x00041000, 0x00010004, 0x00380700  \
++}
++
++/********************************************************/
++/*  Micro code for the 8086:1229 Rev F/10               */
++/********************************************************/
++
++/*  Parameter values for the D102 E-step  */
++#define D102_E_CPUSAVER_TIMER_DWORD		42
++#define D102_E_CPUSAVER_BUNDLE_DWORD		54
++#define D102_E_CPUSAVER_MIN_SIZE_DWORD		46
++
++#define     D102_E_RCVBUNDLE_UCODE \
++{\
++0x007D028F, 0x0E4204F9, 0x14ED0C85, 0x14FA14E9, 0x0EF70E36, 0x1FFF1FFF, \
++0x00E014B9, 0x00000000, 0x00000000, 0x00000000, \
++0x00E014BD, 0x00000000, 0x00000000, 0x00000000, \
++0x00E014D5, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00E014C1, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00E014C8, 0x00000000, 0x00000000, 0x00000000, \
++0x00200600, 0x00E014EE, 0x00000000, 0x00000000, \
++0x0030FF80, 0x00940E46, 0x00038200, 0x00102000, \
++0x00E00E43, 0x00000000, 0x00000000, 0x00000000, \
++0x00300006, 0x00E014FB, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00906E41, 0x00800E3C, 0x00E00E39, 0x00000000, \
++0x00906EFD, 0x00900EFD, 0x00E00EF8, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++0x00000000, 0x00000000, 0x00000000, 0x00000000, \
++}
++
++static void e100_setup_ucode(struct nic *nic, struct cb *cb, struct sk_buff *skb)
++{
++/* *INDENT-OFF* */
++	static struct {
++		u32 ucode[UCODE_SIZE + 1];
++		u8 mac;
++		u8 timer_dword;
++		u8 bundle_dword;
++		u8 min_size_dword;
++	} ucode_opts[] = {
++		{ D101M_B_RCVBUNDLE_UCODE,
++		  mac_82559_D101M,
++		  D101M_CPUSAVER_TIMER_DWORD,
++		  D101M_CPUSAVER_BUNDLE_DWORD,
++		  D101M_CPUSAVER_MIN_SIZE_DWORD },
++		{ D101S_RCVBUNDLE_UCODE,
++		  mac_82559_D101S,
++		  D101S_CPUSAVER_TIMER_DWORD,
++		  D101S_CPUSAVER_BUNDLE_DWORD,
++		  D101S_CPUSAVER_MIN_SIZE_DWORD },
++		{ D102_E_RCVBUNDLE_UCODE,
++		  mac_82551_F,
++		  D102_E_CPUSAVER_TIMER_DWORD,
++		  D102_E_CPUSAVER_BUNDLE_DWORD,
++		  D102_E_CPUSAVER_MIN_SIZE_DWORD },
++		{ D102_E_RCVBUNDLE_UCODE,
++		  mac_82551_10,
++		  D102_E_CPUSAVER_TIMER_DWORD,
++		  D102_E_CPUSAVER_BUNDLE_DWORD,
++		  D102_E_CPUSAVER_MIN_SIZE_DWORD },
++		{ {0}, 0, 0, 0, 0}
++	}, *opts;
++/* *INDENT-ON* */
++
++/*************************************************************************
++*  CPUSaver parameters
++*
++*  All CPUSaver parameters are 16-bit literals that are part of a
++*  "move immediate value" instruction.  By changing the value of
++*  the literal in the instruction before the code is loaded, the
++*  driver can change the algorithm.
++*
++*  INTDELAY - This loads the dead-man timer with its inital value.
++*    When this timer expires the interrupt is asserted, and the
++*    timer is reset each time a new packet is received.  (see
++*    BUNDLEMAX below to set the limit on number of chained packets)
++*    The current default is 0x600 or 1536.  Experiments show that
++*    the value should probably stay within the 0x200 - 0x1000.
++*
++*  BUNDLEMAX -
++*    This sets the maximum number of frames that will be bundled.  In
++*    some situations, such as the TCP windowing algorithm, it may be
++*    better to limit the growth of the bundle size than let it go as
++*    high as it can, because that could cause too much added latency.
++*    The default is six, because this is the number of packets in the
++*    default TCP window size.  A value of 1 would make CPUSaver indicate
++*    an interrupt for every frame received.  If you do not want to put
++*    a limit on the bundle size, set this value to xFFFF.
++*
++*  BUNDLESMALL -
++*    This contains a bit-mask describing the minimum size frame that
++*    will be bundled.  The default masks the lower 7 bits, which means
++*    that any frame less than 128 bytes in length will not be bundled,
++*    but will instead immediately generate an interrupt.  This does
++*    not affect the current bundle in any way.  Any frame that is 128
++*    bytes or large will be bundled normally.  This feature is meant
++*    to provide immediate indication of ACK frames in a TCP environment.
++*    Customers were seeing poor performance when a machine with CPUSaver
++*    enabled was sending but not receiving.  The delay introduced when
++*    the ACKs were received was enough to reduce total throughput, because
++*    the sender would sit idle until the ACK was finally seen.
++*
++*    The current default is 0xFF80, which masks out the lower 7 bits.
++*    This means that any frame which is x7F (127) bytes or smaller
++*    will cause an immediate interrupt.  Because this value must be a
++*    bit mask, there are only a few valid values that can be used.  To
++*    turn this feature off, the driver can write the value xFFFF to the
++*    lower word of this instruction (in the same way that the other
++*    parameters are used).  Likewise, a value of 0xF800 (2047) would
++*    cause an interrupt to be generated for every frame, because all
++*    standard Ethernet frames are <= 2047 bytes in length.
++*************************************************************************/
++
++/* if you wish to disable the ucode functionality, while maintaining the
++ * workarounds it provides, set the following defines to:
++ * BUNDLESMALL 0
++ * BUNDLEMAX 1
++ * INTDELAY 1
++ */
++#define BUNDLESMALL 1
++#define BUNDLEMAX (u16)6
++#define INTDELAY (u16)1536 /* 0x600 */
++
++	/* do not load u-code for ICH devices */
++	if (nic->flags & ich)
++		goto noloaducode;
+ 
+-	if(nic->mac == mac_82551_F || nic->mac == mac_82551_10) {
+-		for(i = 0; i < UCODE_SIZE; i++)
++	/* Search for ucode match against h/w rev_id */
++	for (opts = ucode_opts; opts->mac; opts++) {
++		int i;
++		u32 *ucode = opts->ucode;
++		if (nic->mac != opts->mac)
++			continue;
++
++		/* Insert user-tunable settings */
++		ucode[opts->timer_dword] &= 0xFFFF0000;
++		ucode[opts->timer_dword] |= INTDELAY;
++		ucode[opts->bundle_dword] &= 0xFFFF0000;
++		ucode[opts->bundle_dword] |= BUNDLEMAX;
++		ucode[opts->min_size_dword] &= 0xFFFF0000;
++		ucode[opts->min_size_dword] |= (BUNDLESMALL) ? 0xFFFF : 0xFF80;
++
++		for (i = 0; i < UCODE_SIZE; i++)
+ 			cb->u.ucode[i] = cpu_to_le32(ucode[i]);
+-		cb->command = cpu_to_le16(cb_ucode);
+-	} else
+-		cb->command = cpu_to_le16(cb_nop);
++		cb->command = cpu_to_le16(cb_ucode | cb_el);
++		return;
++	}
++
++noloaducode:
++	cb->command = cpu_to_le16(cb_nop | cb_el);
+ }
+ 
++static inline int e100_exec_cb_wait(struct nic *nic, struct sk_buff *skb,
++	void (*cb_prepare)(struct nic *, struct cb *, struct sk_buff *))
++{
++	int err = 0, counter = 50;
++	struct cb *cb = nic->cb_to_clean;
++
++	if ((err = e100_exec_cb(nic, NULL, e100_setup_ucode)))
++		DPRINTK(PROBE,ERR, "ucode cmd failed with error %d\n", err);
++
++	/* must restart cuc */
++	nic->cuc_cmd = cuc_start;
++
++	/* wait for completion */
++	e100_write_flush(nic);
++	udelay(10);
++
++	/* wait for possibly (ouch) 500ms */
++	while (!(cb->status & cpu_to_le16(cb_complete))) {
++		msleep(10);
++		if (!--counter) break;
++	}
++
++	/* ack any interupts, something could have been set */
++	writeb(~0, &nic->csr->scb.stat_ack);
++
++	/* if the command failed, or is not OK, notify and return */
++	if (!counter || !(cb->status & cpu_to_le16(cb_ok))) {
++		DPRINTK(PROBE,ERR, "ucode load failed\n");
++		err = -EPERM;
++	}
++
++	return err;
++}
+ static void e100_setup_iaaddr(struct nic *nic, struct cb *cb,
+ 	struct sk_buff *skb)
+ {
+@@ -1224,7 +1602,7 @@ static void e100_set_fc(struct nic* nic)
+ 					  || (nic->mac <= mac_82558_D101_A4)) {
+ 		nic->flags &= ~fc_capable;
+ 	} else {
+-		/* See if link partner is capable of Auto-Negotiation (bit 0, reg 6) */	
++		/* See if link partner is capable of Auto-Negotiation (bit 0, reg 6) */
+ 		exp_reg = mdio_read(netdev, nic->mii.phy_id, MII_EXPANSION);
+ 
+ 		if(exp_reg & EXPANSION_NWAY) {
+@@ -1301,12 +1679,13 @@ static int e100_phy_init(struct nic *nic
+ 		mdio_write(netdev, nic->mii.phy_id, MII_NSC_CONG, cong);
+ 	}
+ 
+-	if((nic->mac >= mac_82550_D102) || ((nic->flags & ich) && 
+-		(mdio_read(netdev, nic->mii.phy_id, MII_TPISTATUS) & 0x8000) && 
+-		(nic->eeprom[eeprom_cnfg_mdix] & eeprom_mdix_enabled)))
+-		/* enable/disable MDI/MDI-X auto-switching */
++	if((nic->mac >= mac_82550_D102) || ((nic->flags & ich) &&
++	   (mdio_read(netdev, nic->mii.phy_id, MII_TPISTATUS) & 0x8000) &&
++		!(nic->eeprom[eeprom_cnfg_mdix] & eeprom_mdix_enabled))) {
++		/* enable/disable MDI/MDI-X auto-switching. */
+ 		mdio_write(netdev, nic->mii.phy_id, MII_NCONFIG,
+-			nic->mii.force_media ? 0 : NCONFIG_AUTO_SWITCH);
++				nic->mii.force_media ? 0 : NCONFIG_AUTO_SWITCH);
++	}
+ 
+ 	/* Set Flow Control parameters */
+ 	e100_set_fc(nic);
+@@ -1330,7 +1709,7 @@ static int e100_hw_init(struct nic *nic)
+ 		return err;
+ 	if((err = e100_exec_cmd(nic, ruc_load_base, 0)))
+ 		return err;
+-	if((err = e100_exec_cb(nic, NULL, e100_load_ucode)))
++	if ((err = e100_exec_cb_wait(nic, NULL, e100_setup_ucode)))
+ 		return err;
+ 	if((err = e100_exec_cb(nic, NULL, e100_configure)))
+ 		return err;
+@@ -1405,13 +1784,13 @@ static void e100_update_stats(struct nic
+ 		ns->collisions += nic->tx_collisions;
+ 		ns->tx_errors += le32_to_cpu(s->tx_max_collisions) +
+ 			le32_to_cpu(s->tx_lost_crs);
+-		ns->rx_dropped += le32_to_cpu(s->rx_resource_errors);
+ 		ns->rx_length_errors += le32_to_cpu(s->rx_short_frame_errors) +
+ 			nic->rx_over_length_errors;
+ 		ns->rx_crc_errors += le32_to_cpu(s->rx_crc_errors);
+ 		ns->rx_frame_errors += le32_to_cpu(s->rx_alignment_errors);
+ 		ns->rx_over_errors += le32_to_cpu(s->rx_overrun_errors);
+ 		ns->rx_fifo_errors += le32_to_cpu(s->rx_overrun_errors);
++		ns->rx_missed_errors += le32_to_cpu(s->rx_resource_errors);
+ 		ns->rx_errors += le32_to_cpu(s->rx_crc_errors) +
+ 			le32_to_cpu(s->rx_alignment_errors) +
+ 			le32_to_cpu(s->rx_short_frame_errors) +
+@@ -1435,7 +1814,8 @@ static void e100_update_stats(struct nic
+ 		}
+ 	}
+ 
+-	e100_exec_cmd(nic, cuc_dump_reset, 0);
++	if(e100_exec_cmd(nic, cuc_dump_reset, 0))
++		DPRINTK(TX_ERR, DEBUG, "exec cuc_dump_reset failed\n");
+ }
+ 
+ static void e100_adjust_adaptive_ifs(struct nic *nic, int speed, int duplex)
+@@ -1483,14 +1863,14 @@ static void e100_watchdog(unsigned long 
+ 	mii_check_link(&nic->mii);
+ 
+ 	/* Software generated interrupt to recover from (rare) Rx
+-	* allocation failure.
+-	* Unfortunately have to use a spinlock to not re-enable interrupts
+-	* accidentally, due to hardware that shares a register between the
+-	* interrupt mask bit and the SW Interrupt generation bit */
++	 * allocation failure.
++	 * Unfortunately have to use a spinlock to not re-enable interrupts
++	 * accidentally, due to hardware that shares a register between the
++	 * interrupt mask bit and the SW Interrupt generation bit */
+ 	spin_lock_irq(&nic->cmd_lock);
+ 	writeb(readb(&nic->csr->scb.cmd_hi) | irq_sw_gen,&nic->csr->scb.cmd_hi);
+-	spin_unlock_irq(&nic->cmd_lock);
+ 	e100_write_flush(nic);
++	spin_unlock_irq(&nic->cmd_lock);
+ 
+ 	e100_update_stats(nic);
+ 	e100_adjust_adaptive_ifs(nic, cmd.speed, cmd.duplex);
+@@ -1508,12 +1888,14 @@ static void e100_watchdog(unsigned long 
+ 	mod_timer(&nic->watchdog, jiffies + E100_WATCHDOG_PERIOD);
+ }
+ 
+-static inline void e100_xmit_prepare(struct nic *nic, struct cb *cb,
++static void e100_xmit_prepare(struct nic *nic, struct cb *cb,
+ 	struct sk_buff *skb)
+ {
+-
+ 	cb->status = 0;
+ 	cb->command = nic->tx_command;
++	/* interrupt every 16 packets regardless of delay */
++	if((nic->cbs_avail & ~15) == nic->cbs_avail)
++		cb->command |= cpu_to_le16(cb_i);
+ 	cb->u.tcb.tcb_byte_count = 0;
+ 	cb->u.tcb.threshold = nic->tx_threshold;
+ 
+@@ -1523,7 +1905,7 @@ static inline void e100_xmit_prepare(str
+ 
+ 		IPCB.ip_activation_high = ipcb_ip_activation_default;
+ 
+-		IPCB.ip_activation_low &= ~ipcb_largesend_enable; 
++		IPCB.ip_activation_low &= ~ipcb_largesend_enable;
+ 		IPCB.ip_activation_low &= ~ipcb_tcp_packet;
+ 		IPCB.ip_activation_low &= ~ipcb_tcpudp_checksum_enable;
+ 		IPCB.ip_activation_low &= ~ipcb_ip_checksum_enable;
+@@ -1545,33 +1927,33 @@ static inline void e100_xmit_prepare(str
+ 		/* Clear I bit on other packets */
+ 		cb->command &= ~__constant_cpu_to_le16(cb_i);
+ 
+-	if(skb->ip_summed == CHECKSUM_HW) {                         								
+-		const struct iphdr *ip = skb->nh.iph;                           	
++	if(skb->ip_summed == CHECKSUM_HW) {
++		const struct iphdr *ip = skb->nh.iph;
++
++		if ((ip->protocol == IPPROTO_TCP) ||
++		    (ip->protocol == IPPROTO_UDP)) {
++			IPCB.ip_activation_high |=
++					ipcb_hardwareparsing_enable;
+ 
+-		if ((ip->protocol == IPPROTO_TCP) ||                            	
+-		    (ip->protocol == IPPROTO_UDP)) {                            	
+-			IPCB.ip_activation_high |=                                           
+-					ipcb_hardwareparsing_enable;            	
+-
+-			IPCB.ip_activation_low |=                                           
+-					ipcb_tcpudp_checksum_enable;            	
+-
+-			IPCB.ip_activation_low |=                                           
+-					ipcb_ip_checksum_enable;            	
+-
+-			if (ip->protocol == IPPROTO_TCP) {                              
+-				IPCB.ip_activation_low |= ipcb_tcp_packet;                  
+-			}                                                       	
+-		}                                                                       
++			IPCB.ip_activation_low |=
++					ipcb_tcpudp_checksum_enable;
++
++			IPCB.ip_activation_low |=
++					ipcb_ip_checksum_enable;
++
++			if (ip->protocol == IPPROTO_TCP) {
++				IPCB.ip_activation_low |= ipcb_tcp_packet;
++			}
++		}
+ 	}
+ 
+ 	if(!skb_shinfo(skb)->nr_frags) {
+ 		cb->u.tcb.tbd_count = 1;
+ 		(cb->tbd_ptr)->buf_addr = cpu_to_le32(pci_map_single(nic->pdev,
+-						      skb->data, skb->len, 
++						      skb->data, skb->len,
+ 						      PCI_DMA_TODEVICE));
+ 		(cb->tbd_ptr)->size = cpu_to_le16(skb->len);
+-		cb->u.tcb.tbd_array = cb->tbd_nonseg; 
++		cb->u.tcb.tbd_array = cb->tbd_nonseg;
+ 	} else {
+ 		int i; void *addr;
+ 		struct tbd *tbd_arr_ptr = &(cb->tbd_ptr[1]);
+@@ -1618,7 +2000,8 @@ static int e100_xmit_frame(struct sk_buf
+ 		/* SW workaround for ICH[x] 10Mbps/half duplex Tx hang.
+ 		   Issue a NOP command followed by a 1us delay before
+ 		   issuing the Tx command. */
+-		e100_exec_cmd(nic, cuc_nop, 0);
++		if(e100_exec_cmd(nic, cuc_nop, 0))
++			DPRINTK(TX_ERR, DEBUG, "exec cuc_nop failed\n");
+ 		udelay(1);
+ 	}
+ 
+@@ -1641,20 +2024,21 @@ static int e100_xmit_frame(struct sk_buf
+ 	return 0;
+ }
+ 
+-static inline int e100_tx_clean(struct nic *nic)
++static int e100_tx_clean(struct nic *nic)
+ {
+ 	struct cb *cb;
+ 	int tx_cleaned = 0;
+ 
+ 	spin_lock(&nic->cb_lock);
+ 
+-	DPRINTK(TX_DONE, DEBUG, "cb->status = 0x%04X\n",
+-		nic->cb_to_clean->status);
+-
+ 	/* Clean CBs marked complete */
+ 	for(cb = nic->cb_to_clean;
+ 	    cb->status & cpu_to_le16(cb_complete);
+ 	    cb = nic->cb_to_clean = cb->next) {
++		DPRINTK(TX_DONE, DEBUG, "cb[%d]->status = 0x%04X\n",
++		        (int)(((void*)cb - (void*)nic->cbs)/sizeof(struct cb)),
++		        cb->status);
++
+ 		if(likely(cb->skb != NULL)) {
+ 			nic->net_stats.tx_packets++;
+ 			nic->net_stats.tx_bytes += cb->skb->len;
+@@ -1729,7 +2113,7 @@ static int e100_alloc_cbs(struct nic *ni
+ 			((i+1) % count) * sizeof(struct cb));
+ 		cb->skb = NULL;
+ 
+-		/* 82558 or later */                                                		
++		/* 82558 or later */
+ 		if(nic->mac >= mac_82558_D101_A4) {
+ 			cb->u.tcb.tbd_array = __constant_cpu_to_le32(0xFFFFFFFF);
+ 			cb->tbd_seg = cpu_to_le32(cb->dma_addr + 0x20);
+@@ -1755,28 +2139,41 @@ static int e100_alloc_cbs(struct nic *ni
+ 	return 0;
+ }
+ 
+-static inline void e100_start_receiver(struct nic *nic)
++static inline void e100_start_receiver(struct nic *nic, struct rx *rx)
+ {
++	if(!nic->rxs) return;
++	if(RU_SUSPENDED != nic->ru_running) return;
++
++	/* handle init time starts */
++	if(!rx) rx = nic->rxs;
++
+ 	/* (Re)start RU if suspended or idle and RFA is non-NULL */
+-	if(!nic->ru_running && nic->rx_to_clean->skb) {
+-		e100_exec_cmd(nic, ruc_start, nic->rx_to_clean->dma_addr);
+-		nic->ru_running = 1;
++	if(rx->skb) {
++		e100_exec_cmd(nic, ruc_start, rx->dma_addr);
++		nic->ru_running = RU_RUNNING;
+ 	}
+ }
+ 
+ #define RFD_BUF_LEN (nic->rfd_size + VLAN_ETH_FRAME_LEN)
+-static inline int e100_rx_alloc_skb(struct nic *nic, struct rx *rx)
++static int e100_rx_alloc_skb(struct nic *nic, struct rx *rx)
+ {
+-	if(!(rx->skb = dev_alloc_skb(RFD_BUF_LEN + NET_IP_ALIGN)))
++	if(!(rx->skb = netdev_alloc_skb(nic->netdev, RFD_BUF_LEN
++	                                + NET_IP_ALIGN)))
+ 		return -ENOMEM;
+ 
+ 	/* Align, init, and map the RFD. */
+-	rx->skb->dev = nic->netdev;
+ 	skb_reserve(rx->skb, NET_IP_ALIGN);
+ 	memcpy(rx->skb->data, &nic->blank_rfd, nic->rfd_size);
+ 	rx->dma_addr = pci_map_single(nic->pdev, rx->skb->data,
+ 		RFD_BUF_LEN, PCI_DMA_BIDIRECTIONAL);
+ 
++	if(pci_dma_mapping_error(rx->dma_addr)) {
++		dev_kfree_skb_any(rx->skb);
++		rx->skb = NULL;
++		rx->dma_addr = 0;
++		return -ENOMEM;
++	}
++
+ 	/* Link the RFD to end of RFA by linking previous RFD to
+ 	 * this one, and clearing EL bit of previous.  */
+ 	if(rx->prev->skb) {
+@@ -1817,9 +2214,9 @@ static unsigned char e100_D102_check_che
+ }
+ 
+ /*
+- * Sets the skb->csum value from D101 csum found at the end of the 
+- * Rx frame. The D101M sums all words in frame excluding the ethernet 
+- * II header (14 bytes) so in case the packet is ethernet II and the 
++ * Sets the skb->csum value from D101 csum found at the end of the
++ * Rx frame. The D101M sums all words in frame excluding the ethernet
++ * II header (14 bytes) so in case the packet is ethernet II and the
+  * protocol is IP, all is needed is to assign this value to skb->csum.
+  */
+ static unsigned char e100_D101M_checksum(struct sk_buff *skb)
+@@ -1834,7 +2231,7 @@ static unsigned char e100_D101M_checksum
+ 	return CHECKSUM_NONE;
+ }
+ 
+-static inline int e100_rx_indicate(struct nic *nic, struct rx *rx,
++static int e100_rx_indicate(struct nic *nic, struct rx *rx,
+ 	unsigned int *work_done, unsigned int work_to_do)
+ {
+ 	struct sk_buff *skb = rx->skb;
+@@ -1855,7 +2252,7 @@ static inline int e100_rx_indicate(struc
+ 
+ 	/* If data isn't ready, nothing to indicate */
+ 	if(unlikely(!(rfd_status & cb_complete)))
+-		return -EAGAIN;
++		return -ENODATA;
+ 
+ 	/* Get actual data size */
+ 	actual_size = le16_to_cpu(rfd->actual_size) & 0x3FFF;
+@@ -1866,6 +2263,10 @@ static inline int e100_rx_indicate(struc
+ 	pci_unmap_single(nic->pdev, rx->dma_addr,
+ 		RFD_BUF_LEN, PCI_DMA_FROMDEVICE);
+ 
++	/* this allows for a fast restart without re-enabling interrupts */
++	if(le16_to_cpu(rfd->command) & cb_el)
++		nic->ru_running = RU_SUSPENDED;
++
+ 	/* Pull off the RFD and put the actual data (minus eth hdr) */
+ 	skb_reserve(skb, nic->rfd_size);
+ 
+@@ -1877,7 +2278,7 @@ static inline int e100_rx_indicate(struc
+ 			skb_put(skb, actual_size - 2);
+ 		else
+ 			skb_put(skb, actual_size);
+-	
++
+ 	skb->protocol = eth_type_trans(skb, nic->netdev);
+ 
+ 	/* set the checksum info */
+@@ -1893,18 +2294,16 @@ static inline int e100_rx_indicate(struc
+ 
+ 	if(unlikely(!(rfd_status & cb_ok))) {
+ 		/* Don't indicate if hardware indicates errors */
+-		nic->net_stats.rx_dropped++;
+ 		dev_kfree_skb_any(skb);
+-	} else if(actual_size > nic->netdev->mtu + VLAN_ETH_HLEN) {
++	} else if(actual_size > ETH_DATA_LEN + VLAN_ETH_HLEN) {
+ 		/* Don't indicate oversized frames */
+ 		nic->rx_over_length_errors++;
+-		nic->net_stats.rx_dropped++;
+ 		dev_kfree_skb_any(skb);
+ 	} else {
+ 		nic->net_stats.rx_packets++;
+ 		nic->net_stats.rx_bytes += actual_size;
+ 		nic->netdev->last_rx = jiffies;
+-                                                                                                      
++
+ 		if(nic->vlangrp && (rfd_status & cb_vlan_detect)) {
+ #ifdef CONFIG_E100_NAPI
+ 			vlan_hwaccel_receive_skb(skb, nic->vlangrp, be16_to_cpu(rfd->vlan_id));
+@@ -1931,22 +2330,48 @@ static inline int e100_rx_clean(struct n
+ 	unsigned int work_to_do)
+ {
+ 	struct rx *rx;
++	int restart_required = 0;
++	struct rx *rx_to_start = NULL;
+ 	u32 rfd_cnt = 0;
+ 
++	/* are we already rnr? then pay attention!!! this ensures that
++	 * the state machine progression never allows a start with a
++	 * partially cleaned list, avoiding a race between hardware
++	 * and rx_to_clean when in NAPI mode */
++	if(RU_SUSPENDED == nic->ru_running)
++		restart_required = 1;
++
+ 	/* Indicate newly arrived packets */
+ 	for(rx = nic->rx_to_clean; rx->skb; rx = nic->rx_to_clean = rx->next) {
+-		if(e100_rx_indicate(nic, rx, work_done, work_to_do))
++		int err = e100_rx_indicate(nic, rx, work_done, work_to_do);
++		if(-EAGAIN == err) {
++			/* hit quota so have more work to do, restart once
++			 * cleanup is complete */
++			restart_required = 0;
++			break;
++		} else if(-ENODATA == err)
+ 			break; /* No more to clean */
++
+ 		rfd_cnt++;
+ 	}
+ 
++	/* save our starting point as the place we'll restart the receiver */
++	if(restart_required)
++		rx_to_start = nic->rx_to_clean;
++
+ 	/* Alloc new skbs to refill list */
+ 	for(rx = nic->rx_to_use; !rx->skb; rx = nic->rx_to_use = rx->next) {
+ 		if(unlikely(e100_rx_alloc_skb(nic, rx)))
+ 			break; /* Better luck next time (see watchdog) */
+ 	}
+ 
+-	e100_start_receiver(nic);
++	if(restart_required) {
++		// ack the rnr?
++		writeb(stat_ack_rnr, &nic->csr->scb.stat_ack);
++		e100_start_receiver(nic, rx_to_start);
++		if(work_done)
++			(*work_done)++;
++	}
+ 
+ 	return rfd_cnt;
+ }
+@@ -1956,6 +2381,8 @@ static void e100_rx_clean_list(struct ni
+ 	struct rx *rx;
+ 	unsigned int i, count = nic->params.rfds.count;
+ 
++	nic->ru_running = RU_UNINITIALIZED;
++
+ 	if(nic->rxs) {
+ 		for(rx = nic->rxs, i = 0; i < count; rx++, i++) {
+ 			if(rx->skb) {
+@@ -1969,7 +2396,6 @@ static void e100_rx_clean_list(struct ni
+ 	}
+ 
+ 	nic->rx_to_use = nic->rx_to_clean = NULL;
+-	nic->ru_running = 0;
+ }
+ 
+ static int e100_rx_alloc_list(struct nic *nic)
+@@ -1978,6 +2404,7 @@ static int e100_rx_alloc_list(struct nic
+ 	unsigned int i, count = nic->params.rfds.count;
+ 
+ 	nic->rx_to_use = nic->rx_to_clean = NULL;
++	nic->ru_running = RU_UNINITIALIZED;
+ 
+ 	if(!(nic->rxs = kmalloc(sizeof(struct rx) * count, GFP_ATOMIC)))
+ 		return -ENOMEM;
+@@ -1993,6 +2420,7 @@ static int e100_rx_alloc_list(struct nic
+ 	}
+ 
+ 	nic->rx_to_use = nic->rx_to_clean = nic->rxs;
++	nic->ru_running = RU_SUSPENDED;
+ 
+ 	return 0;
+ }
+@@ -2014,21 +2442,17 @@ static irqreturn_t e100_intr(int irq, vo
+ 
+ 	/* We hit Receive No Resource (RNR); restart RU after cleaning */
+ 	if(stat_ack & stat_ack_rnr)
+-		nic->ru_running = 0;
++		nic->ru_running = RU_SUSPENDED;
+ 
+ #ifdef CONFIG_E100_NAPI
+-	e100_disable_irq(nic);
+-	netif_rx_schedule(netdev);
+-
+-#else /* pre-NAPI (softnet) */
+-        /* do recv work if any */
+-        if(stat_ack & stat_ack_rx)
+-                nic->rx_intr_frames += e100_rx_clean(nic, NULL, 0);
+-
+-        /* clean up after tx'ed packets */
+-        if(stat_ack & stat_ack_tx) 
+-                e100_tx_clean(nic);
+-#endif /* CONFIG_E100_NAPI */ 
++	if(likely(netif_rx_schedule_prep(netdev))) {
++		e100_disable_irq(nic);
++		__netif_rx_schedule(netdev);
++	}
++#else
++	e100_rx_clean(nic, NULL, 0);
++	e100_tx_clean(nic);
++#endif
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -2056,12 +2480,13 @@ static int e100_poll(struct net_device *
+ 
+ 	return 1;
+ }
+-#endif /* CONFIG_E100_NAPI*/
++#endif
+ 
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ static void e100_netpoll(struct net_device *netdev)
+ {
+ 	struct nic *nic = netdev_priv(netdev);
++
+ 	e100_disable_irq(nic);
+ 	e100_intr(nic->pdev->irq, netdev, NULL);
+ 	e100_enable_irq(nic);
+@@ -2096,6 +2521,7 @@ static int e100_change_mtu(struct net_de
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM
+ static int e100_asf(struct nic *nic)
+ {
+ 	/* ASF can be enabled from eeprom */
+@@ -2104,6 +2530,7 @@ static int e100_asf(struct nic *nic)
+ 	   !(nic->eeprom[eeprom_config_asf] & eeprom_gcl) &&
+ 	   ((nic->eeprom[eeprom_smbus_addr] & 0xFF) != 0xFE));
+ }
++#endif
+ 
+ static int e100_up(struct nic *nic)
+ {
+@@ -2116,13 +2543,18 @@ static int e100_up(struct nic *nic)
+ 	if((err = e100_hw_init(nic)))
+ 		goto err_clean_cbs;
+ 	e100_set_multicast_list(nic->netdev);
+-	e100_start_receiver(nic);
++	e100_start_receiver(nic, NULL);
+ 	mod_timer(&nic->watchdog, jiffies);
+-	if((err = request_irq(nic->pdev->irq, e100_intr, SA_SHIRQ,
++	if((err = request_irq(nic->pdev->irq, e100_intr, IRQF_SHARED,
+ 		nic->netdev->name, nic->netdev)))
+ 		goto err_no_irq;
+-	e100_enable_irq(nic);
+ 	netif_wake_queue(nic->netdev);
++#ifdef CONFIG_E100_NAPI
++	netif_poll_enable(nic->netdev);
++	/* enable ints _after_ enabling poll, preventing a race between
++	 * disable ints+schedule */
++#endif
++	e100_enable_irq(nic);
+ 	return 0;
+ 
+ err_no_irq:
+@@ -2136,11 +2568,15 @@ err_rx_clean_list:
+ 
+ static void e100_down(struct nic *nic)
+ {
++#ifdef CONFIG_E100_NAPI
++	/* wait here for poll to complete */
++	netif_poll_disable(nic->netdev);
++#endif
++	netif_stop_queue(nic->netdev);
+ 	e100_hw_reset(nic);
+ 	free_irq(nic->pdev->irq, nic->netdev);
+ 	del_timer_sync(&nic->watchdog);
+ 	netif_carrier_off(nic->netdev);
+-	netif_stop_queue(nic->netdev);
+ 	e100_clean_cbs(nic);
+ 	e100_rx_clean_list(nic);
+ }
+@@ -2149,6 +2585,15 @@ static void e100_tx_timeout(struct net_d
+ {
+ 	struct nic *nic = netdev_priv(netdev);
+ 
++	/* Reset outside of interrupt context, to avoid request_irq
++	 * in interrupt context */
++	schedule_work(&nic->tx_timeout_task);
++}
++
++static void e100_tx_timeout_task(struct net_device *netdev)
++{
++	struct nic *nic = netdev_priv(netdev);
++
+ 	DPRINTK(TX_ERR, DEBUG, "scb.status=0x%02X\n",
+ 		readb(&nic->csr->scb.status));
+ 	e100_down(nic);
+@@ -2182,9 +2627,9 @@ static int e100_loopback_test(struct nic
+ 		mdio_write(nic->netdev, nic->mii.phy_id, MII_BMCR,
+ 			BMCR_LOOPBACK);
+ 
+-	e100_start_receiver(nic);
++	e100_start_receiver(nic, NULL);
+ 
+-	if(!(skb = dev_alloc_skb(ETH_DATA_LEN))) {
++	if(!(skb = netdev_alloc_skb(nic->netdev, ETH_DATA_LEN))) {
+ 		err = -ENOMEM;
+ 		goto err_loopback_none;
+ 	}
+@@ -2194,15 +2639,18 @@ static int e100_loopback_test(struct nic
+ 
+ 	msleep(10);
+ 
++	pci_dma_sync_single_for_cpu(nic->pdev, nic->rx_to_clean->dma_addr,
++		RFD_BUF_LEN, PCI_DMA_FROMDEVICE);
++
+ 	if(memcmp(nic->rx_to_clean->skb->data + nic->rfd_size,
+-	   		skb->data, ETH_DATA_LEN))
++		  skb->data, ETH_DATA_LEN))
+ 		err = -EAGAIN;
+ 
+ err_loopback_none:
+ 	mdio_write(nic->netdev, nic->mii.phy_id, MII_BMCR, 0);
+ 	nic->loopback = lb_none;
+-	e100_hw_init(nic);
+ 	e100_clean_cbs(nic);
++	e100_hw_reset(nic);
+ err_clean_rx:
+ 	e100_rx_clean_list(nic);
+ 	return err;
+@@ -2302,7 +2750,6 @@ static int e100_set_wol(struct net_devic
+ 	else
+ 		nic->flags &= ~wol_magic;
+ 
+-	pci_enable_wake(nic->pdev, 0, nic->flags & (wol_magic | e100_asf(nic)));
+ 	e100_exec_cb(nic, NULL, e100_configure);
+ 
+ 	return 0;
+@@ -2388,7 +2835,7 @@ static int e100_set_ringparam(struct net
+ 	struct param_range *rfds = &nic->params.rfds;
+ 	struct param_range *cbs = &nic->params.cbs;
+ 
+-	if ((ring->rx_mini_pending) || (ring->rx_jumbo_pending)) 
++	if ((ring->rx_mini_pending) || (ring->rx_jumbo_pending))
+ 		return -EINVAL;
+ 
+ 	if(netif_running(netdev))
+@@ -2448,6 +2895,8 @@ static void e100_diag_test(struct net_de
+ 	}
+ 	for(i = 0; i < E100_TEST_LEN; i++)
+ 		test->flags |= data[i] ? ETH_TEST_FL_FAILED : 0;
++
++	msleep_interruptible(4 * 1000);
+ }
+ 
+ static int e100_phys_id(struct net_device *netdev, u32 data)
+@@ -2546,7 +2995,7 @@ int e100_set_tx_csum(struct net_device *
+ 	else {
+ 		nic->offload_features &= ~tx_csum_offload;
+ 	}
+-		
++
+ 	e100_exec_cb(nic, NULL, e100_configure);
+ 
+ 	return 0;
+@@ -2574,7 +3023,7 @@ int e100_set_rx_csum(struct net_device *
+ 	return 0;
+ }
+ 
+-void e100_get_pauseparam(struct net_device *netdev, 
++void e100_get_pauseparam(struct net_device *netdev,
+ 				struct ethtool_pauseparam *epause)
+ {
+ 	struct nic *nic = netdev_priv(netdev);
+@@ -2595,14 +3044,14 @@ void e100_get_pauseparam(struct net_devi
+ 	}
+ }
+ 
+-int e100_set_pauseparam(struct net_device *netdev, 
++int e100_set_pauseparam(struct net_device *netdev,
+ 				struct ethtool_pauseparam *epause)
+ {
+ 	struct nic *nic = netdev_priv(netdev);
+ 
+-	if(nic->mac <= mac_82558_D101_A4) 
++	if(nic->mac <= mac_82558_D101_A4)
+ 		return -EOPNOTSUPP;
+-	
++
+ 	if(epause->autoneg == 1)
+ 		nic->flags &= ~fc_disabled;
+ 	else
+@@ -2613,6 +3062,23 @@ int e100_set_pauseparam(struct net_devic
+ 	return 0;
+ }
+ 
++#ifdef ETHTOOL_OPS_COMPAT
++u32 ethtool_op_get_sg(struct net_device *dev)
++{
++	return (dev->features & NETIF_F_SG) != 0;
++}
++
++int ethtool_op_set_sg(struct net_device *dev, u32 data)
++{
++	if (data)
++		dev->features |= NETIF_F_SG;
++	else
++		dev->features &= ~NETIF_F_SG;
++
++	return 0;
++}
++#endif
++
+ static struct ethtool_ops e100_ethtool_ops = {
+ 	.get_settings		= e100_get_settings,
+ 	.set_settings		= e100_set_settings,
+@@ -2636,12 +3102,15 @@ static struct ethtool_ops e100_ethtool_o
+ 	.phys_id		= e100_phys_id,
+ 	.get_stats_count	= e100_get_stats_count,
+ 	.get_ethtool_stats	= e100_get_ethtool_stats,
++#ifdef ETHTOOL_GPERMADDR
++	.get_perm_addr		= ethtool_op_get_perm_addr,
++#endif
+  	.get_tx_csum		= e100_get_tx_csum,
+  	.set_tx_csum		= e100_set_tx_csum,
+  	.get_rx_csum		= e100_get_rx_csum,
+  	.set_rx_csum		= e100_set_rx_csum,
+ 	.get_sg			= ethtool_op_get_sg,
+-	.set_sg			= ethtool_op_set_sg, 
++	.set_sg			= ethtool_op_set_sg,
+ 	.get_tso		= ethtool_op_get_tso,
+ 	.set_tso		= ethtool_op_set_tso,
+ 	.get_pauseparam		= e100_get_pauseparam,
+@@ -2652,7 +3121,7 @@ static void e100_vlan_rx_add_vid(struct 
+ {
+ 	/* We don't do VLAN filtering */
+ }
+-                                                                                                      
++
+ static void e100_vlan_rx_kill_vid(struct net_device *netdev, u16 vid)
+ {
+ 	struct nic *nic = netdev_priv(netdev);
+@@ -2681,15 +3150,16 @@ static void e100_vlan_rx_register(struct
+ 	e100_exec_cb(nic, NULL, e100_configure);
+ 	e100_enable_irq(nic);
+ }
+-                                                                                                      
++
+ static int e100_do_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ {
+ 	struct nic *nic = netdev_priv(netdev);
+ 
+ #ifdef ETHTOOL_OPS_COMPAT
+ 	if(cmd == SIOCETHTOOL)
+-		return ethtool_ioctl(ifr);
++		return e100_ethtool_ioctl(ifr);
+ #endif
++
+ 	return generic_mii_ioctl(&nic->mii, if_mii(ifr), cmd, NULL);
+ }
+ 
+@@ -2757,12 +3227,11 @@ static int __devinit e100_probe(struct p
+ #ifdef CONFIG_E100_NAPI
+ 	netdev->poll = e100_poll;
+ 	netdev->weight = E100_NAPI_WEIGHT;
+-#endif 
+-
++#endif
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	netdev->poll_controller = e100_netpoll;
+ #endif
+-	strcpy(netdev->name, pci_name(pdev));
++	strncpy(netdev->name, pci_name(pdev), sizeof(netdev->name) - 1);
+ 
+ 	nic = netdev_priv(netdev);
+ 	nic->netdev = netdev;
+@@ -2787,7 +3256,7 @@ static int __devinit e100_probe(struct p
+ 		goto err_out_disable_pdev;
+ 	}
+ 
+-	if((err = pci_set_dma_mask(pdev, 0xFFFFFFFFULL))) {
++	if((err = pci_set_dma_mask(pdev, DMA_32BIT_MASK))) {
+ 		DPRINTK(PROBE, ERR, "No usable DMA configuration, aborting.\n");
+ 		goto err_out_free_res;
+ 	}
+@@ -2809,8 +3278,10 @@ static int __devinit e100_probe(struct p
+ 
+ 	e100_get_defaults(nic);
+ 
++	/* locks must be initialized before calling hw_reset */
+ 	spin_lock_init(&nic->cb_lock);
+ 	spin_lock_init(&nic->cmd_lock);
++	spin_lock_init(&nic->mdio_lock);
+ 
+ 	/* Reset the device before pci_set_master() in case device is in some
+ 	 * funky state and has an interrupt pending - hint: we don't have the
+@@ -2826,18 +3297,26 @@ static int __devinit e100_probe(struct p
+ 	nic->blink_timer.function = e100_blink_led;
+ 	nic->blink_timer.data = (unsigned long)nic;
+ 
++	INIT_WORK(&nic->tx_timeout_task,
++		(void (*)(void *))e100_tx_timeout_task, netdev);
++
+ 	if((err = e100_alloc(nic))) {
+ 		DPRINTK(PROBE, ERR, "Cannot alloc driver memory, aborting.\n");
+ 		goto err_out_iounmap;
+ 	}
+ 
+-	e100_phy_init(nic);
+-
+ 	if((err = e100_eeprom_load(nic)))
+ 		goto err_out_free;
+ 
++	e100_phy_init(nic);
++
+ 	memcpy(netdev->dev_addr, nic->eeprom, ETH_ALEN);
++#ifdef ETHTOOL_GPERMADDR
++	memcpy(netdev->perm_addr, nic->eeprom, ETH_ALEN);
++	if(!is_valid_ether_addr(netdev->perm_addr)) {
++#else
+ 	if(!is_valid_ether_addr(netdev->dev_addr)) {
++#endif
+ 		DPRINTK(PROBE, ERR, "Invalid MAC address from "
+ 			"EEPROM, aborting.\n");
+ 		err = -EAGAIN;
+@@ -2849,7 +3328,10 @@ static int __devinit e100_probe(struct p
+ 	   (nic->eeprom[eeprom_id] & eeprom_id_wol))
+ 		nic->flags |= wol_magic;
+ 
+-	pci_enable_wake(pdev, 0, nic->flags & (wol_magic | e100_asf(nic)));
++	/* ack any pending wake events, disable PME */
++	err = pci_enable_wake(pdev, 0, 0);
++	if (err)
++		DPRINTK(PROBE, ERR, "Error clearing wake event\n");
+ 
+ 	strcpy(netdev->name, "eth%d");
+ 	if((err = register_netdev(netdev))) {
+@@ -2857,9 +3339,9 @@ static int __devinit e100_probe(struct p
+ 		goto err_out_free;
+ 	}
+ 
+-	DPRINTK(PROBE, INFO, "addr 0x%lx, irq %d, "
++	DPRINTK(PROBE, INFO, "addr 0x%llx, irq %d, "
+ 		"MAC addr %02X:%02X:%02X:%02X:%02X:%02X\n",
+-		pci_resource_start(pdev, 0), pdev->irq,
++		(unsigned long long)pci_resource_start(pdev, 0), pdev->irq,
+ 		netdev->dev_addr[0], netdev->dev_addr[1], netdev->dev_addr[2],
+ 		netdev->dev_addr[3], netdev->dev_addr[4], netdev->dev_addr[5]);
+ 
+@@ -2895,64 +3377,203 @@ static void __devexit e100_remove(struct
+ 	}
+ }
+ 
+-#ifdef CONFIG_PM
+-static int e100_suspend(struct pci_dev *pdev, u32 state)
++static int e100_suspend(struct pci_dev *pdev, pm_message_t state)
+ {
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct nic *nic = netdev_priv(netdev);
+ 
+-	if(netif_running(netdev))
++	if (netif_running(netdev))
+ 		e100_down(nic);
+ 	e100_hw_reset(nic);
+ 	netif_device_detach(netdev);
+ 
++#ifdef CONFIG_PM
+ 	pci_save_state(pdev);
+-	pci_enable_wake(pdev, state, nic->flags & (wol_magic | e100_asf(nic)));
++	if (nic->flags & (wol_magic | e100_asf(nic)))
++#else
++	if (nic->flags & (wol_magic))
++#endif
++		pci_enable_wake(pdev, pci_choose_state(pdev, state), 1);
++	else
++		/* disable PME */
++		pci_enable_wake(pdev, 0, 0);
++
+ 	pci_disable_device(pdev);
+-	pci_set_power_state(pdev, state);
++	pci_set_power_state(pdev, pci_choose_state(pdev, state));
+ 
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM
+ static int e100_resume(struct pci_dev *pdev)
+ {
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct nic *nic = netdev_priv(netdev);
+ 
+-	pci_set_power_state(pdev, 0);
++	pci_set_power_state(pdev, PCI_D0);
+ 	pci_restore_state(pdev);
+-	e100_hw_init(nic);
+-
++	/* ack any pending wake events, disable PME */
++	pci_enable_wake(pdev, 0, 0);
+ 	netif_device_attach(netdev);
+-	if(netif_running(netdev))
++	if (netif_running(netdev))
+ 		e100_up(nic);
+ 
+ 	return 0;
+ }
+-#endif
++#endif /* CONFIG_PM */
++
++#ifdef E100_USE_SHUTDOWN_HANDLER
++static void e100_shutdown(struct pci_dev *pdev)
++{
++	e100_suspend(pdev, PMSG_SUSPEND);
++}
++#endif /* E100_USE_SHUTDOWN_HANDLER */
++
++#ifdef E100_USE_PCI_ERS
++/* ------------------ PCI Error Recovery infrastructure  -------------- */
++/**
++ * e100_io_error_detected - called when PCI error is detected.
++ * @pdev: Pointer to PCI device
++ * @state: The current pci conneection state
++ */
++static pci_ers_result_t e100_io_error_detected(struct pci_dev *pdev, pci_channel_state_t state)
++{
++	struct net_device *netdev = pci_get_drvdata(pdev);
++
++	/* Similar to calling e100_down(), but avoids adpater I/O. */
++	netdev->stop(netdev);
++
++	/* Detach; put netif into state similar to hotplug unplug. */
++	netif_poll_enable(netdev);
++	netif_device_detach(netdev);
++	pci_disable_device(pdev);
++
++	/* Request a slot reset. */
++	return PCI_ERS_RESULT_NEED_RESET;
++}
++
++/**
++ * e100_io_slot_reset - called after the pci bus has been reset.
++ * @pdev: Pointer to PCI device
++ *
++ * Restart the card from scratch.
++ */
++static pci_ers_result_t e100_io_slot_reset(struct pci_dev *pdev)
++{
++	struct net_device *netdev = pci_get_drvdata(pdev);
++	struct nic *nic = netdev_priv(netdev);
++
++	if (pci_enable_device(pdev)) {
++		printk(KERN_ERR "e100: Cannot re-enable PCI device after reset.\n");
++		return PCI_ERS_RESULT_DISCONNECT;
++	}
++	pci_set_master(pdev);
++
++	/* Only one device per card can do a reset */
++	if (0 != PCI_FUNC(pdev->devfn))
++		return PCI_ERS_RESULT_RECOVERED;
++	e100_hw_reset(nic);
++	e100_phy_init(nic);
++
++	return PCI_ERS_RESULT_RECOVERED;
++}
++
++/**
++ * e100_io_resume - resume normal operations
++ * @pdev: Pointer to PCI device
++ *
++ * Resume normal operations after an error recovery
++ * sequence has been completed.
++ */
++static void e100_io_resume(struct pci_dev *pdev)
++{
++	struct net_device *netdev = pci_get_drvdata(pdev);
++	struct nic *nic = netdev_priv(netdev);
++
++	/* ack any pending wake events, disable PME */
++	pci_enable_wake(pdev, 0, 0);
++
++	netif_device_attach(netdev);
++	if (netif_running(netdev)) {
++		e100_open(netdev);
++		mod_timer(&nic->watchdog, jiffies);
++	}
++}
++
++static struct pci_error_handlers e100_err_handler = {
++	.error_detected = e100_io_error_detected,
++	.slot_reset = e100_io_slot_reset,
++	.resume = e100_io_resume,
++};
++#endif /* E100_USE_PCI_ERS */
+ 
+ static struct pci_driver e100_driver = {
+ 	.name =         DRV_NAME,
+ 	.id_table =     e100_id_table,
+ 	.probe =        e100_probe,
+ 	.remove =       __devexit_p(e100_remove),
+-#ifdef CONFIG_PM
++	/* Power Management hooks */
+ 	.suspend =      e100_suspend,
++#ifdef CONFIG_PM
+ 	.resume =       e100_resume,
+ #endif
++#ifdef E100_USE_SHUTDOWN_HANDLER
++	.shutdown =     e100_shutdown,
++#endif
++#ifdef E100_USE_PCI_ERS
++	.err_handler = &e100_err_handler,
++#endif
++};
++
++#ifdef E100_USE_REBOOT_NOTIFIER
++static int e100_notify_reboot(struct notifier_block *nb, unsigned long event, void *ptr)
++{
++	struct pci_dev *pdev = NULL;
++
++	switch (event) {
++	case SYS_DOWN:
++	case SYS_HALT:
++	case SYS_POWER_OFF:
++		while ((pdev = pci_find_device(PCI_ANY_ID, PCI_ANY_ID, pdev))) {
++			if (pci_dev_driver(pdev) == &e100_driver)
++				e100_suspend(pdev, PMSG_SUSPEND);
++		}
++	}
++	return NOTIFY_DONE;
++}
++
++struct notifier_block e100_notifier_reboot = {
++	.notifier_call	= e100_notify_reboot,
++	.next		= NULL,
++	.priority	= 0
+ };
++#endif /* E100_USE_REBOOT_NOTIFIER */
+ 
+ static int __init e100_init_module(void)
+ {
++#ifdef E100_USE_REBOOT_NOTIFIER
++	int retval;
++#endif
+ 	if(((1 << debug) - 1) & NETIF_MSG_DRV) {
+ 		printk(KERN_INFO PFX "%s, %s\n", DRV_DESCRIPTION, DRV_VERSION);
+ 		printk(KERN_INFO PFX "%s\n", DRV_COPYRIGHT);
+ 	}
+-	return pci_module_init(&e100_driver);
++#ifdef E100_USE_REBOOT_NOTIFIER
++	retval = pci_module_init(&e100_driver);
++	if (retval >= 0)
++		register_reboot_notifier(&e100_notifier_reboot);
++
++	return retval;
++#else
++	return pci_register_driver(&e100_driver);
++#endif
+ }
+ 
+ static void __exit e100_cleanup_module(void)
+ {
++#ifdef E100_USE_REBOOT_NOTIFIER
++	unregister_reboot_notifier(&e100_notifier_reboot);
++#endif
+ 	pci_unregister_driver(&e100_driver);
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-1334.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1334.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1334);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

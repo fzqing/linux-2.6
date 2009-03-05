@@ -1,0 +1,389 @@
+#! /usr/bin/env bash
+# Patch: -piix_slc90e66_pio_fallback_fix
+# Date: Fri May 26 10:19:06 2006
+# Source: MontaVista Software, Inc.
+# MR: 18126
+# Type: Defect Fix
+# Disposition: accepted into 2.6.17-rc4-mm1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Description:
+# 
+# The fallback to PIO mode in the hwif->dma_check() handler doesn't work in
+# the Intel PIIX and SMsC SLC90E66 IDE drivers because:
+# 
+# - config_drive_for_dma() calls the hwif->speedproc() handler with a wrong
+#   mode number (unbiased by XFER_PIO_0) in case of the PIO fallback;
+# 
+# - hwif->tuneproc() handler doesn't really set the drive's own speed (this
+#   is not fixed as yet).
+# 
+#  drivers/ide/pci/piix.c     |   33 ++++++++++++++++-----------------
+#  drivers/ide/pci/slc90e66.c |   20 +++++++++-----------
+#  2 files changed, 25 insertions(+), 28 deletions(-)
+# 
+
+PATCHNUM=598
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 18126
+Type: Defect Fix
+Disposition: accepted into 2.6.17-rc4-mm1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Description:
+
+The fallback to PIO mode in the hwif->dma_check() handler doesn't work in
+the Intel PIIX and SMsC SLC90E66 IDE drivers because:
+
+- config_drive_for_dma() calls the hwif->speedproc() handler with a wrong
+  mode number (unbiased by XFER_PIO_0) in case of the PIO fallback;
+
+- hwif->tuneproc() handler doesn't really set the drive's own speed (this
+  is not fixed as yet).
+
+ drivers/ide/pci/piix.c     |   33 ++++++++++++++++-----------------
+ drivers/ide/pci/slc90e66.c |   20 +++++++++-----------
+ mvl_patches/pro-0598.c     |   16 ++++++++++++++++
+ 3 files changed, 41 insertions(+), 28 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/piix.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/piix.c
++++ linux-2.6.10/drivers/ide/pci/piix.c
+@@ -1,13 +1,14 @@
+ /*
+- *  linux/drivers/ide/pci/piix.c	Version 0.44	March 20, 2003
++ *  linux/drivers/ide/pci/piix.c	Version 0.45	May 12, 2006
+  *
+  *  Copyright (C) 1998-1999 Andrzej Krzysztofowicz, Author and Maintainer
+  *  Copyright (C) 1998-2000 Andre Hedrick <andre@linux-ide.org>
+  *  Copyright (C) 2003 Red Hat Inc <alan@redhat.com>
++ *  Copyright (C) 2006 MontaVista Software, Inc. <source@mvista.com>
+  *
+  *  May be copied or modified under the terms of the GNU General Public License
+  *
+- *  PIO mode setting function for Intel chipsets.  
++ *  PIO mode setting function for Intel chipsets.
+  *  For use instead of BIOS settings.
+  *
+  * 40-41
+@@ -25,7 +26,7 @@
+  * sitre = word42 & 0x4000; secondary
+  *
+  * 44 8421|8421    hdd|hdb
+- * 
++ *
+  * 48 8421         hdd|hdc|hdb|hda udma enabled
+  *
+  *    0001         hda
+@@ -335,21 +336,20 @@ static int piix_tune_chipset (ide_drive_
+  *	@drive: IDE drive to configure
+  *
+  *	Set up a PIIX interface channel for the best available speed.
+- *	We prefer UDMA if it is available and then MWDMA. If DMA is 
+- *	not available we switch to PIO and return 0. 
++ *	We prefer UDMA if it is available and then MWDMA.  If DMA is
++ *	not available we switch to PIO and return 0.
+  */
+  
+ static int piix_config_drive_for_dma (ide_drive_t *drive)
+ {
+ 	u8 speed = ide_dma_speed(drive, piix_ratemask(drive));
+ 
+-	/* If no DMA speed was available or the chipset has DMA bugs
+-	   then disable DMA and use PIO */
+-	   
+-	if (!speed || no_piix_dma) {
+-		u8 tspeed = ide_get_best_pio_mode(drive, 255, 5, NULL);
+-		speed = piix_dma_2_pio(XFER_PIO_0 + tspeed);
+-	}
++	/*
++	 * If no DMA speed was available or the chipset has DMA bugs
++	 * then disable DMA and use PIO
++	 */
++	if (!speed || no_piix_dma)
++		return 0;
+ 
+ 	(void) piix_tune_chipset(drive, speed);
+ 	return ide_dma_enable(drive);
+@@ -372,17 +372,16 @@ static int piix_config_drive_xfer_rate (
+ 
+ 	if ((id->capability & 1) && drive->autodma) {
+ 
+-		if (ide_use_dma(drive)) {
+-			if (piix_config_drive_for_dma(drive))
+-				return hwif->ide_dma_on(drive);
+-		}
++		if (ide_use_dma(drive) && piix_config_drive_for_dma(drive))
++			return hwif->ide_dma_on(drive);
+ 
+ 		goto fast_ata_pio;
+ 
+ 	} else if ((id->capability & 8) || (id->field_valid & 2)) {
+ fast_ata_pio:
+ 		/* Find best PIO mode. */
+-		hwif->tuneproc(drive, 255);
++		(void) hwif->speedproc(drive, XFER_PIO_0 +
++				       ide_get_best_pio_mode(drive, 255, 4, NULL));
+ 		return hwif->ide_dma_off_quietly(drive);
+ 	}
+ 	/* IORDY not supported */
+Index: linux-2.6.10/drivers/ide/pci/slc90e66.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/slc90e66.c
++++ linux-2.6.10/drivers/ide/pci/slc90e66.c
+@@ -1,9 +1,10 @@
+ /*
+- *  linux/drivers/ide/pci/slc90e66.c	Version 0.11	September 11, 2002
++ *  linux/drivers/ide/pci/slc90e66.c	Version 0.12	May 12, 2006
+  *
+  *  Copyright (C) 2000-2002 Andre Hedrick <andre@linux-ide.org>
++ *  Copyright (C) 2006 MontaVista Software, Inc. <source@mvista.com>
+  *
+- * This a look-a-like variation of the ICH0 PIIX4 Ultra-66,
++ * This is a look-alike variation of the ICH0 PIIX4 Ultra-66,
+  * but this keeps the ISA-Bridge and slots alive.
+  *
+  */
+@@ -161,10 +162,8 @@ static int slc90e66_config_drive_for_dma
+ {
+ 	u8 speed = ide_dma_speed(drive, slc90e66_ratemask(drive));
+ 
+-	if (!(speed)) {
+-		u8 tspeed = ide_get_best_pio_mode(drive, 255, 5, NULL);
+-		speed = slc90e66_dma_2_pio(XFER_PIO_0 + tspeed);
+-	}
++	if (!speed)
++		return 0;
+ 
+ 	(void) slc90e66_tune_chipset(drive, speed);
+ 	return ide_dma_enable(drive);
+@@ -179,16 +178,15 @@ static int slc90e66_config_drive_xfer_ra
+ 
+ 	if (id && (id->capability & 1) && drive->autodma) {
+ 
+-		if (ide_use_dma(drive)) {
+-			if (slc90e66_config_drive_for_dma(drive))
+-				return hwif->ide_dma_on(drive);
+-		}
++		if (ide_use_dma(drive) && slc90e66_config_drive_for_dma(drive))
++			return hwif->ide_dma_on(drive);
+ 
+ 		goto fast_ata_pio;
+ 
+ 	} else if ((id->capability & 8) || (id->field_valid & 2)) {
+ fast_ata_pio:
+-		hwif->tuneproc(drive, 5);
++		(void) hwif->speedproc(drive, XFER_PIO_0 +
++				       ide_get_best_pio_mode(drive, 255, 4, NULL));
+ 		return hwif->ide_dma_off_quietly(drive);
+ 	}
+ 	/* IORDY not supported */
+Index: linux-2.6.10/mvl_patches/pro-0598.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0598.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(598);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

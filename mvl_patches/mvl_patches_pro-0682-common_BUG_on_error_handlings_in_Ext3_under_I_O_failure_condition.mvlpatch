@@ -1,0 +1,378 @@
+#! /usr/bin/env bash
+# Patch: -common_BUG_on_error_handlings_in_Ext3_under_I_O_failure_condition
+# Date: Thu Jun 29 13:37:22 2006
+# MR: 17090
+# Commit: 66d272434a1b009b94bab07bae98dec39e0a9706
+# Author: Hisashi Hifumi <hifumi.hisashi@lab.ntt.co.jp>
+# Date:   Tue Jan 11 03:30:37 2005 -0800
+# 
+#     [PATCH] BUG on error handlings in Ext3 under I/O failure condition
+#     
+#     I found bugs on error handlings in the functions arround the ext3 file
+#     system, which cause inadequate completions of synchronous write I/O
+#     operations when disk I/O failures occur.  Both 2.4 and 2.6 have this
+#     problem.
+#     
+#     	I carried out following experiment:
+#     
+#     1.  Mount a ext3 file system on a SCSI disk with ordered mode.
+#     2.  Open a file on the file system with O_SYNC|O_RDWR|O_TRUNC|O_CREAT flag.
+#     3.  Write 512 bytes data to the file by calling write() every 5 seconds, and
+#          examine return values from the syscall.
+#          from write().
+#     4.  Disconnect the SCSI cable,  and examine messages from the kernel.
+#     
+#     After the SCSI cable is disconnected, write() must fail.  But the result
+#     was different: write() succeeded for a while even though messages of the
+#     kernel notified SCSI I/O error.
+#     
+#     By applying following modifications, the above problem was solved.
+#     
+#     Signed-off-by: Hisashi Hifumi <hifumi.hisashi@lab.ntt.co.jp>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=682
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 17090
+Commit: 66d272434a1b009b94bab07bae98dec39e0a9706
+Author: Hisashi Hifumi <hifumi.hisashi@lab.ntt.co.jp>
+Date:   Tue Jan 11 03:30:37 2005 -0800
+
+    [PATCH] BUG on error handlings in Ext3 under I/O failure condition
+    
+    I found bugs on error handlings in the functions arround the ext3 file
+    system, which cause inadequate completions of synchronous write I/O
+    operations when disk I/O failures occur.  Both 2.4 and 2.6 have this
+    problem.
+    
+    	I carried out following experiment:
+    
+    1.  Mount a ext3 file system on a SCSI disk with ordered mode.
+    2.  Open a file on the file system with O_SYNC|O_RDWR|O_TRUNC|O_CREAT flag.
+    3.  Write 512 bytes data to the file by calling write() every 5 seconds, and
+         examine return values from the syscall.
+         from write().
+    4.  Disconnect the SCSI cable,  and examine messages from the kernel.
+    
+    After the SCSI cable is disconnected, write() must fail.  But the result
+    was different: write() succeeded for a while even though messages of the
+    kernel notified SCSI I/O error.
+    
+    By applying following modifications, the above problem was solved.
+    
+    Signed-off-by: Hisashi Hifumi <hifumi.hisashi@lab.ntt.co.jp>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 7a31850..341ba4c 100644
+Index: linux-2.6.10/fs/buffer.c
+===================================================================
+--- linux-2.6.10.orig/fs/buffer.c
++++ linux-2.6.10/fs/buffer.c
+@@ -314,10 +314,10 @@ int file_fsync(struct file *filp, struct
+ {
+ 	struct inode * inode = dentry->d_inode;
+ 	struct super_block * sb;
+-	int ret;
++	int ret, err;
+ 
+ 	/* sync the inode to buffers */
+-	write_inode_now(inode, 0);
++	ret = write_inode_now(inode, 0);
+ 
+ 	/* sync the superblock to buffers */
+ 	sb = inode->i_sb;
+@@ -327,7 +327,9 @@ int file_fsync(struct file *filp, struct
+ 	unlock_super(sb);
+ 
+ 	/* .. finally sync the buffers to disk */
+-	ret = sync_blockdev(sb->s_bdev);
++	err = sync_blockdev(sb->s_bdev);
++	if (!ret)
++		ret = err;
+ 	return ret;
+ }
+ 
+Index: linux-2.6.10/fs/fs-writeback.c
+===================================================================
+--- linux-2.6.10.orig/fs/fs-writeback.c
++++ linux-2.6.10/fs/fs-writeback.c
+@@ -558,22 +558,24 @@ void sync_inodes(int wait)
+  *	dirty. This is primarily needed by knfsd.
+  */
+  
+-void write_inode_now(struct inode *inode, int sync)
++int write_inode_now(struct inode *inode, int sync)
+ {
++	int ret;
+ 	struct writeback_control wbc = {
+ 		.nr_to_write = LONG_MAX,
+ 		.sync_mode = WB_SYNC_ALL,
+ 	};
+ 
+ 	if (inode->i_mapping->backing_dev_info->memory_backed)
+-		return;
++		return 0;
+ 
+ 	might_sleep();
+ 	spin_lock(&inode_lock);
+-	__writeback_single_inode(inode, &wbc);
++	ret = __writeback_single_inode(inode, &wbc);
+ 	spin_unlock(&inode_lock);
+ 	if (sync)
+ 		wait_on_inode(inode);
++	return ret;
+ }
+ EXPORT_SYMBOL(write_inode_now);
+ 
+@@ -642,8 +644,11 @@ int generic_osync_inode(struct inode *in
+ 		need_write_inode_now = 1;
+ 	spin_unlock(&inode_lock);
+ 
+-	if (need_write_inode_now)
+-		write_inode_now(inode, 1);
++	if (need_write_inode_now) {
++		err2 = write_inode_now(inode, 1);
++		if (!err)
++			err = err2;
++	}
+ 	else
+ 		wait_on_inode(inode);
+ 
+Index: linux-2.6.10/fs/jbd/commit.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/commit.c
++++ linux-2.6.10/fs/jbd/commit.c
+@@ -337,6 +337,9 @@ write_out_data:
+ 	}
+ 	spin_unlock(&journal->j_list_lock);
+ 
++	if (err)
++		__journal_abort_hard(journal);
++
+ 	journal_write_revoke_records(journal, commit_transaction);
+ 
+ 	jbd_debug(3, "JBD: commit phase 2\n");
+Index: linux-2.6.10/include/linux/fs.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/fs.h
++++ linux-2.6.10/include/linux/fs.h
+@@ -1339,7 +1339,7 @@ static inline void invalidate_remote_ino
+ 		invalidate_inode_pages(inode->i_mapping);
+ }
+ extern void invalidate_inode_pages2(struct address_space *mapping);
+-extern void write_inode_now(struct inode *, int);
++extern int write_inode_now(struct inode *, int);
+ extern int filemap_fdatawrite(struct address_space *);
+ extern int filemap_flush(struct address_space *);
+ extern int filemap_fdatawait(struct address_space *);
+Index: linux-2.6.10/mvl_patches/pro-0682.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0682.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(682);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

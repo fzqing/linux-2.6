@@ -1,0 +1,316 @@
+#! /usr/bin/env bash
+# Patch: -common_Fix_JBD_race_in_t_forget_list_handling
+# Date: Thu Jun 29 13:41:27 2006
+# MR: 17090
+# Commit: e6c9f5c1888097c936334bf9740024520ca47b8e
+# Author: Jan Kara <jack@suse.cz>
+# Date:   Tue Sep 6 15:19:09 2005 -0700
+# 
+#     [PATCH] Fix JBD race in t_forget list handling
+#     
+#     Fix race between journal_commit_transaction() and other places as
+#     journal_unmap_buffer() that are adding buffers to transaction's t_forget list.
+#      We have to protect against such places by holding j_list_lock even when
+#     traversing the t_forget list.  The fact that other places can only add buffers
+#     to the list makes the locking easier.  OTOH the lock ranking complicates the
+#     stuff...
+#     
+#     Signed-off-by: Jan Kara <jack@suse.cz>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=693
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 17090
+Commit: e6c9f5c1888097c936334bf9740024520ca47b8e
+Author: Jan Kara <jack@suse.cz>
+Date:   Tue Sep 6 15:19:09 2005 -0700
+
+    [PATCH] Fix JBD race in t_forget list handling
+    
+    Fix race between journal_commit_transaction() and other places as
+    journal_unmap_buffer() that are adding buffers to transaction's t_forget list.
+     We have to protect against such places by holding j_list_lock even when
+    traversing the t_forget list.  The fact that other places can only add buffers
+    to the list makes the locking easier.  OTOH the lock ranking complicates the
+    stuff...
+    
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/jbd/commit.c b/fs/jbd/commit.c
+index dac720c..9d0494d 100644
+Index: linux-2.6.10/fs/jbd/commit.c
+===================================================================
+--- linux-2.6.10.orig/fs/jbd/commit.c
++++ linux-2.6.10/fs/jbd/commit.c
+@@ -720,11 +720,17 @@ wait_for_iobuf:
+ 	J_ASSERT(commit_transaction->t_log_list == NULL);
+ 
+ restart_loop:
++	/*
++	 * As there are other places (journal_unmap_buffer()) adding buffers
++	 * to this list we have to be careful and hold the j_list_lock.
++	 */
++	spin_lock(&journal->j_list_lock);
+ 	while (commit_transaction->t_forget) {
+ 		transaction_t *cp_transaction;
+ 		struct buffer_head *bh;
+ 
+ 		jh = commit_transaction->t_forget;
++		spin_unlock(&journal->j_list_lock);
+ 		bh = jh2bh(jh);
+ 		jbd_lock_bh_state(bh);
+ 		J_ASSERT_JH(jh,	jh->b_transaction == commit_transaction ||
+@@ -792,9 +798,25 @@ restart_loop:
+ 			journal_remove_journal_head(bh);  /* needs a brelse */
+ 			release_buffer_page(bh);
+ 		}
++		cond_resched_lock(&journal->j_list_lock);
++	}
++	spin_unlock(&journal->j_list_lock);
++	/*
++	 * This is a bit sleazy.  We borrow j_list_lock to protect
++	 * journal->j_committing_transaction in __journal_remove_checkpoint.
++	 * Really, __journal_remove_checkpoint should be using j_state_lock but
++	 * it's a bit hassle to hold that across __journal_remove_checkpoint
++	 */
++	spin_lock(&journal->j_state_lock);
++	spin_lock(&journal->j_list_lock);
++	/*
++	 * Now recheck if some buffers did not get attached to the transaction
++	 * while the lock was dropped...
++	 */
++	if (commit_transaction->t_forget) {
+ 		spin_unlock(&journal->j_list_lock);
+-		if (cond_resched())
+-			goto restart_loop;
++		spin_unlock(&journal->j_state_lock);
++		goto restart_loop;
+ 	}
+ 
+ 	/* Done with this transaction! */
+@@ -803,14 +825,6 @@ restart_loop:
+ 
+ 	J_ASSERT(commit_transaction->t_state == T_COMMIT);
+ 
+-	/*
+-	 * This is a bit sleazy.  We borrow j_list_lock to protect
+-	 * journal->j_committing_transaction in __journal_remove_checkpoint.
+-	 * Really, __jornal_remove_checkpoint should be using j_state_lock but
+-	 * it's a bit hassle to hold that across __journal_remove_checkpoint
+-	 */
+-	spin_lock(&journal->j_state_lock);
+-	spin_lock(&journal->j_list_lock);
+ 	commit_transaction->t_state = T_FINISHED;
+ 	J_ASSERT(commit_transaction == journal->j_committing_transaction);
+ 	journal->j_commit_sequence = commit_transaction->t_tid;
+Index: linux-2.6.10/mvl_patches/pro-0693.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0693.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(693);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

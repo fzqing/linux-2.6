@@ -1,0 +1,360 @@
+#! /usr/bin/env bash
+# Patch: -ppc_ibm_ocp_phy_feat_exc
+# Date: Wed Dec 28 14:59:07 2005
+# [PATCH] ppc32: add phy excluded features to ocp_func_emac_data
+# 
+# This patch adds a field to struct ocp_func_emac_data that allows
+# platform-specific unsupported PHY features to be passed in to the ibm_emac
+# ethernet driver.
+# 
+# This patch also adds some logic for the Bamboo eval board to populate this
+# field based on the dip switches on the board.  This is a workaround for the
+# improperly biased RJ-45 sockets on the Rev.  0 Bamboo.
+# 
+# Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+# Signed-off-by: Matt Porter <mporter@kernel.crashing.org>
+# Cc: Jeff Garzik <jgarzik@pobox.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# commit 2698ebcb4338f09206b5accd75bc5cf2ed3dc641
+# tree 36d594ab86d57a558edc143de2ece41597c8a13b
+# parent 8e8fff09756bdb799154d034c63033192d6f8f89
+# author Matt Porter <mporter@kernel.crashing.org> Sat, 03 Sep 2005 15:55:35 -0700
+# committer Linus Torvalds <torvalds@evo.osdl.org> Mon, 05 Sep 2005 00:05:56 -0700
+# 
+#  arch/ppc/platforms/4xx/bamboo.c |   52 +++++++++++++++++++++++++++++++++-------
+#  include/asm-ppc/ibm_ocp.h       |    1 
+#  2 files changed, 45 insertions(+), 8 deletions(-)
+# 
+
+PATCHNUM=138
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+[PATCH] ppc32: add phy excluded features to ocp_func_emac_data
+
+This patch adds a field to struct ocp_func_emac_data that allows
+platform-specific unsupported PHY features to be passed in to the ibm_emac
+ethernet driver.
+
+This patch also adds some logic for the Bamboo eval board to populate this
+field based on the dip switches on the board.  This is a workaround for the
+improperly biased RJ-45 sockets on the Rev.  0 Bamboo.
+
+Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+Signed-off-by: Matt Porter <mporter@kernel.crashing.org>
+Cc: Jeff Garzik <jgarzik@pobox.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+commit 2698ebcb4338f09206b5accd75bc5cf2ed3dc641
+tree 36d594ab86d57a558edc143de2ece41597c8a13b
+parent 8e8fff09756bdb799154d034c63033192d6f8f89
+author Matt Porter <mporter@kernel.crashing.org> Sat, 03 Sep 2005 15:55:35 -0700
+committer Linus Torvalds <torvalds@evo.osdl.org> Mon, 05 Sep 2005 00:05:56 -0700
+
+ arch/ppc/platforms/4xx/bamboo.c |   52 +++++++++++++++++++++++++++++++++-------
+ include/asm-ppc/ibm_ocp.h       |    1 
+ mvl_patches/pro-0138.c          |   16 ++++++++++++
+ 3 files changed, 61 insertions(+), 8 deletions(-)
+
+Index: linux-2.6.10/arch/ppc/platforms/4xx/bamboo.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/4xx/bamboo.c
++++ linux-2.6.10/arch/ppc/platforms/4xx/bamboo.c
+@@ -124,33 +124,69 @@ bamboo_map_irq(struct pci_dev *dev, unsi
+ 
+ static void __init bamboo_set_emacdata(void)
+ {
+-	unsigned char * selection1_base;
++	u8 * base_addr;
+ 	struct ocp_def *def;
+ 	struct ocp_func_emac_data *emacdata;
+-	u8 selection1_val;
++	u8 val;
+ 	int mode;
++	u32 excluded = 0;
+ 
+-	selection1_base = ioremap64(BAMBOO_FPGA_SELECTION1_REG_ADDR, 16);
+-	selection1_val = readb(selection1_base);
+-	iounmap((void *) selection1_base);
+-	if (BAMBOO_SEL_MII(selection1_val))
++	base_addr = ioremap64(BAMBOO_FPGA_SELECTION1_REG_ADDR, 16);
++	val = readb(base_addr);
++	iounmap((void *) base_addr);
++	if (BAMBOO_SEL_MII(val))
+ 		mode = PHY_MODE_MII;
+-	else if (BAMBOO_SEL_RMII(selection1_val))
++	else if (BAMBOO_SEL_RMII(val))
+ 		mode = PHY_MODE_RMII;
+ 	else
+ 		mode = PHY_MODE_SMII;
+ 
+-	/* Set mac_addr and phy mode for each EMAC */
++	/*
++	 * SW2 on the Bamboo is used for ethernet configuration and is accessed
++	 * via the CONFIG2 register in the FPGA.  If the ANEG pin is set,
++	 * overwrite the supported features with the settings in SW2.
++	 *
++	 * This is used as a workaround for the improperly biased RJ-45 sockets
++	 * on the Rev. 0 Bamboo.  By default only 10baseT is functional.
++	 * Removing inductors L17 and L18 from the board allows 100baseT, but
++	 * disables 10baseT.  The Rev. 1 has no such limitations.
++	 */
++
++	base_addr = ioremap64(BAMBOO_FPGA_CONFIG2_REG_ADDR, 8);
++	val = readb(base_addr);
++	iounmap((void *) base_addr);
++	if (!BAMBOO_AUTONEGOTIATE(val)) {
++		excluded |= SUPPORTED_Autoneg;
++		if (BAMBOO_FORCE_100Mbps(val)) {
++			excluded |= SUPPORTED_10baseT_Full;
++			excluded |= SUPPORTED_10baseT_Half;
++			if (BAMBOO_FULL_DUPLEX_EN(val))
++				excluded |= SUPPORTED_100baseT_Half;
++			else
++				excluded |= SUPPORTED_100baseT_Full;
++		} else {
++			excluded |= SUPPORTED_100baseT_Full;
++			excluded |= SUPPORTED_100baseT_Half;
++			if (BAMBOO_FULL_DUPLEX_EN(val))
++				excluded |= SUPPORTED_10baseT_Half;
++			else
++				excluded |= SUPPORTED_10baseT_Full;
++		}
++	}
++
++	/* Set mac_addr, phy mode and unsupported phy features for each EMAC */
+ 
+ 	def = ocp_get_one_device(OCP_VENDOR_IBM, OCP_FUNC_EMAC, 0);
+ 	emacdata = def->additions;
+ 	memcpy(emacdata->mac_addr, __res.bi_enetaddr, 6);
+ 	emacdata->phy_mode = mode;
++	emacdata->phy_feat_exc = excluded;
+ 
+ 	def = ocp_get_one_device(OCP_VENDOR_IBM, OCP_FUNC_EMAC, 1);
+ 	emacdata = def->additions;
+ 	memcpy(emacdata->mac_addr, __res.bi_enet1addr, 6);
+ 	emacdata->phy_mode = mode;
++	emacdata->phy_feat_exc = excluded;
+ }
+ 
+ static int
+Index: linux-2.6.10/include/asm-ppc/ibm_ocp.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/ibm_ocp.h
++++ linux-2.6.10/include/asm-ppc/ibm_ocp.h
+@@ -67,6 +67,7 @@ struct ocp_func_emac_data {
+ 	int	phy_mode;	/* PHY type or configurable mode */
+ 	u8	mac_addr[6];	/* EMAC mac address */
+ 	u32	phy_map;	/* EMAC phy map */
++	u32	phy_feat_exc;	/* Excluded PHY features */
+ };
+ 
+ /* Sysfs support */
+Index: linux-2.6.10/mvl_patches/pro-0138.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0138.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(138);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1135 @@
+#! /usr/bin/env bash
+# Patch: -ARM_3377_2_add_support_for_intel_xsc3_core
+# Date: Fri Dec  7 11:49:44 2007
+# MR: 20443
+# [ARM] 3377/2: add support for intel xsc3 core
+# 
+# Patch from Lennert Buytenhek
+# 
+# This patch adds support for the new XScale v3 core.  This is an
+# ARMv5 ISA core with the following additions:
+# 
+# - L2 cache
+# - I/O coherency support (on select chipsets)
+# - Low-Locality Reference cache attributes (replaces mini-cache)
+# - Supersections (v6 compatible)
+# - 36-bit addressing (v6 compatible)
+# - Single instruction cache line clean/invalidate
+# - LRU cache replacement (vs round-robin)
+# 
+# I attempted to merge the XSC3 support into proc-xscale.S, but XSC3
+# cores have separate errata and have to handle things like L2, so it
+# is simpler to keep it separate.
+# 
+# L2 cache support is currently a build option because the L2 enable
+# bit must be set before we enable the MMU and there is no easy way to
+# capture command line parameters at this point.
+# 
+# There are still optimizations that can be done such as using LLR for
+# copypage (in theory using the exisiting mini-cache code) but those
+# can be addressed down the road.
+# 
+# Signed-off-by: Deepak Saxena <dsaxena@plexity.net>
+# Signed-off-by: Lennert Buytenhek <buytenh@wantstofly.org>
+# Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+# commit 23bdf86aa06ebe71bcbf6b7d25de9958c6ab33fa
+# tree 56636558e8cdeee0739e7d8c82d66ffe625340b3
+# parent de4533a04eb4f66dbef71f59a9c118256b886823
+# author Lennert Buytenhek <buytenh@wantstofly.org> Tue, 28 Mar 2006 21:00:40 +0100
+# committer Russell King <rmk+kernel@arm.linux.org.uk> Tue, 28 Mar 2006 21:00:40 +0100
+# 
+#  arch/arm/Makefile            |    1 
+#  arch/arm/mm/Kconfig          |   19 +
+#  arch/arm/mm/Makefile         |    2 
+#  arch/arm/mm/copypage-xsc3.S  |   97 ++++++++
+#  arch/arm/mm/mm-armv.c        |    3 
+#  arch/arm/mm/proc-xsc3.S      |  498 +++++++++++++++++++++++++++++++++++++++++++
+#  include/asm-arm/cacheflush.h |    8 
+#  include/asm-arm/domain.h     |   18 +
+#  include/asm-arm/page.h       |    9 
+#  include/asm-arm/proc-fns.h   |    8 
+#  include/asm-arm/system.h     |   19 +
+#  11 files changed, 680 insertions(+), 2 deletions(-)
+# 
+
+PATCHNUM=1411
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 20443
+[ARM] 3377/2: add support for intel xsc3 core
+
+Patch from Lennert Buytenhek
+
+This patch adds support for the new XScale v3 core.  This is an
+ARMv5 ISA core with the following additions:
+
+- L2 cache
+- I/O coherency support (on select chipsets)
+- Low-Locality Reference cache attributes (replaces mini-cache)
+- Supersections (v6 compatible)
+- 36-bit addressing (v6 compatible)
+- Single instruction cache line clean/invalidate
+- LRU cache replacement (vs round-robin)
+
+I attempted to merge the XSC3 support into proc-xscale.S, but XSC3
+cores have separate errata and have to handle things like L2, so it
+is simpler to keep it separate.
+
+L2 cache support is currently a build option because the L2 enable
+bit must be set before we enable the MMU and there is no easy way to
+capture command line parameters at this point.
+
+There are still optimizations that can be done such as using LLR for
+copypage (in theory using the exisiting mini-cache code) but those
+can be addressed down the road.
+
+Signed-off-by: Deepak Saxena <dsaxena@plexity.net>
+Signed-off-by: Lennert Buytenhek <buytenh@wantstofly.org>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+commit 23bdf86aa06ebe71bcbf6b7d25de9958c6ab33fa
+tree 56636558e8cdeee0739e7d8c82d66ffe625340b3
+parent de4533a04eb4f66dbef71f59a9c118256b886823
+author Lennert Buytenhek <buytenh@wantstofly.org> Tue, 28 Mar 2006 21:00:40 +0100
+committer Russell King <rmk+kernel@arm.linux.org.uk> Tue, 28 Mar 2006 21:00:40 +0100
+
+ arch/arm/Makefile            |    1 
+ arch/arm/mm/Kconfig          |   19 +
+ arch/arm/mm/Makefile         |    2 
+ arch/arm/mm/copypage-xsc3.S  |   97 ++++++++
+ arch/arm/mm/mm-armv.c        |    3 
+ arch/arm/mm/proc-xsc3.S      |  498 +++++++++++++++++++++++++++++++++++++++++++
+ include/asm-arm/cacheflush.h |    8 
+ include/asm-arm/domain.h     |   18 +
+ include/asm-arm/page.h       |    9 
+ include/asm-arm/proc-fns.h   |    8 
+ include/asm-arm/system.h     |   19 +
+ mvl_patches/pro-1411.c       |   16 +
+ 12 files changed, 696 insertions(+), 2 deletions(-)
+
+Index: linux-2.6.10/arch/arm/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/arm/Makefile
++++ linux-2.6.10/arch/arm/Makefile
+@@ -58,6 +58,7 @@ tune-$(CONFIG_CPU_ARM926T)	:=-mtune=arm9
+ tune-$(CONFIG_CPU_SA110)	:=-mtune=strongarm110
+ tune-$(CONFIG_CPU_SA1100)	:=-mtune=strongarm1100
+ tune-$(CONFIG_CPU_XSCALE)	:=$(call cc-option,-mtune=xscale,-mtune=strongarm110) -Wa,-mcpu=xscale
++tune-$(CONFIG_CPU_XSC3)		:=$(call cc-option,-mtune=xscale,-mtune=strongarm110) -Wa,-mcpu=xscale
+ tune-$(CONFIG_CPU_V6)		:=$(call cc-option,-mtune=arm1136j-s,-mtune=strongarm)
+ 
+ ifeq ($(CONFIG_AEABI),y)
+Index: linux-2.6.10/arch/arm/mm/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/Kconfig
++++ linux-2.6.10/arch/arm/mm/Kconfig
+@@ -241,6 +241,17 @@ config CPU_XSCALE
+ 	select CPU_TLB_V4WBI
+ 	select CPU_MINICACHE
+ 
++# XScale Core Version 3
++config CPU_XSC3
++ 	bool
++ 	depends on ARCH_IXP23XX
++ 	default y
++ 	select CPU_32v5
++ 	select CPU_ABRT_EV5T
++ 	select CPU_CACHE_VIVT
++ 	select CPU_TLB_V4WBI
++ 	select IO_36
++
+ # ARMv6
+ config CPU_V6
+ 	bool "Support ARM V6 processor"
+@@ -350,11 +361,17 @@ config CPU_MINICACHE
+ 	help
+ 	  Processor has a minicache.
+ 
++#
++# CPU supports 36-bit I/O
++#
++config IO_36
++	bool
++
+ comment "Processor Features"
+ 
+ config ARM_THUMB
+ 	bool "Support Thumb user binaries"
+-	depends on CPU_ARM720T || CPU_ARM920T || CPU_ARM922T || CPU_ARM925T || CPU_ARM926T || CPU_ARM1020 || CPU_ARM1020E || CPU_ARM1022 || CPU_ARM1026 || CPU_XSCALE || CPU_V6
++	depends on CPU_ARM720T || CPU_ARM920T || CPU_ARM922T || CPU_ARM925T || CPU_ARM926T || CPU_ARM1020 || CPU_ARM1020E || CPU_ARM1022 || CPU_ARM1026 || CPU_XSCALE || CPU_XSC3 || CPU_V6
+ 	default y
+ 	help
+ 	  Say Y if you want to include kernel support for running user space
+Index: linux-2.6.10/arch/arm/mm/Makefile
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/Makefile
++++ linux-2.6.10/arch/arm/mm/Makefile
+@@ -30,6 +30,7 @@ obj-$(CONFIG_CPU_COPY_V4WB)	+= copypage-
+ obj-$(CONFIG_CPU_COPY_V6)	+= copypage-v6.o mmu.o
+ obj-$(CONFIG_CPU_SA1100)	+= copypage-v4mc.o
+ obj-$(CONFIG_CPU_XSCALE)	+= copypage-xscale.o copypage-xscale-export.o
++obj-$(CONFIG_CPU_XSC3)		+= copypage-xsc3.o
+ 
+ obj-$(CONFIG_CPU_MINICACHE)	+= minicache.o
+ 
+@@ -53,4 +54,5 @@ obj-$(CONFIG_CPU_ARM1026)	+= proc-arm102
+ obj-$(CONFIG_CPU_SA110)		+= proc-sa110.o
+ obj-$(CONFIG_CPU_SA1100)	+= proc-sa1100.o
+ obj-$(CONFIG_CPU_XSCALE)	+= proc-xscale.o
++obj-$(CONFIG_CPU_XSC3)		+= proc-xsc3.o
+ obj-$(CONFIG_CPU_V6)		+= proc-v6.o
+Index: linux-2.6.10/arch/arm/mm/copypage-xsc3.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mm/copypage-xsc3.S
+@@ -0,0 +1,97 @@
++/*
++ *  linux/arch/arm/lib/copypage-xsc3.S
++ *
++ *  Copyright (C) 2004 Intel Corp.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Adapted for 3rd gen XScale core, no more mini-dcache
++ * Author: Matt Gilbert (matthew.m.gilbert@intel.com)
++ */
++
++#include <linux/linkage.h>
++#include <linux/init.h>
++#include <asm/asm-offsets.h>
++
++/*
++ * General note:
++ *  We don't really want write-allocate cache behaviour for these functions
++ *  since that will just eat through 8K of the cache.
++ */
++
++	.text
++	.align	5
++/*
++ * XSC3 optimised copy_user_page
++ *  r0 = destination
++ *  r1 = source
++ *  r2 = virtual user address of ultimate destination page
++ *
++ * The source page may have some clean entries in the cache already, but we
++ * can safely ignore them - break_cow() will flush them out of the cache
++ * if we eventually end up using our copied page.
++ *
++ */
++ENTRY(xsc3_mc_copy_user_page)
++	stmfd	sp!, {r4, r5, lr}
++	mov	lr, #PAGE_SZ/64-1
++
++	pld	[r1, #0]
++	pld	[r1, #32]
++1:	pld	[r1, #64]
++	pld	[r1, #96]
++
++2:	ldrd	r2, [r1], #8
++	mov	ip, r0
++	ldrd	r4, [r1], #8
++	mcr	p15, 0, ip, c7, c6, 1		@ invalidate
++	strd	r2, [r0], #8
++	ldrd	r2, [r1], #8
++	strd	r4, [r0], #8
++	ldrd	r4, [r1], #8
++	strd	r2, [r0], #8
++	strd	r4, [r0], #8
++	ldrd	r2, [r1], #8
++	mov	ip, r0
++	ldrd	r4, [r1], #8
++	mcr	p15, 0, ip, c7, c6, 1		@ invalidate
++	strd	r2, [r0], #8
++	ldrd	r2, [r1], #8
++	subs	lr, lr, #1
++	strd	r4, [r0], #8
++	ldrd	r4, [r1], #8
++	strd	r2, [r0], #8
++	strd	r4, [r0], #8
++	bgt	1b
++	beq	2b
++
++	ldmfd	sp!, {r4, r5, pc}
++
++	.align	5
++/*
++ * XScale optimised clear_user_page
++ *  r0 = destination
++ *  r1 = virtual user address of ultimate destination page
++ */
++ENTRY(xsc3_mc_clear_user_page)
++	mov	r1, #PAGE_SZ/32
++	mov	r2, #0
++	mov	r3, #0
++1:	mcr	p15, 0, r0, c7, c6, 1		@ invalidate line
++	strd	r2, [r0], #8
++	strd	r2, [r0], #8
++	strd	r2, [r0], #8
++	strd	r2, [r0], #8
++	subs	r1, r1, #1
++	bne	1b
++	mov	pc, lr
++
++	__INITDATA
++
++	.type	xsc3_mc_user_fns, #object
++ENTRY(xsc3_mc_user_fns)
++	.long	xsc3_mc_clear_user_page
++	.long	xsc3_mc_copy_user_page
++	.size	xsc3_mc_user_fns, . - xsc3_mc_user_fns
+Index: linux-2.6.10/arch/arm/mm/mm-armv.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/mm-armv.c
++++ linux-2.6.10/arch/arm/mm/mm-armv.c
+@@ -521,7 +521,8 @@ static void __init create_mapping(struct
+ 	 *	supersections are only allocated for domain 0 regardless
+ 	 *	of the actual domain assignments in use.
+ 	 */
+-	if (cpu_architecture() >= CPU_ARCH_ARMv6 && domain == 0) {
++	if ((cpu_architecture() >= CPU_ARCH_ARMv6 || cpu_is_xsc3())
++		&& domain == 0) {
+ 		/* Align to supersection boundary */
+ 		while ((virt & ~SUPERSECTION_MASK || (virt + off) &
+ 			~SUPERSECTION_MASK) && length >= (PGDIR_SIZE / 2)) {
+Index: linux-2.6.10/arch/arm/mm/proc-xsc3.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/arm/mm/proc-xsc3.S
+@@ -0,0 +1,498 @@
++/*
++ * linux/arch/arm/mm/proc-xsc3.S
++ *
++ * Original Author: Matthew Gilbert
++ * Current Maintainer: Deepak Saxena <dsaxena@plexity.net>
++ *
++ * Copyright 2004 (C) Intel Corp.
++ * Copyright 2005 (c) MontaVista Software, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * MMU functions for the Intel XScale3 Core (XSC3).  The XSC3 core is an
++ * extension to Intel's original XScale core that adds the following
++ * features:
++ *
++ * - ARMv6 Supersections
++ * - Low Locality Reference pages (replaces mini-cache)
++ * - 36-bit addressing
++ * - L2 cache
++ * - Cache-coherency if chipset supports it
++ *
++ * Based on orignal XScale code by Nicolas Pitre
++ */
++
++#include <linux/linkage.h>
++#include <linux/init.h>
++#include <asm/assembler.h>
++#include <asm/procinfo.h>
++#include <asm/hardware.h>
++#include <asm/pgtable.h>
++#include <asm/page.h>
++#include <asm/ptrace.h>
++#include "proc-macros.S"
++
++/*
++ * This is the maximum size of an area which will be flushed.  If the
++ * area is larger than this, then we flush the whole cache.
++ */
++#define MAX_AREA_SIZE	32768
++
++/*
++ * The cache line size of the I and D cache.
++ */
++#define CACHELINESIZE	32
++
++/*
++ * The size of the data cache.
++ */
++#define CACHESIZE	32768
++
++/*
++ * Run with L2 enabled.
++ */
++#define L2_CACHE_ENABLE	1
++
++/*
++ * Enable the Branch Target Buffer (can cause crashes, see erratum #42.)
++ */
++#define BTB_ENABLE	0
++
++/*
++ * This macro is used to wait for a CP15 write and is needed
++ * when we have to ensure that the last operation to the co-pro
++ * was completed before continuing with operation.
++ */
++	.macro	cpwait_ret, lr, rd
++	mrc	p15, 0, \rd, c2, c0, 0		@ arbitrary read of cp15
++	sub	pc, \lr, \rd, LSR #32		@ wait for completion and
++						@ flush instruction pipeline
++	.endm
++
++/*
++ * This macro cleans & invalidates the entire xsc3 dcache by set & way.
++ */
++
++ 	.macro  clean_d_cache rd, rs
++	mov	\rd, #0x1f00
++	orr	\rd, \rd, #0x00e0
++1:	mcr	p15, 0, \rd, c7, c14, 2		@ clean/inv set/way
++	adds	\rd, \rd, #0x40000000
++	bcc	1b
++	subs	\rd, \rd, #0x20
++	bpl	1b
++	.endm
++
++	.text
++
++/*
++ * cpu_xsc3_proc_init()
++ *
++ * Nothing too exciting at the moment
++ */
++ENTRY(cpu_xsc3_proc_init)
++	mov	pc, lr
++
++/*
++ * cpu_xsc3_proc_fin()
++ */
++ENTRY(cpu_xsc3_proc_fin)
++	str	lr, [sp, #-4]!
++	mov	r0, #PSR_F_BIT|PSR_I_BIT|SVC_MODE
++	msr	cpsr_c, r0
++	bl	xsc3_flush_kern_cache_all	@ clean caches
++	mrc	p15, 0, r0, c1, c0, 0		@ ctrl register
++	bic	r0, r0, #0x1800			@ ...IZ...........
++	bic	r0, r0, #0x0006			@ .............CA.
++	mcr	p15, 0, r0, c1, c0, 0		@ disable caches
++	ldr	pc, [sp], #4
++
++/*
++ * cpu_xsc3_reset(loc)
++ *
++ * Perform a soft reset of the system.  Put the CPU into the
++ * same state as it would be if it had been reset, and branch
++ * to what would be the reset vector.
++ *
++ * loc: location to jump to for soft reset
++ */
++	.align	5
++ENTRY(cpu_xsc3_reset)
++	mov	r1, #PSR_F_BIT|PSR_I_BIT|SVC_MODE
++	msr	cpsr_c, r1			@ reset CPSR
++	mrc	p15, 0, r1, c1, c0, 0		@ ctrl register
++	bic	r1, r1, #0x0086			@ ........B....CA.
++	bic	r1, r1, #0x3900			@ ..VIZ..S........
++	mcr	p15, 0, r1, c1, c0, 0		@ ctrl register
++	mcr	p15, 0, ip, c7, c7, 0		@ invalidate I,D caches & BTB
++	bic	r1, r1, #0x0001			@ ...............M
++	mcr	p15, 0, r1, c1, c0, 0		@ ctrl register
++	@ CAUTION: MMU turned off from this point.  We count on the pipeline
++	@ already containing those two last instructions to survive.
++	mcr	p15, 0, ip, c8, c7, 0		@ invalidate I & D TLBs
++	mov	pc, r0
++
++/*
++ * cpu_xsc3_do_idle()
++ *
++ * Cause the processor to idle
++ *
++ * For now we do nothing but go to idle mode for every case
++ *
++ * XScale supports clock switching, but using idle mode support
++ * allows external hardware to react to system state changes.
++
++ MMG: Come back to this one.
++ */
++	.align	5
++
++ENTRY(cpu_xsc3_do_idle)
++	mov	r0, #1
++	mcr	p14, 0, r0, c7, c0, 0		@ Go to IDLE
++	mov	pc, lr
++
++/* ================================= CACHE ================================ */
++
++/*
++ *	flush_user_cache_all()
++ *
++ *	Invalidate all cache entries in a particular address
++ *	space.
++ */
++ENTRY(xsc3_flush_user_cache_all)
++	/* FALLTHROUGH */
++
++/*
++ *	flush_kern_cache_all()
++ *
++ *	Clean and invalidate the entire cache.
++ */
++ENTRY(xsc3_flush_kern_cache_all)
++	mov	r2, #VM_EXEC
++	mov	ip, #0
++__flush_whole_cache:
++	clean_d_cache r0, r1
++	tst	r2, #VM_EXEC
++	mcrne	p15, 0, ip, c7, c5, 0		@ Invalidate I cache & BTB
++	mcrne	p15, 0, ip, c7, c10, 4		@ Drain Write Buffer
++	mcrne	p15, 0, ip, c7, c5, 4		@ Prefetch Flush
++	mov	pc, lr
++
++/*
++ *	flush_user_cache_range(start, end, vm_flags)
++ *
++ *	Invalidate a range of cache entries in the specified
++ *	address space.
++ *
++ *	- start - start address (may not be aligned)
++ *	- end	- end address (exclusive, may not be aligned)
++ *	- vma	- vma_area_struct describing address space
++ */
++	.align	5
++ENTRY(xsc3_flush_user_cache_range)
++	mov	ip, #0
++	sub	r3, r1, r0			@ calculate total size
++	cmp	r3, #MAX_AREA_SIZE
++	bhs	__flush_whole_cache
++
++1:	tst	r2, #VM_EXEC
++	mcrne	p15, 0, r0, c7, c5, 1		@ Invalidate I cache line
++	mcr	p15, 0, r0, c7, c14, 1		@ Clean/invalidate D cache line
++	add	r0, r0, #CACHELINESIZE
++	cmp	r0, r1
++	blo	1b
++	tst	r2, #VM_EXEC
++	mcrne	p15, 0, ip, c7, c5, 6		@ Invalidate BTB
++	mcrne	p15, 0, ip, c7, c10, 4		@ Drain Write Buffer
++	mcrne	p15, 0, ip, c7, c5, 4		@ Prefetch Flush
++	mov	pc, lr
++
++/*
++ *	coherent_kern_range(start, end)
++ *
++ *	Ensure coherency between the Icache and the Dcache in the
++ *	region described by start.  If you have non-snooping
++ *	Harvard caches, you need to implement this function.
++ *
++ *	- start  - virtual start address
++ *	- end	 - virtual end address
++ *
++ *	Note: single I-cache line invalidation isn't used here since
++ *	it also trashes the mini I-cache used by JTAG debuggers.
++ */
++ENTRY(xsc3_coherent_kern_range)
++/* FALLTHROUGH */
++ENTRY(xsc3_coherent_user_range)
++	bic	r0, r0, #CACHELINESIZE - 1
++1:	mcr	p15, 0, r0, c7, c10, 1		@ clean D entry
++	add	r0, r0, #CACHELINESIZE
++	cmp	r0, r1
++	blo	1b
++	mov	r0, #0
++	mcr	p15, 0, r0, c7, c5, 0		@ Invalidate I cache & BTB
++	mcr	p15, 0, r0, c7, c10, 4		@ Drain Write Buffer
++	mcr	p15, 0, r0, c7, c5, 4		@ Prefetch Flush
++	mov	pc, lr
++
++/*
++ *	flush_kern_dcache_page(void *page)
++ *
++ *	Ensure no D cache aliasing occurs, either with itself or
++ *	the I cache
++ *
++ *	- addr	- page aligned address
++ */
++ENTRY(xsc3_flush_kern_dcache_page)
++	add	r1, r0, #PAGE_SZ
++1:	mcr	p15, 0, r0, c7, c14, 1		@ Clean/Invalidate D Cache line
++	add	r0, r0, #CACHELINESIZE
++	cmp	r0, r1
++	blo	1b
++	mov	r0, #0
++	mcr	p15, 0, r0, c7, c5, 0		@ Invalidate I cache & BTB
++	mcr	p15, 0, r0, c7, c10, 4		@ Drain Write Buffer
++	mcr	p15, 0, r0, c7, c5, 4		@ Prefetch Flush
++	mov	pc, lr
++
++/*
++ *	dma_inv_range(start, end)
++ *
++ *	Invalidate (discard) the specified virtual address range.
++ *	May not write back any entries.  If 'start' or 'end'
++ *	are not cache line aligned, those lines must be written
++ *	back.
++ *
++ *	- start  - virtual start address
++ *	- end	 - virtual end address
++ */
++ENTRY(xsc3_dma_inv_range)
++	tst	r0, #CACHELINESIZE - 1
++	bic	r0, r0, #CACHELINESIZE - 1
++	mcrne	p15, 0, r0, c7, c10, 1		@ clean L1 D entry
++	mcrne	p15, 1, r0, c7, c11, 1		@ clean L2 D entry
++	tst	r1, #CACHELINESIZE - 1
++	mcrne	p15, 0, r1, c7, c10, 1		@ clean L1 D entry
++	mcrne	p15, 1, r1, c7, c11, 1		@ clean L2 D entry
++1:	mcr	p15, 0, r0, c7, c6, 1		@ invalidate L1 D entry
++	mcr	p15, 1, r0, c7, c7, 1		@ Invalidate L2 D cache line
++	add	r0, r0, #CACHELINESIZE
++	cmp	r0, r1
++	blo	1b
++	mcr	p15, 0, r0, c7, c10, 4		@ Drain Write Buffer
++	mov	pc, lr
++
++/*
++ *	dma_clean_range(start, end)
++ *
++ *	Clean the specified virtual address range.
++ *
++ *	- start  - virtual start address
++ *	- end	 - virtual end address
++ */
++ENTRY(xsc3_dma_clean_range)
++	bic	r0, r0, #CACHELINESIZE - 1
++1:	mcr	p15, 0, r0, c7, c10, 1		@ clean L1 D entry
++	mcr	p15, 1, r0, c7, c11, 1		@ clean L2 D entry
++	add	r0, r0, #CACHELINESIZE
++	cmp	r0, r1
++	blo	1b
++	mcr	p15, 0, r0, c7, c10, 4		@ Drain Write Buffer
++	mov	pc, lr
++
++/*
++ *	dma_flush_range(start, end)
++ *
++ *	Clean and invalidate the specified virtual address range.
++ *
++ *	- start  - virtual start address
++ *	- end	 - virtual end address
++ */
++ENTRY(xsc3_dma_flush_range)
++	bic	r0, r0, #CACHELINESIZE - 1
++1:	mcr	p15, 0, r0, c7, c14, 1	@ Clean/invalidate L1 D cache line
++	mcr	p15, 1, r0, c7, c11, 1	@ Clean L2 D cache line
++	mcr	p15, 1, r0, c7, c7, 1	@ Invalidate L2 D cache line
++	add	r0, r0, #CACHELINESIZE
++	cmp	r0, r1
++	blo	1b
++	mcr	p15, 0, r0, c7, c10, 4		@ Drain Write Buffer
++	mov	pc, lr
++
++ENTRY(xsc3_cache_fns)
++	.long	xsc3_flush_kern_cache_all
++	.long	xsc3_flush_user_cache_all
++	.long	xsc3_flush_user_cache_range
++	.long	xsc3_coherent_kern_range
++	.long	xsc3_coherent_user_range
++	.long	xsc3_flush_kern_dcache_page
++	.long	xsc3_dma_inv_range
++	.long	xsc3_dma_clean_range
++	.long	xsc3_dma_flush_range
++
++ENTRY(cpu_xsc3_dcache_clean_area)
++1:	mcr	p15, 0, r0, c7, c10, 1		@ clean D entry
++	add	r0, r0, #CACHELINESIZE
++	subs	r1, r1, #CACHELINESIZE
++	bhi	1b
++	mov	pc, lr
++
++/* =============================== PageTable ============================== */
++
++/*
++ * cpu_xsc3_switch_mm(pgd)
++ *
++ * Set the translation base pointer to be as described by pgd.
++ *
++ * pgd: new page tables
++ */
++	.align	5
++ENTRY(cpu_xsc3_switch_mm)
++	clean_d_cache r1, r2
++	mcr	p15, 0, ip, c7, c5, 0		@ Invalidate I cache & BTB
++	mcr	p15, 0, ip, c7, c10, 4		@ Drain Write Buffer
++	mcr	p15, 0, ip, c7, c5, 4		@ Prefetch Flush
++#ifdef L2_CACHE_ENABLE
++	orr	r0, r0, #0x18			@ cache the page table in L2
++#endif
++	mcr	p15, 0, r0, c2, c0, 0		@ load page table pointer
++	mcr	p15, 0, ip, c8, c7, 0		@ invalidate I & D TLBs
++	cpwait_ret lr, ip
++
++/*
++ * cpu_xsc3_set_pte(ptep, pte)
++ *
++ * Set a PTE and flush it out
++ *
++ */
++	.align	5
++ENTRY(cpu_xsc3_set_pte)
++	str	r1, [r0], #-2048		@ linux version
++
++	bic	r2, r1, #0xff0
++	orr	r2, r2, #PTE_TYPE_EXT		@ extended page
++
++	eor	r3, r1, #L_PTE_PRESENT | L_PTE_YOUNG | L_PTE_WRITE | L_PTE_DIRTY
++
++	tst	r3, #L_PTE_USER			@ User?
++	orrne	r2, r2, #PTE_EXT_AP_URO_SRW	@ yes -> user r/o, system r/w
++
++	tst	r3, #L_PTE_WRITE | L_PTE_DIRTY	@ Write and Dirty?
++	orreq	r2, r2, #PTE_EXT_AP_UNO_SRW	@ yes -> user n/a, system r/w
++						@ combined with user -> user r/w
++
++#if L2_CACHE_ENABLE
++	@ If its cacheable it needs to be in L2 also.
++	eor	ip, r1, #L_PTE_CACHEABLE
++	tst	ip, #L_PTE_CACHEABLE
++	orreq	r2, r2, #PTE_EXT_TEX(0x5)
++#endif
++
++	tst	r3, #L_PTE_PRESENT | L_PTE_YOUNG	@ Present and Young?
++	movne	r2, #0				@ no -> fault
++
++	str	r2, [r0]			@ hardware version
++	mov	ip, #0
++	mcr	p15, 0, r0, c7, c10, 1		@ Clean D cache line mcr
++	mcr	p15, 0, ip, c7, c10, 4		@ Drain Write Buffer
++	mov	pc, lr
++
++	.ltorg
++
++	.align
++
++	__INIT
++
++	.type	__xsc3_setup, #function
++__xsc3_setup:
++	mov	r0, #PSR_F_BIT|PSR_I_BIT|SVC_MODE
++	msr	cpsr_c, r0
++	mcr	p15, 0, ip, c7, c7, 0		@ invalidate I, D caches & BTB
++	mcr	p15, 0, ip, c7, c10, 4		@ Drain Write Buffer
++	mcr	p15, 0, ip, c7, c5, 4		@ Prefetch Flush
++	mcr	p15, 0, ip, c8, c7, 0		@ invalidate I, D TLBs
++#if L2_CACHE_ENABLE
++	orr	r4, r4, #0x18			@ cache the page table in L2
++#endif
++	mcr	p15, 0, r4, c2, c0, 0		@ load page table pointer
++	mov	r0, #1				@ Allow access to CP0 and CP13
++	orr	r0, r0, #1 << 13		@ Its undefined whether this
++	mcr	p15, 0, r0, c15, c1, 0		@ affects USR or SVC modes
++	mrc	p15, 0, r0, c1, c0, 1		@ get auxiliary control reg
++	and	r0, r0, #2			@ preserve bit P bit setting
++#if L2_CACHE_ENABLE
++	orr	r0, r0, #(1 << 10)		@ enable L2 for LLR cache
++#endif
++	mcr	p15, 0, r0, c1, c0, 1		@ set auxiliary control reg
++	mrc	p15, 0, r0, c1, c0, 0		@ get control register
++	bic	r0, r0, #0x0200			@ .... ..R. .... ....
++	bic	r0, r0, #0x0002			@ .... .... .... ..A.
++	orr	r0, r0, #0x0005			@ .... .... .... .C.M
++#if BTB_ENABLE
++	orr	r0, r0, #0x3900			@ ..VI Z..S .... ....
++#else
++	orr	r0, r0, #0x3100			@ ..VI ...S .... ....
++#endif
++#if L2_CACHE_ENABLE
++	orr 	r0, r0, #0x4000000		@ L2 enable
++#endif
++	mov	pc, lr
++
++	.size	__xsc3_setup, . - __xsc3_setup
++
++	__INITDATA
++
++/*
++ * Purpose : Function pointers used to access above functions - all calls
++ *	     come through these
++ */
++
++	.type	xsc3_processor_functions, #object
++ENTRY(xsc3_processor_functions)
++	.word	v5t_early_abort
++	.word	cpu_xsc3_proc_init
++	.word	cpu_xsc3_proc_fin
++	.word	cpu_xsc3_reset
++	.word	cpu_xsc3_do_idle
++	.word	cpu_xsc3_dcache_clean_area
++	.word	cpu_xsc3_switch_mm
++	.word	cpu_xsc3_set_pte
++	.size	xsc3_processor_functions, . - xsc3_processor_functions
++
++	.section ".rodata"
++
++	.type	cpu_arch_name, #object
++cpu_arch_name:
++	.asciz	"armv5te"
++	.size	cpu_arch_name, . - cpu_arch_name
++
++	.type	cpu_elf_name, #object
++cpu_elf_name:
++	.asciz	"v5"
++	.size	cpu_elf_name, . - cpu_elf_name
++
++	.type	cpu_xsc3_name, #object
++cpu_xsc3_name:
++	.asciz	"XScale-Core3"
++	.size	cpu_xsc3_name, . - cpu_xsc3_name
++
++	.align
++
++	.section ".proc.info.init", #alloc, #execinstr
++
++	.type	__xsc3_proc_info,#object
++__xsc3_proc_info:
++	.long	0x69056000
++	.long	0xffffe000
++	.long	0x00000c0e
++	b	__xsc3_setup
++	.long	cpu_arch_name
++	.long	cpu_elf_name
++	.long	HWCAP_SWP|HWCAP_HALF|HWCAP_THUMB|HWCAP_FAST_MULT|HWCAP_EDSP
++	.long	cpu_xsc3_name
++	.long	xsc3_processor_functions
++	.long	v4wbi_tlb_fns
++	.long	xsc3_mc_user_fns
++	.long	xsc3_cache_fns
++	.size	__xsc3_proc_info, . - __xsc3_proc_info
+Index: linux-2.6.10/include/asm-arm/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/cacheflush.h
++++ linux-2.6.10/include/asm-arm/cacheflush.h
+@@ -69,6 +69,14 @@
+ # endif
+ #endif
+ 
++#if defined(CONFIG_CPU_XSC3)
++# ifdef _CACHE
++#  define MULTI_CACHE 1
++# else
++#  define _CACHE xsc3
++# endif
++#endif
++
+ #if defined(CONFIG_CPU_V6)
+ //# ifdef _CACHE
+ #  define MULTI_CACHE 1
+Index: linux-2.6.10/include/asm-arm/domain.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/domain.h
++++ linux-2.6.10/include/asm-arm/domain.h
+@@ -16,11 +16,29 @@
+  *  DOMAIN_IO     - domain 2 includes all IO only
+  *  DOMAIN_USER   - domain 1 includes all user memory only
+  *  DOMAIN_KERNEL - domain 0 includes all kernel memory only
++ *
++ * The domain numbering depends on whether we support 36 physical
++ * address for I/O or not.  Addresses above the 32 bit boundary can
++ * only be mapped using supersections and supersections can only
++ * be set for domain 0.  We could just default to DOMAIN_IO as zero,
++ * but there may be systems with supersection support and no 36-bit
++ * addressing.  In such cases, we want to map system memory with
++ * supersections to reduce TLB misses and footprint.
++ *
++ * 36-bit addressing and supersections are only available on
++ * CPUs based on ARMv6+ or the Intel XSC3 core.
+  */
++#ifndef CONFIG_IO_36
+ #define DOMAIN_KERNEL	0
+ #define DOMAIN_TABLE	0
+ #define DOMAIN_USER	1
+ #define DOMAIN_IO	2
++#else
++#define DOMAIN_KERNEL	2
++#define DOMAIN_TABLE	2
++#define DOMAIN_USER	1
++#define DOMAIN_IO	0
++#endif
+ 
+ /*
+  * Domain types
+Index: linux-2.6.10/include/asm-arm/page.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/page.h
++++ linux-2.6.10/include/asm-arm/page.h
+@@ -40,6 +40,7 @@
+  *	  v4wb		- ARMv4 with writeback cache, without minicache
+  *	  v4_mc		- ARMv4 with minicache
+  *	  xscale	- Xscale
++ *	  xsc3		- XScalev3
+  */
+ #undef _USER
+ #undef MULTI_USER
+@@ -84,6 +85,14 @@
+ # endif
+ #endif
+ 
++#ifdef CONFIG_CPU_XSC3
++# ifdef _USER
++#  define MULTI_USER 1
++# else
++#  define _USER xsc3_mc
++# endif
++#endif
++
+ #ifdef CONFIG_CPU_COPY_V6
+ # define MULTI_USER 1
+ #endif
+Index: linux-2.6.10/include/asm-arm/proc-fns.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/proc-fns.h
++++ linux-2.6.10/include/asm-arm/proc-fns.h
+@@ -138,6 +138,14 @@
+ #   define CPU_NAME cpu_xscale
+ #  endif
+ # endif
++# ifdef CONFIG_CPU_XSC3
++#  ifdef CPU_NAME
++#   undef  MULTI_CPU
++#   define MULTI_CPU
++#  else
++#   define CPU_NAME cpu_xsc3
++#  endif
++# endif
+ # ifdef CONFIG_CPU_V6
+ #  ifdef CPU_NAME
+ #   undef  MULTI_CPU
+Index: linux-2.6.10/include/asm-arm/system.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/system.h
++++ linux-2.6.10/include/asm-arm/system.h
+@@ -109,6 +109,25 @@ extern int cpu_architecture(void);
+ #define	cpu_is_xscale()	1
+ #endif
+ 
++/*
++ * Intel's XScale3 core supports some v6 features (supersections, L2)
++ * but advertises itself as v5 as it does not support the v6 ISA.  For
++ * this reason, we need a way to explicitly test for this type of CPU.
++ */
++#ifndef CONFIG_CPU_XSC3
++#define cpu_is_xsc3()	0
++#else
++static inline int cpu_is_xsc3(void)
++{
++	extern unsigned int processor_id;
++
++	if ((processor_id & 0xffffe000) == 0x69056000)
++		return 1;
++
++	return 0;
++}
++#endif
++
+ #define set_cr(x)					\
+ 	__asm__ __volatile__(				\
+ 	"mcr	p15, 0, %0, c1, c0, 0	@ set CR"	\
+Index: linux-2.6.10/mvl_patches/pro-1411.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1411.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1411);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

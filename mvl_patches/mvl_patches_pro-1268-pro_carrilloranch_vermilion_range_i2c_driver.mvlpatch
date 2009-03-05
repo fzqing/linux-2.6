@@ -1,0 +1,1224 @@
+#! /usr/bin/env bash
+# Patch: -pro_carrilloranch_vermilion_range_i2c_driver
+# Date: Mon Mar 26 17:51:05 2007
+# Source: MontaVista Software, Inc.
+# MR: 21353
+# Type: Enhancement
+# Disposition: needs submitting to <i2c@lm-sensors.org>.
+# Signed-off-by: Andy Lowe <alowe@mvista.com>
+# Description:
+#     I2C driver for the Vermilion Range I2C controller.
+# 
+
+PATCHNUM=1268
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 21353
+Type: Enhancement
+Disposition: needs submitting to <i2c@lm-sensors.org>.
+Signed-off-by: Andy Lowe <alowe@mvista.com>
+Description:
+    I2C driver for the Vermilion Range I2C controller.
+
+Index: linux-cr/drivers/i2c/busses/i2c-vr.c
+===================================================================
+--- /dev/null
++++ linux-cr/drivers/i2c/busses/i2c-vr.c
+@@ -0,0 +1,835 @@
++/*
++ *  drivers/i2c/busses/i2c-vr.c
++ *
++ *  I2C driver for the Vermilion Range I2C controller.
++ *
++ *  Copyright (C) 2006 MontaVista Software, Inc.
++ *
++ *  Derived from drivers/i2c/busses/i2c-pxa.c
++ *  Copyright (C) 2002 Intrinsyc Software Inc.
++ *  Copyright (C) 2004 Deep Blue Solutions Ltd.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2 as
++ *  published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/i2c-id.h>
++#include <linux/init.h>
++#include <linux/time.h>
++#include <linux/sched.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/pci.h>
++
++#include "i2c-vr.h"
++
++#ifdef DEBUG
++
++struct bits {
++	u32 mask;
++	const char *set;
++	const char *unset;
++};
++#define BIT(m, s, u)	{ .mask = m, .set = s, .unset = u }
++
++static inline void
++decode_bits(const char *prefix, const struct bits *bits, int num, u32 val)
++{
++	printk("%s %08x: ", prefix, val);
++	while (num--) {
++		const char *str = val & bits->mask ? bits->set : bits->unset;
++		if (str)
++			printk("%s ", str);
++		bits++;
++	}
++}
++
++static const struct bits isr_bits[] = {
++	BIT(ISR_RWM, "RX", "TX"),
++	BIT(ISR_ACKNAK, "NAK", "ACK"),
++	BIT(ISR_UB, "Bsy", "Rdy"),
++	BIT(ISR_IBB, "BusBsy", "BusRdy"),
++	BIT(ISR_SSD, "SlaveStop", NULL),
++	BIT(ISR_ALD, "ALD", NULL),
++	BIT(ISR_ITE, "TxEmpty", NULL),
++	BIT(ISR_IRF, "RxFull", NULL),
++	BIT(ISR_GCAD, "GenCall", NULL),
++	BIT(ISR_SAD, "SlaveAddr", NULL),
++	BIT(ISR_BED, "BusErr", NULL),
++};
++
++static void decode_ISR(unsigned int val)
++{
++	decode_bits(KERN_DEBUG "ISR", isr_bits, ARRAY_SIZE(isr_bits), val);
++	printk("\n");
++}
++
++static const struct bits icr_bits[] = {
++	BIT(ICR_START, "START", NULL),
++	BIT(ICR_STOP, "STOP", NULL),
++	BIT(ICR_ACKNAK, "ACKNAK", NULL),
++	BIT(ICR_TB, "TB", NULL),
++	BIT(ICR_MA, "MA", NULL),
++	BIT(ICR_SCLE, "SCLE", "scle"),
++	BIT(ICR_IUE, "IUE", "iue"),
++	BIT(ICR_GCD, "GCD", NULL),
++	BIT(ICR_ITEIE, "ITEIE", NULL),
++	BIT(ICR_IRFIE, "IRFIE", NULL),
++	BIT(ICR_BEIE, "BEIE", NULL),
++	BIT(ICR_SSDIE, "SSDIE", NULL),
++	BIT(ICR_ALDIE, "ALDIE", NULL),
++	BIT(ICR_SADIE, "SADIE", NULL),
++	BIT(ICR_UR, "UR", "ur"),
++};
++
++static void decode_ICR(unsigned int val)
++{
++	decode_bits(KERN_DEBUG "ICR", icr_bits, ARRAY_SIZE(icr_bits), val);
++	printk("\n");
++}
++
++static unsigned int i2c_debug = DEBUG;
++
++static void i2c_vr_show_state(struct vr_i2c *i2c, int lno, const char *fname)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++
++	dev_dbg(&i2c->adap.dev, "state:%s:%d: ISR=%08x, ICR=%08x, IBMR=%02x\n",
++		fname, lno, readl(&regs->isr), readl(&regs->icr),
++		readl(&regs->ibmr));
++}
++
++#define show_state(i2c) i2c_vr_show_state(i2c, __LINE__, __FUNCTION__)
++#else
++#define i2c_debug	0
++
++#define show_state(i2c) do { } while (0)
++#define decode_ISR(val) do { } while (0)
++#define decode_ICR(val) do { } while (0)
++#endif
++
++static void i2c_vr_scream_blue_murder(struct vr_i2c *i2c, const char *why)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	int i;
++
++	dev_err(&i2c->adap.dev, "error: %s\n", why);
++	dev_err(&i2c->adap.dev, "msg_num: %d msg_idx: %d msg_ptr: %d\n",
++	       i2c->msg_num, i2c->msg_idx, i2c->msg_ptr);
++	dev_err(&i2c->adap.dev, "ICR: %08x ISR: %08x\n",
++		readl(&regs->icr), readl(&regs->isr));
++	dev_err(&i2c->adap.dev, "log: ");
++	for (i = 0; i < i2c->irqlogidx; i++)
++		printk("[%08x:%08x] ", i2c->isrlog[i], i2c->icrlog[i]);
++	printk("\n");
++}
++
++static void i2c_vr_abort(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	unsigned long timeout = jiffies + HZ / 4;
++	u32 icr;
++
++	while (time_before(jiffies, timeout) && (readl(&regs->ibmr) & 0x1) == 0) {
++		icr = readl(&regs->icr);
++
++		icr &= ~ICR_START;
++		icr |= ICR_ACKNAK | ICR_STOP | ICR_TB;
++
++		writel(icr, &regs->icr);
++
++		show_state(i2c);
++
++		msleep(1);
++	}
++
++	icr = readl(&regs->icr) & ~(ICR_MA | ICR_START | ICR_STOP);
++	writel(icr, &regs->icr);
++}
++
++static int i2c_vr_wait_bus_not_busy(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	int timeout = I2C_VR_DEF_TIMEOUT;
++
++	while (timeout-- && (readl(&regs->isr) & (ISR_IBB | ISR_UB))) {
++		if ((readl(&regs->isr) & ISR_SAD) != 0)
++			timeout += 4;
++
++		msleep(2);
++		show_state(i2c);
++	}
++
++	if (timeout <= 0)
++		show_state(i2c);
++
++	return timeout <= 0 ? I2C_RETRY : 0;
++}
++
++static int i2c_vr_wait_master(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs *__iomem regs = i2c->regs;
++	unsigned long timeout = jiffies + HZ * 4;
++	u32 isr;
++
++	while (time_before(jiffies, timeout)) {
++		if (i2c_debug > 1)
++			dev_dbg(&i2c->adap.dev,
++				"%s: %ld: ISR=%08x, ICR=%08x, IBMR=%02x\n",
++				__func__, (long)jiffies, readl(&regs->isr),
++				readl(&regs->icr), readl(&regs->ibmr));
++
++		/* wait for unit and bus being not busy, and we also do a
++		 * quick check of the i2c lines themselves to ensure they've
++		 * gone high...
++		 */
++		isr = readl(&regs->isr);
++		if ((isr & (ISR_UB | ISR_IBB)) == 0 &&
++		    (readl(&regs->ibmr) == 3)) {
++			if (i2c_debug > 0)
++				dev_dbg(&i2c->adap.dev, "%s: done\n", __func__);
++			return 1;
++		}
++
++		msleep(1);
++	}
++
++	if (i2c_debug > 0)
++		dev_dbg(&i2c->adap.dev, "%s: did not free\n", __func__);
++
++	return 0;
++}
++
++static int i2c_vr_set_master(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	u32 val;
++
++	if (i2c_debug)
++		dev_dbg(&i2c->adap.dev, "setting to bus master\n");
++
++	val = readl(&regs->isr);
++	if ((val & (ISR_UB | ISR_IBB)) != 0) {
++		dev_dbg(&i2c->adap.dev, "%s: unit is busy\n", __func__);
++		if (!i2c_vr_wait_master(i2c)) {
++			dev_dbg(&i2c->adap.dev, "%s: error: unit busy\n",
++				__func__);
++			return I2C_RETRY;
++		}
++	}
++
++	val = readl(&regs->icr);
++	writel(val | ICR_SCLE, &regs->icr);
++	return 0;
++}
++
++static void i2c_vr_reset(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++
++	dev_dbg(&i2c->adap.dev, "Resetting I2C Controller Unit\n");
++
++	/* abort any transfer currently under way */
++	i2c_vr_abort(i2c);
++
++	/* reset */
++	writel(ICR_UR, &regs->icr);
++	writel(I2C_ISR_INIT, &regs->isr);
++	writel(readl(&regs->icr) & ~ICR_UR, &regs->icr);
++
++	/* set control register values and enable unit */
++	writel(I2C_ICR_INIT | ICR_IUE, &regs->icr);
++
++	udelay(100);
++}
++
++#ifdef CONFIG_PM
++static void i2c_vr_stop(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	u32 icr;
++
++	icr = readl(&regs->icr);
++
++	show_state(i2c);
++
++	icr |= ICR_STOP;
++	icr &= ~(ICR_START);
++	writel(icr, &regs->icr);
++
++	show_state(i2c);
++}
++
++static void i2c_vr_start(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	u32 icr;
++
++	icr = readl(&regs->icr);
++	icr |= ICR_START;
++	icr &= ~(ICR_STOP | ICR_ALDIE | ICR_ACKNAK);
++	writel(icr, &regs->icr);
++}
++
++static int i2c_vr_controller_suspend(struct pci_dev *dev, uint32_t state)
++{
++	struct vr_i2c *i2c = (struct vr_i2c *)pci_get_drvdata(dev);
++	if (i2c) {
++		i2c_vr_wait_bus_not_busy(&i2c[0]);
++		i2c_vr_stop(&i2c[0]);
++
++		i2c_vr_wait_bus_not_busy(&i2c[1]);
++		i2c_vr_stop(&i2c[1]);
++	}
++	return 0;
++}
++
++static int i2c_vr_controller_resume(struct pci_dev *dev)
++{
++	struct vr_i2c *i2c = (struct vr_i2c *)pci_get_drvdata(dev);
++
++	if (i2c) {
++		i2c_vr_reset(&i2c[0]);
++		i2c_vr_reset(&i2c[1]);
++
++		i2c_vr_start(&i2c[0]);
++		i2c_vr_start(&i2c[1]);
++	}
++	return 0;
++}
++#endif				/* ifdef CONFIG_PM */
++
++/*
++ * VR I2C Master mode
++ */
++
++static inline unsigned int i2c_vr_addr_byte(struct i2c_msg *msg)
++{
++	unsigned int addr = (msg->addr & 0x7f) << 1;
++
++	if (msg->flags & I2C_M_RD)
++		addr |= 1;
++
++	return addr;
++}
++
++static inline void i2c_vr_start_message(struct vr_i2c *i2c)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	u32 icr;
++
++	/*
++	 * Step 1: target slave address into IDBR
++	 */
++	writel(i2c_vr_addr_byte(i2c->msg), &regs->idbr);
++
++	/*
++	 * Step 2: initiate the write.
++	 */
++	icr = readl(&regs->icr) & ~(ICR_STOP | ICR_ALDIE);
++	writel(icr | ICR_START | ICR_TB, &regs->icr);
++}
++
++/*
++ * We are protected by the adapter bus semaphore.
++ */
++static int i2c_vr_do_xfer(struct vr_i2c *i2c, struct i2c_msg *msg, int num)
++{
++	long timeout;
++	int ret;
++
++	/*
++	 * Wait for the bus to become free.
++	 */
++	ret = i2c_vr_wait_bus_not_busy(i2c);
++	if (ret) {
++		dev_err(&i2c->adap.dev,
++			"i2c_vr: timeout waiting for bus free\n");
++		goto out;
++	}
++
++	/*
++	 * Set master mode.
++	 */
++	ret = i2c_vr_set_master(i2c);
++	if (ret) {
++		dev_err(&i2c->adap.dev, "i2c_vr_set_master: error %d\n", ret);
++		goto out;
++	}
++
++	spin_lock_irq(&i2c->lock);
++
++	i2c->msg = msg;
++	i2c->msg_num = num;
++	i2c->msg_idx = 0;
++	i2c->msg_ptr = 0;
++	i2c->irqlogidx = 0;
++
++	i2c_vr_start_message(i2c);
++
++	spin_unlock_irq(&i2c->lock);
++
++	/*
++	 * The rest of the processing occurs in the interrupt handler.
++	 */
++	timeout = wait_event_timeout(i2c->wait, i2c->msg_num == 0, HZ * 5);
++
++	/*
++	 * We place the return code in i2c->msg_idx.
++	 */
++	ret = i2c->msg_idx;
++
++	if (timeout == 0)
++		i2c_vr_scream_blue_murder(i2c, "timeout");
++
++      out:
++	return ret;
++}
++
++/*
++ * i2c_vr_master_complete - complete the message and wake up.
++ */
++static void i2c_vr_master_complete(struct vr_i2c *i2c, int ret)
++{
++	i2c->msg_ptr = 0;
++	i2c->msg = NULL;
++	i2c->msg_idx++;
++	i2c->msg_num = 0;
++	if (ret)
++		i2c->msg_idx = ret;
++	wake_up(&i2c->wait);
++}
++
++static void i2c_vr_irq_txempty(struct vr_i2c *i2c, u32 isr)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	u32 icr;
++
++	icr = readl(&regs->icr) & ~(ICR_START | ICR_STOP | ICR_ACKNAK | ICR_TB);
++
++      again:
++	/*
++	 * If ISR_ALD is set, we lost arbitration.
++	 */
++	if (isr & ISR_ALD) {
++		/*
++		 * Do we need to do anything here?  The docs
++		 * are vague about what happens.
++		 */
++		i2c_vr_scream_blue_murder(i2c, "ALD set");
++
++		/*
++		 * We ignore this error.  We seem to see spurious ALDs
++		 * for seemingly no reason.  If we handle them as I think
++		 * they should, we end up causing an I2C error, which
++		 * is painful for some systems.
++		 */
++		return;		/* ignore */
++	}
++
++	if (isr & ISR_BED) {
++		int ret = I2C_VR_BUS_ERROR;
++
++		/*
++		 * I2C bus error - either the device NAK'd us, or
++		 * something more serious happened.  If we were NAK'd
++		 * on the initial address phase, we can retry.
++		 */
++		if (isr & ISR_ACKNAK) {
++			if (i2c->msg_ptr == 0 && i2c->msg_idx == 0)
++				ret = I2C_RETRY;
++			else
++				ret = I2C_VR_XFER_NAKED;
++		}
++		i2c_vr_master_complete(i2c, ret);
++	} else if (isr & ISR_RWM) {
++		/*
++		 * Read mode.  We have just sent the address byte, and
++		 * now we must initiate the transfer.
++		 */
++		if (i2c->msg_ptr == i2c->msg->len - 1 &&
++		    i2c->msg_idx == i2c->msg_num - 1)
++			icr |= ICR_STOP | ICR_ACKNAK;
++
++		icr |= ICR_ALDIE | ICR_TB;
++	} else if (i2c->msg_ptr < i2c->msg->len) {
++		/*
++		 * Write mode.  Write the next data byte.
++		 */
++		writel(i2c->msg->buf[i2c->msg_ptr++], &regs->idbr);
++
++		icr |= ICR_ALDIE | ICR_TB;
++
++		/*
++		 * If this is the last byte of the last message, send
++		 * a STOP.
++		 */
++
++		if (i2c->msg_ptr == i2c->msg->len &&
++		    i2c->msg_idx == i2c->msg_num - 1)
++			icr |= ICR_STOP;
++	} else if (i2c->msg_idx < i2c->msg_num - 1) {
++		/*
++		 * Next segment of the message.
++		 */
++		i2c->msg_ptr = 0;
++		i2c->msg_idx++;
++		i2c->msg++;
++
++		/*
++		 * If we aren't doing a repeated start and address,
++		 * go back and try to send the next byte.  Note that
++		 * we do not support switching the R/W direction here.
++		 */
++		if (i2c->msg->flags & I2C_M_NOSTART)
++			goto again;
++
++		/*
++		 * Write the next address.
++		 */
++		writel(i2c_vr_addr_byte(i2c->msg), &regs->idbr);
++
++		/*
++		 * And trigger a repeated start, and send the byte.
++		 */
++		icr &= ~ICR_ALDIE;
++		icr |= ICR_START | ICR_TB;
++	} else {
++		if (i2c->msg->len == 0) {
++			/*
++			 * Device probes have a message length of zero
++			 * and need the bus to be reset before it can
++			 * be used again.
++			 */
++			i2c_vr_reset(i2c);
++		}
++		i2c_vr_master_complete(i2c, 0);
++	}
++
++	i2c->icrlog[i2c->irqlogidx - 1] = icr;
++
++	writel(icr, &regs->icr);
++	show_state(i2c);
++}
++
++static void i2c_vr_irq_rxfull(struct vr_i2c *i2c, u32 isr)
++{
++	struct i2c_vr_regs __iomem *regs = i2c->regs;
++	u32 icr;
++
++	icr = readl(&regs->icr) & ~(ICR_START | ICR_STOP | ICR_ACKNAK | ICR_TB);
++
++	/*
++	 * Read the byte.
++	 */
++	i2c->msg->buf[i2c->msg_ptr++] = readl(&regs->idbr);
++
++	if (i2c->msg_ptr < i2c->msg->len) {
++		/*
++		 * If this is the last byte of the last
++		 * message, send a STOP.
++		 */
++		if (i2c->msg_ptr == i2c->msg->len - 1)
++			icr |= ICR_STOP | ICR_ACKNAK;
++
++		icr |= ICR_ALDIE | ICR_TB;
++	} else {
++		i2c_vr_master_complete(i2c, 0);
++	}
++
++	i2c->icrlog[i2c->irqlogidx - 1] = icr;
++
++	writel(icr, &regs->icr);
++}
++
++static irqreturn_t i2c_vr_handler(int this_irq, void *dev_id,
++				  struct pt_regs *pt_regs)
++{
++	struct vr_i2c *i2cs = dev_id;
++	u32 isr[I2C_VR_ADAP_NR];
++	int i;
++
++	isr[0] = readl(&i2cs[0].regs->isr);
++	isr[1] = readl(&i2cs[1].regs->isr);
++
++	if (!(isr[0] & I2C_ISR_IRQ) && !(isr[1] & I2C_ISR_IRQ)) {
++		/*
++		 * This isn't our interrupt.  It must be for another device
++		 * sharing this IRQ.
++		 */
++		return IRQ_NONE;
++	}
++
++	for (i = 0; i < I2C_VR_ADAP_NR; i++) {
++		struct vr_i2c *i2c = &i2cs[i];
++		struct i2c_vr_regs __iomem *regs = i2c->regs;
++
++		if (!(isr[i] & I2C_ISR_IRQ))
++			continue;
++
++		if (i2c_debug > 2) {
++			dev_dbg(&i2c->adap.dev,
++				"%s: ISR=%08x, ICR=%08x, IBMR=%02x\n",
++				__func__, isr[i], readl(&regs->icr),
++				readl(&regs->ibmr));
++			decode_ISR(isr[i]);
++			decode_ICR(readl(&regs->icr));
++		}
++
++		if (i2c->irqlogidx < ARRAY_SIZE(i2c->isrlog))
++			i2c->isrlog[i2c->irqlogidx++] = isr[i];
++
++		show_state(i2c);
++
++		/*
++		* Always clear all pending IRQs.
++		*/
++		writel(isr[i] & I2C_ISR_IRQ, &regs->isr);
++
++		if (i2c->msg) {
++			if (isr[i] & ISR_ITE)
++				i2c_vr_irq_txempty(i2c, isr[i]);
++			if (isr[i] & ISR_IRF)
++				i2c_vr_irq_rxfull(i2c, isr[i]);
++		} else {
++			i2c_vr_scream_blue_murder(i2c, "spurious irq");
++		}
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int i2c_vr_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
++{
++	struct vr_i2c *i2c = i2c_get_adapdata(adap);
++	struct i2c_vr_regs __iomem *regs;
++	int ret, i;
++
++	regs = i2c->regs;
++
++	/* If the I2C controller is disabled we need to reset it (probably due
++	  to a suspend/resume destroying state). We do this here as we can then
++	  avoid worrying about resuming the controller before its users. */
++	if (!(readl(&regs->icr) & ICR_IUE))
++		i2c_vr_reset(i2c);
++
++	for (i = adap->retries; i >= 0; i--) {
++		ret = i2c_vr_do_xfer(i2c, msgs, num);
++		if (ret != I2C_RETRY)
++			goto out;
++
++		if (i2c_debug)
++			dev_dbg(&adap->dev, "Retrying transmission\n");
++		udelay(100);
++	}
++	dev_dbg(&adap->dev, "Exhausted retries\n");
++	ret = -EREMOTEIO;
++      out:
++	return ret;
++}
++
++static u32 i2c_vr_functionality(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
++}
++
++static struct i2c_algorithm i2c_vr_algorithm = {
++	.id = I2C_ALGO_PXA,
++	.master_xfer = i2c_vr_xfer,
++	.functionality = i2c_vr_functionality,
++};
++
++static struct vr_i2c i2c_vr[I2C_VR_ADAP_NR] = {
++	{
++	 .lock = SPIN_LOCK_UNLOCKED,
++	 .wait = __WAIT_QUEUE_HEAD_INITIALIZER(i2c_vr[0].wait),
++	 .adap = {
++		  .owner = THIS_MODULE,
++		  .id = I2C_ALGO_PXA,
++		  .algo = &i2c_vr_algorithm,
++		  .name = "vr_i2c0",
++		  .retries = 5,
++		  },
++	 },
++	{
++	 .lock = SPIN_LOCK_UNLOCKED,
++	 .wait = __WAIT_QUEUE_HEAD_INITIALIZER(i2c_vr[1].wait),
++	 .adap = {
++		  .owner = THIS_MODULE,
++		  .id = I2C_ALGO_PXA,
++		  .algo = &i2c_vr_algorithm,
++		  .name = "vr_i2c1",
++		  .retries = 5,
++		  },
++	 },
++};
++
++static int i2c_vr_mapregs(struct pci_dev *dev, int idx)
++{
++	void __iomem *base;
++
++	if (!dev || idx >= I2C_VR_ADAP_NR)
++		return -EINVAL;
++
++	base = pci_iomap(dev, idx, 0);
++	if (!base) {
++		dev_dbg(&dev->dev, "error mapping memory\n");
++		return -EFAULT;
++	}
++	i2c_vr[idx].regs = base;
++	return 0;
++}
++
++static int i2c_vr_setdata(struct pci_dev *dev, int idx)
++{
++	int retval;
++
++	if (!dev || idx >= I2C_VR_ADAP_NR)
++		return -EINVAL;
++
++	i2c_vr[idx].adap.dev.parent = &dev->dev;
++	i2c_set_adapdata(&i2c_vr[idx].adap, &i2c_vr[idx]);
++	retval = i2c_add_adapter(&i2c_vr[idx].adap);
++	return retval;
++}
++
++static int i2c_vr_unmapregs(struct pci_dev *dev, int idx)
++{
++	if (!dev || idx >= I2C_VR_ADAP_NR)
++		return -EINVAL;
++
++	if (i2c_vr[idx].regs)
++		pci_iounmap(dev, i2c_vr[idx].regs);
++
++	return 0;
++}
++
++static int i2c_vr_probe(struct pci_dev *dev, const struct pci_device_id *id)
++{
++	int retval;
++
++	retval = pci_enable_device(dev);
++	if (retval)
++		goto out;
++
++	retval = pci_request_regions(dev, "vr_i2c");
++	if (retval)
++		goto disable_dev;
++
++	retval = i2c_vr_mapregs(dev, 0);
++	if (retval)
++		goto release_bars;
++
++	retval = i2c_vr_mapregs(dev, 1);
++	if (retval)
++		goto unmap_0;
++
++	/* enable Message Signaled Interrupts */
++	pci_enable_msi(dev);
++
++	retval = request_irq(dev->irq, i2c_vr_handler, SA_SHIRQ, "vr_i2c",
++				i2c_vr);
++	if (retval) {
++		dev_err(&dev->dev, "request irq %s fail, %d\n",
++			pci_name(dev), retval);
++		goto unmap_1;
++	}
++
++	retval = i2c_vr_setdata(dev, 0);
++	if (retval)
++		goto fail_irq;
++	i2c_vr_reset(&i2c_vr[0]);
++
++	retval = i2c_vr_setdata(dev, 1);
++	if (retval)
++		goto fail_setdata;
++	i2c_vr_reset(&i2c_vr[1]);
++
++	pci_set_drvdata(dev, i2c_vr);
++	return 0;
++
++      fail_setdata:
++	i2c_del_adapter(&i2c_vr[0].adap);
++      fail_irq:
++	free_irq(dev->irq, i2c_vr);
++      unmap_1:
++	pci_disable_msi(dev);
++	i2c_vr_unmapregs(dev, 1);
++      unmap_0:
++	i2c_vr_unmapregs(dev, 0);
++      release_bars:
++	pci_release_regions(dev);
++      disable_dev:
++	pci_disable_device(dev);
++      out:
++	return retval;
++}
++
++static void i2c_vr_remove(struct pci_dev *dev)
++{
++	struct i2c_vr_regs __iomem *regs;
++
++	/* disable device */
++	regs = i2c_vr[0].regs;
++	writel(0, &regs->icr);
++	regs = i2c_vr[1].regs;
++	writel(0, &regs->icr);
++
++	pci_set_drvdata(dev, NULL);
++	i2c_del_adapter(&i2c_vr[1].adap);
++	i2c_del_adapter(&i2c_vr[0].adap);
++
++	free_irq(dev->irq, i2c_vr);
++	pci_disable_msi(dev);
++
++	i2c_vr_unmapregs(dev, 1);
++	i2c_vr_unmapregs(dev, 0);
++
++	pci_release_regions(dev);
++	pci_disable_device(dev);
++}
++
++#define PCI_DEVICE_ID_VR_I2C	0x5010
++
++static struct pci_device_id i2c_vr_ids[] = {
++	{
++	 .vendor = PCI_VENDOR_ID_INTEL,
++	 .device = PCI_DEVICE_ID_VR_I2C,
++	 .subvendor = PCI_ANY_ID,
++	 .subdevice = PCI_ANY_ID,
++	 },
++	{0,}
++};
++
++static struct pci_driver i2c_vr_driver = {
++	.name = "vr_i2c",
++	.id_table = i2c_vr_ids,
++	.probe = i2c_vr_probe,
++	.remove = __devexit_p(i2c_vr_remove),
++#ifdef CONFIG_PM
++	.resume = i2c_vr_controller_resume,
++	.suspend = i2c_vr_controller_suspend,
++#endif
++};
++
++static int __init i2c_vr_init(void)
++{
++	return pci_register_driver(&i2c_vr_driver);
++}
++
++static void i2c_vr_exit(void)
++{
++	return pci_unregister_driver(&i2c_vr_driver);
++}
++
++module_init(i2c_vr_init);
++module_exit(i2c_vr_exit);
++
++MODULE_DESCRIPTION("Intel Vermilion Range I2C controller driver");
++MODULE_LICENSE("GPL");
++MODULE_DEVICE_TABLE(pci, i2c_vr_ids);
+Index: linux-cr/drivers/i2c/busses/i2c-vr.h
+===================================================================
+--- /dev/null
++++ linux-cr/drivers/i2c/busses/i2c-vr.h
+@@ -0,0 +1,123 @@
++/*
++ * drivers/i2c/busses/i2c-vr.h
++ *
++ * Header file for the Vermilion Range I2C driver.
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#ifndef I2C_VR_H
++#define I2C_VR_H
++
++#define	I2C_VR_ADAP_NR	2
++
++#define I2C_VR_DEF_TIMEOUT             3
++
++#define I2C_VR_BUS_ERROR               (-EREMOTEIO)
++#define I2C_VR_XFER_NAKED              (-ECONNREFUSED)
++
++struct i2c_vr_regs {
++	uint32_t icr;
++	uint32_t isr;
++	uint32_t reserved;
++	uint32_t idbr;
++	uint32_t reserved1;
++	uint32_t ibmr;
++};
++
++/*
++ * New stuff...
++ */
++struct vr_i2c {
++	spinlock_t lock;
++	wait_queue_head_t wait;
++	struct i2c_msg *msg;
++	unsigned int msg_num;
++	unsigned int msg_idx;
++	unsigned int msg_ptr;
++	struct i2c_vr_regs __iomem *regs;
++
++	struct i2c_adapter adap;
++
++	int irqlogidx;
++	u32 isrlog[32];
++	u32 icrlog[32];
++};
++
++/*
++ * I2C registers
++ */
++
++#define ICR_START	(1 << 0)	/* start bit */
++#define ICR_STOP	(1 << 1)	/* stop bit */
++#define ICR_ACKNAK	(1 << 2)	/* send ACK(0) or NAK(1) */
++#define ICR_TB		(1 << 3)	/* transfer byte bit */
++#define ICR_MA		(1 << 4)	/* master abort */
++#define ICR_SCLE	(1 << 5)	/* master clock enable */
++#define ICR_IUE		(1 << 6)	/* unit enable */
++#define ICR_GCD		(1 << 7)	/* general call disable */
++#define ICR_ITEIE	(1 << 8)	/* enable tx interrupts */
++#define ICR_IRFIE	(1 << 9)	/* enable rx interrupts */
++#define ICR_BEIE	(1 << 10)	/* enable bus error ints */
++#define ICR_SSDIE	(1 << 11)	/* slave STOP detected int enable */
++#define ICR_ALDIE	(1 << 12)	/* enable arbitration interrupt */
++#define ICR_SADIE	(1 << 13)	/* slave address detected int enable */
++#define ICR_UR		(1 << 14)	/* unit reset */
++#define ICR_FM		(1 << 15)	/* fast mode */
++
++#define ISR_RWM		(1 << 0)	/* read/write mode */
++#define ISR_ACKNAK	(1 << 1)	/* ack/nak status */
++#define ISR_UB		(1 << 2)	/* unit busy */
++#define ISR_IBB		(1 << 3)	/* bus busy */
++#define ISR_SSD		(1 << 4)	/* slave stop detected */
++#define ISR_ALD		(1 << 5)	/* arbitration loss detected */
++#define ISR_ITE		(1 << 6)	/* tx buffer empty */
++#define ISR_IRF		(1 << 7)	/* rx buffer full */
++#define ISR_GCAD	(1 << 8)	/* general call address detected */
++#define ISR_SAD		(1 << 9)	/* slave address detected */
++#define ISR_BED		(1 << 10)	/* bus error no ACK/NAK */
++
++#define I2C_RETRY               (-2000)	/* an error has occurred retry transmit */
++#define I2C_TRANSMIT		1
++#define I2C_RECEIVE		0
++
++#define I2C_ICR_INIT	(ICR_BEIE | ICR_IRFIE | ICR_ITEIE | ICR_GCD | ICR_SCLE)
++/* ICR initialize bit values
++*
++*  15. FM       0 (100 Khz operation)
++*  14. UR       0 (No unit reset)
++*  13. SADIE    0 (Disables the unit from interrupting on slave addresses
++*                                       matching its slave address)
++*  12. ALDIE    0 (Disables the unit from interrupt when it loses arbitration
++*                                       in master mode)
++*  11. SSDIE    0 (Disables interrupts from a slave stop detected, in slave mode)
++*  10. BEIE     1 (Enable interrupts from detected bus errors, no ACK sent)
++*  9.  IRFIE    1 (Enable interrupts from full buffer received)
++*  8.  ITEIE    1 (Enables the I2C unit to interrupt when transmit buffer empty)
++*  7.  GCD      1 (Disables i2c unit response to general call messages as a slave)
++*  6.  IUE      0 (Disable unit until we change settings)
++*  5.  SCLE     1 (Enables the i2c clock output for master mode (drives SCL)
++*  4.  MA       0 (Only send stop with the ICR stop bit)
++*  3.  TB       0 (We are not transmitting a byte initially)
++*  2.  ACKNAK   0 (Send an ACK after the unit receives a byte)
++*  1.  STOP     0 (Do not send a STOP)
++*  0.  START    0 (Do not send a START)
++*
++*/
++
++#define I2C_ISR_INIT	0x7FF
++/* I2C status register init values
++ *
++ * 10. BED      1 (Clear bus error detected)
++ * 9.  SAD      1 (Clear slave address detected)
++ * 7.  IRF      1 (Clear IDBR Receive Full)
++ * 6.  ITE      1 (Clear IDBR Transmit Empty)
++ * 5.  ALD      1 (Clear Arbitration Loss Detected)
++ * 4.  SSD      1 (Clear Slave Stop Detected)
++ */
++
++#define I2C_ISR_IRQ	(ISR_SSD | ISR_ALD | ISR_ITE | ISR_IRF | ISR_SAD | ISR_BED)
++
++#endif
+Index: linux-cr/drivers/i2c/busses/Kconfig
+===================================================================
+--- linux-cr.orig/drivers/i2c/busses/Kconfig
++++ linux-cr/drivers/i2c/busses/Kconfig
+@@ -524,6 +524,10 @@ config I2C_EMMA2RH
+ 	help
+  	  Support for NEC EMMA2RH I2C Adapter
+ 
++config I2C_VERMILION
++	tristate "Intel Vermilion Range I2C adapter"
++	depends on I2C && PCI && EXPERIMENTAL && !64BIT
++
+ config I2C_VR41XX
+ 	tristate "VR41xx GPIO-Based I2C Interface"
+ 	depends on I2C && CPU_VR41XX
+Index: linux-cr/drivers/i2c/busses/Makefile
+===================================================================
+--- linux-cr.orig/drivers/i2c/busses/Makefile
++++ linux-cr/drivers/i2c/busses/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_I2C_OMAP)          += i2c-o
+ obj-$(CONFIG_AVALANCHE_SSP_I2C) += i2c_avalanche.o
+ obj-$(CONFIG_I2C_DAVINCI)       += i2c-davinci.o
+ obj-$(CONFIG_I2C_EMMA2RH)	+= i2c-emma2rh.o
++obj-$(CONFIG_I2C_VERMILION)	+= i2c-vr.o
+ obj-$(CONFIG_I2C_VR41XX)	+= i2c-vr41xx.o
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_BUS),y)
+Index: linux-cr/mvl_patches/pro-1268.c
+===================================================================
+--- /dev/null
++++ linux-cr/mvl_patches/pro-1268.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1268);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,507 @@
+#! /usr/bin/env bash
+# Patch: -ppc32_emac_rt_fix
+# Date: Thu Feb  2 15:41:18 2006
+# Source: MontaVista Software, Inc.
+# MR: 16643
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: Valnetine Barshak <vbarshak@ru.mvista.com>
+# Description:
+#   This patch adds preemprion RT support to EMAC driver.
+# 
+
+PATCHNUM=296
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16643
+Type: Defect Fix
+Disposition: local
+Signed-off-by: Valnetine Barshak <vbarshak@ru.mvista.com>
+Description:
+  This patch adds preemprion RT support to EMAC driver.
+
+ drivers/net/ibm_emac/ibm_emac_core.c |    5 +++
+ drivers/net/ibm_emac/ibm_emac_mal.c  |   53 +++++++++++++++++++++++------------
+ drivers/net/ibm_emac/ibm_emac_mal.h  |    2 +
+ mvl_patches/pro-0296.c               |   16 ++++++++++
+ 4 files changed, 59 insertions(+), 17 deletions(-)
+
+Index: linux-2.6.10/drivers/net/ibm_emac/ibm_emac_core.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/ibm_emac/ibm_emac_core.c
++++ linux-2.6.10/drivers/net/ibm_emac/ibm_emac_core.c
+@@ -1030,14 +1030,17 @@ static inline int emac_xmit_finish(struc
+ {
+ 	struct emac_regs *p = dev->emacp;
+ 	struct net_device *ndev = dev->ndev;
++	unsigned long flags;
+ 
+ 	/* Send the packet out */
++	spin_lock_irqsave(&dev->mal->lock, flags);
+ 	out_be32(&p->tmr0, EMAC_TMR0_XMIT);
+ 
+ 	if (unlikely(++dev->tx_cnt == NUM_TX_BUFF)) {
+ 		netif_stop_queue(ndev);
+ 		DBG2("%d: stopped TX queue" NL, dev->def->index);
+ 	}
++	spin_unlock_irqrestore(&dev->mal->lock, flags);
+ 
+ 	ndev->trans_start = jiffies;
+ 	++dev->stats.tx_packets;
+@@ -1936,6 +1939,7 @@ poll_ctrl(struct net_device *dev)
+ 	struct net_device *poll_dev = &(mal->poll_dev);
+ 
+ 	/* disable  MAL interrupts */
++	spin_lock(&mal->lock)
+ 	mal_disable_eob_irq(mal);
+ 	netif_poll_disable(poll_dev);
+ 
+@@ -1945,6 +1949,7 @@ poll_ctrl(struct net_device *dev)
+ 	netif_poll_enable(poll_dev);
+ 	/* Enable mal interrupts */
+ 	mal_enable_eob_irq(mal);
++	spin_unlock(&mal->lock)
+ }
+ 
+ int
+Index: linux-2.6.10/drivers/net/ibm_emac/ibm_emac_mal.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/ibm_emac/ibm_emac_mal.c
++++ linux-2.6.10/drivers/net/ibm_emac/ibm_emac_mal.c
+@@ -38,15 +38,15 @@ int __init mal_register_commac(struct ib
+ 			       struct mal_commac *commac)
+ {
+ 	unsigned long flags;
+-	local_irq_save(flags);
+ 
+ 	MAL_DBG("%d: reg(%08x, %08x)" NL, mal->def->index,
+ 		commac->tx_chan_mask, commac->rx_chan_mask);
+ 
++	write_lock_irqsave(&mal->mc_lock, flags);
+ 	/* Don't let multiple commacs claim the same channel(s) */
+ 	if ((mal->tx_chan_mask & commac->tx_chan_mask) ||
+ 	    (mal->rx_chan_mask & commac->rx_chan_mask)) {
+-		local_irq_restore(flags);
++		write_unlock_irqrestore(&mal->mc_lock, flags);
+ 		printk(KERN_WARNING "mal%d: COMMAC channels conflict!\n",
+ 		       mal->def->index);
+ 		return -EBUSY;
+@@ -56,7 +56,7 @@ int __init mal_register_commac(struct ib
+ 	mal->rx_chan_mask |= commac->rx_chan_mask;
+ 	list_add(&commac->list, &mal->list);
+ 
+-	local_irq_restore(flags);
++	write_unlock_irqrestore(&mal->mc_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -64,16 +64,16 @@ void __exit mal_unregister_commac(struct
+ 				  struct mal_commac *commac)
+ {
+ 	unsigned long flags;
+-	local_irq_save(flags);
+ 
+ 	MAL_DBG("%d: unreg(%08x, %08x)" NL, mal->def->index,
+ 		commac->tx_chan_mask, commac->rx_chan_mask);
+ 
++	write_lock_irqsave(&mal->mc_lock, flags);
+ 	mal->tx_chan_mask &= ~commac->tx_chan_mask;
+ 	mal->rx_chan_mask &= ~commac->rx_chan_mask;
+ 	list_del_init(&commac->list);
+ 
+-	local_irq_restore(flags);
++	write_unlock_irqrestore(&mal->mc_lock, flags);
+ }
+ 
+ int mal_set_rcbs(struct ibm_ocp_mal *mal, int channel, unsigned long size)
+@@ -91,7 +91,9 @@ int mal_set_rcbs(struct ibm_ocp_mal *mal
+ 		return -EINVAL;
+ 	}
+ 
++	spin_lock(&mal->lock);
+ 	set_mal_dcrn(mal, MAL_RCBS(channel), size >> 4);
++	spin_unlock(&mal->lock);
+ 	return 0;
+ }
+ 
+@@ -111,48 +113,52 @@ int mal_rx_bd_offset(struct ibm_ocp_mal 
+ 
+ void mal_enable_tx_channel(struct ibm_ocp_mal *mal, int channel)
+ {
+-	local_bh_disable();
+ 	MAL_DBG("%d: enable_tx(%d)" NL, mal->def->index, channel);
++	spin_lock_bh(&mal->lock);
+ 	set_mal_dcrn(mal, MAL_TXCASR,
+ 		     get_mal_dcrn(mal, MAL_TXCASR) | MAL_CHAN_MASK(channel));
+-	local_bh_enable();
++	spin_unlock_bh(&mal->lock);
+ }
+ 
+ void mal_disable_tx_channel(struct ibm_ocp_mal *mal, int channel)
+ {
+-	set_mal_dcrn(mal, MAL_TXCARR, MAL_CHAN_MASK(channel));
+ 	MAL_DBG("%d: disable_tx(%d)" NL, mal->def->index, channel);
++	spin_lock(&mal->lock);
++	set_mal_dcrn(mal, MAL_TXCARR, MAL_CHAN_MASK(channel));
++	spin_unlock(&mal->lock);
+ }
+ 
+ void mal_enable_rx_channel(struct ibm_ocp_mal *mal, int channel)
+ {
+-	local_bh_disable();
+ 	MAL_DBG("%d: enable_rx(%d)" NL, mal->def->index, channel);
++	spin_lock_bh(&mal->lock);
+ 	set_mal_dcrn(mal, MAL_RXCASR,
+ 		     get_mal_dcrn(mal, MAL_RXCASR) | MAL_CHAN_MASK(channel));
+-	local_bh_enable();
++	spin_unlock_bh(&mal->lock);
+ }
+ 
+ void mal_disable_rx_channel(struct ibm_ocp_mal *mal, int channel)
+ {
+-	set_mal_dcrn(mal, MAL_RXCARR, MAL_CHAN_MASK(channel));
+ 	MAL_DBG("%d: disable_rx(%d)" NL, mal->def->index, channel);
++	spin_lock(&mal->lock);
++	set_mal_dcrn(mal, MAL_RXCARR, MAL_CHAN_MASK(channel));
++	spin_unlock(&mal->lock);
+ }
+ 
+ void mal_poll_add(struct ibm_ocp_mal *mal, struct mal_commac *commac)
+ {
+-	local_bh_disable();
+ 	MAL_DBG("%d: poll_add(%p)" NL, mal->def->index, commac);
++	spin_lock_bh(&mal->lock);
+ 	list_add_tail(&commac->poll_list, &mal->poll_list);
+-	local_bh_enable();
++	spin_unlock_bh(&mal->lock);
+ }
+ 
+ void mal_poll_del(struct ibm_ocp_mal *mal, struct mal_commac *commac)
+ {
+-	local_bh_disable();
+ 	MAL_DBG("%d: poll_del(%p)" NL, mal->def->index, commac);
++	spin_lock_bh(&mal->lock);
+ 	list_del(&commac->poll_list);
+-	local_bh_enable();
++	spin_unlock_bh(&mal->lock);
+ }
+ 
+ static irqreturn_t mal_serr(int irq, void *dev_instance, struct pt_regs *regs)
+@@ -195,12 +201,14 @@ static irqreturn_t mal_serr(int irq, voi
+ 
+ static inline void mal_schedule_poll(struct ibm_ocp_mal *mal)
+ {
++	spin_lock(&mal->lock);
+ 	if (likely(netif_rx_schedule_prep(&mal->poll_dev))) {
+ 		MAL_DBG2("%d: schedule_poll" NL, mal->def->index);
+ 		mal_disable_eob_irq(mal);
+ 		__netif_rx_schedule(&mal->poll_dev);
+ 	} else
+ 		MAL_DBG2("%d: already in poll" NL, mal->def->index);
++	spin_unlock(&mal->lock);
+ }
+ 
+ static irqreturn_t mal_txeob(int irq, void *dev_instance, struct pt_regs *regs)
+@@ -247,6 +255,7 @@ static irqreturn_t mal_rxde(int irq, voi
+ 
+ 	MAL_DBG("%d: rxde %08x" NL, mal->def->index, deir);
+ 
++	read_lock(&mal->mc_lock);
+ 	list_for_each(l, &mal->list) {
+ 		struct mal_commac *mc = list_entry(l, struct mal_commac, list);
+ 		if (deir & mc->rx_chan_mask) {
+@@ -254,6 +263,7 @@ static irqreturn_t mal_rxde(int irq, voi
+ 			mc->ops->rxde(mc->dev);
+ 		}
+ 	}
++	read_unlock(&mal->mc_lock);
+ 
+ 	mal_schedule_poll(mal);
+ 	set_mal_dcrn(mal, MAL_RXDEIR, deir);
+@@ -269,6 +279,8 @@ static int mal_poll(struct net_device *n
+ 
+ 	MAL_DBG2("%d: poll(%d) %d ->" NL, mal->def->index, *budget,
+ 		 rx_work_limit);
++
++	read_lock(&mal->mc_lock);
+       again:
+ 	/* Process TX skbs */
+ 	list_for_each(l, &mal->poll_list) {
+@@ -295,10 +307,10 @@ static int mal_poll(struct net_device *n
+ 	}
+ 
+ 	/* We need to disable IRQs to protect from RXDE IRQ here */
+-	local_irq_disable();
++	spin_lock_irq(&mal->lock);
+ 	__netif_rx_complete(ndev);
+ 	mal_enable_eob_irq(mal);
+-	local_irq_enable();
++	spin_unlock_irq(&mal->lock);
+ 
+ 	done = 1;
+ 
+@@ -308,11 +320,13 @@ static int mal_poll(struct net_device *n
+ 		    list_entry(l, struct mal_commac, poll_list);
+ 		if (unlikely(mc->ops->peek_rx(mc->dev) || mc->rx_stopped)) {
+ 			MAL_DBG2("%d: rotting packet" NL, mal->def->index);
++			spin_lock(&mal->lock);
+ 			if (netif_rx_reschedule(ndev, received))
+ 				mal_disable_eob_irq(mal);
+ 			else
+ 				MAL_DBG2("%d: already in poll list" NL,
+ 					 mal->def->index);
++			spin_unlock(&mal->lock);
+ 
+ 			if (rx_work_limit > 0)
+ 				goto again;
+@@ -323,6 +337,7 @@ static int mal_poll(struct net_device *n
+ 	}
+ 
+       more_work:
++	read_unlock(&mal->mc_lock);
+ 	ndev->quota -= received;
+ 	*budget -= received;
+ 
+@@ -336,11 +351,13 @@ static void mal_reset(struct ibm_ocp_mal
+ 	int n = 10;
+ 	MAL_DBG("%d: reset" NL, mal->def->index);
+ 
++	spin_lock(&mal->lock);
+ 	set_mal_dcrn(mal, MAL_CFG, MAL_CFG_SR);
+ 
+ 	/* Wait for reset to complete (1 system clock) */
+ 	while ((get_mal_dcrn(mal, MAL_CFG) & MAL_CFG_SR) && n)
+ 		--n;
++	spin_unlock(&mal->lock);
+ 
+ 	if (unlikely(!n))
+ 		printk(KERN_ERR "mal%d: reset timeout\n", mal->def->index);
+@@ -410,6 +427,8 @@ static int __init mal_probe(struct ocp_d
+ 		return -ENOMEM;
+ 	}
+ 	memset(mal, 0, sizeof(*mal));
++	spin_lock_init(&mal->lock);
++	rwlock_init(&mal->mc_lock);
+ 	mal->dcrbase = maldata->dcr_base;
+ 	mal->def = ocpdev->def;
+ 
+Index: linux-2.6.10/drivers/net/ibm_emac/ibm_emac_mal.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/ibm_emac/ibm_emac_mal.h
++++ linux-2.6.10/drivers/net/ibm_emac/ibm_emac_mal.h
+@@ -192,6 +192,8 @@ struct mal_commac {
+ 
+ struct ibm_ocp_mal {
+ 	int			dcrbase;
++	spinlock_t		lock;
++	rwlock_t		mc_lock;
+ 
+ 	struct list_head	poll_list;
+ 	struct net_device	poll_dev;
+Index: linux-2.6.10/mvl_patches/pro-0296.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0296.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(296);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

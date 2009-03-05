@@ -1,0 +1,671 @@
+#! /usr/bin/env bash
+# Patch: -usbnet_pegasus_various_bugfixes
+# Date: Wed Dec 28 15:00:59 2005
+# ChangeSet key is petkan@nucleusys.com|ChangeSet|20050115002532|35044
+# ChangeSet@1.1975.56.11, 2005-01-14 16:25:32-08:00, petkan@nucleusys.com
+#   [PATCH] pegasus 2.6.10 cset
+#   
+#   Various fixes to the 'pegasus' driver, notably fixing OSDL bugid #3978
+#   so this can be used with bridges again (or for that matter, other
+#   normal usage).
+#   
+#       * Bugfixes in the status urb completion handler:
+#   
+#           - Never use garbage that happens to be sitting in the URB
+#             data buffer to change the carrier status.
+#   
+#   
+#           - There are two bits which claim to report parts of carrier
+#             detect bit.  This switches to the one that works sometimes;
+#             monitoring through MII might be the best solution.
+#   
+#           - Stop log spamming ... at least some of these chips seem
+#             to get confused about data toggle, no point in warning
+#             about each packet error as it's detected.
+#   
+#       * Report the normal Ethernet MTU.
+#   
+#       * Better ethtool support:
+#   
+#           - Save the message level set by userspace
+#           - Basic WOL support
+#   
+#       * Add USB suspend() and resume() methods, to go with WOL.
+#         Modeled on what stir4200 does.
+#   
+#   Also, some of the messages are converted to the more conventional
+#   style:  "ethN: message text", or driver model style before the
+#   device is registered.
+#   
+#   	* removed redundant MII code since CONFIG_MII is always set by Kconfig;
+#     	* updated the version string;
+#   
+#   Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+#   Signed-off-by: Petko Manolov <petkan@nucleusys.com>
+#   Signed-off-by: Greg Kroah-Hartman <greg@kroah.com>
+# 
+#  drivers/usb/net/pegasus.c |  204 +++++++++++++++++++++++++---------------------
+#  drivers/usb/net/pegasus.h |    3 
+#  2 files changed, 117 insertions(+), 90 deletions(-)
+# 
+
+PATCHNUM=192
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+ChangeSet key is petkan@nucleusys.com|ChangeSet|20050115002532|35044
+ChangeSet@1.1975.56.11, 2005-01-14 16:25:32-08:00, petkan@nucleusys.com
+  [PATCH] pegasus 2.6.10 cset
+  
+  Various fixes to the 'pegasus' driver, notably fixing OSDL bugid #3978
+  so this can be used with bridges again (or for that matter, other
+  normal usage).
+  
+      * Bugfixes in the status urb completion handler:
+  
+          - Never use garbage that happens to be sitting in the URB
+            data buffer to change the carrier status.
+  
+  
+          - There are two bits which claim to report parts of carrier
+            detect bit.  This switches to the one that works sometimes;
+            monitoring through MII might be the best solution.
+  
+          - Stop log spamming ... at least some of these chips seem
+            to get confused about data toggle, no point in warning
+            about each packet error as it's detected.
+  
+      * Report the normal Ethernet MTU.
+  
+      * Better ethtool support:
+  
+          - Save the message level set by userspace
+          - Basic WOL support
+  
+      * Add USB suspend() and resume() methods, to go with WOL.
+        Modeled on what stir4200 does.
+  
+  Also, some of the messages are converted to the more conventional
+  style:  "ethN: message text", or driver model style before the
+  device is registered.
+  
+  	* removed redundant MII code since CONFIG_MII is always set by Kconfig;
+    	* updated the version string;
+  
+  Signed-off-by: David Brownell <dbrownell@users.sourceforge.net>
+  Signed-off-by: Petko Manolov <petkan@nucleusys.com>
+  Signed-off-by: Greg Kroah-Hartman <greg@kroah.com>
+
+ drivers/usb/net/pegasus.c |  204 +++++++++++++++++++++++++---------------------
+ drivers/usb/net/pegasus.h |    3 
+ mvl_patches/pro-0192.c    |   16 +++
+ 3 files changed, 133 insertions(+), 90 deletions(-)
+
+Index: linux-2.6.10/drivers/usb/net/pegasus.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/net/pegasus.c
++++ linux-2.6.10/drivers/usb/net/pegasus.c
+@@ -28,6 +28,8 @@
+  * 			is out of the interrupt routine.
+  */
+ 
++#undef	DEBUG
++
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
+@@ -45,7 +47,7 @@
+ /*
+  * Version Information
+  */
+-#define DRIVER_VERSION "v0.5.12 (2003/06/06)"
++#define DRIVER_VERSION "v0.5.12 (2005/01/13)"
+ #define DRIVER_AUTHOR "Petko Manolov <petkan@users.sourceforge.net>"
+ #define DRIVER_DESC "Pegasus/Pegasus II USB Ethernet driver"
+ 
+@@ -712,11 +714,11 @@ static void intr_callback(struct urb *ur
+ {
+ 	pegasus_t *pegasus = urb->context;
+ 	struct net_device *net;
+-	__u8 *d;
+ 	int status;
+ 
+ 	if (!pegasus)
+ 		return;
++	net = pegasus->net;
+ 
+ 	switch (urb->status) {
+ 	case 0:
+@@ -726,36 +728,50 @@ static void intr_callback(struct urb *ur
+ 	case -ESHUTDOWN:
+ 		return;
+ 	default:
+-		info("intr status %d", urb->status);
++		/* some Pegasus-I products report LOTS of data
++		 * toggle errors... avoid log spamming
++		 */
++		pr_debug("%s: intr status %d\n", net->name, urb->status);
+ 	}
+ 
+-	d = urb->transfer_buffer;
+-	net = pegasus->net;
+-	if (d[0] & 0xfc) {
+-		pegasus->stats.tx_errors++;
+-		if (d[0] & TX_UNDERRUN)
+-			pegasus->stats.tx_fifo_errors++;
+-		if (d[0] & (EXCESSIVE_COL | JABBER_TIMEOUT))
+-			pegasus->stats.tx_aborted_errors++;
+-		if (d[0] & LATE_COL)
+-			pegasus->stats.tx_window_errors++;
+-		if (d[5] & LINK_STATUS) {
+-			netif_carrier_on(net);
+-		} else {
+-			pegasus->stats.tx_carrier_errors++;
+-			netif_carrier_off(net);	
++	if (urb->actual_length >= 6) {
++		u8	* d = urb->transfer_buffer;
++
++		/* byte 0 == tx_status1, reg 2B */
++		if (d[0] & (TX_UNDERRUN|EXCESSIVE_COL
++					|LATE_COL|JABBER_TIMEOUT)) {
++			pegasus->stats.tx_errors++;
++			if (d[0] & TX_UNDERRUN)
++				pegasus->stats.tx_fifo_errors++;
++			if (d[0] & (EXCESSIVE_COL | JABBER_TIMEOUT))
++				pegasus->stats.tx_aborted_errors++;
++			if (d[0] & LATE_COL)
++				pegasus->stats.tx_window_errors++;
+ 		}
++
++		/* d[5].LINK_STATUS lies on some adapters.
++		 * d[0].NO_CARRIER kicks in only with failed TX.
++		 * ... so monitoring with MII may be safest.
++		 */
++		if (d[0] & NO_CARRIER)
++			netif_carrier_off(net);	
++		else
++			netif_carrier_on(net);
++
++		/* bytes 3-4 == rx_lostpkt, reg 2E/2F */
++		pegasus->stats.rx_missed_errors += ((d[3] & 0x7f) << 8) | d[4];
+ 	}
+ 
+ 	status = usb_submit_urb(urb, SLAB_ATOMIC);
+ 	if (status)
+-		err("%s: can't resubmit interrupt urb, %d", net->name, status);
++		printk(KERN_ERR "%s: can't resubmit interrupt urb, %d\n",
++				net->name, status);
+ }
+ 
+ static void pegasus_tx_timeout(struct net_device *net)
+ {
+ 	pegasus_t *pegasus = netdev_priv(net);
+-	warn("%s: Tx timed out.", net->name);
++	printk(KERN_WARNING "%s: tx timeout\n", net->name);
+ 	pegasus->tx_urb->transfer_flags |= URB_ASYNC_UNLINK;
+ 	usb_unlink_urb(pegasus->tx_urb);
+ 	pegasus->stats.tx_errors++;
+@@ -948,14 +964,57 @@ void pegasus_get_drvinfo(struct net_devi
+ 	usb_make_path(pegasus->usb, info->bus_info, sizeof (info->bus_info));
+ }
+ 
+-#ifdef	CONFIG_MII
+-static int pegasus_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
++/* also handles three patterns of some kind in hardware */
++#define	WOL_SUPPORTED	(WAKE_MAGIC|WAKE_PHY)
++
++static void
++pegasus_get_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
++{
++	pegasus_t	*pegasus = netdev_priv(dev);
++
++	wol->supported = WAKE_MAGIC | WAKE_PHY;
++	wol->wolopts = pegasus->wolopts;
++}
++
++static int
++pegasus_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
++{
++	pegasus_t	*pegasus = netdev_priv(dev);
++	u8		reg78 = 0x04;
++	
++	if (wol->wolopts & ~WOL_SUPPORTED)
++		return -EINVAL;
++
++	if (wol->wolopts & WAKE_MAGIC)
++		reg78 |= 0x80;
++	if (wol->wolopts & WAKE_PHY)
++		reg78 |= 0x40;
++	if (wol->wolopts)
++		pegasus->eth_regs[0] |= 0x10;
++	else
++		pegasus->eth_regs[0] &= ~0x10;
++	pegasus->wolopts = wol->wolopts;
++	return set_register(pegasus, WakeupControl, reg78);
++}
++
++static inline void
++pegasus_reset_wol(struct net_device *dev)
++{
++	struct ethtool_wolinfo wol;
++	
++	memset(&wol, 0, sizeof wol);
++	(void) pegasus_set_wol(dev, &wol);
++}
++
++static int
++pegasus_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+ {
+ 	pegasus_t *pegasus = netdev_priv(dev);
+ 	mii_ethtool_gset(&pegasus->mii, ecmd);
+ 	return 0;
+ }
+-static int pegasus_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
++static int
++pegasus_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+ {
+ 	pegasus_t *pegasus = netdev_priv(dev);
+ 	return mii_ethtool_sset(&pegasus->mii, ecmd);
+@@ -975,19 +1034,14 @@ static u32 pegasus_get_link(struct net_d
+ 
+ static u32 pegasus_get_msglevel(struct net_device *dev)
+ {
+-	/*
+-	 * pegasus_t *pegasus = netdev_priv(dev);
+-	 * return pegasus->msg_enable; FIXME
+-	 */
+-	return 0;
++	pegasus_t *pegasus = netdev_priv(dev);
++	return pegasus->msg_level;
+ }
+ 
+ static void pegasus_set_msglevel(struct net_device *dev, u32 v)
+ {
+-	/*
+-	 * pegasus_t *pegasus = netdev_priv(dev);
+-	 * pegasus->msg_enable = edata.data; FIXME
+-	 */
++	pegasus_t *pegasus = netdev_priv(dev);
++	pegasus->msg_level = v;
+ }
+ 
+ static struct ethtool_ops ops = {
+@@ -998,58 +1052,10 @@ static struct ethtool_ops ops = {
+ 	.get_link = pegasus_get_link,
+ 	.get_msglevel = pegasus_get_msglevel,
+ 	.set_msglevel = pegasus_set_msglevel,
++	.get_wol = pegasus_get_wol,
++	.set_wol = pegasus_set_wol,
+ };
+ 
+-#else
+-
+-static int pegasus_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+-{
+-	pegasus_t *pegasus = netdev_priv(dev);
+-	short lpa, bmcr;
+-	u8 port;
+-
+-	ecmd->supported = (SUPPORTED_10baseT_Half |
+-			  SUPPORTED_10baseT_Full |
+-			  SUPPORTED_100baseT_Half |
+-			  SUPPORTED_100baseT_Full |
+-			  SUPPORTED_Autoneg |
+-			  SUPPORTED_TP | SUPPORTED_MII);
+-	get_registers(pegasus, Reg7b, 1, &port);
+-	if (port == 0)
+-		ecmd->port = PORT_MII;
+-	else
+-		ecmd->port = PORT_TP;
+-	ecmd->transceiver = XCVR_INTERNAL;
+-	ecmd->phy_address = pegasus->phy;
+-	read_mii_word(pegasus, pegasus->phy, MII_BMCR, &bmcr);
+-	read_mii_word(pegasus, pegasus->phy, MII_LPA, &lpa);
+-	if (bmcr & BMCR_ANENABLE) {
+-		ecmd->autoneg = AUTONEG_ENABLE;
+-		ecmd->speed = lpa & (LPA_100HALF | LPA_100FULL) ?
+-		    SPEED_100 : SPEED_10;
+-		if (ecmd->speed == SPEED_100)
+-			ecmd->duplex = lpa & LPA_100FULL ?
+-			    DUPLEX_FULL : DUPLEX_HALF;
+-		else
+-			ecmd->duplex = lpa & LPA_10FULL ?
+-			    DUPLEX_FULL : DUPLEX_HALF;
+-	} else {
+-		ecmd->autoneg = AUTONEG_DISABLE;
+-		ecmd->speed = bmcr & BMCR_SPEED100 ?
+-		    SPEED_100 : SPEED_10;
+-		ecmd->duplex = bmcr & BMCR_FULLDPLX ?
+-		    DUPLEX_FULL : DUPLEX_HALF;
+-	}
+-	return 0;
+-}
+-
+-static struct ethtool_ops ops = {
+-	.get_drvinfo = pegasus_get_drvinfo,
+-	.get_settings = pegasus_get_settings,
+-	.get_link = ethtool_op_get_link,
+-};
+-#endif
+-
+ static int pegasus_ioctl(struct net_device *net, struct ifreq *rq, int cmd)
+ {
+ 	__u16 *data = (__u16 *) & rq->ifr_ifru;
+@@ -1081,12 +1087,12 @@ static void pegasus_set_multicast(struct
+ 
+ 	if (net->flags & IFF_PROMISC) {
+ 		pegasus->eth_regs[EthCtrl2] |= RX_PROMISCUOUS;
+-		info("%s: Promiscuous mode enabled", net->name);
++		pr_info("%s: Promiscuous mode enabled.\n", net->name);
+ 	} else if ((net->mc_count > multicast_filter_limit) ||
+ 		   (net->flags & IFF_ALLMULTI)) {
+ 		pegasus->eth_regs[EthCtrl0] |= RX_MULTICAST;
+ 		pegasus->eth_regs[EthCtrl2] &= ~RX_PROMISCUOUS;
+-		info("%s set allmulti", net->name);
++		pr_info("%s: set allmulti\n", net->name);
+ 	} else {
+ 		pegasus->eth_regs[EthCtrl0] &= ~RX_MULTICAST;
+ 		pegasus->eth_regs[EthCtrl2] &= ~RX_PROMISCUOUS;
+@@ -1180,7 +1186,6 @@ static int pegasus_probe(struct usb_inte
+ 	net->hard_start_xmit = pegasus_start_xmit;
+ 	net->set_multicast_list = pegasus_set_multicast;
+ 	net->get_stats = pegasus_netdev_stats;
+-	net->mtu = PEGASUS_MTU;
+ 	SET_ETHTOOL_OPS(net, &ops);
+ 	pegasus->mii.dev = net;
+ 	pegasus->mii.mdio_read = mdio_read;
+@@ -1192,27 +1197,28 @@ static int pegasus_probe(struct usb_inte
+ 	pegasus->features = usb_dev_id[dev_index].private;
+ 	get_interrupt_interval(pegasus);
+ 	if (reset_mac(pegasus)) {
+-		err("can't reset MAC");
++		dev_err(&intf->dev, "can't reset MAC\n");
+ 		res = -EIO;
+ 		goto out2;
+ 	}
+ 	set_ethernet_addr(pegasus);
+ 	fill_skb_pool(pegasus);
+ 	if (pegasus->features & PEGASUS_II) {
+-		info("setup Pegasus II specific registers");
++		dev_info(&intf->dev, "setup Pegasus II specific registers\n");
+ 		setup_pegasus_II(pegasus);
+ 	}
+ 	pegasus->phy = mii_phy_probe(pegasus);
+ 	if (pegasus->phy == 0xff) {
+-		warn("can't locate MII phy, using default");
++		dev_warn(&intf->dev, "can't locate MII phy, using default\n");
+ 		pegasus->phy = 1;
+ 	}
+ 	usb_set_intfdata(intf, pegasus);
+ 	SET_NETDEV_DEV(net, &intf->dev);
++	pegasus_reset_wol(net);
+ 	res = register_netdev(net);
+ 	if (res)
+ 		goto out3;
+-	printk("%s: %s\n", net->name, usb_dev_id[dev_index].name);
++	pr_info("%s: %s\n", net->name, usb_dev_id[dev_index].name);
+ 	return 0;
+ 
+ out3:
+@@ -1247,16 +1253,34 @@ static void pegasus_disconnect(struct us
+ 	free_netdev(pegasus->net);
+ }
+ 
++static int pegasus_suspend (struct usb_interface *intf, u32 state)
++{
++	struct pegasus *pegasus = usb_get_intfdata(intf);
++	
++	netif_device_detach (pegasus->net);
++	return 0;
++}
++
++static int pegasus_resume (struct usb_interface *intf)
++{
++	struct pegasus *pegasus = usb_get_intfdata(intf);
++
++	netif_device_attach (pegasus->net);
++	return 0;
++}
++
+ static struct usb_driver pegasus_driver = {
+ 	.name = driver_name,
+ 	.probe = pegasus_probe,
+ 	.disconnect = pegasus_disconnect,
+ 	.id_table = pegasus_ids,
++	.suspend = pegasus_suspend,
++	.resume = pegasus_resume,
+ };
+ 
+ static int __init pegasus_init(void)
+ {
+-	info(DRIVER_VERSION ":" DRIVER_DESC);
++	pr_info("%s: %s, " DRIVER_DESC "\n", driver_name, DRIVER_VERSION);
+ 	return usb_register(&pegasus_driver);
+ }
+ 
+Index: linux-2.6.10/drivers/usb/net/pegasus.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/net/pegasus.h
++++ linux-2.6.10/drivers/usb/net/pegasus.h
+@@ -76,6 +76,7 @@ enum pegasus_registers {
+ 	EthTxStat0 = 0x2b,
+ 	EthTxStat1 = 0x2c,
+ 	EthRxStat = 0x2d,
++	WakeupControl = 0x78,
+ 	Reg7b = 0x7b,
+ 	Gpio0 = 0x7e,
+ 	Gpio1 = 0x7f,
+@@ -90,6 +91,8 @@ typedef struct pegasus {
+ 	struct mii_if_info	mii;
+ 	unsigned		flags;
+ 	unsigned		features;
++	u32			msg_level;
++	u32			wolopts;
+ 	int			dev_index;
+ 	int			intr_interval;
+ 	struct tasklet_struct	rx_tl;
+Index: linux-2.6.10/mvl_patches/pro-0192.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0192.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(192);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

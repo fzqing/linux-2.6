@@ -1,0 +1,2244 @@
+#! /usr/bin/env bash
+# Patch: -xtensa-architecture-support-for-tensilica-xtensa-part-4
+# Date: Fri Feb 16 17:09:22 2007
+# 
+# From: Chris Zankel <czankel@tensilica.com>
+# 
+# The attached patches provides part 4 of an architecture implementation for the
+# Tensilica Xtensa CPU series.
+# 
+# Signed-off-by: Chris Zankel <chris@zankel.net>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# 
+
+PATCHNUM=1085
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+
+From: Chris Zankel <czankel@tensilica.com>
+
+The attached patches provides part 4 of an architecture implementation for the
+Tensilica Xtensa CPU series.
+
+Signed-off-by: Chris Zankel <chris@zankel.net>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+
+Index: linux-2.6.10/arch/xtensa/lib/checksum.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/checksum.S
+@@ -0,0 +1,410 @@
++/*
++ * INET		An implementation of the TCP/IP protocol suite for the LINUX
++ *		operating system.  INET is implemented using the  BSD Socket
++ *		interface as the means of communication with the user level.
++ *
++ *		IP/TCP/UDP checksumming routines
++ *
++ * Xtensa version:  Copyright (C) 2001 Tensilica, Inc. by Kevin Chea
++ *                  Optimized by Joe Taylor
++ *
++ *		This program is free software; you can redistribute it and/or
++ *		modify it under the terms of the GNU General Public License
++ *		as published by the Free Software Foundation; either version
++ *		2 of the License, or (at your option) any later version.
++ */
++
++#include <asm/errno.h>
++#include <linux/linkage.h>
++#define _ASMLANGUAGE
++#include <xtensa/config/core.h>
++
++/*
++ * computes a partial checksum, e.g. for TCP/UDP fragments
++ */
++
++/*
++ * unsigned int csum_partial(const unsigned char *buf, int len,
++ *                           unsigned int sum);
++ *    a2 = buf
++ *    a3 = len
++ *    a4 = sum
++ *
++ * This function assumes 2- or 4-byte alignment.  Other alignments will fail!
++ */
++
++/* ONES_ADD converts twos-complement math to ones-complement. */
++#define ONES_ADD(sum, val)	  \
++	add	sum, sum, val	; \
++	bgeu	sum, val, 99f	; \
++	addi	sum, sum, 1	; \
++99:				;
++
++.text
++ENTRY(csum_partial)
++	  /*
++	   * Experiments with Ethernet and SLIP connections show that buf
++	   * is aligned on either a 2-byte or 4-byte boundary.
++	   */
++	entry	sp, 32
++	extui	a5, a2, 0, 2
++	bnez	a5, 8f		/* branch if 2-byte aligned */
++	/* Fall-through on common case, 4-byte alignment */
++1:
++	srli	a5, a3, 5	/* 32-byte chunks */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a5, 2f
++#else
++	beqz	a5, 2f
++	slli	a5, a5, 5
++	add	a5, a5, a2	/* a5 = end of last 32-byte chunk */
++.Loop1:
++#endif
++	l32i	a6, a2, 0
++	l32i	a7, a2, 4
++	ONES_ADD(a4, a6)
++	ONES_ADD(a4, a7)
++	l32i	a6, a2, 8
++	l32i	a7, a2, 12
++	ONES_ADD(a4, a6)
++	ONES_ADD(a4, a7)
++	l32i	a6, a2, 16
++	l32i	a7, a2, 20
++	ONES_ADD(a4, a6)
++	ONES_ADD(a4, a7)
++	l32i	a6, a2, 24
++	l32i	a7, a2, 28
++	ONES_ADD(a4, a6)
++	ONES_ADD(a4, a7)
++	addi	a2, a2, 4*8
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a5, .Loop1
++#endif
++2:
++	extui	a5, a3, 2, 3	/* remaining 4-byte chunks */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a5, 3f
++#else
++	beqz	a5, 3f
++	slli	a5, a5, 2
++	add	a5, a5, a2	/* a5 = end of last 4-byte chunk */
++.Loop2:
++#endif
++	l32i	a6, a2, 0
++	ONES_ADD(a4, a6)
++	addi	a2, a2, 4
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a5, .Loop2
++#endif
++3:
++	_bbci.l	a3, 1, 5f	/* remaining 2-byte chunk */
++	l16ui	a6, a2, 0
++	ONES_ADD(a4, a6)
++	addi	a2, a2, 2
++5:
++	_bbci.l	a3, 0, 7f	/* remaining 1-byte chunk */
++6:	l8ui	a6, a2, 0
++#ifdef __XTENSA_EB__
++	slli	a6, a6, 8	/* load byte into bits 8..15 */
++#endif
++	ONES_ADD(a4, a6)
++7:
++	mov	a2, a4
++	retw
++
++	/* uncommon case, buf is 2-byte aligned */
++8:
++	beqz	a3, 7b		/* branch if len == 0 */
++	beqi	a3, 1, 6b	/* branch if len == 1 */
++
++	extui	a5, a2, 0, 1
++	bnez	a5, 8f		/* branch if 1-byte aligned */
++
++	l16ui	a6, a2, 0	/* common case, len >= 2 */
++	ONES_ADD(a4, a6)
++	addi	a2, a2, 2	/* adjust buf */
++	addi	a3, a3, -2	/* adjust len */
++	j	1b		/* now buf is 4-byte aligned */
++
++	/* case: odd-byte aligned, len > 1
++	 * This case is dog slow, so don't give us an odd address.
++	 * (I don't think this ever happens, but just in case.)
++	 */
++8:
++	srli	a5, a3, 2	/* 4-byte chunks */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a5, 2f
++#else
++	beqz	a5, 2f
++	slli	a5, a5, 2
++	add	a5, a5, a2	/* a5 = end of last 4-byte chunk */
++.Loop3:
++#endif
++	l8ui	a6, a2, 0	/* bits 24..31 */
++	l16ui	a7, a2, 1	/* bits  8..23 */
++	l8ui	a8, a2, 3	/* bits  0.. 8 */
++#ifdef	__XTENSA_EB__
++	slli	a6, a6, 24
++#else
++	slli	a8, a8, 24
++#endif
++	slli	a7, a7, 8
++	or	a7, a7, a6
++	or	a7, a7, a8
++	ONES_ADD(a4, a7)
++	addi	a2, a2, 4
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a5, .Loop3
++#endif
++2:
++	_bbci.l	a3, 1, 3f	/* remaining 2-byte chunk, still odd addr */
++	l8ui	a6, a2, 0
++	l8ui	a7, a2, 1
++#ifdef	__XTENSA_EB__
++	slli	a6, a6, 8
++#else
++	slli	a7, a7, 8
++#endif
++	or	a7, a7, a6
++	ONES_ADD(a4, a7)
++	addi	a2, a2, 2
++3:
++	j	5b		/* branch to handle the remaining byte */
++
++
++
++/*
++ * Copy from ds while checksumming, otherwise like csum_partial
++ *
++ * The macros SRC and DST specify the type of access for the instruction.
++ * thus we can call a custom exception handler for each access type.
++ */
++
++#define SRC(y...)			\
++	9999: y;			\
++	.section __ex_table, "a";	\
++	.long 9999b, 6001f	;	\
++	.previous
++
++#define DST(y...)			\
++	9999: y;			\
++	.section __ex_table, "a";	\
++	.long 9999b, 6002f	;	\
++	.previous
++
++/*
++unsigned int csum_partial_copy_generic (const char *src, char *dst, int len,
++					int sum, int *src_err_ptr, int *dst_err_ptr)
++	a2  = src
++	a3  = dst
++	a4  = len
++	a5  = sum
++	a6  = src_err_ptr
++	a7  = dst_err_ptr
++	a8  = temp
++	a9  = temp
++	a10 = temp
++	a11 = original len for exception handling
++	a12 = original dst for exception handling
++
++    This function is optimized for 4-byte aligned addresses.  Other
++    alignments work, but not nearly as efficiently.
++ */
++
++ENTRY(csum_partial_copy_generic)
++	entry	sp, 32
++	mov	a12, a3
++	mov	a11, a4
++	or	a10, a2, a3
++
++	/* We optimize the following alignment tests for the 4-byte
++	aligned case.  Two bbsi.l instructions might seem more optimal
++	(commented out below).  However, both labels 5: and 3: are out
++	of the imm8 range, so the assembler relaxes them into
++	equivalent bbci.l, j combinations, which is actually
++	slower. */
++
++	extui	a9, a10, 0, 2
++	beqz	a9, 1f		/* branch if both are 4-byte aligned */
++	bbsi.l	a10, 0, 5f	/* branch if one address is odd */
++	j	3f		/* one address is 2-byte aligned */
++
++/*	_bbsi.l	a10, 0, 5f */	/* branch if odd address */
++/*	_bbsi.l	a10, 1, 3f */	/* branch if 2-byte-aligned address */
++
++1:
++	/* src and dst are both 4-byte aligned */
++	srli	a10, a4, 5	/* 32-byte chunks */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a10, 2f
++#else
++	beqz	a10, 2f
++	slli	a10, a10, 5
++	add	a10, a10, a2	/* a10 = end of last 32-byte src chunk */
++.Loop5:
++#endif
++SRC(	l32i	a9, a2, 0	)
++SRC(	l32i	a8, a2, 4	)
++DST(	s32i	a9, a3, 0	)
++DST(	s32i	a8, a3, 4	)
++	ONES_ADD(a5, a9)
++	ONES_ADD(a5, a8)
++SRC(	l32i	a9, a2, 8	)
++SRC(	l32i	a8, a2, 12	)
++DST(	s32i	a9, a3, 8	)
++DST(	s32i	a8, a3, 12	)
++	ONES_ADD(a5, a9)
++	ONES_ADD(a5, a8)
++SRC(	l32i	a9, a2, 16	)
++SRC(	l32i	a8, a2, 20	)
++DST(	s32i	a9, a3, 16	)
++DST(	s32i	a8, a3, 20	)
++	ONES_ADD(a5, a9)
++	ONES_ADD(a5, a8)
++SRC(	l32i	a9, a2, 24	)
++SRC(	l32i	a8, a2, 28	)
++DST(	s32i	a9, a3, 24	)
++DST(	s32i	a8, a3, 28	)
++	ONES_ADD(a5, a9)
++	ONES_ADD(a5, a8)
++	addi	a2, a2, 32
++	addi	a3, a3, 32
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a10, .Loop5
++#endif
++2:
++	extui	a10, a4, 2, 3	/* remaining 4-byte chunks */
++	extui	a4, a4, 0, 2	/* reset len for general-case, 2-byte chunks */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a10, 3f
++#else
++	beqz	a10, 3f
++	slli	a10, a10, 2
++	add	a10, a10, a2	/* a10 = end of last 4-byte src chunk */
++.Loop6:
++#endif
++SRC(	l32i	a9, a2, 0	)
++DST(	s32i	a9, a3, 0	)
++	ONES_ADD(a5, a9)
++	addi	a2, a2, 4
++	addi	a3, a3, 4
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a10, .Loop6
++#endif
++3:
++	/*
++	Control comes to here in two cases: (1) It may fall through
++	to here from the 4-byte alignment case to process, at most,
++	one 2-byte chunk.  (2) It branches to here from above if
++	either src or dst is 2-byte aligned, and we process all bytes
++	here, except for perhaps a trailing odd byte.  It's
++	inefficient, so align your addresses to 4-byte boundaries.
++
++	a2 = src
++	a3 = dst
++	a4 = len
++	a5 = sum
++	*/
++	srli	a10, a4, 1	/* 2-byte chunks */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a10, 4f
++#else
++	beqz	a10, 4f
++	slli	a10, a10, 1
++	add	a10, a10, a2	/* a10 = end of last 2-byte src chunk */
++.Loop7:
++#endif
++SRC(	l16ui	a9, a2, 0	)
++DST(	s16i	a9, a3, 0	)
++	ONES_ADD(a5, a9)
++	addi	a2, a2, 2
++	addi	a3, a3, 2
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a10, .Loop7
++#endif
++4:
++	/* This section processes a possible trailing odd byte. */
++	_bbci.l	a4, 0, 8f	/* 1-byte chunk */
++SRC(	l8ui	a9, a2, 0	)
++DST(	s8i	a9, a3, 0	)
++#ifdef __XTENSA_EB__
++	slli	a9, a9, 8	/* shift byte to bits 8..15 */
++#endif
++	ONES_ADD(a5, a9)
++8:
++	mov	a2, a5
++	retw
++
++5:
++	/* Control branch to here when either src or dst is odd.  We
++	process all bytes using 8-bit accesses.  Grossly inefficient,
++	so don't feed us an odd address. */
++
++	srli	a10, a4, 1	/* handle in pairs for 16-bit csum */
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a10, 6f
++#else
++	beqz	a10, 6f
++	slli	a10, a10, 1
++	add	a10, a10, a2	/* a10 = end of last odd-aligned, 2-byte src chunk */
++.Loop8:
++#endif
++SRC(	l8ui	a9, a2, 0	)
++SRC(	l8ui	a8, a2, 1	)
++DST(	s8i	a9, a3, 0	)
++DST(	s8i	a8, a3, 1	)
++#ifdef __XTENSA_EB__
++	slli	a9, a9, 8	/* combine into a single 16-bit value */
++#else				/* for checksum computation */
++	slli	a8, a8, 8
++#endif
++	or	a9, a9, a8
++	ONES_ADD(a5, a9)
++	addi	a2, a2, 2
++	addi	a3, a3, 2
++#if !XCHAL_HAVE_LOOPS
++	blt	a2, a10, .Loop8
++#endif
++6:
++	j	4b		/* process the possible trailing odd byte */
++
++
++# Exception handler:
++.section .fixup, "ax"
++/*
++	a6  = src_err_ptr
++	a7  = dst_err_ptr
++	a11 = original len for exception handling
++	a12 = original dst for exception handling
++*/
++
++6001:
++	_movi	a2, -EFAULT
++	s32i	a2, a6, 0	/* src_err_ptr */
++
++	# clear the complete destination - computing the rest
++	# is too much work
++	movi	a2, 0
++#if XCHAL_HAVE_LOOPS
++	loopgtz	a11, 2f
++#else
++	beqz	a11, 2f
++	add	a11, a11, a12	/* a11 = ending address */
++.Leloop:
++#endif
++	s8i	a2, a12, 0
++	addi	a12, a12, 1
++#if !XCHAL_HAVE_LOOPS
++	blt	a12, a11, .Leloop
++#endif
++2:
++	retw
++
++6002:
++	movi	a2, -EFAULT
++	s32i	a2, a7, 0	/* dst_err_ptr */
++	movi	a2, 0
++	retw
++
++.previous
++
+Index: linux-2.6.10/arch/xtensa/lib/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/Makefile
+@@ -0,0 +1,7 @@
++#
++# Makefile for Xtensa-specific library files.
++#
++
++lib-y	+= memcopy.o memset.o checksum.o strcasecmp.o \
++	   usercopy.o strncpy_user.o strnlen_user.o
++lib-$(CONFIG_PCI) += pci-auto.o
+Index: linux-2.6.10/arch/xtensa/lib/memcopy.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/memcopy.S
+@@ -0,0 +1,315 @@
++/*
++ * arch/xtensa/lib/hal/memcopy.S -- Core HAL library functions
++ * xthal_memcpy and xthal_bcopy
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2002 - 2005 Tensilica Inc.
++ */
++
++#include <xtensa/coreasm.h>
++
++	.macro	src_b	r, w0, w1
++#ifdef __XTENSA_EB__
++	src	\r, \w0, \w1
++#else
++	src	\r, \w1, \w0
++#endif
++	.endm
++
++	.macro	ssa8	r
++#ifdef __XTENSA_EB__
++	ssa8b	\r
++#else
++	ssa8l	\r
++#endif
++	.endm
++
++
++/*
++ * void *memcpy(void *dst, const void *src, size_t len);
++ * void *memmove(void *dst, const void *src, size_t len);
++ * void *bcopy(const void *src, void *dst, size_t len);
++ *
++ * This function is intended to do the same thing as the standard
++ * library function memcpy() (or bcopy()) for most cases.
++ * However, where the source and/or destination references
++ * an instruction RAM or ROM or a data RAM or ROM, that
++ * source and/or destination will always be accessed with
++ * 32-bit load and store instructions (as required for these
++ * types of devices).
++ *
++ * !!!!!!!  XTFIXME:
++ * !!!!!!!  Handling of IRAM/IROM has not yet
++ * !!!!!!!  been implemented.
++ *
++ * The bcopy version is provided here to avoid the overhead
++ * of an extra call, for callers that require this convention.
++ *
++ * The (general case) algorithm is as follows:
++ *   If destination is unaligned, align it by conditionally
++ *     copying 1 and 2 bytes.
++ *   If source is aligned,
++ *     do 16 bytes with a loop, and then finish up with
++ *     8, 4, 2, and 1 byte copies conditional on the length;
++ *   else (if source is unaligned),
++ *     do the same, but use SRC to align the source data.
++ *   This code tries to use fall-through branches for the common
++ *     case of aligned source and destination and multiple
++ *     of 4 (or 8) length.
++ *
++ * Register use:
++ *	a0/ return address
++ *	a1/ stack pointer
++ *	a2/ return value
++ *	a3/ src
++ *	a4/ length
++ *	a5/ dst
++ *	a6/ tmp
++ *	a7/ tmp
++ *	a8/ tmp
++ *	a9/ tmp
++ *	a10/ tmp
++ *	a11/ tmp
++ */
++
++	.text
++	.align	4
++	.global	bcopy
++	.type   bcopy,@function
++bcopy:
++	entry	sp, 16		# minimal stack frame
++	# a2=src, a3=dst, a4=len
++	mov	a5, a3		# copy dst so that a2 is return value
++	mov	a3, a2
++	mov	a2, a5
++	j	.Lcommon	# go to common code for memcpy+bcopy
++
++
++/*
++ * Byte by byte copy
++ */
++	.align	4
++	.byte	0		# 1 mod 4 alignment for LOOPNEZ
++				# (0 mod 4 alignment for LBEG)
++.Lbytecopy:
++#if XCHAL_HAVE_LOOPS
++	loopnez	a4, .Lbytecopydone
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a4, .Lbytecopydone
++	add	a7, a3, a4	# a7 = end address for source
++#endif /* !XCHAL_HAVE_LOOPS */
++.Lnextbyte:
++	l8ui	a6, a3, 0
++	addi	a3, a3, 1
++	s8i	a6, a5, 0
++	addi	a5, a5, 1
++#if !XCHAL_HAVE_LOOPS
++	blt	a3, a7, .Lnextbyte
++#endif /* !XCHAL_HAVE_LOOPS */
++.Lbytecopydone:
++	retw
++
++/*
++ * Destination is unaligned
++ */
++
++	.align	4
++.Ldst1mod2:	# dst is only byte aligned
++	_bltui	a4, 7, .Lbytecopy	# do short copies byte by byte
++
++	# copy 1 byte
++	l8ui	a6, a3,  0
++	addi	a3, a3,  1
++	addi	a4, a4, -1
++	s8i	a6, a5,  0
++	addi	a5, a5,  1
++	_bbci.l	a5, 1, .Ldstaligned	# if dst is now aligned, then
++					# return to main algorithm
++.Ldst2mod4:	# dst 16-bit aligned
++	# copy 2 bytes
++	_bltui	a4, 6, .Lbytecopy	# do short copies byte by byte
++	l8ui	a6, a3,  0
++	l8ui	a7, a3,  1
++	addi	a3, a3,  2
++	addi	a4, a4, -2
++	s8i	a6, a5,  0
++	s8i	a7, a5,  1
++	addi	a5, a5,  2
++	j	.Ldstaligned	# dst is now aligned, return to main algorithm
++
++	.align	4
++	.global	memcpy
++	.type   memcpy,@function
++memcpy:
++	.global	memmove
++	.type   memmove,@function
++memmove:
++
++	entry	sp, 16		# minimal stack frame
++	# a2/ dst, a3/ src, a4/ len
++	mov	a5, a2		# copy dst so that a2 is return value
++.Lcommon:
++	_bbsi.l	a2, 0, .Ldst1mod2	# if dst is 1 mod 2
++	_bbsi.l	a2, 1, .Ldst2mod4	# if dst is 2 mod 4
++.Ldstaligned:	# return here from .Ldst?mod? once dst is aligned
++	srli	a7, a4, 4	# number of loop iterations with 16B
++				# per iteration
++	movi	a8, 3		# if source is not aligned,
++	_bany	a3, a8, .Lsrcunaligned	# then use shifting copy
++	/*
++	 * Destination and source are word-aligned, use word copy.
++	 */
++	# copy 16 bytes per iteration for word-aligned dst and word-aligned src
++#if XCHAL_HAVE_LOOPS
++	loopnez	a7, .Loop1done
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a7, .Loop1done
++	slli	a8, a7, 4
++	add	a8, a8, a3	# a8 = end of last 16B source chunk
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop1:
++	l32i	a6, a3,  0
++	l32i	a7, a3,  4
++	s32i	a6, a5,  0
++	l32i	a6, a3,  8
++	s32i	a7, a5,  4
++	l32i	a7, a3, 12
++	s32i	a6, a5,  8
++	addi	a3, a3, 16
++	s32i	a7, a5, 12
++	addi	a5, a5, 16
++#if !XCHAL_HAVE_LOOPS
++	blt	a3, a8, .Loop1
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop1done:
++	bbci.l	a4, 3, .L2
++	# copy 8 bytes
++	l32i	a6, a3,  0
++	l32i	a7, a3,  4
++	addi	a3, a3,  8
++	s32i	a6, a5,  0
++	s32i	a7, a5,  4
++	addi	a5, a5,  8
++.L2:
++	bbsi.l	a4, 2, .L3
++	bbsi.l	a4, 1, .L4
++	bbsi.l	a4, 0, .L5
++	retw
++.L3:
++	# copy 4 bytes
++	l32i	a6, a3,  0
++	addi	a3, a3,  4
++	s32i	a6, a5,  0
++	addi	a5, a5,  4
++	bbsi.l	a4, 1, .L4
++	bbsi.l	a4, 0, .L5
++	retw
++.L4:
++	# copy 2 bytes
++	l16ui	a6, a3,  0
++	addi	a3, a3,  2
++	s16i	a6, a5,  0
++	addi	a5, a5,  2
++	bbsi.l	a4, 0, .L5
++	retw
++.L5:
++	# copy 1 byte
++	l8ui	a6, a3,  0
++	s8i	a6, a5,  0
++	retw
++
++/*
++ * Destination is aligned, Source is unaligned
++ */
++
++	.align	4
++.Lsrcunaligned:
++	_beqz	a4, .Ldone	# avoid loading anything for zero-length copies
++	# copy 16 bytes per iteration for word-aligned dst and unaligned src
++	ssa8	a3		# set shift amount from byte offset
++#define SIM_CHECKS_ALIGNMENT	1	/* set to 1 when running on ISS (simulator) with the
++					   lint or ferret client, or 0 to save a few cycles */
++#if XCHAL_UNALIGNED_LOAD_EXCEPTION || SIM_CHECKS_ALIGNMENT
++	and	a11, a3, a8	# save unalignment offset for below
++	sub	a3, a3, a11	# align a3
++#endif
++	l32i	a6, a3, 0	# load first word
++#if XCHAL_HAVE_LOOPS
++	loopnez	a7, .Loop2done
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a7, .Loop2done
++	slli	a10, a7, 4
++	add	a10, a10, a3	# a10 = end of last 16B source chunk
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop2:
++	l32i	a7, a3,  4
++	l32i	a8, a3,  8
++	src_b	a6, a6, a7
++	s32i	a6, a5,  0
++	l32i	a9, a3, 12
++	src_b	a7, a7, a8
++	s32i	a7, a5,  4
++	l32i	a6, a3, 16
++	src_b	a8, a8, a9
++	s32i	a8, a5,  8
++	addi	a3, a3, 16
++	src_b	a9, a9, a6
++	s32i	a9, a5, 12
++	addi	a5, a5, 16
++#if !XCHAL_HAVE_LOOPS
++	blt	a3, a10, .Loop2
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop2done:
++	bbci.l	a4, 3, .L12
++	# copy 8 bytes
++	l32i	a7, a3,  4
++	l32i	a8, a3,  8
++	src_b	a6, a6, a7
++	s32i	a6, a5,  0
++	addi	a3, a3,  8
++	src_b	a7, a7, a8
++	s32i	a7, a5,  4
++	addi	a5, a5,  8
++	mov	a6, a8
++.L12:
++	bbci.l	a4, 2, .L13
++	# copy 4 bytes
++	l32i	a7, a3,  4
++	addi	a3, a3,  4
++	src_b	a6, a6, a7
++	s32i	a6, a5,  0
++	addi	a5, a5,  4
++	mov	a6, a7
++.L13:
++#if XCHAL_UNALIGNED_LOAD_EXCEPTION || SIM_CHECKS_ALIGNMENT
++	add	a3, a3, a11	# readjust a3 with correct misalignment
++#endif
++	bbsi.l	a4, 1, .L14
++	bbsi.l	a4, 0, .L15
++.Ldone:	retw
++.L14:
++	# copy 2 bytes
++	l8ui	a6, a3,  0
++	l8ui	a7, a3,  1
++	addi	a3, a3,  2
++	s8i	a6, a5,  0
++	s8i	a7, a5,  1
++	addi	a5, a5,  2
++	bbsi.l	a4, 0, .L15
++	retw
++.L15:
++	# copy 1 byte
++	l8ui	a6, a3,  0
++	s8i	a6, a5,  0
++	retw
++
++/*
++ * Local Variables:
++ * mode:fundamental
++ * comment-start: "# "
++ * comment-start-skip: "# *"
++ * End:
++ */
+Index: linux-2.6.10/arch/xtensa/lib/memset.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/memset.S
+@@ -0,0 +1,160 @@
++/*
++ *  arch/xtensa/lib/memset.S
++ *
++ *  ANSI C standard library function memset
++ *  (Well, almost.  .fixup code might return zero.)
++ *
++ *  This file is subject to the terms and conditions of the GNU General
++ *  Public License.  See the file "COPYING" in the main directory of
++ *  this archive for more details.
++ *
++ *  Copyright (C) 2002 Tensilica Inc.
++ */
++
++#include <xtensa/coreasm.h>
++
++/*
++ * void *memset(void *dst, int c, size_t length)
++ *
++ * The algorithm is as follows:
++ *   Create a word with c in all byte positions
++ *   If the destination is aligned,
++ *     do 16B chucks with a loop, and then finish up with
++ *     8B, 4B, 2B, and 1B stores conditional on the length.
++ *   If destination is unaligned, align it by conditionally
++ *     setting 1B and 2B and then go to aligned case.
++ *   This code tries to use fall-through branches for the common
++ *     case of an aligned destination (except for the branches to
++ *     the alignment labels).
++ */
++
++/* Load or store instructions that may cause exceptions use the EX macro. */
++
++#define EX(insn,reg1,reg2,offset,handler)	\
++9:	insn	reg1, reg2, offset;		\
++	.section __ex_table, "a";		\
++	.word	9b, handler;			\
++	.previous
++
++
++.text
++.align	4
++.global	memset
++.type	memset,@function
++memset:
++	entry	sp, 16		# minimal stack frame
++	# a2/ dst, a3/ c, a4/ length
++	extui	a3, a3, 0, 8	# mask to just 8 bits
++	slli	a7, a3, 8	# duplicate character in all bytes of word
++	or	a3, a3, a7	# ...
++	slli	a7, a3, 16	# ...
++	or	a3, a3, a7	# ...
++	mov	a5, a2		# copy dst so that a2 is return value
++	movi	a6, 3		# for alignment tests
++	bany	a2, a6, .Ldstunaligned # if dst is unaligned
++.L0:	# return here from .Ldstunaligned when dst is aligned
++	srli	a7, a4, 4	# number of loop iterations with 16B
++				# per iteration
++	bnez	a4, .Laligned
++	retw
++
++/*
++ * Destination is word-aligned.
++ */
++	# set 16 bytes per iteration for word-aligned dst
++	.align	4		# 1 mod 4 alignment for LOOPNEZ
++	.byte	0		# (0 mod 4 alignment for LBEG)
++.Laligned:
++#if XCHAL_HAVE_LOOPS
++	loopnez	a7, .Loop1done
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a7, .Loop1done
++	slli	a6, a7, 4
++	add	a6, a6, a5	# a6 = end of last 16B chunk
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop1:
++	EX(s32i, a3, a5,  0, memset_fixup)
++	EX(s32i, a3, a5,  4, memset_fixup)
++	EX(s32i, a3, a5,  8, memset_fixup)
++	EX(s32i, a3, a5, 12, memset_fixup)
++	addi	a5, a5, 16
++#if !XCHAL_HAVE_LOOPS
++	blt	a5, a6, .Loop1
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop1done:
++	bbci.l	a4, 3, .L2
++	# set 8 bytes
++	EX(s32i, a3, a5,  0, memset_fixup)
++	EX(s32i, a3, a5,  4, memset_fixup)
++	addi	a5, a5,  8
++.L2:
++	bbci.l	a4, 2, .L3
++	# set 4 bytes
++	EX(s32i, a3, a5,  0, memset_fixup)
++	addi	a5, a5,  4
++.L3:
++	bbci.l	a4, 1, .L4
++	# set 2 bytes
++	EX(s16i, a3, a5,  0, memset_fixup)
++	addi	a5, a5,  2
++.L4:
++	bbci.l	a4, 0, .L5
++	# set 1 byte
++	EX(s8i, a3, a5,  0, memset_fixup)
++.L5:
++.Lret1:
++	retw
++
++/*
++ * Destination is unaligned
++ */
++
++.Ldstunaligned:
++	bltui	a4, 8, .Lbyteset	# do short copies byte by byte
++	bbci.l	a5, 0, .L20		# branch if dst alignment half-aligned
++	# dst is only byte aligned
++	# set 1 byte
++	EX(s8i, a3, a5,  0, memset_fixup)
++	addi	a5, a5,  1
++	addi	a4, a4, -1
++	# now retest if dst aligned
++	bbci.l	a5, 1, .L0	# if now aligned, return to main algorithm
++.L20:
++	# dst half-aligned
++	# set 2 bytes
++	EX(s16i, a3, a5,  0, memset_fixup)
++	addi	a5, a5,  2
++	addi	a4, a4, -2
++	j	.L0		# dst is now aligned, return to main algorithm
++
++/*
++ * Byte by byte set
++ */
++	.align	4
++	.byte	0		# 1 mod 4 alignment for LOOPNEZ
++				# (0 mod 4 alignment for LBEG)
++.Lbyteset:
++#if XCHAL_HAVE_LOOPS
++	loopnez	a4, .Lbytesetdone
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a4, .Lbytesetdone
++	add	a6, a5, a4	# a6 = ending address
++#endif /* !XCHAL_HAVE_LOOPS */
++.Lbyteloop:
++	EX(s8i, a3, a5, 0, memset_fixup)
++	addi	a5, a5, 1
++#if !XCHAL_HAVE_LOOPS
++	blt	a5, a6, .Lbyteloop
++#endif /* !XCHAL_HAVE_LOOPS */
++.Lbytesetdone:
++	retw
++
++
++	.section .fixup, "ax"
++	.align	4
++
++/* We return zero if a failure occurred. */
++
++memset_fixup:
++	movi	a2, 0
++	retw
+Index: linux-2.6.10/arch/xtensa/lib/pci-auto.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/pci-auto.c
+@@ -0,0 +1,352 @@
++/*
++ * arch/xtensa/kernel/pci-auto.c
++ *
++ * PCI autoconfiguration library
++ *
++ * Copyright (C) 2001 - 2005 Tensilica Inc.
++ *
++ * Chris Zankel <zankel@tensilica.com, cez@zankel.net>
++ *
++ * Based on work from Matt Porter <mporter@mvista.com>
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++
++#include <asm/pci-bridge.h>
++
++
++/*
++ *
++ * Setting up a PCI
++ *
++ * pci_ctrl->first_busno = <first bus number (0)>
++ * pci_ctrl->last_busno = <last bus number (0xff)>
++ * pci_ctrl->ops = <PCI config operations>
++ * pci_ctrl->map_irq = <function to return the interrupt number for a device>
++ *
++ * pci_ctrl->io_space.start = <IO space start address (PCI view)>
++ * pci_ctrl->io_space.end = <IO space end address (PCI view)>
++ * pci_ctrl->io_space.base = <IO space offset: address 0 from CPU space>
++ * pci_ctrl->mem_space.start = <MEM space start address (PCI view)>
++ * pci_ctrl->mem_space.end = <MEM space end address (PCI view)>
++ * pci_ctrl->mem_space.base = <MEM space offset: address 0 from CPU space>
++ *
++ * pcibios_init_resource(&pci_ctrl->io_resource, <IO space start>,
++ * 			 <IO space end>, IORESOURCE_IO, "PCI host bridge");
++ * pcibios_init_resource(&pci_ctrl->mem_resources[0], <MEM space start>,
++ * 			 <MEM space end>, IORESOURCE_MEM, "PCI host bridge");
++ *
++ * pci_ctrl->last_busno = pciauto_bus_scan(pci_ctrl,pci_ctrl->first_busno);
++ *
++ * int __init pciauto_bus_scan(struct pci_controller *pci_ctrl, int current_bus)
++ *
++ */
++
++
++/* define DEBUG to print some debugging messages. */
++
++#undef DEBUG
++
++#ifdef DEBUG
++# define DBG(x...) printk(x)
++#else
++# define DBG(x...)
++#endif
++
++static int pciauto_upper_iospc;
++static int pciauto_upper_memspc;
++
++static struct pci_dev pciauto_dev;
++static struct pci_bus pciauto_bus;
++
++/*
++ * Helper functions
++ */
++
++/* Initialize the bars of a PCI device.  */
++
++static void __init
++pciauto_setup_bars(struct pci_dev *dev, int bar_limit)
++{
++	int bar_size;
++	int bar, bar_nr;
++	int *upper_limit;
++	int found_mem64 = 0;
++
++	for (bar = PCI_BASE_ADDRESS_0, bar_nr = 0;
++	     bar <= bar_limit;
++	     bar+=4, bar_nr++)
++	{
++		/* Tickle the BAR and get the size */
++		pci_write_config_dword(dev, bar, 0xffffffff);
++		pci_read_config_dword(dev, bar, &bar_size);
++
++		/* If BAR is not implemented go to the next BAR */
++		if (!bar_size)
++			continue;
++
++		/* Check the BAR type and set our address mask */
++		if (bar_size & PCI_BASE_ADDRESS_SPACE_IO)
++		{
++			bar_size &= PCI_BASE_ADDRESS_IO_MASK;
++			upper_limit = &pciauto_upper_iospc;
++			DBG("PCI Autoconfig: BAR %d, I/O, ", bar_nr);
++		}
++		else
++		{
++			if ((bar_size & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
++			    PCI_BASE_ADDRESS_MEM_TYPE_64)
++				found_mem64 = 1;
++
++			bar_size &= PCI_BASE_ADDRESS_MEM_MASK;
++			upper_limit = &pciauto_upper_memspc;
++			DBG("PCI Autoconfig: BAR %d, Mem, ", bar_nr);
++		}
++
++		/* Allocate a base address (bar_size is negative!) */
++		*upper_limit = (*upper_limit + bar_size) & bar_size;
++
++		/* Write it out and update our limit */
++		pci_write_config_dword(dev, bar, *upper_limit);
++
++		/*
++		 * If we are a 64-bit decoder then increment to the
++		 * upper 32 bits of the bar and force it to locate
++		 * in the lower 4GB of memory.
++		 */
++
++		if (found_mem64)
++			pci_write_config_dword(dev, (bar+=4), 0x00000000);
++
++		DBG("size=0x%x, address=0x%x\n", ~bar_size + 1, *upper_limit);
++	}
++}
++
++/* Initialize the interrupt number. */
++
++static void __init
++pciauto_setup_irq(struct pci_controller* pci_ctrl,struct pci_dev *dev,int devfn)
++{
++	u8 pin;
++	int irq = 0;
++
++	pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &pin);
++
++	/* Fix illegal pin numbers. */
++
++	if (pin == 0 || pin > 4)
++		pin = 1;
++
++	if (pci_ctrl->map_irq)
++		irq = pci_ctrl->map_irq(dev, PCI_SLOT(devfn), pin);
++
++	if (irq == -1)
++		irq = 0;
++
++	DBG("PCI Autoconfig: Interrupt %d, pin %d\n", irq, pin);
++
++	pci_write_config_byte(dev, PCI_INTERRUPT_LINE, irq);
++}
++
++
++static void __init
++pciauto_prescan_setup_bridge(struct pci_dev *dev, int current_bus,
++			     int sub_bus, int *iosave, int *memsave)
++{
++	/* Configure bus number registers */
++	pci_write_config_byte(dev, PCI_PRIMARY_BUS, current_bus);
++	pci_write_config_byte(dev, PCI_SECONDARY_BUS, sub_bus + 1);
++	pci_write_config_byte(dev, PCI_SUBORDINATE_BUS,	0xff);
++
++	/* Round memory allocator to 1MB boundary */
++	pciauto_upper_memspc &= ~(0x100000 - 1);
++	*memsave = pciauto_upper_memspc;
++
++	/* Round I/O allocator to 4KB boundary */
++	pciauto_upper_iospc &= ~(0x1000 - 1);
++	*iosave = pciauto_upper_iospc;
++
++	/* Set up memory and I/O filter limits, assume 32-bit I/O space */
++	pci_write_config_word(dev, PCI_MEMORY_LIMIT,
++			      ((pciauto_upper_memspc - 1) & 0xfff00000) >> 16);
++	pci_write_config_byte(dev, PCI_IO_LIMIT,
++			      ((pciauto_upper_iospc - 1) & 0x0000f000) >> 8);
++	pci_write_config_word(dev, PCI_IO_LIMIT_UPPER16,
++			      ((pciauto_upper_iospc - 1) & 0xffff0000) >> 16);
++}
++
++static void __init
++pciauto_postscan_setup_bridge(struct pci_dev *dev, int current_bus, int sub_bus,
++			      int *iosave, int *memsave)
++{
++	int cmdstat;
++
++	/* Configure bus number registers */
++	pci_write_config_byte(dev, PCI_SUBORDINATE_BUS,	sub_bus);
++
++	/*
++	 * Round memory allocator to 1MB boundary.
++	 * If no space used, allocate minimum.
++	 */
++	pciauto_upper_memspc &= ~(0x100000 - 1);
++	if (*memsave == pciauto_upper_memspc)
++		pciauto_upper_memspc -= 0x00100000;
++
++	pci_write_config_word(dev, PCI_MEMORY_BASE, pciauto_upper_memspc >> 16);
++
++	/* Allocate 1MB for pre-fretch */
++	pci_write_config_word(dev, PCI_PREF_MEMORY_LIMIT,
++			      ((pciauto_upper_memspc - 1) & 0xfff00000) >> 16);
++
++	pciauto_upper_memspc -= 0x100000;
++
++	pci_write_config_word(dev, PCI_PREF_MEMORY_BASE,
++			      pciauto_upper_memspc >> 16);
++
++	/* Round I/O allocator to 4KB boundary */
++	pciauto_upper_iospc &= ~(0x1000 - 1);
++	if (*iosave == pciauto_upper_iospc)
++		pciauto_upper_iospc -= 0x1000;
++
++	pci_write_config_byte(dev, PCI_IO_BASE,
++			      (pciauto_upper_iospc & 0x0000f000) >> 8);
++	pci_write_config_word(dev, PCI_IO_BASE_UPPER16,
++			      pciauto_upper_iospc >> 16);
++
++	/* Enable memory and I/O accesses, enable bus master */
++	pci_read_config_dword(dev, PCI_COMMAND, &cmdstat);
++	pci_write_config_dword(dev, PCI_COMMAND,
++			       cmdstat |
++			       PCI_COMMAND_IO |
++			       PCI_COMMAND_MEMORY |
++			       PCI_COMMAND_MASTER);
++}
++
++/*
++ * Scan the current PCI bus.
++ */
++
++
++int __init pciauto_bus_scan(struct pci_controller *pci_ctrl, int current_bus)
++{
++	int sub_bus, pci_devfn, pci_class, cmdstat, found_multi=0;
++	unsigned short vid;
++	unsigned char header_type;
++	struct pci_dev *dev = &pciauto_dev;
++
++        pciauto_dev.bus = &pciauto_bus;
++        pciauto_dev.sysdata = pci_ctrl;
++	pciauto_bus.ops = pci_ctrl->ops;
++
++	/*
++	 * Fetch our I/O and memory space upper boundaries used
++	 * to allocated base addresses on this pci_controller.
++	 */
++
++	if (current_bus == pci_ctrl->first_busno)
++	{
++		pciauto_upper_iospc = pci_ctrl->io_resource.end + 1;
++		pciauto_upper_memspc = pci_ctrl->mem_resources[0].end + 1;
++	}
++
++	sub_bus = current_bus;
++
++	for (pci_devfn = 0; pci_devfn < 0xff; pci_devfn++)
++	{
++		/* Skip our host bridge */
++		if ((current_bus == pci_ctrl->first_busno) && (pci_devfn == 0))
++			continue;
++
++		if (PCI_FUNC(pci_devfn) && !found_multi)
++			continue;
++
++		pciauto_bus.number = current_bus;
++		pciauto_dev.devfn = pci_devfn;
++
++		/* If config space read fails from this device, move on */
++		if (pci_read_config_byte(dev, PCI_HEADER_TYPE, &header_type))
++			continue;
++
++		if (!PCI_FUNC(pci_devfn))
++			found_multi = header_type & 0x80;
++		pci_read_config_word(dev, PCI_VENDOR_ID, &vid);
++
++		if (vid == 0xffff || vid == 0x0000) {
++			found_multi = 0;
++			continue;
++		}
++
++		pci_read_config_dword(dev, PCI_CLASS_REVISION, &pci_class);
++
++		if ((pci_class >> 16) == PCI_CLASS_BRIDGE_PCI) {
++
++			int iosave, memsave;
++
++			DBG("PCI Autoconfig: Found P2P bridge, device %d\n",
++			    PCI_SLOT(pci_devfn));
++
++			/* Allocate PCI I/O and/or memory space */
++			pciauto_setup_bars(dev, PCI_BASE_ADDRESS_1);
++
++			pciauto_prescan_setup_bridge(dev, current_bus, sub_bus,
++					&iosave, &memsave);
++			sub_bus = pciauto_bus_scan(pci_ctrl, sub_bus+1);
++			pciauto_postscan_setup_bridge(dev, current_bus, sub_bus,
++					&iosave, &memsave);
++			pciauto_bus.number = current_bus;
++
++			continue;
++
++		}
++
++
++#if 0
++		/* Skip legacy mode IDE controller */
++
++		if ((pci_class >> 16) == PCI_CLASS_STORAGE_IDE) {
++
++			unsigned char prg_iface;
++			pci_read_config_byte(dev, PCI_CLASS_PROG, &prg_iface);
++
++			if (!(prg_iface & PCIAUTO_IDE_MODE_MASK)) {
++				DBG("PCI Autoconfig: Skipping legacy mode "
++				    "IDE controller\n");
++				continue;
++			}
++		}
++#endif
++
++		/*
++		 * Found a peripheral, enable some standard
++		 * settings
++		 */
++
++		pci_read_config_dword(dev, PCI_COMMAND,	&cmdstat);
++		pci_write_config_dword(dev, PCI_COMMAND,
++				cmdstat |
++					PCI_COMMAND_IO |
++					PCI_COMMAND_MEMORY |
++					PCI_COMMAND_MASTER);
++		pci_write_config_byte(dev, PCI_LATENCY_TIMER, 0x80);
++
++		/* Allocate PCI I/O and/or memory space */
++		DBG("PCI Autoconfig: Found Bus %d, Device %d, Function %d\n",
++		    current_bus, PCI_SLOT(pci_devfn), PCI_FUNC(pci_devfn) );
++
++		pciauto_setup_bars(dev, PCI_BASE_ADDRESS_5);
++		pciauto_setup_irq(pci_ctrl, dev, pci_devfn);
++	}
++	return sub_bus;
++}
++
++
++
++
++
+Index: linux-2.6.10/arch/xtensa/lib/strcasecmp.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/strcasecmp.c
+@@ -0,0 +1,32 @@
++/*
++ *  linux/arch/xtensa/lib/strcasecmp.c
++ *
++ *  This file is subject to the terms and conditions of the GNU General
++ *  Public License.  See the file "COPYING" in the main directory of
++ *  this archive for more details.
++ *
++ *  Copyright (C) 2002 Tensilica Inc.
++ */
++
++#include <linux/string.h>
++
++
++/* We handle nothing here except the C locale.  Since this is used in
++   only one place, on strings known to contain only 7 bit ASCII, this
++   is ok.  */
++
++int strcasecmp(const char *a, const char *b)
++{
++	int ca, cb;
++
++	do {
++		ca = *a++ & 0xff;
++		cb = *b++ & 0xff;
++		if (ca >= 'A' && ca <= 'Z')
++			ca += 'a' - 'A';
++		if (cb >= 'A' && cb <= 'Z')
++			cb += 'a' - 'A';
++	} while (ca == cb && ca != '\0');
++
++	return ca - cb;
++}
+Index: linux-2.6.10/arch/xtensa/lib/strncpy_user.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/strncpy_user.S
+@@ -0,0 +1,224 @@
++/*
++ *  arch/xtensa/lib/strncpy_user.S
++ *
++ *  This file is subject to the terms and conditions of the GNU General
++ *  Public License.  See the file "COPYING" in the main directory of
++ *  this archive for more details.
++ *
++ *  Returns: -EFAULT if exception before terminator, N if the entire
++ *  buffer filled, else strlen.
++ *
++ *  Copyright (C) 2002 Tensilica Inc.
++ */
++
++#include <xtensa/coreasm.h>
++#include <linux/errno.h>
++
++/* Load or store instructions that may cause exceptions use the EX macro. */
++
++#define EX(insn,reg1,reg2,offset,handler)	\
++9:	insn	reg1, reg2, offset;		\
++	.section __ex_table, "a";		\
++	.word	9b, handler;			\
++	.previous
++
++/*
++ * char *__strncpy_user(char *dst, const char *src, size_t len)
++ */
++.text
++.begin literal
++.align	4
++.Lmask0:
++	.byte	0xff, 0x00, 0x00, 0x00
++.Lmask1:
++	.byte	0x00, 0xff, 0x00, 0x00
++.Lmask2:
++	.byte	0x00, 0x00, 0xff, 0x00
++.Lmask3:
++	.byte	0x00, 0x00, 0x00, 0xff
++.end literal
++
++# Register use
++#   a0/ return address
++#   a1/ stack pointer
++#   a2/ return value
++#   a3/ src
++#   a4/ len
++#   a5/ mask0
++#   a6/ mask1
++#   a7/ mask2
++#   a8/ mask3
++#   a9/ tmp
++#   a10/ tmp
++#   a11/ dst
++#   a12/ tmp
++
++.align	4
++.global	__strncpy_user
++.type	__strncpy_user,@function
++__strncpy_user:
++	entry	sp, 16		# minimal stack frame
++	# a2/ dst, a3/ src, a4/ len
++	mov	a11, a2		# leave dst in return value register
++	beqz	a4, .Lret	# if len is zero
++	l32r	a5, .Lmask0	# mask for byte 0
++	l32r	a6, .Lmask1	# mask for byte 1
++	l32r	a7, .Lmask2	# mask for byte 2
++	l32r	a8, .Lmask3	# mask for byte 3
++	bbsi.l	a3, 0, .Lsrc1mod2 # if only  8-bit aligned
++	bbsi.l	a3, 1, .Lsrc2mod4 # if only 16-bit aligned
++.Lsrcaligned:	# return here when src is word-aligned
++	srli	a12, a4, 2	# number of loop iterations with 4B per loop
++	movi	a9, 3
++	bnone	a11, a9, .Laligned
++	j	.Ldstunaligned
++
++.Lsrc1mod2:	# src address is odd
++	EX(l8ui, a9, a3, 0, fixup_l)	# get byte 0
++	addi	a3, a3, 1		# advance src pointer
++	EX(s8i, a9, a11, 0, fixup_s)	# store byte 0
++	beqz	a9, .Lret		# if byte 0 is zero
++	addi	a11, a11, 1		# advance dst pointer
++	addi	a4, a4, -1		# decrement len
++	beqz	a4, .Lret		# if len is zero
++	bbci.l	a3, 1, .Lsrcaligned	# if src is now word-aligned
++
++.Lsrc2mod4:	# src address is 2 mod 4
++	EX(l8ui, a9, a3, 0, fixup_l)	# get byte 0
++	/* 1-cycle interlock */
++	EX(s8i, a9, a11, 0, fixup_s)	# store byte 0
++	beqz	a9, .Lret		# if byte 0 is zero
++	addi	a11, a11, 1		# advance dst pointer
++	addi	a4, a4, -1		# decrement len
++	beqz	a4, .Lret		# if len is zero
++	EX(l8ui, a9, a3, 1, fixup_l)	# get byte 0
++	addi	a3, a3, 2		# advance src pointer
++	EX(s8i, a9, a11, 0, fixup_s)	# store byte 0
++	beqz	a9, .Lret		# if byte 0 is zero
++	addi	a11, a11, 1		# advance dst pointer
++	addi	a4, a4, -1		# decrement len
++	bnez	a4, .Lsrcaligned	# if len is nonzero
++.Lret:
++	sub	a2, a11, a2		# compute strlen
++	retw
++
++/*
++ * dst is word-aligned, src is word-aligned
++ */
++	.align	4		# 1 mod 4 alignment for LOOPNEZ
++	.byte	0		# (0 mod 4 alignment for LBEG)
++.Laligned:
++#if XCHAL_HAVE_LOOPS
++	loopnez	a12, .Loop1done
++#else
++	beqz	a12, .Loop1done
++	slli	a12, a12, 2
++	add	a12, a12, a11	# a12 = end of last 4B chunck
++#endif
++.Loop1:
++	EX(l32i, a9, a3, 0, fixup_l)	# get word from src
++	addi	a3, a3, 4		# advance src pointer
++	bnone	a9, a5, .Lz0		# if byte 0 is zero
++	bnone	a9, a6, .Lz1		# if byte 1 is zero
++	bnone	a9, a7, .Lz2		# if byte 2 is zero
++	EX(s32i, a9, a11, 0, fixup_s)	# store word to dst
++	bnone	a9, a8, .Lz3		# if byte 3 is zero
++	addi	a11, a11, 4		# advance dst pointer
++#if !XCHAL_HAVE_LOOPS
++	blt	a11, a12, .Loop1
++#endif
++
++.Loop1done:
++	bbci.l	a4, 1, .L100
++	# copy 2 bytes
++	EX(l16ui, a9, a3, 0, fixup_l)
++	addi	a3, a3, 2		# advance src pointer
++#ifdef __XTENSA_EB__
++	bnone	a9, a7, .Lz0		# if byte 2 is zero
++	bnone	a9, a8, .Lz1		# if byte 3 is zero
++#else
++	bnone	a9, a5, .Lz0		# if byte 0 is zero
++	bnone	a9, a6, .Lz1		# if byte 1 is zero
++#endif
++	EX(s16i, a9, a11, 0, fixup_s)
++	addi	a11, a11, 2		# advance dst pointer
++.L100:
++	bbci.l	a4, 0, .Lret
++	EX(l8ui, a9, a3, 0, fixup_l)
++	/* slot */
++	EX(s8i, a9, a11, 0, fixup_s)
++	beqz	a9, .Lret		# if byte is zero
++	addi	a11, a11, 1-3		# advance dst ptr 1, but also cancel
++					# the effect of adding 3 in .Lz3 code
++	/* fall thru to .Lz3 and "retw" */
++
++.Lz3:	# byte 3 is zero
++	addi	a11, a11, 3		# advance dst pointer
++	sub	a2, a11, a2		# compute strlen
++	retw
++.Lz0:	# byte 0 is zero
++#ifdef __XTENSA_EB__
++	movi	a9, 0
++#endif /* __XTENSA_EB__ */
++	EX(s8i, a9, a11, 0, fixup_s)
++	sub	a2, a11, a2		# compute strlen
++	retw
++.Lz1:	# byte 1 is zero
++#ifdef __XTENSA_EB__
++        extui   a9, a9, 16, 16
++#endif /* __XTENSA_EB__ */
++	EX(s16i, a9, a11, 0, fixup_s)
++	addi	a11, a11, 1		# advance dst pointer
++	sub	a2, a11, a2		# compute strlen
++	retw
++.Lz2:	# byte 2 is zero
++#ifdef __XTENSA_EB__
++        extui   a9, a9, 16, 16
++#endif /* __XTENSA_EB__ */
++	EX(s16i, a9, a11, 0, fixup_s)
++	movi	a9, 0
++	EX(s8i, a9, a11, 2, fixup_s)
++	addi	a11, a11, 2		# advance dst pointer
++	sub	a2, a11, a2		# compute strlen
++	retw
++
++	.align	4		# 1 mod 4 alignment for LOOPNEZ
++	.byte	0		# (0 mod 4 alignment for LBEG)
++.Ldstunaligned:
++/*
++ * for now just use byte copy loop
++ */
++#if XCHAL_HAVE_LOOPS
++	loopnez	a4, .Lunalignedend
++#else
++	beqz	a4, .Lunalignedend
++	add	a12, a11, a4		# a12 = ending address
++#endif /* XCHAL_HAVE_LOOPS */
++.Lnextbyte:
++	EX(l8ui, a9, a3, 0, fixup_l)
++	addi	a3, a3, 1
++	EX(s8i, a9, a11, 0, fixup_s)
++	beqz	a9, .Lunalignedend
++	addi	a11, a11, 1
++#if !XCHAL_HAVE_LOOPS
++	blt	a11, a12, .Lnextbyte
++#endif
++
++.Lunalignedend:
++	sub	a2, a11, a2		# compute strlen
++	retw
++
++
++	.section .fixup, "ax"
++	.align	4
++
++	/* For now, just return -EFAULT.  Future implementations might
++	 * like to clear remaining kernel space, like the fixup
++	 * implementation in memset().  Thus, we differentiate between
++	 * load/store fixups. */
++
++fixup_s:
++fixup_l:
++	movi	a2, -EFAULT
++	retw
++
+Index: linux-2.6.10/arch/xtensa/lib/strnlen_user.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/strnlen_user.S
+@@ -0,0 +1,147 @@
++/*
++ *  arch/xtensa/lib/strnlen_user.S
++ *
++ *  This file is subject to the terms and conditions of the GNU General
++ *  Public License.  See the file "COPYING" in the main directory of
++ *  this archive for more details.
++ *
++ *  Returns strnlen, including trailing zero terminator.
++ *  Zero indicates error.
++ *
++ *  Copyright (C) 2002 Tensilica Inc.
++ */
++
++#include <xtensa/coreasm.h>
++
++/* Load or store instructions that may cause exceptions use the EX macro. */
++
++#define EX(insn,reg1,reg2,offset,handler)	\
++9:	insn	reg1, reg2, offset;		\
++	.section __ex_table, "a";		\
++	.word	9b, handler;			\
++	.previous
++
++/*
++ * size_t __strnlen_user(const char *s, size_t len)
++ */
++.text
++.begin literal
++.align	4
++.Lmask0:
++	.byte	0xff, 0x00, 0x00, 0x00
++.Lmask1:
++	.byte	0x00, 0xff, 0x00, 0x00
++.Lmask2:
++	.byte	0x00, 0x00, 0xff, 0x00
++.Lmask3:
++	.byte	0x00, 0x00, 0x00, 0xff
++.end literal
++
++# Register use:
++#   a2/ src
++#   a3/ len
++#   a4/ tmp
++#   a5/ mask0
++#   a6/ mask1
++#   a7/ mask2
++#   a8/ mask3
++#   a9/ tmp
++#   a10/ tmp
++
++.align	4
++.global	__strnlen_user
++.type	__strnlen_user,@function
++__strnlen_user:
++	entry	sp, 16		# minimal stack frame
++	# a2/ s, a3/ len
++	addi	a4, a2, -4	# because we overincrement at the end;
++				# we compensate with load offsets of 4
++	l32r	a5, .Lmask0	# mask for byte 0
++	l32r	a6, .Lmask1	# mask for byte 1
++	l32r	a7, .Lmask2	# mask for byte 2
++	l32r	a8, .Lmask3	# mask for byte 3
++	bbsi.l	a2, 0, .L1mod2	# if only  8-bit aligned
++	bbsi.l	a2, 1, .L2mod4	# if only 16-bit aligned
++
++/*
++ * String is word-aligned.
++ */
++.Laligned:
++	srli	a10, a3, 2	# number of loop iterations with 4B per loop
++#if XCHAL_HAVE_LOOPS
++	loopnez	a10, .Ldone
++#else
++	beqz	a10, .Ldone
++	slli	a10, a10, 2
++	add	a10, a10, a4	# a10 = end of last 4B chunk
++#endif /* XCHAL_HAVE_LOOPS */
++.Loop:
++	EX(l32i, a9, a4, 4, lenfixup)	# get next word of string
++	addi	a4, a4, 4		# advance string pointer
++	bnone	a9, a5, .Lz0		# if byte 0 is zero
++	bnone	a9, a6, .Lz1		# if byte 1 is zero
++	bnone	a9, a7, .Lz2		# if byte 2 is zero
++	bnone	a9, a8, .Lz3		# if byte 3 is zero
++#if !XCHAL_HAVE_LOOPS
++	blt	a4, a10, .Loop
++#endif
++
++.Ldone:
++	EX(l32i, a9, a4, 4, lenfixup)	# load 4 bytes for remaining checks
++
++	bbci.l	a3, 1, .L100
++	# check two more bytes (bytes 0, 1 of word)
++	addi	a4, a4, 2	# advance string pointer
++	bnone	a9, a5, .Lz0	# if byte 0 is zero
++	bnone	a9, a6, .Lz1	# if byte 1 is zero
++.L100:
++	bbci.l	a3, 0, .L101
++	# check one more byte (byte 2 of word)
++	# Actually, we don't need to check.  Zero or nonzero, we'll add one.
++	# Do not add an extra one for the NULL terminator since we have
++	#  exhausted the original len parameter.
++	addi	a4, a4, 1	# advance string pointer
++.L101:
++	sub	a2, a4, a2	# compute length
++	retw
++
++# NOTE that in several places below, we point to the byte just after
++# the zero byte in order to include the NULL terminator in the count.
++
++.Lz3:	# byte 3 is zero
++	addi	a4, a4, 3	# point to zero byte
++.Lz0:	# byte 0 is zero
++	addi	a4, a4, 1	# point just beyond zero byte
++	sub	a2, a4, a2	# subtract to get length
++	retw
++.Lz1:	# byte 1 is zero
++	addi	a4, a4, 1+1	# point just beyond zero byte
++	sub	a2, a4, a2	# subtract to get length
++	retw
++.Lz2:	# byte 2 is zero
++	addi	a4, a4, 2+1	# point just beyond zero byte
++	sub	a2, a4, a2	# subtract to get length
++	retw
++
++.L1mod2:	# address is odd
++	EX(l8ui, a9, a4, 4, lenfixup)	# get byte 0
++	addi	a4, a4, 1		# advance string pointer
++	beqz	a9, .Lz3		# if byte 0 is zero
++	bbci.l	a4, 1, .Laligned	# if string pointer is now word-aligned
++
++.L2mod4:	# address is 2 mod 4
++	addi	a4, a4, 2	# advance ptr for aligned access
++	EX(l32i, a9, a4, 0, lenfixup)	# get word with first two bytes of string
++	bnone	a9, a7, .Lz2	# if byte 2 (of word, not string) is zero
++	bany	a9, a8, .Laligned # if byte 3 (of word, not string) is nonzero
++	# byte 3 is zero
++	addi	a4, a4, 3+1	# point just beyond zero byte
++	sub	a2, a4, a2	# subtract to get length
++	retw
++
++	.section .fixup, "ax"
++	.align	4
++lenfixup:
++	movi	a2, 0
++	retw
++
+Index: linux-2.6.10/arch/xtensa/lib/usercopy.S
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/xtensa/lib/usercopy.S
+@@ -0,0 +1,321 @@
++/*
++ *  arch/xtensa/lib/usercopy.S
++ *
++ *  Copy to/from user space (derived from arch/xtensa/lib/hal/memcopy.S)
++ *
++ *  DO NOT COMBINE this function with <arch/xtensa/lib/hal/memcopy.S>.
++ *  It needs to remain separate and distinct.  The hal files are part
++ *  of the the Xtensa link-time HAL, and those files may differ per
++ *  processor configuration.  Patching the kernel for another
++ *  processor configuration includes replacing the hal files, and we
++ *  could loose the special functionality for accessing user-space
++ *  memory during such a patch.  We sacrifice a little code space here
++ *  in favor to simplify code maintenance.
++ *
++ *  This file is subject to the terms and conditions of the GNU General
++ *  Public License.  See the file "COPYING" in the main directory of
++ *  this archive for more details.
++ *
++ *  Copyright (C) 2002 Tensilica Inc.
++ */
++
++
++/*
++ * size_t __xtensa_copy_user (void *dst, const void *src, size_t len);
++ *
++ * The returned value is the number of bytes not copied.  Implies zero
++ * is success.
++ *
++ * The general case algorithm is as follows:
++ *   If the destination and source are both aligned,
++ *     do 16B chunks with a loop, and then finish up with
++ *     8B, 4B, 2B, and 1B copies conditional on the length.
++ *   If destination is aligned and source unaligned,
++ *     do the same, but use SRC to align the source data.
++ *   If destination is unaligned, align it by conditionally
++ *     copying 1B and 2B and then retest.
++ *   This code tries to use fall-through braches for the common
++ *     case of aligned destinations (except for the branches to
++ *     the alignment label).
++ *
++ * Register use:
++ *	a0/ return address
++ *	a1/ stack pointer
++ *	a2/ return value
++ *	a3/ src
++ *	a4/ length
++ *	a5/ dst
++ *	a6/ tmp
++ *	a7/ tmp
++ *	a8/ tmp
++ *	a9/ tmp
++ *	a10/ tmp
++ *	a11/ original length
++ */
++
++#include <xtensa/coreasm.h>
++
++#ifdef __XTENSA_EB__
++#define ALIGN(R, W0, W1) src	R, W0, W1
++#define SSA8(R)	ssa8b R
++#else
++#define ALIGN(R, W0, W1) src	R, W1, W0
++#define SSA8(R)	ssa8l R
++#endif
++
++/* Load or store instructions that may cause exceptions use the EX macro. */
++
++#define EX(insn,reg1,reg2,offset,handler)	\
++9:	insn	reg1, reg2, offset;		\
++	.section __ex_table, "a";		\
++	.word	9b, handler;			\
++	.previous
++
++
++	.text
++	.align	4
++	.global	__xtensa_copy_user
++	.type	__xtensa_copy_user,@function
++__xtensa_copy_user:
++	entry	sp, 16		# minimal stack frame
++	# a2/ dst, a3/ src, a4/ len
++	mov	a5, a2		# copy dst so that a2 is return value
++	mov	a11, a4		# preserve original len for error case
++.Lcommon:
++	bbsi.l	a2, 0, .Ldst1mod2 # if dst is 1 mod 2
++	bbsi.l	a2, 1, .Ldst2mod4 # if dst is 2 mod 4
++.Ldstaligned:	# return here from .Ldstunaligned when dst is aligned
++	srli	a7, a4, 4	# number of loop iterations with 16B
++				# per iteration
++	movi	a8, 3		  # if source is also aligned,
++	bnone	a3, a8, .Laligned # then use word copy
++	SSA8(	a3)		# set shift amount from byte offset
++	bnez	a4, .Lsrcunaligned
++	movi	a2, 0		# return success for len==0
++	retw
++
++/*
++ * Destination is unaligned
++ */
++
++.Ldst1mod2:	# dst is only byte aligned
++	bltui	a4, 7, .Lbytecopy	# do short copies byte by byte
++
++	# copy 1 byte
++	EX(l8ui, a6, a3, 0, l_fixup)
++	addi	a3, a3,  1
++	EX(s8i, a6, a5,  0, s_fixup)
++	addi	a5, a5,  1
++	addi	a4, a4, -1
++	bbci.l	a5, 1, .Ldstaligned	# if dst is now aligned, then
++					# return to main algorithm
++.Ldst2mod4:	# dst 16-bit aligned
++	# copy 2 bytes
++	bltui	a4, 6, .Lbytecopy	# do short copies byte by byte
++	EX(l8ui, a6, a3, 0, l_fixup)
++	EX(l8ui, a7, a3, 1, l_fixup)
++	addi	a3, a3,  2
++	EX(s8i, a6, a5,  0, s_fixup)
++	EX(s8i, a7, a5,  1, s_fixup)
++	addi	a5, a5,  2
++	addi	a4, a4, -2
++	j	.Ldstaligned	# dst is now aligned, return to main algorithm
++
++/*
++ * Byte by byte copy
++ */
++	.align	4
++	.byte	0		# 1 mod 4 alignment for LOOPNEZ
++				# (0 mod 4 alignment for LBEG)
++.Lbytecopy:
++#if XCHAL_HAVE_LOOPS
++	loopnez	a4, .Lbytecopydone
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a4, .Lbytecopydone
++	add	a7, a3, a4	# a7 = end address for source
++#endif /* !XCHAL_HAVE_LOOPS */
++.Lnextbyte:
++	EX(l8ui, a6, a3, 0, l_fixup)
++	addi	a3, a3, 1
++	EX(s8i, a6, a5, 0, s_fixup)
++	addi	a5, a5, 1
++#if !XCHAL_HAVE_LOOPS
++	blt	a3, a7, .Lnextbyte
++#endif /* !XCHAL_HAVE_LOOPS */
++.Lbytecopydone:
++	movi	a2, 0		# return success for len bytes copied
++	retw
++
++/*
++ * Destination and source are word-aligned.
++ */
++	# copy 16 bytes per iteration for word-aligned dst and word-aligned src
++	.align	4		# 1 mod 4 alignment for LOOPNEZ
++	.byte	0		# (0 mod 4 alignment for LBEG)
++.Laligned:
++#if XCHAL_HAVE_LOOPS
++	loopnez	a7, .Loop1done
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a7, .Loop1done
++	slli	a8, a7, 4
++	add	a8, a8, a3	# a8 = end of last 16B source chunk
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop1:
++	EX(l32i, a6, a3,  0, l_fixup)
++	EX(l32i, a7, a3,  4, l_fixup)
++	EX(s32i, a6, a5,  0, s_fixup)
++	EX(l32i, a6, a3,  8, l_fixup)
++	EX(s32i, a7, a5,  4, s_fixup)
++	EX(l32i, a7, a3, 12, l_fixup)
++	EX(s32i, a6, a5,  8, s_fixup)
++	addi	a3, a3, 16
++	EX(s32i, a7, a5, 12, s_fixup)
++	addi	a5, a5, 16
++#if !XCHAL_HAVE_LOOPS
++	blt	a3, a8, .Loop1
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop1done:
++	bbci.l	a4, 3, .L2
++	# copy 8 bytes
++	EX(l32i, a6, a3,  0, l_fixup)
++	EX(l32i, a7, a3,  4, l_fixup)
++	addi	a3, a3,  8
++	EX(s32i, a6, a5,  0, s_fixup)
++	EX(s32i, a7, a5,  4, s_fixup)
++	addi	a5, a5,  8
++.L2:
++	bbci.l	a4, 2, .L3
++	# copy 4 bytes
++	EX(l32i, a6, a3,  0, l_fixup)
++	addi	a3, a3,  4
++	EX(s32i, a6, a5,  0, s_fixup)
++	addi	a5, a5,  4
++.L3:
++	bbci.l	a4, 1, .L4
++	# copy 2 bytes
++	EX(l16ui, a6, a3,  0, l_fixup)
++	addi	a3, a3,  2
++	EX(s16i,  a6, a5,  0, s_fixup)
++	addi	a5, a5,  2
++.L4:
++	bbci.l	a4, 0, .L5
++	# copy 1 byte
++	EX(l8ui, a6, a3,  0, l_fixup)
++	EX(s8i,  a6, a5,  0, s_fixup)
++.L5:
++	movi	a2, 0		# return success for len bytes copied
++	retw
++
++/*
++ * Destination is aligned, Source is unaligned
++ */
++
++	.align	4
++	.byte	0		# 1 mod 4 alignement for LOOPNEZ
++				# (0 mod 4 alignment for LBEG)
++.Lsrcunaligned:
++	# copy 16 bytes per iteration for word-aligned dst and unaligned src
++	and	a10, a3, a8	# save unalignment offset for below
++	sub	a3, a3, a10	# align a3 (to avoid sim warnings only; not needed for hardware)
++	EX(l32i, a6, a3, 0, l_fixup)	# load first word
++#if XCHAL_HAVE_LOOPS
++	loopnez	a7, .Loop2done
++#else /* !XCHAL_HAVE_LOOPS */
++	beqz	a7, .Loop2done
++	slli	a10, a7, 4
++	add	a10, a10, a3	# a10 = end of last 16B source chunk
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop2:
++	EX(l32i, a7, a3,  4, l_fixup)
++	EX(l32i, a8, a3,  8, l_fixup)
++	ALIGN(	a6, a6, a7)
++	EX(s32i, a6, a5,  0, s_fixup)
++	EX(l32i, a9, a3, 12, l_fixup)
++	ALIGN(	a7, a7, a8)
++	EX(s32i, a7, a5,  4, s_fixup)
++	EX(l32i, a6, a3, 16, l_fixup)
++	ALIGN(	a8, a8, a9)
++	EX(s32i, a8, a5,  8, s_fixup)
++	addi	a3, a3, 16
++	ALIGN(	a9, a9, a6)
++	EX(s32i, a9, a5, 12, s_fixup)
++	addi	a5, a5, 16
++#if !XCHAL_HAVE_LOOPS
++	blt	a3, a10, .Loop2
++#endif /* !XCHAL_HAVE_LOOPS */
++.Loop2done:
++	bbci.l	a4, 3, .L12
++	# copy 8 bytes
++	EX(l32i, a7, a3,  4, l_fixup)
++	EX(l32i, a8, a3,  8, l_fixup)
++	ALIGN(	a6, a6, a7)
++	EX(s32i, a6, a5,  0, s_fixup)
++	addi	a3, a3,  8
++	ALIGN(	a7, a7, a8)
++	EX(s32i, a7, a5,  4, s_fixup)
++	addi	a5, a5,  8
++	mov	a6, a8
++.L12:
++	bbci.l	a4, 2, .L13
++	# copy 4 bytes
++	EX(l32i, a7, a3,  4, l_fixup)
++	addi	a3, a3,  4
++	ALIGN(	a6, a6, a7)
++	EX(s32i, a6, a5,  0, s_fixup)
++	addi	a5, a5,  4
++	mov	a6, a7
++.L13:
++	add	a3, a3, a10	# readjust a3 with correct misalignment
++	bbci.l	a4, 1, .L14
++	# copy 2 bytes
++	EX(l8ui, a6, a3,  0, l_fixup)
++	EX(l8ui, a7, a3,  1, l_fixup)
++	addi	a3, a3,  2
++	EX(s8i, a6, a5,  0, s_fixup)
++	EX(s8i, a7, a5,  1, s_fixup)
++	addi	a5, a5,  2
++.L14:
++	bbci.l	a4, 0, .L15
++	# copy 1 byte
++	EX(l8ui, a6, a3,  0, l_fixup)
++	EX(s8i,  a6, a5,  0, s_fixup)
++.L15:
++	movi	a2, 0		# return success for len bytes copied
++	retw
++
++
++	.section .fixup, "ax"
++	.align	4
++
++/* a2 = original dst; a5 = current dst; a11= original len
++ * bytes_copied = a5 - a2
++ * retval = bytes_not_copied = original len - bytes_copied
++ * retval = a11 - (a5 - a2)
++ *
++ * Clearing the remaining pieces of kernel memory plugs security
++ * holes.  This functionality is the equivalent of the *_zeroing
++ * functions that some architectures provide.
++ */
++
++.Lmemset:
++	.word	memset
++
++s_fixup:
++	sub	a2, a5, a2	/* a2 <-- bytes copied */
++	sub	a2, a11, a2	/* a2 <-- bytes not copied */
++	retw
++
++l_fixup:
++	sub	a2, a5, a2	/* a2 <-- bytes copied */
++	sub	a2, a11, a2	/* a2 <-- bytes not copied == return value */
++
++	/* void *memset(void *s, int c, size_t n); */
++	mov	a6, a5		/* s */
++	movi	a7, 0		/* c */
++	mov	a8, a2		/* n */
++	l32r	a4, .Lmemset
++	callx4	a4
++	/* Ignore memset return value in a6. */
++	/* a2 still contains bytes not copied. */
++	retw
++
+Index: linux-2.6.10/mvl_patches/pro-1085.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1085.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1085);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,600 @@
+#! /usr/bin/env bash
+# Patch: -NETLINK_Synchronous_message_processing
+# Date: Fri Jan  4 18:37:58 2008
+# MR: 18686
+# 
+# commit 2a0a6ebee1d68552152ae8d4aeda91d806995dec
+# Author: Herbert Xu <herbert@gondor.apana.org.au>
+# Date:   Tue May 3 14:55:09 2005 -0700
+# 
+#     [NETLINK]: Synchronous message processing.
+#     
+#     Let's recap the problem.  The current asynchronous netlink kernel
+#     message processing is vulnerable to these attacks:
+#     
+#     1) Hit and run: Attacker sends one or more messages and then exits
+#     before they're processed.  This may confuse/disable the next netlink
+#     user that gets the netlink address of the attacker since it may
+#     receive the responses to the attacker's messages.
+#     
+#     Proposed solutions:
+#     
+#     a) Synchronous processing.
+#     b) Stream mode socket.
+#     c) Restrict/prohibit binding.
+#     
+#     2) Starvation: Because various netlink rcv functions were written
+#     to not return until all messages have been processed on a socket,
+#     it is possible for these functions to execute for an arbitrarily
+#     long period of time.  If this is successfully exploited it could
+#     also be used to hold rtnl forever.
+#     
+#     Proposed solutions:
+#     
+#     a) Synchronous processing.
+#     b) Stream mode socket.
+#     
+#     Firstly let's cross off solution c).  It only solves the first
+#     problem and it has user-visible impacts.  In particular, it'll
+#     break user space applications that expect to bind or communicate
+#     with specific netlink addresses (pid's).
+#     
+#     So we're left with a choice of synchronous processing versus
+#     SOCK_STREAM for netlink.
+#     
+#     For the moment I'm sticking with the synchronous approach as
+#     suggested by Alexey since it's simpler and I'd rather spend
+#     my time working on other things.
+#     
+#     However, it does have a number of deficiencies compared to the
+#     stream mode solution:
+#     
+#     1) User-space to user-space netlink communication is still vulnerable.
+#     
+#     2) Inefficient use of resources.  This is especially true for rtnetlink
+#     since the lock is shared with other users such as networking drivers.
+#     The latter could hold the rtnl while communicating with hardware which
+#     causes the rtnetlink user to wait when it could be doing other things.
+#     
+#     3) It is still possible to DoS all netlink users by flooding the kernel
+#     netlink receive queue.  The attacker simply fills the receive socket
+#     with a single netlink message that fills up the entire queue.  The
+#     attacker then continues to call sendmsg with the same message in a loop.
+#     
+#     Point 3) can be countered by retransmissions in user-space code, however
+#     it is pretty messy.
+#     
+#     In light of these problems (in particular, point 3), we should implement
+#     stream mode netlink at some point.  In the mean time, here is a patch
+#     that implements synchronous processing.
+#     
+#     Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+#     Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1493
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18686
+
+commit 2a0a6ebee1d68552152ae8d4aeda91d806995dec
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Tue May 3 14:55:09 2005 -0700
+
+    [NETLINK]: Synchronous message processing.
+    
+    Let's recap the problem.  The current asynchronous netlink kernel
+    message processing is vulnerable to these attacks:
+    
+    1) Hit and run: Attacker sends one or more messages and then exits
+    before they're processed.  This may confuse/disable the next netlink
+    user that gets the netlink address of the attacker since it may
+    receive the responses to the attacker's messages.
+    
+    Proposed solutions:
+    
+    a) Synchronous processing.
+    b) Stream mode socket.
+    c) Restrict/prohibit binding.
+    
+    2) Starvation: Because various netlink rcv functions were written
+    to not return until all messages have been processed on a socket,
+    it is possible for these functions to execute for an arbitrarily
+    long period of time.  If this is successfully exploited it could
+    also be used to hold rtnl forever.
+    
+    Proposed solutions:
+    
+    a) Synchronous processing.
+    b) Stream mode socket.
+    
+    Firstly let's cross off solution c).  It only solves the first
+    problem and it has user-visible impacts.  In particular, it'll
+    break user space applications that expect to bind or communicate
+    with specific netlink addresses (pid's).
+    
+    So we're left with a choice of synchronous processing versus
+    SOCK_STREAM for netlink.
+    
+    For the moment I'm sticking with the synchronous approach as
+    suggested by Alexey since it's simpler and I'd rather spend
+    my time working on other things.
+    
+    However, it does have a number of deficiencies compared to the
+    stream mode solution:
+    
+    1) User-space to user-space netlink communication is still vulnerable.
+    
+    2) Inefficient use of resources.  This is especially true for rtnetlink
+    since the lock is shared with other users such as networking drivers.
+    The latter could hold the rtnl while communicating with hardware which
+    causes the rtnetlink user to wait when it could be doing other things.
+    
+    3) It is still possible to DoS all netlink users by flooding the kernel
+    netlink receive queue.  The attacker simply fills the receive socket
+    with a single netlink message that fills up the entire queue.  The
+    attacker then continues to call sendmsg with the same message in a loop.
+    
+    Point 3) can be countered by retransmissions in user-space code, however
+    it is pretty messy.
+    
+    In light of these problems (in particular, point 3), we should implement
+    stream mode netlink at some point.  In the mean time, here is a patch
+    that implements synchronous processing.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/audit.c b/kernel/audit.c
+index 0f84dd7..ac26d4d 100644
+
+Index: linux-2.6.10/kernel/audit.c
+===================================================================
+--- linux-2.6.10.orig/kernel/audit.c
++++ linux-2.6.10/kernel/audit.c
+@@ -405,7 +405,7 @@ static int audit_receive_msg(struct sk_b
+ /* Get message from skb (based on rtnetlink_rcv_skb).  Each message is
+  * processed by audit_receive_msg.  Malformed skbs with wrong length are
+  * discarded silently.  */
+-static int audit_receive_skb(struct sk_buff *skb)
++static void audit_receive_skb(struct sk_buff *skb)
+ {
+ 	int		err;
+ 	struct nlmsghdr	*nlh;
+@@ -414,7 +414,7 @@ static int audit_receive_skb(struct sk_b
+ 	while (skb->len >= NLMSG_SPACE(0)) {
+ 		nlh = (struct nlmsghdr *)skb->data;
+ 		if (nlh->nlmsg_len < sizeof(*nlh) || skb->len < nlh->nlmsg_len)
+-			return 0;
++			return;
+ 		rlen = NLMSG_ALIGN(nlh->nlmsg_len);
+ 		if (rlen > skb->len)
+ 			rlen = skb->len;
+@@ -424,23 +424,20 @@ static int audit_receive_skb(struct sk_b
+ 			netlink_ack(skb, nlh, 0);
+ 		skb_pull(skb, rlen);
+ 	}
+-	return 0;
+ }
+ 
+ /* Receive messages from netlink socket. */
+ static void audit_receive(struct sock *sk, int length)
+ {
+ 	struct sk_buff  *skb;
++	unsigned int qlen;
+ 
+-	if (down_trylock(&audit_netlink_sem))
+-		return;
++	down(&audit_netlink_sem);
+ 
+-				/* FIXME: this must not cause starvation */
+-	while ((skb = skb_dequeue(&sk->sk_receive_queue))) {
+-		if (audit_receive_skb(skb) && skb->len)
+-			skb_queue_head(&sk->sk_receive_queue, skb);
+-		else
+-			kfree_skb(skb);
++	for (qlen = skb_queue_len(&sk->sk_receive_queue); qlen; qlen--) {
++		skb = skb_dequeue(&sk->sk_receive_queue);
++		audit_receive_skb(skb);
++		kfree_skb(skb);
+ 	}
+ 	up(&audit_netlink_sem);
+ }
+Index: linux-2.6.10/net/core/rtnetlink.c
+===================================================================
+--- linux-2.6.10.orig/net/core/rtnetlink.c
++++ linux-2.6.10/net/core/rtnetlink.c
+@@ -590,26 +590,31 @@ static inline int rtnetlink_rcv_skb(stru
+ 
+ /*
+  *  rtnetlink input queue processing routine:
+- *	- try to acquire shared lock. If it is failed, defer processing.
++ *	- process as much as there was in the queue upon entry.
+  *	- feed skbs to rtnetlink_rcv_skb, until it refuse a message,
+- *	  that will occur, when a dump started and/or acquisition of
+- *	  exclusive lock failed.
++ *	  that will occur, when a dump started.
+  */
+ 
+ static void rtnetlink_rcv(struct sock *sk, int len)
+ {
++	unsigned int qlen = skb_queue_len(&sk->sk_receive_queue);
++
+ 	do {
+ 		struct sk_buff *skb;
+ 
+-		if (rtnl_shlock_nowait())
+-			return;
++		rtnl_lock();
++
++		if (qlen > skb_queue_len(&sk->sk_receive_queue))
++			qlen = skb_queue_len(&sk->sk_receive_queue);
+ 
+-		while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
++		while (qlen--) {
++			skb = skb_dequeue(&sk->sk_receive_queue);
+ 			if (rtnetlink_rcv_skb(skb)) {
+-				if (skb->len)
++				if (skb->len) {
+ 					skb_queue_head(&sk->sk_receive_queue,
+ 						       skb);
+-				else
++					qlen++;
++				} else
+ 					kfree_skb(skb);
+ 				break;
+ 			}
+@@ -619,7 +624,7 @@ static void rtnetlink_rcv(struct sock *s
+ 		up(&rtnl_sem);
+ 
+ 		netdev_run_todo();
+-	} while (rtnl && rtnl->sk_receive_queue.qlen);
++	} while (qlen);
+ }
+ 
+ static struct rtnetlink_link link_rtnetlink_table[RTM_MAX-RTM_BASE+1] =
+Index: linux-2.6.10/net/decnet/netfilter/dn_rtmsg.c
+===================================================================
+--- linux-2.6.10.orig/net/decnet/netfilter/dn_rtmsg.c
++++ linux-2.6.10/net/decnet/netfilter/dn_rtmsg.c
+@@ -119,8 +119,9 @@ static inline void dnrmg_receive_user_sk
+ static void dnrmg_receive_user_sk(struct sock *sk, int len)
+ {
+ 	struct sk_buff *skb;
++	unsigned int qlen = skb_queue_len(&sk->sk_receive_queue);
+ 
+-	while((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
++	while (qlen-- && (skb = skb_dequeue(&sk->sk_receive_queue))) {
+ 		dnrmg_receive_user_skb(skb);
+ 		kfree_skb(skb);
+ 	}
+Index: linux-2.6.10/net/ipv4/netfilter/ip_queue.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/netfilter/ip_queue.c
++++ linux-2.6.10/net/ipv4/netfilter/ip_queue.c
+@@ -538,20 +538,18 @@ ipq_rcv_skb(struct sk_buff *skb)
+ static void
+ ipq_rcv_sk(struct sock *sk, int len)
+ {
+-	do {
+-		struct sk_buff *skb;
++	struct sk_buff *skb;
++	unsigned int qlen;
+ 
+-		if (down_trylock(&ipqnl_sem))
+-			return;
++	down(&ipqnl_sem);
+ 			
+-		while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
+-			ipq_rcv_skb(skb);
+-			kfree_skb(skb);
+-		}
++	for (qlen = skb_queue_len(&sk->sk_receive_queue); qlen; qlen--) {
++		skb = skb_dequeue(&sk->sk_receive_queue);
++		ipq_rcv_skb(skb);
++		kfree_skb(skb);
++	}
+ 		
+-		up(&ipqnl_sem);
+-
+-	} while (ipqnl && ipqnl->sk_receive_queue.qlen);
++	up(&ipqnl_sem);
+ }
+ 
+ static int
+Index: linux-2.6.10/net/ipv4/tcp_diag.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/tcp_diag.c
++++ linux-2.6.10/net/ipv4/tcp_diag.c
+@@ -777,8 +777,9 @@ static inline void tcpdiag_rcv_skb(struc
+ static void tcpdiag_rcv(struct sock *sk, int len)
+ {
+ 	struct sk_buff *skb;
++	unsigned int qlen = skb_queue_len(&sk->sk_receive_queue);
+ 
+-	while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
++	while (qlen-- && (skb = skb_dequeue(&sk->sk_receive_queue))) {
+ 		tcpdiag_rcv_skb(skb);
+ 		kfree_skb(skb);
+ 	}
+Index: linux-2.6.10/net/ipv6/netfilter/ip6_queue.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/netfilter/ip6_queue.c
++++ linux-2.6.10/net/ipv6/netfilter/ip6_queue.c
+@@ -543,20 +543,18 @@ ipq_rcv_skb(struct sk_buff *skb)
+ static void
+ ipq_rcv_sk(struct sock *sk, int len)
+ {
+-	do {
+-		struct sk_buff *skb;
++	struct sk_buff *skb;
++	unsigned int qlen;
+ 
+-		if (down_trylock(&ipqnl_sem))
+-			return;
++	down(&ipqnl_sem);
+ 			
+-		while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
+-			ipq_rcv_skb(skb);
+-			kfree_skb(skb);
+-		}
++	for (qlen = skb_queue_len(&sk->sk_receive_queue); qlen; qlen--) {
++		skb = skb_dequeue(&sk->sk_receive_queue);
++		ipq_rcv_skb(skb);
++		kfree_skb(skb);
++	}
+ 		
+-		up(&ipqnl_sem);
+-
+-	} while (ipqnl && ipqnl->sk_receive_queue.qlen);
++	up(&ipqnl_sem);
+ }
+ 
+ static int
+Index: linux-2.6.10/net/xfrm/xfrm_user.c
+===================================================================
+--- linux-2.6.10.orig/net/xfrm/xfrm_user.c
++++ linux-2.6.10/net/xfrm/xfrm_user.c
+@@ -1856,17 +1856,24 @@ static int xfrm_user_rcv_skb(struct sk_b
+ 
+ static void xfrm_netlink_rcv(struct sock *sk, int len)
+ {
++	unsigned int qlen = skb_queue_len(&sk->sk_receive_queue);
++
+ 	do {
+ 		struct sk_buff *skb;
+ 
+ 		down(&xfrm_cfg_sem);
+ 
+-		while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
++		if (qlen > skb_queue_len(&sk->sk_receive_queue))
++			qlen = skb_queue_len(&sk->sk_receive_queue);
++
++		while (qlen--) {
++			skb = skb_dequeue(&sk->sk_receive_queue);
+ 			if (xfrm_user_rcv_skb(skb)) {
+-				if (skb->len)
++				if (skb->len) {
+ 					skb_queue_head(&sk->sk_receive_queue,
+ 						       skb);
+-				else
++					qlen++;
++				} else
+ 					kfree_skb(skb);
+ 				break;
+ 			}
+@@ -1875,7 +1882,7 @@ static void xfrm_netlink_rcv(struct sock
+ 
+ 		up(&xfrm_cfg_sem);
+ 
+-	} while (xfrm_nl && xfrm_nl->sk_receive_queue.qlen);
++	} while (qlen);
+ }
+ 
+ static int build_expire(struct sk_buff *skb, struct xfrm_state *x, int hard)
+Index: linux-2.6.10/mvl_patches/pro-1493.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1493.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1493);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

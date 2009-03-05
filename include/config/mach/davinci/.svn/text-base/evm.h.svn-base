@@ -1,0 +1,1 @@
+#define CONFIG_MACH_DAVINCI_EVM 1

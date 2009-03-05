@@ -1,0 +1,810 @@
+#! /usr/bin/env bash
+# Patch: -pro_IPV4_Replace__in_dev_get_with__in_dev_get_rcu_rtnl
+# Date: Mon Mar  5 07:56:11 2007
+# MR: 18624
+# 
+# commit e5ed639913eea3e4783a550291775ab78dd84966
+# Author: Herbert Xu <herbert@gondor.apana.org.au>
+# Date:   Mon Oct 3 14:35:55 2005 -0700
+# 
+#     [IPV4]: Replace __in_dev_get with __in_dev_get_rcu/rtnl
+#     
+#     The following patch renames __in_dev_get() to __in_dev_get_rtnl() and
+#     introduces __in_dev_get_rcu() to cover the second case.
+#     
+#     1) RCU with refcnt should use in_dev_get().
+#     2) RCU without refcnt should use __in_dev_get_rcu().
+#     3) All others must hold RTNL and use __in_dev_get_rtnl().
+#     
+#     There is one exception in net/ipv4/route.c which is in fact a pre-existing
+#     race condition.  I've marked it as such so that we remember to fix it.
+#     
+#     This patch is based on suggestions and prior work by Suzanne Wood and
+#     Paul McKenney.
+#     
+#     Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+#     Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1147
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18624
+
+commit e5ed639913eea3e4783a550291775ab78dd84966
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Mon Oct 3 14:35:55 2005 -0700
+
+    [IPV4]: Replace __in_dev_get with __in_dev_get_rcu/rtnl
+    
+    The following patch renames __in_dev_get() to __in_dev_get_rtnl() and
+    introduces __in_dev_get_rcu() to cover the second case.
+    
+    1) RCU with refcnt should use in_dev_get().
+    2) RCU without refcnt should use __in_dev_get_rcu().
+    3) All others must hold RTNL and use __in_dev_get_rtnl().
+    
+    There is one exception in net/ipv4/route.c which is in fact a pre-existing
+    race condition.  I've marked it as such so that we remember to fix it.
+    
+    This patch is based on suggestions and prior work by Suzanne Wood and
+    Paul McKenney.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 6d00c3d..bf81cd4 100644
+
+Index: linux-2.6.10/drivers/net/wan/sdlamain.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/wan/sdlamain.c
++++ linux-2.6.10/drivers/net/wan/sdlamain.c
+@@ -57,6 +57,7 @@
+ #include <linux/ioport.h>	/* request_region(), release_region() */
+ #include <linux/wanrouter.h>	/* WAN router definitions */
+ #include <linux/wanpipe.h>	/* WANPIPE common user API definitions */
++#include <linux/rcupdate.h>
+ 
+ #include <linux/in.h>
+ #include <asm/io.h>		/* phys_to_virt() */
+@@ -1268,37 +1269,41 @@ unsigned long get_ip_address(struct net_
+ 	
+ 	struct in_ifaddr *ifaddr;
+ 	struct in_device *in_dev;
++	unsigned long addr = 0;
+ 
+-	if ((in_dev = __in_dev_get(dev)) == NULL){
+-		return 0;
++	rcu_read_lock();
++	if ((in_dev = __in_dev_get_rcu(dev)) == NULL){
++		goto out;
+ 	}
+ 
+ 	if ((ifaddr = in_dev->ifa_list)== NULL ){
+-		return 0;
++		goto out;
+ 	}
+ 	
+ 	switch (option){
+ 
+ 	case WAN_LOCAL_IP:
+-		return ifaddr->ifa_local;
++		addr = ifaddr->ifa_local;
+ 		break;
+ 	
+ 	case WAN_POINTOPOINT_IP:
+-		return ifaddr->ifa_address;
++		addr = ifaddr->ifa_address;
+ 		break;	
+ 
+ 	case WAN_NETMASK_IP:
+-		return ifaddr->ifa_mask;
++		addr = ifaddr->ifa_mask;
+ 		break;
+ 
+ 	case WAN_BROADCAST_IP:
+-		return ifaddr->ifa_broadcast;
++		addr = ifaddr->ifa_broadcast;
+ 		break;
+ 	default:
+-		return 0;
++		break;
+ 	}
+ 
+-	return 0;
++out:
++	rcu_read_unlock();
++	return addr;
+ }	
+ 
+ void add_gateway(sdla_t *card, struct net_device *dev)
+Index: linux-2.6.10/drivers/net/wan/syncppp.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/wan/syncppp.c
++++ linux-2.6.10/drivers/net/wan/syncppp.c
+@@ -769,7 +769,7 @@ static void sppp_cisco_input (struct spp
+ 		u32 addr = 0, mask = ~0; /* FIXME: is the mask correct? */
+ #ifdef CONFIG_INET
+ 		rcu_read_lock();
+-		if ((in_dev = __in_dev_get(dev)) != NULL)
++		if ((in_dev = __in_dev_get_rcu(dev)) != NULL)
+ 		{
+ 			for (ifa=in_dev->ifa_list; ifa != NULL;
+ 				ifa=ifa->ifa_next) {
+Index: linux-2.6.10/drivers/net/wireless/strip.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/wireless/strip.c
++++ linux-2.6.10/drivers/net/wireless/strip.c
+@@ -1352,7 +1352,7 @@ static unsigned char *strip_make_packet(
+ 		struct in_device *in_dev;
+ 
+ 		rcu_read_lock();
+-		in_dev = __in_dev_get(strip_info->dev);
++		in_dev = __in_dev_get_rcu(strip_info->dev);
+ 		if (in_dev == NULL) {
+ 			rcu_read_unlock();
+ 			return NULL;
+@@ -1508,7 +1508,7 @@ static void strip_send(struct strip *str
+ 
+ 		brd = addr = 0;
+ 		rcu_read_lock();
+-		in_dev = __in_dev_get(strip_info->dev);
++		in_dev = __in_dev_get_rcu(strip_info->dev);
+ 		if (in_dev) {
+ 			if (in_dev->ifa_list) {
+ 				brd = in_dev->ifa_list->ifa_broadcast;
+Index: linux-2.6.10/drivers/parisc/led.c
+===================================================================
+--- linux-2.6.10.orig/drivers/parisc/led.c
++++ linux-2.6.10/drivers/parisc/led.c
+@@ -37,6 +37,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/ctype.h>
+ #include <linux/blkdev.h>
++#include <linux/rcupdate.h>
+ #include <asm/io.h>
+ #include <asm/processor.h>
+ #include <asm/hardware.h>
+@@ -358,9 +359,10 @@ static __inline__ int led_get_net_activi
+ 	/* we are running as tasklet, so locking dev_base 
+ 	 * for reading should be OK */
+ 	read_lock(&dev_base_lock);
++	rcu_read_lock();
+ 	for (dev = dev_base; dev; dev = dev->next) {
+ 	    struct net_device_stats *stats;
+-	    struct in_device *in_dev = __in_dev_get(dev);
++	    struct in_device *in_dev = __in_dev_get_rcu(dev);
+ 	    if (!in_dev || !in_dev->ifa_list)
+ 		continue;
+ 	    if (LOOPBACK(in_dev->ifa_list->ifa_local))
+@@ -371,6 +373,7 @@ static __inline__ int led_get_net_activi
+ 	    rx_total += stats->rx_packets;
+ 	    tx_total += stats->tx_packets;
+ 	}
++	rcu_read_unlock();
+ 	read_unlock(&dev_base_lock);
+ 
+ 	retval = 0;
+Index: linux-2.6.10/drivers/s390/net/qeth_main.c
+===================================================================
+--- linux-2.6.10.orig/drivers/s390/net/qeth_main.c
++++ linux-2.6.10/drivers/s390/net/qeth_main.c
+@@ -4880,7 +4880,7 @@ qeth_free_vlan_addresses4(struct qeth_ca
+ 	if (!card->vlangrp)
+ 		return;
+ 	rcu_read_lock();
+-	in_dev = __in_dev_get(card->vlangrp->vlan_devices[vid]);
++	in_dev = __in_dev_get_rcu(card->vlangrp->vlan_devices[vid]);
+ 	if (!in_dev)
+ 		goto out;
+ 	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next) {
+@@ -7175,7 +7175,7 @@ qeth_arp_constructor(struct neighbour *n
+ 		goto out;
+ 
+ 	rcu_read_lock();
+-	in_dev = rcu_dereference(__in_dev_get(dev));
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (in_dev == NULL) {
+ 		rcu_read_unlock();
+ 		return -EINVAL;
+Index: linux-2.6.10/include/linux/inetdevice.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/inetdevice.h
++++ linux-2.6.10/include/linux/inetdevice.h
+@@ -140,13 +140,21 @@ static __inline__ int bad_mask(u32 mask,
+ 
+ #define endfor_ifa(in_dev) }
+ 
++static inline struct in_device *__in_dev_get_rcu(const struct net_device *dev)
++{
++	struct in_device *in_dev = dev->ip_ptr;
++	if (in_dev)
++		in_dev = rcu_dereference(in_dev);
++	return in_dev;
++}
++
+ static __inline__ struct in_device *
+ in_dev_get(const struct net_device *dev)
+ {
+ 	struct in_device *in_dev;
+ 
+ 	rcu_read_lock();
+-	in_dev = dev->ip_ptr;
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (in_dev)
+ 		atomic_inc(&in_dev->refcnt);
+ 	rcu_read_unlock();
+@@ -154,7 +162,7 @@ in_dev_get(const struct net_device *dev)
+ }
+ 
+ static __inline__ struct in_device *
+-__in_dev_get(const struct net_device *dev)
++__in_dev_get_rtnl(const struct net_device *dev)
+ {
+ 	return (struct in_device*)dev->ip_ptr;
+ }
+Index: linux-2.6.10/net/atm/clip.c
+===================================================================
+--- linux-2.6.10.orig/net/atm/clip.c
++++ linux-2.6.10/net/atm/clip.c
+@@ -307,7 +307,7 @@ static int clip_constructor(struct neigh
+ 	if (neigh->type != RTN_UNICAST) return -EINVAL;
+ 
+ 	rcu_read_lock();
+-	in_dev = rcu_dereference(__in_dev_get(dev));
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (!in_dev) {
+ 		rcu_read_unlock();
+ 		return -EINVAL;
+Index: linux-2.6.10/net/core/netpoll.c
+===================================================================
+--- linux-2.6.10.orig/net/core/netpoll.c
++++ linux-2.6.10/net/core/netpoll.c
+@@ -623,7 +623,7 @@ int netpoll_setup(struct netpoll *np)
+ 
+ 	if (!np->local_ip) {
+ 		rcu_read_lock();
+-		in_dev = __in_dev_get(ndev);
++		in_dev = __in_dev_get_rcu(ndev);
+ 
+ 		if (!in_dev || !in_dev->ifa_list) {
+ 			rcu_read_unlock();
+Index: linux-2.6.10/net/core/pktgen.c
+===================================================================
+--- linux-2.6.10.orig/net/core/pktgen.c
++++ linux-2.6.10/net/core/pktgen.c
+@@ -269,7 +269,7 @@ static struct net_device *setup_inject(s
+ 		struct in_device *in_dev;
+ 
+ 		rcu_read_lock();
+-		in_dev = __in_dev_get(odev);
++		in_dev = __in_dev_get_rcu(odev);
+ 		if (in_dev) {
+ 			if (in_dev->ifa_list) {
+ 				info->saddr_min = in_dev->ifa_list->ifa_address;
+Index: linux-2.6.10/net/econet/af_econet.c
+===================================================================
+--- linux-2.6.10.orig/net/econet/af_econet.c
++++ linux-2.6.10/net/econet/af_econet.c
+@@ -406,7 +406,7 @@ static int econet_sendmsg(struct kiocb *
+ 		unsigned long network = 0;
+ 
+ 		rcu_read_lock();
+-		idev = __in_dev_get(dev);
++		idev = __in_dev_get_rcu(dev);
+ 		if (idev) {
+ 			if (idev->ifa_list)
+ 				network = ntohl(idev->ifa_list->ifa_address) & 
+Index: linux-2.6.10/net/ipv4/arp.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/arp.c
++++ linux-2.6.10/net/ipv4/arp.c
+@@ -238,7 +238,7 @@ static int arp_constructor(struct neighb
+ 	neigh->type = inet_addr_type(addr);
+ 
+ 	rcu_read_lock();
+-	in_dev = rcu_dereference(__in_dev_get(dev));
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (in_dev == NULL) {
+ 		rcu_read_unlock();
+ 		return -EINVAL;
+@@ -985,8 +985,8 @@ int arp_req_set(struct arpreq *r, struct
+ 			ipv4_devconf.proxy_arp = 1;
+ 			return 0;
+ 		}
+-		if (__in_dev_get(dev)) {
+-			__in_dev_get(dev)->cnf.proxy_arp = 1;
++		if (__in_dev_get_rtnl(dev)) {
++			__in_dev_get_rtnl(dev)->cnf.proxy_arp = 1;
+ 			return 0;
+ 		}
+ 		return -ENXIO;
+@@ -1091,8 +1091,8 @@ int arp_req_delete(struct arpreq *r, str
+ 				ipv4_devconf.proxy_arp = 0;
+ 				return 0;
+ 			}
+-			if (__in_dev_get(dev)) {
+-				__in_dev_get(dev)->cnf.proxy_arp = 0;
++			if (__in_dev_get_rtnl(dev)) {
++				__in_dev_get_rtnl(dev)->cnf.proxy_arp = 0;
+ 				return 0;
+ 			}
+ 			return -ENXIO;
+Index: linux-2.6.10/net/ipv4/devinet.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/devinet.c
++++ linux-2.6.10/net/ipv4/devinet.c
+@@ -333,7 +333,7 @@ static int inet_insert_ifa(struct in_ifa
+ 
+ static int inet_set_ifa(struct net_device *dev, struct in_ifaddr *ifa)
+ {
+-	struct in_device *in_dev = __in_dev_get(dev);
++	struct in_device *in_dev = __in_dev_get_rtnl(dev);
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -431,7 +431,7 @@ int inet_rtm_newaddr(struct sk_buff *skb
+ 		goto out;
+ 
+ 	rc = -ENOBUFS;
+-	if ((in_dev = __in_dev_get(dev)) == NULL) {
++	if ((in_dev = __in_dev_get_rtnl(dev)) == NULL) {
+ 		in_dev = inetdev_init(dev);
+ 		if (!in_dev)
+ 			goto out;
+@@ -566,7 +566,7 @@ int devinet_ioctl(unsigned int cmd, void
+ 	if (colon)
+ 		*colon = ':';
+ 
+-	if ((in_dev = __in_dev_get(dev)) != NULL) {
++	if ((in_dev = __in_dev_get_rtnl(dev)) != NULL) {
+ 		if (tryaddrmatch) {
+ 			/* Matthias Andree */
+ 			/* compare label and address (4.4BSD style) */
+@@ -730,7 +730,7 @@ rarok:
+ 
+ static int inet_gifconf(struct net_device *dev, char __user *buf, int len)
+ {
+-	struct in_device *in_dev = __in_dev_get(dev);
++	struct in_device *in_dev = __in_dev_get_rtnl(dev);
+ 	struct in_ifaddr *ifa;
+ 	struct ifreq ifr;
+ 	int done = 0;
+@@ -773,7 +773,7 @@ u32 inet_select_addr(const struct net_de
+ 	struct in_device *in_dev;
+ 
+ 	rcu_read_lock();
+-	in_dev = __in_dev_get(dev);
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (!in_dev)
+ 		goto no_in_dev;
+ 
+@@ -800,7 +800,7 @@ no_in_dev:
+ 	read_lock(&dev_base_lock);
+ 	rcu_read_lock();
+ 	for (dev = dev_base; dev; dev = dev->next) {
+-		if ((in_dev = __in_dev_get(dev)) == NULL)
++		if ((in_dev = __in_dev_get_rcu(dev)) == NULL)
+ 			continue;
+ 
+ 		for_primary_ifa(in_dev) {
+@@ -869,7 +869,7 @@ u32 inet_confirm_addr(const struct net_d
+ 
+ 	if (dev) {
+ 		rcu_read_lock();
+-		if ((in_dev = __in_dev_get(dev)))
++		if ((in_dev = __in_dev_get_rcu(dev)))
+ 			addr = confirm_addr_indev(in_dev, dst, local, scope);
+ 		rcu_read_unlock();
+ 
+@@ -879,7 +879,7 @@ u32 inet_confirm_addr(const struct net_d
+ 	read_lock(&dev_base_lock);
+ 	rcu_read_lock();
+ 	for (dev = dev_base; dev; dev = dev->next) {
+-		if ((in_dev = __in_dev_get(dev))) {
++		if ((in_dev = __in_dev_get_rcu(dev))) {
+ 			addr = confirm_addr_indev(in_dev, dst, local, scope);
+ 			if (addr)
+ 				break;
+@@ -939,7 +939,7 @@ static int inetdev_event(struct notifier
+ 			 void *ptr)
+ {
+ 	struct net_device *dev = ptr;
+-	struct in_device *in_dev = __in_dev_get(dev);
++	struct in_device *in_dev = __in_dev_get_rtnl(dev);
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -1055,7 +1055,7 @@ static int inet_dump_ifaddr(struct sk_bu
+ 		if (idx > s_idx)
+ 			s_ip_idx = 0;
+ 		rcu_read_lock();
+-		if ((in_dev = __in_dev_get(dev)) == NULL) {
++		if ((in_dev = __in_dev_get_rcu(dev)) == NULL) {
+ 			rcu_read_unlock();
+ 			continue;
+ 		}
+@@ -1126,7 +1126,7 @@ void inet_forward_change(void)
+ 	for (dev = dev_base; dev; dev = dev->next) {
+ 		struct in_device *in_dev;
+ 		rcu_read_lock();
+-		in_dev = __in_dev_get(dev);
++		in_dev = __in_dev_get_rcu(dev);
+ 		if (in_dev)
+ 			in_dev->cnf.forwarding = on;
+ 		rcu_read_unlock();
+Index: linux-2.6.10/net/ipv4/fib_frontend.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/fib_frontend.c
++++ linux-2.6.10/net/ipv4/fib_frontend.c
+@@ -173,7 +173,7 @@ int fib_validate_source(u32 src, u32 dst
+ 
+ 	no_addr = rpf = 0;
+ 	rcu_read_lock();
+-	in_dev = __in_dev_get(dev);
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (in_dev) {
+ 		no_addr = in_dev->ifa_list == NULL;
+ 		rpf = IN_DEV_RPFILTER(in_dev);
+@@ -554,7 +554,7 @@ static int fib_inetaddr_event(struct not
+ static int fib_netdev_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+ 	struct net_device *dev = ptr;
+-	struct in_device *in_dev = __in_dev_get(dev);
++	struct in_device *in_dev = __in_dev_get_rtnl(dev);
+ 
+ 	if (event == NETDEV_UNREGISTER) {
+ 		fib_disable_ip(dev, 2);
+Index: linux-2.6.10/net/ipv4/fib_semantics.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/fib_semantics.c
++++ linux-2.6.10/net/ipv4/fib_semantics.c
+@@ -995,7 +995,7 @@ fib_convert_rtentry(int cmd, struct nlms
+ 		rta->rta_oif = &dev->ifindex;
+ 		if (colon) {
+ 			struct in_ifaddr *ifa;
+-			struct in_device *in_dev = __in_dev_get(dev);
++			struct in_device *in_dev = __in_dev_get_rtnl(dev);
+ 			if (!in_dev)
+ 				return -ENODEV;
+ 			*colon = ':';
+@@ -1176,7 +1176,7 @@ int fib_sync_up(struct net_device *dev)
+ 			}
+ 			if (nh->nh_dev == NULL || !(nh->nh_dev->flags&IFF_UP))
+ 				continue;
+-			if (nh->nh_dev != dev || __in_dev_get(dev) == NULL)
++			if (nh->nh_dev != dev || !__in_dev_get_rtnl(dev))
+ 				continue;
+ 			alive++;
+ 			spin_lock_bh(&fib_multipath_lock);
+Index: linux-2.6.10/net/ipv4/igmp.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/igmp.c
++++ linux-2.6.10/net/ipv4/igmp.c
+@@ -1323,7 +1323,7 @@ static struct in_device * ip_mc_find_dev
+ 	}
+ 	if (dev) {
+ 		imr->imr_ifindex = dev->ifindex;
+-		idev = __in_dev_get(dev);
++		idev = __in_dev_get_rtnl(dev);
+ 	}
+ 	return idev;
+ }
+Index: linux-2.6.10/net/ipv4/ip_gre.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/ip_gre.c
++++ linux-2.6.10/net/ipv4/ip_gre.c
+@@ -1106,10 +1106,10 @@ static int ipgre_open(struct net_device 
+ 			return -EADDRNOTAVAIL;
+ 		dev = rt->u.dst.dev;
+ 		ip_rt_put(rt);
+-		if (__in_dev_get(dev) == NULL)
++		if (__in_dev_get_rtnl(dev) == NULL)
+ 			return -EADDRNOTAVAIL;
+ 		t->mlink = dev->ifindex;
+-		ip_mc_inc_group(__in_dev_get(dev), t->parms.iph.daddr);
++		ip_mc_inc_group(__in_dev_get_rtnl(dev), t->parms.iph.daddr);
+ 	}
+ 	return 0;
+ }
+Index: linux-2.6.10/net/ipv4/ipmr.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/ipmr.c
++++ linux-2.6.10/net/ipv4/ipmr.c
+@@ -149,7 +149,7 @@ struct net_device *ipmr_new_tunnel(struc
+ 		if (err == 0 && (dev = __dev_get_by_name(p.name)) != NULL) {
+ 			dev->flags |= IFF_MULTICAST;
+ 
+-			in_dev = __in_dev_get(dev);
++			in_dev = __in_dev_get_rtnl(dev);
+ 			if (in_dev == NULL && (in_dev = inetdev_init(dev)) == NULL)
+ 				goto failure;
+ 			in_dev->cnf.rp_filter = 0;
+@@ -278,7 +278,7 @@ static int vif_delete(int vifi)
+ 
+ 	dev_set_allmulti(dev, -1);
+ 
+-	if ((in_dev = __in_dev_get(dev)) != NULL) {
++	if ((in_dev = __in_dev_get_rtnl(dev)) != NULL) {
+ 		in_dev->cnf.mc_forwarding--;
+ 		ip_rt_multicast_event(in_dev);
+ 	}
+@@ -418,7 +418,7 @@ static int vif_add(struct vifctl *vifc, 
+ 		return -EINVAL;
+ 	}
+ 
+-	if ((in_dev = __in_dev_get(dev)) == NULL)
++	if ((in_dev = __in_dev_get_rtnl(dev)) == NULL)
+ 		return -EADDRNOTAVAIL;
+ 	in_dev->cnf.mc_forwarding++;
+ 	dev_set_allmulti(dev, +1);
+Index: linux-2.6.10/net/ipv4/route.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv4/route.c
++++ linux-2.6.10/net/ipv4/route.c
+@@ -1861,7 +1861,7 @@ int ip_route_input(struct sk_buff *skb, 
+ 		struct in_device *in_dev;
+ 
+ 		rcu_read_lock();
+-		if ((in_dev = __in_dev_get(dev)) != NULL) {
++		if ((in_dev = __in_dev_get_rcu(dev)) != NULL) {
+ 			int our = ip_check_mc(in_dev, daddr, saddr,
+ 				skb->nh.iph->protocol);
+ 			if (our
+@@ -1963,7 +1963,9 @@ static int ip_route_output_slow(struct r
+ 		err = -ENODEV;
+ 		if (dev_out == NULL)
+ 			goto out;
+-		if (__in_dev_get(dev_out) == NULL) {
++
++		/* RACE: Check return value of inet_select_addr instead. */
++		if (__in_dev_get_rtnl(dev_out) == NULL) {
+ 			dev_put(dev_out);
+ 			goto out;	/* Wrong error code */
+ 		}
+Index: linux-2.6.10/net/ipv6/addrconf.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/addrconf.c
++++ linux-2.6.10/net/ipv6/addrconf.c
+@@ -1927,7 +1927,7 @@ static void sit_add_v4_addrs(struct inet
+ 	}
+ 
+         for (dev = dev_base; dev != NULL; dev = dev->next) {
+-		struct in_device * in_dev = __in_dev_get(dev);
++		struct in_device * in_dev = __in_dev_get_rtnl(dev);
+ 		if (in_dev && (dev->flags & IFF_UP)) {
+ 			struct in_ifaddr * ifa;
+ 
+Index: linux-2.6.10/net/irda/irlan/irlan_eth.c
+===================================================================
+--- linux-2.6.10.orig/net/irda/irlan/irlan_eth.c
++++ linux-2.6.10/net/irda/irlan/irlan_eth.c
+@@ -304,7 +304,7 @@ void irlan_eth_send_gratuitous_arp(struc
+ #ifdef CONFIG_INET
+ 	IRDA_DEBUG(4, "IrLAN: Sending gratuitous ARP\n");
+ 	rcu_read_lock();
+-	in_dev = __in_dev_get(dev);
++	in_dev = __in_dev_get_rcu(dev);
+ 	if (in_dev == NULL)
+ 		goto out;
+ 	if (in_dev->ifa_list)
+Index: linux-2.6.10/net/sctp/protocol.c
+===================================================================
+--- linux-2.6.10.orig/net/sctp/protocol.c
++++ linux-2.6.10/net/sctp/protocol.c
+@@ -147,7 +147,7 @@ static void sctp_v4_copy_addrlist(struct
+ 	struct sctp_sockaddr_entry *addr;
+ 
+ 	rcu_read_lock();
+-	if ((in_dev = __in_dev_get(dev)) == NULL) {
++	if ((in_dev = __in_dev_get_rcu(dev)) == NULL) {
+ 		rcu_read_unlock();
+ 		return;
+ 	}
+Index: linux-2.6.10/mvl_patches/pro-1147.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1147.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1147);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

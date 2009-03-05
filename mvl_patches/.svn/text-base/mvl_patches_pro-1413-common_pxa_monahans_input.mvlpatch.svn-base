@@ -1,0 +1,1360 @@
+#! /usr/bin/env bash
+# Patch: -common_pxa_monahans_input
+# Date: Fri Dec  7 11:49:52 2007
+# Source: Marvell International Ltd
+# MR: 20443
+# Type: Enhancement
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	Add input device drivers (keypad, touchscreen)
+# 
+
+PATCHNUM=1413
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Marvell International Ltd
+MR: 20443
+Type: Enhancement
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	Add input device drivers (keypad, touchscreen)
+
+Index: linux-2.6.10/drivers/input/keyboard/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/input/keyboard/Kconfig
++++ linux-2.6.10/drivers/input/keyboard/Kconfig
+@@ -67,6 +67,35 @@ config KEYBOARD_XTKBD
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called xtkbd.
+ 
++config KEYPAD_ZYLONITE
++	tristate "Zylonite Keypad"
++	depends on INPUT && INPUT_KEYBOARD && MACH_ZYLONITE
++	default y
++	help
++	   Say Y to support the zylonite board keypad.
++
++config KEYPAD_ZYLONITE_REPEATKEY
++	bool "Zylonite Keypad Repeat Key support"
++	depends on KEYPAD_ZYLONITE
++	default y
++	help
++	   Say Y to support the zylonite board keypad repeat key.
++
++config KEYPAD_ZYLONITE_COMBOKEY
++	bool "Zylonite Keypad Combo Key support"
++	depends on KEYPAD_ZYLONITE
++	default y
++	help
++	   Say Y to support the zylonite board keypad combo key.
++	   Maxium TWO keys could be pressed simultaneously.
++
++config KEYPAD_ZYLONITE_SHIFT
++	bool "Zylonite Keypad Shift Key support"
++	depends on KEYPAD_ZYLONITE
++	default n
++	help
++	   Say Y to support the zylonite board keypad shift key.
++
+ config KEYBOARD_NEWTON
+ 	tristate "Newton keyboard"
+ 	depends on INPUT && INPUT_KEYBOARD
+Index: linux-2.6.10/drivers/input/keyboard/zylonite_kbd.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/keyboard/zylonite_kbd.c
+@@ -0,0 +1,440 @@
++/*
++ *  linux/drivers/input/keyboard/zylonite_kbd.c
++ *
++ *  Keypad driver for zylonite Platform
++ *
++ *  Copyright (C) 2006, Marvell International Ltd (jingqing.xu@marvell.com)
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2 as
++ *  published by the Free Software Foundation.
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <asm/irq.h>
++#include <asm/hardware.h>
++#include <asm/arch/pxa-regs.h>
++#include <linux/device.h>
++
++#include "zylonite_kbd.h"
++
++#define USE_DEFAULT_DEBOUNCE 1
++
++/* Bit Definitions for KeyPad Interface Control Register */
++#define     DIRECT_KP_INTR_ENABLE		(0x1    <<  0)
++#define     DIRECT_KP_ENABLE			(0x1    <<  1)
++#define     ROTARY_ENCODER_0_ENABLE		(0x1    <<  2)
++#define     ROTARY_ENCODER_1_ENABLE		(0x1    <<  3)
++#define     ROTARY_ENCODER_ZERO_DEB		(0x1    <<  4)
++#define     DIRECT_INTR_BIT			(0x1    <<  5)
++#define     DIRECT_KEY_NUMS			(0x1	<<  6)
++#define     DIRECT_DEBOUNCE_BIT			(0x1    <<  9)
++#define     MATRIX_INTR_ENABLE			(0x1    <<  11)
++#define     MATRIX_KP_ENABLE			(0x1    <<  12)
++#define     IGNORE_MULTIPLE_KEY_PRESS		(0x1    <<  21)
++#define     MATRIX_INTR_BIT			(0x1    <<  22)
++#define     AUTO_SCAN_ON_ACTIVITY		(0x1    <<  29)
++#define     AUTO_SCAN_BIT			(0x1    <<  30)
++#define     MAT_SCAN_LINE0			(0x1    <<  13)
++#define     MAT_SCAN_LINE1			(0x1    <<  14)
++#define     MAT_SCAN_LINE2			(0x1    <<  15)
++#define     MAT_SCAN_LINE3			(0x1    <<  16)
++#define     MAT_SCAN_LINE4			(0x1    <<  17)
++#define     MAT_SCAN_LINE5			(0x1    <<  18)
++#define     MAT_SCAN_LINE6			(0x1    <<  19)
++#define     MAT_SCAN_LINE7			(0x1    <<  20)
++
++/* Bit Definitions for KeyPad Interface Direct Key Register */
++
++#define     DIRECT_KEY_PRESSED			(0x1    <<  31)
++#define     DIRECT_KEY_IN_7			(0x1    <<  7)
++#define     DIRECT_KEY_IN_6			(0x1    <<  6)
++#define     DIRECT_KEY_IN_5			(0x1    <<  5)
++#define     DIRECT_KEY_IN_4			(0x1    <<  4)
++#define     DIRECT_KEY_IN_3			(0x1    <<  3)
++#define     DIRECT_KEY_IN_2			(0x1    <<  2)
++#define     ROTARY_ENC_0_SENSOR_B		(0x1    <<  1)
++#define     ROTARY_ENC_0_SENSOR_A		(0x1    <<  0)
++#define     DIRECT_KEY_NUMS_MIN_1		(0x1    <<  6)
++
++/* Bit Definitions for KeyPad Encoder Count Register */
++
++#define     UNDERFLOW_ROTARY_ENC_0		(0x1    <<  14)
++#define     OVERFLOW_ROTARY_ENC_0		(0x1    <<  15)
++
++/* Bit Definitions for KeyPad Interface Matrix Key Register */
++
++#define     MATRIX_KEY_PRESSED			(0x1    <<  31)
++#define     MATRIX_ROW_MASK			0xFF
++
++/* Bit Definitions for KeyPad Interface Automatic Scan Register */
++
++#define     SCAN_ON_BIT				(0x1    <<  31)
++#define     ROW_SELECTED_MASK			0xF0
++#define     COL_SELECTED_MASK			0x0F
++#define     MULTI_KEYS_PRESS			0x7C000000
++#define     SINGLE_KEY_PRESS			(0x1    <<  26)
++
++#define     KPASMKP(n)        			__REG(0x41500028 + ((n)<<3))
++#define     KPASMKP_MASK       			0xFF
++/*
++Bit Definitions for KeyPad Interface Automatic Scan Multiple
++Key Press Register 0,1,2,3
++*/
++
++#define     MATRIX_KP_COL_EVEN_MASK		0x0000FF
++#define     MATRIX_KP_COL_ODD_MASK		0xFF0000
++#define     KP_INVALID_ROW			0xFF
++
++/*
++KeyPad controller supports 3 modes of operation.
++All three will be tested but the default
++mode shall be AUTO_SCAN_ON_ACT
++*/
++#define     MANUAL_MATRIX_SCAN		0
++#define     AUTO_SCAN_ON_ACT		1
++#define     AUTO_SCAN_BY_AS_BIT		2
++
++#define     NOT_AVAILABLE		0
++#define     AVAILABLE			1
++#define     COUNT_MASK			0xFF
++
++#define     START_VALUE			0x7F
++
++/*maximum number of keys that can be detected simultaneously*/
++#define  DEFAULT_DIRECT_DEBOUNCE_MS  30
++#define  DEFAULT_MATRIX_DEBOUNCE_MS  30
++
++union scode {
++	u8 scan_code[8];
++	u32 word[2];
++};
++
++#ifdef CONFIG_KEYPAD_ZYLONITE_COMBOKEY
++static int combo_key = 1;
++static int pre_combo = 0;
++static int pre_combo_rel = 1;
++static int keys_pressed[] = { 0, 0 };
++static union scode u_pre;
++#endif
++
++
++MODULE_AUTHOR("Xu Jingqing <Jingqing.Xu@marvell.com>");
++MODULE_DESCRIPTION("Zylonite board keypad driver");
++MODULE_LICENSE("GPL");
++
++static int read_scan_code_automatically(int *key_index)
++{
++	int retval = -1;	/* Default to failure indication */
++	u32 num_of_keys_pressed = 0;
++	int scan_code_index = 0;
++	/* minimize slow hardware accesses */
++	u32 kp_asr_tmp;
++
++	*key_index = NO_KEY;	/* Default to failure indication */
++
++	num_of_keys_pressed = ((KPAS & MULTI_KEYS_PRESS) >> 26);
++
++	if (num_of_keys_pressed == 1) {
++		kp_asr_tmp = KPAS;
++		/* test for valid data */
++		if ((ROW_SELECTED_MASK == (kp_asr_tmp & ROW_SELECTED_MASK)) ||
++		    (COL_SELECTED_MASK == (kp_asr_tmp & COL_SELECTED_MASK))) {
++			/* If either row or column field == 0xFF,
++			   data are invalid */
++			*key_index = NO_KEY;
++		} else {
++			/* if not invalid, 3 bits of data for each field.
++			   Compress to 6 bits for index into
++			   the 64-entry LUT. */
++			scan_code_index =
++			    ((kp_asr_tmp & ROW_SELECTED_MASK) >> 1) |
++			    (kp_asr_tmp & COL_SELECTED_MASK);
++
++			*key_index = scan_code_index;
++
++#ifdef CONFIG_KEYPAD_ZYLONITE_COMBOKEY
++			if (combo_key) {
++				u_pre.word[0] = 0;
++				u_pre.word[1] = 0;
++				u_pre.
++				    scan_code[kp_asr_tmp & COL_SELECTED_MASK] =
++				    (1 <<
++				     ((kp_asr_tmp & ROW_SELECTED_MASK) >> 4));
++				if (keys_pressed[1] !=
++				    pxakbd_keycode[scan_code_index])
++					keys_pressed[0] =
++					    pxakbd_keycode[scan_code_index];
++				if (pre_combo)
++					pre_combo_rel = 1;
++			}
++#endif
++
++			retval = 0;
++		}
++	} else {
++#ifdef CONFIG_KEYPAD_ZYLONITE_COMBOKEY
++		if (combo_key && (num_of_keys_pressed > 1)) {
++			int i, row, col;
++			u32 kpasmkp;
++			union scode u;
++
++			u.word[0] = 0;
++			u.word[1] = 0;
++
++			for (i = 0; i < 4; i++) {
++				kpasmkp = KPASMKP(i);
++				if (kpasmkp & KPASMKP_MASK) {
++					col = i * 2;
++					u.scan_code[col] =
++					    (kpasmkp & KPASMKP_MASK);
++					if (u_pre.scan_code[col] !=
++					    u.scan_code[col]) {
++						row = fls(u.scan_code[col]) - 1;
++						scan_code_index =
++						    (row << 3) | col;
++						*key_index = scan_code_index;
++					}
++				}
++				if (kpasmkp & (KPASMKP_MASK << 16)) {
++					col = i * 2 + 1;
++					u.scan_code[col] =
++					    (kpasmkp >> 16) & KPASMKP_MASK;
++					if (u_pre.scan_code[col] !=
++					    u.scan_code[col]) {
++						row = fls(u.scan_code[col]) - 1;
++						scan_code_index =
++						    (row << 3) | col;
++						*key_index = scan_code_index;
++					}
++				}
++			}
++
++			pre_combo = 1;
++			pre_combo_rel = 0;
++			keys_pressed[1] = pxakbd_keycode[scan_code_index];
++			u_pre.word[0] = u.word[0];
++			u_pre.word[1] = u.word[1];
++
++		} else
++#endif
++			/* do not support multi key press */
++			*key_index = NO_KEY;
++	}
++	return retval;
++}
++
++/*-------------------------------------------------------------------------
++Function: read_direct_keys
++Purpose:  This function looks for any Thumbwheel movement or
++	button press and returns a scan code.
++Returns:  success/failure.
++type no:  I/F proc 2
++---------------------------------------------------------------------------*/
++static int read_direct_keys(int *key)
++{
++	u32 curr_count, save_kp_rotary_encoder_count_reg;
++	static u32 prev_count = START_VALUE;
++
++	save_kp_rotary_encoder_count_reg = KPREC;
++	curr_count = save_kp_rotary_encoder_count_reg & COUNT_MASK;
++
++	if (save_kp_rotary_encoder_count_reg & OVERFLOW_ROTARY_ENC_0) {
++		KPREC = START_VALUE;
++		prev_count = START_VALUE;
++		*key = KP_SC_SCROLL_UP;	/* Scroll Up */
++	} else if (save_kp_rotary_encoder_count_reg & UNDERFLOW_ROTARY_ENC_0) {
++		KPREC = START_VALUE;
++		prev_count = START_VALUE;
++		*key = KP_SC_SCROLL_DOWN;	/* Scroll Down */
++	} else if (curr_count > prev_count) {
++		*key = KP_SC_SCROLL_UP;
++		prev_count = curr_count;	/* Scroll Up */
++	} else if (curr_count < prev_count) {
++		*key = KP_SC_SCROLL_DOWN;
++		prev_count = curr_count;	/* Scroll Down */
++	}
++
++	return 0;
++}
++
++static void pxakbd_config_controller(int use_default_debounces,
++			      u8 matix_debounce_ms,
++			      u8 direct_debounce_ms, u8 max_row, u8 max_col)
++{
++	/* Init the control regs for direct keys */
++	KPC = (((max_row - 1) << 26) |
++	       ((max_col - 1) << 23) |
++	       MAT_SCAN_LINE0 |
++	       MAT_SCAN_LINE1 |
++	       MAT_SCAN_LINE2 |
++	       MAT_SCAN_LINE3 |
++	       MAT_SCAN_LINE4 |
++	       MAT_SCAN_LINE5 |
++	       MAT_SCAN_LINE6 |
++	       MAT_SCAN_LINE7 |
++	       AUTO_SCAN_ON_ACTIVITY |
++	       MATRIX_INTR_ENABLE |
++	       MATRIX_KP_ENABLE |
++	       ROTARY_ENCODER_ZERO_DEB |
++	       DIRECT_KP_INTR_ENABLE |
++	       DIRECT_KEY_NUMS | DIRECT_KP_ENABLE | ROTARY_ENCODER_0_ENABLE);
++
++	KPREC = START_VALUE;
++
++	if (use_default_debounces)
++		KPKDI = (DEFAULT_DIRECT_DEBOUNCE_MS << 8 |
++			 DEFAULT_MATRIX_DEBOUNCE_MS);
++	else
++		KPKDI = ((direct_debounce_ms << 8)
++			 | matix_debounce_ms);
++}
++
++static int pxakbd_read_scancode(int *pui8_data)
++{
++	u32 kp_status;
++	int key = NO_KEY;
++
++	kp_status = KPC;
++	/*
++	   Process matrix first to capture scroll
++	   wheel press rather than interpreting it
++	   as a rotate, which can happen unintentionally.
++	 */
++	if (kp_status & MATRIX_INTR_BIT) {
++		read_scan_code_automatically(&key);
++		if (key == NO_KEY) {
++			*pui8_data = NO_KEY;
++			return -1;
++		}
++		key = pxakbd_keycode[key];
++	} else if (kp_status & DIRECT_INTR_BIT)
++		read_direct_keys(&key);
++
++	*pui8_data = key;
++
++	return key == NO_KEY;
++}
++
++static struct input_dev zylonite_kp_dev;
++
++static irqreturn_t pxakbd_interrrupt(int irq, void *ptr, struct pt_regs *regs)
++{
++	int key;
++	static int pre_key;
++	int handled = 0;
++
++	pxakbd_read_scancode(&key);
++
++#ifdef CONFIG_KEYPAD_ZYLONITE_COMBOKEY
++	pr_debug(
++	    "%s, key %x, [0] %x [1] %x, pre_combo %d pre_combo_rel %d, pre_key %x\n",
++	    __func__, key, keys_pressed[0], keys_pressed[1], pre_combo,
++	    pre_combo_rel, pre_key);
++	if (keys_pressed[0] && keys_pressed[1] && pre_combo_rel && pre_combo) {
++		if (keys_pressed[0] == key)
++			input_report_key(&zylonite_kp_dev, keys_pressed[1], 0);
++		if (keys_pressed[1] == key) {
++			input_report_key(&zylonite_kp_dev, keys_pressed[0], 0);
++			keys_pressed[0] = key;
++		}
++		keys_pressed[1] = 0;
++		pre_combo = 0;
++		pre_key = key;
++		handled = !0;
++	}
++#endif
++
++	if (!handled && (key == KP_SC_SCROLL_UP || key == KP_SC_SCROLL_DOWN)) {
++		input_report_key(&zylonite_kp_dev, key, 1);
++		input_report_key(&zylonite_kp_dev, key, 0);
++		handled = !0;
++	}
++	if (!handled) {
++		if (key != NO_KEY) {
++			input_report_key(&zylonite_kp_dev, key, 1);
++			pre_key = key;
++		} else
++			input_report_key(&zylonite_kp_dev, pre_key, 0);
++	}
++	return IRQ_HANDLED;
++}
++
++static int zb_kp_resume(struct device *dev, u32 level)
++{
++	switch (level) {
++	case RESUME_POWER_ON:
++		pxa_set_cken(CKEN_KEYPAD, 1);
++		pxakbd_config_controller(USE_DEFAULT_DEBOUNCE, 0, 0,
++				 KEYPAD_ROWS_NUM, KEYPAD_COLS_NUM);
++
++		break;
++	}
++
++	return 0;
++
++}
++
++static int zb_kp_suspend(struct device *dev, u32 state, u32 level)
++{
++	switch (level) {
++	case SUSPEND_POWER_DOWN:
++		pxa_set_cken(CKEN_KEYPAD, 0);
++		break;
++	}
++
++	return 0;
++
++}
++
++static struct device_driver zb_kp_drv = {
++	.bus = &platform_bus_type,
++	.name = "zb_kp",
++	.resume = zb_kp_resume,
++	.suspend = zb_kp_suspend,
++};
++
++static int __init pxakbd_init(void)
++{
++	int i, err;
++
++	pxa_set_cken(CKEN_KEYPAD, 1);
++	pxakbd_config_controller(USE_DEFAULT_DEBOUNCE, 0, 0,
++				 KEYPAD_ROWS_NUM, KEYPAD_COLS_NUM);
++	init_input_dev(&zylonite_kp_dev);
++#ifdef CONFIG_KEYPAD_ZYLONITE_REPEATKEY
++	zylonite_kp_dev.evbit[0] = BIT(EV_KEY) | BIT(EV_REP);
++#else
++	zylonite_kp_dev.evbit[0] = BIT(EV_KEY);
++#endif
++
++	for (i = 0; i < NBITS(MAX_KEYS); i++)
++		zylonite_kp_dev.keybit[i] = 0xffffffff;
++
++	err = request_irq(IRQ_KEYPAD, pxakbd_interrrupt, 0, "Keypad", NULL);
++
++	if (err) {
++		printk(KERN_CRIT "Wow!  Can't register IRQ[%d] for Keypad\n",
++		       IRQ_KEYPAD);
++		return err;
++	}
++
++	zylonite_kp_dev.name = "pxa-keypad";
++	input_register_device(&zylonite_kp_dev);
++
++	return driver_register(&zb_kp_drv);
++}
++
++static void __exit pxakbd_exit(void)
++{
++	driver_unregister(&zb_kp_drv);
++	input_unregister_device(&zylonite_kp_dev);
++	free_irq(IRQ_KEYPAD, NULL);
++}
++
++module_init(pxakbd_init);
++module_exit(pxakbd_exit);
+Index: linux-2.6.10/drivers/input/keyboard/zylonite_kbd.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/keyboard/zylonite_kbd.h
+@@ -0,0 +1,224 @@
++#ifndef __PXA_KBD_H
++#define __PXA_KBD_H
++
++#define MAX_KEYS 0xff
++#define NO_KEY			0xFF
++
++#define     KP_SC_A                    KEY_A
++#define     KP_SC_B                    KEY_B
++#define     KP_SC_C                    KEY_C
++#define     KP_SC_D                    KEY_D
++#define     KP_SC_E                    KEY_E
++#define     KP_SC_F                    KEY_F
++#define     KP_SC_G                    KEY_G
++#define     KP_SC_H                    KEY_H
++#define     KP_SC_I                    KEY_I
++#define     KP_SC_J                    KEY_J
++#define     KP_SC_K                    KEY_K
++#define     KP_SC_L                    KEY_L
++#define     KP_SC_M                    KEY_M
++#define     KP_SC_N                    KEY_N
++#define     KP_SC_O                    KEY_O
++#define     KP_SC_P                    KEY_P
++#define     KP_SC_Q                    KEY_Q
++#define     KP_SC_R                    KEY_R
++#define     KP_SC_S                    KEY_S
++#define     KP_SC_T                    KEY_T
++#define     KP_SC_U                    KEY_U
++#define     KP_SC_V                    KEY_V
++#define     KP_SC_W                    KEY_W
++#define     KP_SC_X                    KEY_X
++#define     KP_SC_Y                    KEY_Y
++#define     KP_SC_Z                    KEY_Z
++
++#define     KP_SC_PERIOD           KEY_PREVIOUS
++#define     KP_SC_AT_SYMBOL    KEY_2	/* @ */
++#define     KP_SC_SLASH             KEY_SLASH
++#define     KP_SC_BACKSLASH     KEY_BACKSLASH
++
++#define     KP_SC_HOME              KEY_HOME
++#ifndef CONFIG_KEYPAD_ZYLONITE_SHIFT
++#define     KP_SC_SHIFT             KEY_CAPSLOCK
++#else
++#define     KP_SC_SHIFT             KEY_LEFTSHIFT
++#endif
++#define     KP_SC_SPACE	            KEY_SPACE
++#define     KP_SC_SPACE_RSVD	KEY_F21
++#define     KP_SC_BLUEKEY		KEY_BLUE
++#define     KP_SC_BACK                 KEY_BACK
++
++#define     KP_SC_1                    KEY_1
++#define     KP_SC_2                    KEY_2
++#define     KP_SC_3                    KEY_3
++#define     KP_SC_4                    KEY_4
++#define     KP_SC_5                    KEY_5
++#define     KP_SC_6                    KEY_6
++#define     KP_SC_7                    KEY_7
++#define     KP_SC_8                    KEY_8
++#define     KP_SC_9                    KEY_9
++#define     KP_SC_0                    KEY_0
++
++#define     KP_SC_SOFT1                KEY_F22
++#define     KP_SC_SOFT2                KEY_F23
++#define     KP_SC_SEND                 KEY_SENDFILE
++#define     KP_SC_END                  KEY_END
++/* Navigation center scan codes */
++#define     KP_SC_N_UP                 KEY_UP
++#define     KP_SC_N_DOWN               KEY_DOWN
++#define     KP_SC_N_LEFT               KEY_LEFT
++#define     KP_SC_N_RIGHT              KEY_RIGHT
++#define     KP_SC_N_ACTION             KEY_ENTER
++
++#define     KP_SC_SCROLL_PUSH          KEY_ENTER
++
++#define     KP_SC_STAR		KEY_8	    /* * */
++#define     KP_SC_POUND		KEY_3	    /* # */
++#define     KP_SC_BANG		KEY_9	    /* ! */
++#define     KP_SC_QMARK		KEY_BACKSLASH	/* ? */
++#define     KP_SC_DOLLAR	KEY_4	/* $ */
++#define     KP_SC_AMPERSAND	KEY_7	/* & */
++
++#define     KP_SC_COLON                KEY_SEMICOLON
++#define     KP_SC_SEMICOLON        KEY_SEMICOLON
++/*#define     KP_SC_????		0x83 */
++/*#define     KP_SC_????		0xA3 */
++#define     KP_SC_TAB                  KEY_TAB
++#define     KP_SC_L_PAREN		KEY_KPLEFTPAREN	/* ( */
++#define     KP_SC_R_PAREN              KEY_KPRIGHTPAREN
++/*#define     KP_SC_L_ARROW  ???	0xA4 */
++#define     KP_SC_ENTER		KEY_ENTER	/* Also called "RETURN" */
++
++#define     KP_SC_SCROLL_UP            KEY_UP
++#define     KP_SC_SCROLL_DOWN          KEY_DOWN
++
++#define     KP_SC_RECORD               KEY_RECORD
++#define     KP_SC_DELETE               KEY_DELETE
++
++#define     KP_SC_AUX1                KEY_AUX
++#define     KP_SC_AUX2                 KEY_AUX
++#define     KP_SC_AUX3                 KEY_AUX
++
++#define     KP_SC_VOL_UP               KEY_VOLUMEUP
++#define     KP_SC_VOL_DN               KEY_VOLUMEDOWN
++
++/* New navigation-station chord scan codes */
++
++#define     KP_SC_N_UP_LEFT              KEY_F1
++#define     KP_SC_N_UP_RIGHT             KEY_F2
++#define     KP_SC_N_DOWN_LEFT            KEY_F3
++#define     KP_SC_N_DOWN_RIGHT           KEY_F4
++#define     KP_SC_N_ACTION_UP            KEY_F5
++#define     KP_SC_N_ACTION_DOWN          KEY_F6
++#define     KP_SC_N_ACTION_LEFT          KEY_F7
++#define     KP_SC_N_ACTION_RIGHT         KEY_F8
++#define     KP_SC_N_ACTION_UP_LEFT       KEY_F9
++#define     KP_SC_N_ACTION_UP_RIGHT      KEY_F10
++#define     KP_SC_N_ACTION_DOWN_LEFT     KEY_F11
++#define     KP_SC_N_ACTION_DOWN_RIGHT    KEY_F12
++
++/*
++ * For the sake of speed and simplicity, this table is configured so that the
++ * single-closure matrix scan codes are placed using an MK_INn (row) by
++ * MK_OUTm (column) format.  That will permit direct use of the KPAS
++ * register's lower 8 bits, which yield that indexing.
++ * Multiclosure (chorded) scan codes are processed in-line by the multipress parser
++ */
++
++/*
++ Note: Zylonite-specific
++ Unassigned cells filled with 0xFE (KP_SC_INVALID_KEY)
++ */
++#define KP_MAX_SINGLE_SCAN_CODES 64
++
++/*
++ * we treat
++ *   key CONTACT as KP_SC_AUX1;
++ *   key CALENDAR as KP_SC_AUX2;
++ *   key EMAIL as KP_SC_AUX3
++ */
++static int pxakbd_keycode[KP_MAX_SINGLE_SCAN_CODES] = {
++	/*IN0 */
++/*OUT0 */ KP_SC_A,
++/*OUT1 */ KP_SC_B,
++/*OUT2 */ KP_SC_C,
++/*OUT3 */ KP_SC_AUX1,
++/*OUT4 */ KP_SC_AUX3,
++/*OUT5 */ KP_SC_D,
++/*OUT6 */ KP_SC_SOFT1,
++/*OUT7 */ KP_SC_N_UP,
++
++	/*IN1 */
++/*OUT0 */ KP_SC_E,
++/*OUT1 */ KP_SC_F,
++/*OUT2 */ KP_SC_G,
++/*OUT3 */ KP_SC_1,
++/*OUT4 */ KP_SC_3,
++/*OUT5 */ KP_SC_H,
++/*OUT6 */ KP_SC_SOFT2,
++/*OUT7*/ KP_SC_N_DOWN,
++
++	/*IN2 */
++/*OUT0 */ KP_SC_I,
++/*OUT1 */ KP_SC_J,
++/*OUT2 */ KP_SC_K,
++/*OUT3 */ KP_SC_4,
++/*OUT4 */ KP_SC_6,
++/*OUT5 */ KP_SC_L,
++/*OUT6 */ KP_SC_HOME,
++/*OUT7 */ KP_SC_N_LEFT,
++
++	/*IN3 */
++/*OUT0 */ KP_SC_M,
++/*OUT1 */ KP_SC_N,
++/*OUT2 */ KP_SC_O,
++/*OUT3 */ KP_SC_7,
++/*OUT4 */ KP_SC_9,
++/*OUT5 */ KP_SC_P,
++/*OUT6 */ KP_SC_END,
++/*OUT7 */ KP_SC_N_RIGHT,
++
++	/*IN4 */
++/*OUT0 */ KP_SC_AUX2,
++/*OUT1 */ KP_SC_2,
++/*OUT2 */ KP_SC_5,
++/*OUT3 */ KP_SC_8,
++/*OUT4*/ KP_SC_0,
++/*OUT5 */ KP_SC_SPACE,
++/*OUT6 */ KP_SC_SCROLL_PUSH,
++/*OUT7 */ 0xFE,
++
++	/*IN5 */
++/*OUT0 */ KP_SC_Q,
++/*OUT1 */ KP_SC_R,
++/*OUT2 */ KP_SC_S,
++/*OUT3 */ KP_SC_STAR,
++/*OUT4 */ KP_SC_POUND,
++/*OUT5 */ KP_SC_T,
++/*OUT6 */ KP_SC_SEND,
++/*OUT7 */ KP_SC_N_ACTION,
++
++	/*IN6 */
++/*OUT0 */ KP_SC_U,
++/*OUT1 */ KP_SC_V,
++/*OUT2 */ KP_SC_W,
++/*OUT3 */ KP_SC_SHIFT,
++/*OUT4 */ KP_SC_DELETE,
++/*OUT5 */ KP_SC_X,
++/*OUT6 */ KP_SC_BACK,
++/*OUT7 */ KP_SC_VOL_UP,
++
++	/*IN7 */
++/*OUT0 */ 0xFE,
++/*OUT1 */ KP_SC_Y,
++/*OUT2 */ KP_SC_Z,
++/*OUT3 */ 0xFE,
++/*OUT4 */ 0xFE,
++/*OUT5 */ 0xFE,
++/*OUT6 */ KP_SC_RECORD,
++/*OUT7 */ KP_SC_VOL_DN,
++};				/*pxakbd_keycodeLower */
++
++#define     KEYPAD_COLS_NUM      8
++#define     KEYPAD_ROWS_NUM     8
++
++#endif
+Index: linux-2.6.10/drivers/input/touchscreen/mhn_audio_touch.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/touchscreen/mhn_audio_touch.c
+@@ -0,0 +1,373 @@
++/*
++ *  drivers/input/touchscreen/mhn_audio_touch.c.
++ *
++ *  Author:	bridge.wu@marvell.com
++ *  Created:	Nov 17, 2006
++ *  Copyright:	Marvell Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2 as
++ *  published by the Free Software Foundation.
++ */
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++
++#include <sound/driver.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/initval.h>
++
++#include <asm/semaphore.h>
++#include <asm/hardware.h>
++#include <asm/arch/pxa-regs.h>
++#include <linux/suspend.h>
++#include <linux/spinlock.h>
++
++#include <asm/arch/codec/acodec.h>
++#include <asm/arch/mhn_audio_plat.h>
++
++static p_zy_acocec_context_t p_zy_codec_ctxt = NULL;
++
++#include <linux/input.h>
++#include <asm/arch/codec/wm9713.h>
++#define PEN_DOWN 1
++#define PEN_UP 0
++typedef struct {
++	unsigned int is_registered;	/* Is the driver AC97 registered */
++	int adc_errs;			/* sample read back errors */
++	spinlock_t lock;
++	struct input_dev *idev;
++	struct completion thread_init;
++	struct completion thread_exit;
++	struct task_struct *rtask;
++	struct semaphore  sem;
++	int (*cont_mode)(void);
++	int  use_count;
++	int restart;
++} codec_zy_ts_t;
++
++static codec_zy_ts_t codec_zy_ts;
++
++static struct input_dev codec_zy_ts_input;
++
++#ifdef CONFIG_PM
++static int touch_suspend = 0 ;
++#endif
++
++
++/*
++ * add a touch event
++ */
++static int codec_zy_ts_evt_add(codec_zy_ts_t* ts, u16 pressure, u16 x, u16 y)
++{
++        /* add event and remove adc src bits */
++        static u16 pre_press = 0;
++        input_report_abs(ts->idev, ABS_X, x & 0xfff);
++        input_report_abs(ts->idev, ABS_Y, y & 0xfff);
++        if (pressure == pre_press)
++                pressure--;
++        pre_press = pressure;
++        input_report_abs(ts->idev, ABS_PRESSURE, pressure & 0xfff);
++        return 0;
++}
++
++/*
++ * add a pen up event
++ */
++static void codec_zy_ts_evt_release(codec_zy_ts_t* ts)
++{
++	input_report_abs(ts->idev, ABS_PRESSURE, 0);
++}
++
++/*
++ * Kill the touchscreen thread and stop
++ * the touch digitiser.
++ */
++static void codec_zy_ts_input_close(struct input_dev *idev)
++{
++	codec_zy_ts_t *ts = (codec_zy_ts_t *) &codec_zy_ts;
++	dev_dbg(idev->dev, "close ts input!\n");
++	spin_lock(&ts->lock);
++	if (--ts->use_count == 0) {
++		spin_unlock(&ts->lock);
++		/* kill thread */
++		init_completion(&ts->thread_exit);
++		if (ts->rtask) {
++			send_sig(SIGKILL, ts->rtask, 1);
++			wait_for_completion(&ts->thread_exit);
++		}
++
++		/* stop digitiser */
++		zy_acodec_disable_touch(p_zy_codec_ctxt);
++	} else
++		spin_unlock(&ts->lock);
++}
++
++/*
++ * Sample the touchscreen
++ */
++int ac97_poll_touch(codec_zy_ts_t *ts)
++{
++	unsigned short x = 0, y = 0;
++	int if_down = 0;
++
++	/* get x value */
++	pr_debug("x:0x%x\n",x);
++	if (ZY_ACODEC_SUCCESS != zy_acodec_get_adc_sample(p_zy_codec_ctxt, &x,
++		ZY_TOUCH_SAMPLE_X, &if_down))
++			return -EIO;
++
++	/* the pen is up */
++	if (1 != if_down)
++		return PEN_UP;
++
++	/* get y value */
++	pr_debug("y:0x%x\n",y);
++	if( ZY_ACODEC_SUCCESS != zy_acodec_get_adc_sample(p_zy_codec_ctxt, &y,
++		ZY_TOUCH_SAMPLE_Y, &if_down))
++			return -EIO;
++
++	/* the pen is up */
++	if (1 != if_down)
++		return PEN_UP;
++	/*
++ 	 * the pen is down, can not get the pressure value,
++	 * so if pen is down, give the max pressure value
++	 */
++	codec_zy_ts_evt_add(ts,0xfff, x, y);
++	return PEN_DOWN;
++}
++
++/*
++ * The touchscreen sample reader thread
++ */
++static int codec_zy_ts_thread(void *_ts)
++{
++	codec_zy_ts_t *ts = (codec_zy_ts_t *)_ts;
++	struct task_struct *tsk = current;
++	int valid = 0;
++	int pen_status = PEN_UP;
++	ts->rtask = tsk;
++
++	/* set up thread context */
++	daemonize("ktsd");
++
++	/* we will die when we receive SIGKILL */
++	spin_lock_irq(&tsk->proc_lock);
++	siginitsetinv(&tsk->blocked, sigmask(SIGKILL));
++	recalc_sigpending();
++	spin_unlock_irq(&tsk->proc_lock);
++
++	/* init is complete */
++	complete(&ts->thread_init);
++
++	/* touch reader loop */
++	for (;;) {
++		ts->restart = 0;
++		if(signal_pending(tsk))
++			break;
++
++		/* get x_y value */
++		pen_status = ac97_poll_touch(ts);
++		if (PEN_DOWN == pen_status )
++			valid = 1;
++		else if (PEN_UP == pen_status && valid) {
++			valid = 0;
++			codec_zy_ts_evt_release(ts);
++		}
++
++		set_task_state(tsk, TASK_INTERRUPTIBLE);
++		if (HZ >= 100)
++			schedule_timeout(HZ/100);
++		else
++			schedule_timeout(1);
++#ifdef CONFIG_PM
++		if(tsk->flags & PF_FREEZE){
++			refrigerator();
++		}
++#endif
++	}
++
++	ts->rtask = NULL;
++	complete_and_exit(&ts->thread_exit, 0);
++
++	return 0;
++}
++
++/*
++ * Start the touchscreen thread and
++ * the touch digitiser.
++ */
++static int codec_zy_ts_input_open(struct input_dev *idev)
++{
++	codec_zy_ts_t *ts = (codec_zy_ts_t *) &codec_zy_ts;
++	int ret;
++#ifdef CONFIG_PM
++	if(touch_suspend){
++		printk(KERN_INFO "touch is suspended!\n");
++		return -1;
++	}
++#endif
++
++	spin_lock(&ts->lock);
++	if ( ts->use_count++ == 0 ) {
++		spin_unlock( &ts->lock );
++		/* start touchscreen thread */
++		ts->idev = idev;
++		init_completion(&ts->thread_init);
++		ret = kernel_thread(codec_zy_ts_thread, ts, 0);
++		if (ret >= 0)
++			wait_for_completion(&ts->thread_init);
++
++		/* start digitiser */
++		zy_acodec_enable_touch(p_zy_codec_ctxt);
++
++	} else
++		spin_unlock( &ts->lock );
++	return 0;
++}
++
++/*
++ * initilze the pxa touch screen
++ */
++ static int alsa_ts_init( void )
++{
++	codec_zy_ts_t* ts = &codec_zy_ts;
++
++	memset(ts, 0, sizeof(codec_zy_ts_t));
++
++	/* tell input system what we events we accept and register */
++	codec_zy_ts_input.name = "codec zy touchscreen";
++	codec_zy_ts_input.open = codec_zy_ts_input_open;
++	codec_zy_ts_input.close = codec_zy_ts_input_close;
++	__set_bit(EV_ABS, codec_zy_ts_input.evbit);
++	__set_bit(ABS_X, codec_zy_ts_input.absbit);
++	__set_bit(ABS_Y, codec_zy_ts_input.absbit);
++	__set_bit(ABS_PRESSURE, codec_zy_ts_input.absbit);
++	input_register_device(&codec_zy_ts_input);
++	spin_lock_init(&ts->lock);
++	init_MUTEX(&ts->sem);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int touch_codec_zy_suspend(struct device *_dev, pm_message_t state, u32 level)
++{
++	int ret=0;
++	if(level == SUSPEND_DISABLE) {
++		zy_acodec_suspend(p_zy_codec_ctxt);
++		pxa_set_cken(CKEN_AC97, 0);
++		pxa_set_cken(CKEN_SSP3, 0);
++		printk(KERN_INFO "alsa touch suspend!\n");
++	}
++	touch_suspend = 1;
++	return ret;
++}
++
++static int touch_codec_zy_resume(struct device *_dev, u32 level)
++{
++	int ret = 0;
++	if (level == RESUME_ENABLE){
++		pxa_set_cken(CKEN_AC97, 1);
++		zy_acodec_resume(p_zy_codec_ctxt);
++		printk(KERN_INFO "alsa touch resume!\n");
++	}
++	touch_suspend = 0 ;
++	return ret;
++}
++#else
++#define touch_codec_zy_suspend	NULL
++#define touch_codec_zy_resume	NULL
++#endif
++
++static int __devinit touch_codec_zy_probe(struct device *dev)
++{
++	snd_card_t *card = NULL;
++	int ret;
++	zy_acodec_error_t status;
++
++	ret = alsa_prepare_for_zy(&p_zy_codec_ctxt);
++	if (ret)
++		goto err;
++
++	status = zy_acodec_init(p_zy_codec_ctxt, 1);
++	if (ZY_ACODEC_SUCCESS != status) {
++		ret = -EIO;
++		goto err;
++	}
++	/* power down the units of the acodec, sleep the acodec, zy_acodec_init()
++	 * will open all the units' power of the codec while ALSA need all the codec
++	 * units power down and the codec should sleep if it can.
++	 * So on the zylonite platform we call below function to power down and sleep
++	 * wm9713 codec.
++	 */
++	p_zy_codec_ctxt->g_pfn_codec_specific_dinit(p_zy_codec_ctxt);
++
++	alsa_ts_init();
++
++	return 0;
++err:
++	if (p_zy_codec_ctxt) {
++		zy_acodec_deinit(p_zy_codec_ctxt);
++		pxa_set_cken(CKEN_AC97, 0);
++		kfree(p_zy_codec_ctxt);
++		p_zy_codec_ctxt = NULL;
++	}
++
++	if (card)
++		snd_card_free(card);
++
++	return ret;
++}
++
++static int __devexit touch_codec_zy_remove(struct device *dev)
++{
++	snd_card_t *card = dev_get_drvdata(dev);
++
++	input_unregister_device(&codec_zy_ts_input);
++
++	if (p_zy_codec_ctxt) {
++		alsa_zy_codec_put(p_zy_codec_ctxt);
++		kfree(p_zy_codec_ctxt);
++		p_zy_codec_ctxt = NULL;
++	}
++
++	if (card) {
++		snd_card_free(card);
++		dev_set_drvdata(dev, NULL);
++	}
++
++	return 0;
++}
++
++static struct device_driver touch_codec_zy_driver = {
++	.name 	= 	"pxa2xx-touch",
++	.bus 	=	&platform_bus_type,
++	.probe 	= 	touch_codec_zy_probe,
++	.remove = 	__devexit_p(touch_codec_zy_remove),
++	.suspend= 	touch_codec_zy_suspend,
++	.resume = 	touch_codec_zy_resume,
++};
++
++static int __init touch_codec_zy_init(void)
++{
++	return driver_register(&touch_codec_zy_driver);
++}
++
++static void __exit touch_code_zy_exit(void)
++{
++	driver_unregister(&touch_codec_zy_driver);
++}
++module_init(touch_codec_zy_init);
++module_exit(touch_code_zy_exit);
++
++EXPORT_SYMBOL(p_zy_codec_ctxt);
++
++MODULE_AUTHOR("bridge.wu@marvell.com");
++MODULE_DESCRIPTION("zylonite audio touch codec driver on ALSA");
++MODULE_LICENSE("GPL");
++
+Index: linux-2.6.10/drivers/input/keyboard/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/input/keyboard/Makefile
++++ linux-2.6.10/drivers/input/keyboard/Makefile
+@@ -15,3 +15,4 @@ obj-$(CONFIG_KEYBOARD_98KBD)		+= 98kbd.o
+ obj-$(CONFIG_KEYBOARD_OMAP)             += omap-keypad.o
+ obj-$(CONFIG_OMAP_PS2)			+= innovator_ps2.o
+ obj-$(CONFIG_KEYBOARD_MAINSTONE) 	+= mstone_keypad.o
++obj-$(CONFIG_KEYPAD_ZYLONITE)		+= zylonite_kbd.o
+Index: linux-2.6.10/drivers/input/touchscreen/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/input/touchscreen/Kconfig
++++ linux-2.6.10/drivers/input/touchscreen/Kconfig
+@@ -47,5 +47,14 @@ config TOUCHSCREEN_OMAP
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called omap_ts.
+ 
++config SND_ZYLONITE_TOUCH
++        bool "Monahans touch screen driver based on AC97"
++        depends on SND && PXA3xx
++        default y
++        select SND_ZYLONITE_CORE
++        help
++          Say Y to enable the touch screen on Monahans Platform Development Kit (Zylonite)
++
++
+ 
+ 
+Index: linux-2.6.10/drivers/input/touchscreen/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/input/touchscreen/Makefile
++++ linux-2.6.10/drivers/input/touchscreen/Makefile
+@@ -7,3 +7,4 @@
+ obj-$(CONFIG_TOUCHSCREEN_BITSY)	+= h3600_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_GUNZE)	+= gunze.o
+ obj-$(CONFIG_TOUCHSCREEN_OMAP)	+= omap/
++obj-$(CONFIG_SND_ZYLONITE_TOUCH) += mhn_audio_touch.o
+Index: linux-2.6.10/mvl_patches/pro-1413.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1413.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1413);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

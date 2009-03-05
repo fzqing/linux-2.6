@@ -1,0 +1,509 @@
+#! /usr/bin/env bash
+# Patch: -cmd64x_fix_pio_mode_setup
+# Date: Fri Jan  4 18:40:02 2008
+# Source: MontaVista Software, Inc.
+# MR: 23989
+# Type: Defect Fix
+# Disposition: accepted into 2.6.21-rc3
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# cmd64x: fix PIO mode setup (take 3)
+# 
+# The driver's tuneproc() method fails to set the drive's own speed -- fix this
+# by renaming the function to cmd64x_tune_pio(), making it return the mode set,
+# and "wrapping" the new tuneproc() method around it; while at it, also get rid
+# of the non-working prefetch control code (filtering out related argument values
+# in the "wrapper"), remove redundant PIO5 mode limitation, make cmdprintk() give
+# more sensible mode info, and remove mention about the obsolete /proc/ interface.
+# Get rid of the broken config_chipset_for_pio() which always tried to set PIO4,
+# switch to always auto-tuning PIO instead.
+# Oh, and add the missing PIO5 support to the speedproc() method while at it. :-)
+# 
+# Warning: compile tested only -- getting to the real hardware isn't that easy...
+# 
+# On Tuesday 06 February 2007 22:11, Mikael Pettersson <mikpe@it.uu.se> wrote:
+# > 
+# > Worked fine on my SPARC Ultra5 with a CMD646 IDE controller.
+# 
+# This patch is a bit different from the upstream version due to a number of IDE
+# cleanups that happened in 2.6.21-rc1; also, it #include's "ide-timing.h" for
+# the sake of #define XFER_PIO_5 that wasn't in <linux/ata.h> in 2.6.10 yet...
+# 
+# commit f92d50e6fd14f6e4601f59aac4cffe617b7b2ce6
+# tree cb5859a3087788c579ad051dd679f1acdc33ff1c
+# parent 21b824771309927172247546b0bff0c4e6831875
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 03 Mar 2007 17:48:53 +0100
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 03 Mar 2007 17:48:53 +0100
+# 
+#  drivers/ide/pci/cmd64x.c |  109 ++++++++++++++++++-----------------------------
+#  1 files changed, 44 insertions(+), 65 deletions(-)
+# 
+
+PATCHNUM=1527
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 23989
+Type: Defect Fix
+Disposition: accepted into 2.6.21-rc3
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+cmd64x: fix PIO mode setup (take 3)
+
+The driver's tuneproc() method fails to set the drive's own speed -- fix this
+by renaming the function to cmd64x_tune_pio(), making it return the mode set,
+and "wrapping" the new tuneproc() method around it; while at it, also get rid
+of the non-working prefetch control code (filtering out related argument values
+in the "wrapper"), remove redundant PIO5 mode limitation, make cmdprintk() give
+more sensible mode info, and remove mention about the obsolete /proc/ interface.
+Get rid of the broken config_chipset_for_pio() which always tried to set PIO4,
+switch to always auto-tuning PIO instead.
+Oh, and add the missing PIO5 support to the speedproc() method while at it. :-)
+
+Warning: compile tested only -- getting to the real hardware isn't that easy...
+
+On Tuesday 06 February 2007 22:11, Mikael Pettersson <mikpe@it.uu.se> wrote:
+> 
+> Worked fine on my SPARC Ultra5 with a CMD646 IDE controller.
+
+This patch is a bit different from the upstream version due to a number of IDE
+cleanups that happened in 2.6.21-rc1; also, it #include's "ide-timing.h" for
+the sake of #define XFER_PIO_5 that wasn't in <linux/ata.h> in 2.6.10 yet...
+
+commit f92d50e6fd14f6e4601f59aac4cffe617b7b2ce6
+tree cb5859a3087788c579ad051dd679f1acdc33ff1c
+parent 21b824771309927172247546b0bff0c4e6831875
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Sat, 03 Mar 2007 17:48:53 +0100
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Sat, 03 Mar 2007 17:48:53 +0100
+
+ drivers/ide/pci/cmd64x.c |  109 ++++++++++++++++++-----------------------------
+ mvl_patches/pro-1527.c   |   16 ++++++
+ 2 files changed, 60 insertions(+), 65 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/cmd64x.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/cmd64x.c
++++ linux-2.6.10/drivers/ide/pci/cmd64x.c
+@@ -1,6 +1,6 @@
+ /* $Id: cmd64x.c,v 1.21 2000/01/30 23:23:16
+  *
+- * linux/drivers/ide/pci/cmd64x.c		Version 1.30	Sept 10, 2002
++ * linux/drivers/ide/pci/cmd64x.c		Version 1.41	Feb 3, 2007
+  *
+  * cmd64x.c: Enable interrupts at initialization time on Ultra/PCI machines.
+  *           Note, this driver is not used at all on other systems because
+@@ -12,6 +12,7 @@
+  * Copyright (C) 1998		David S. Miller (davem@redhat.com)
+  *
+  * Copyright (C) 1999-2002	Andre Hedrick <andre@linux-ide.org>
++ * Copyright (C) 2007		MontaVista Software, Inc. <source@mvista.com>
+  */
+ 
+ #include <linux/config.h>
+@@ -22,6 +23,7 @@
+ #include <linux/hdreg.h>
+ #include <linux/ide.h>
+ #include <linux/init.h>
++#include "ide-timing.h"
+ 
+ #include <asm/io.h>
+ 
+@@ -271,43 +273,25 @@ static void program_drive_counts (ide_dr
+ }
+ 
+ /*
+- * Attempts to set the interface PIO mode.
+- * The preferred method of selecting PIO modes (e.g. mode 4) is 
+- * "echo 'piomode:4' > /proc/ide/hdx/settings".  Special cases are
+- * 8: prefetch off, 9: prefetch on, 255: auto-select best mode.
+- * Called with 255 at boot time.
++ * This routine selects drive's best PIO mode, calculates setup/active/recovery
++ * counts, and then writes them into the chipset registers.
+  */
+-
+-static void cmd64x_tuneproc (ide_drive_t *drive, u8 mode_wanted)
++static u8 cmd64x_tune_pio (ide_drive_t *drive, u8 mode_wanted)
+ {
+ 	int setup_time, active_time, recovery_time;
+ 	int clock_time, pio_mode, cycle_time;
+ 	u8 recovery_count2, cycle_count;
+ 	int setup_count, active_count, recovery_count;
+ 	int bus_speed = system_bus_clock();
+-	/*byte b;*/
+ 	ide_pio_data_t  d;
+ 
+-	switch (mode_wanted) {
+-		case 8: /* set prefetch off */
+-		case 9: /* set prefetch on */
+-			mode_wanted &= 1;
+-			/*set_prefetch_mode(index, mode_wanted);*/
+-			cmdprintk("%s: %sabled cmd640 prefetch\n",
+-				drive->name, mode_wanted ? "en" : "dis");
+-			return;
+-	}
+-
+-	mode_wanted = ide_get_best_pio_mode (drive, mode_wanted, 5, &d);
+-	pio_mode = d.pio_mode;
++	pio_mode = ide_get_best_pio_mode(drive, mode_wanted, 5, &d);
+ 	cycle_time = d.cycle_time;
+ 
+ 	/*
+ 	 * I copied all this complicated stuff from cmd640.c and made a few
+ 	 * minor changes.  For now I am just going to pray that it is correct.
+ 	 */
+-	if (pio_mode > 5)
+-		pio_mode = 5;
+ 	setup_time  = ide_pio_timings[pio_mode].setup_time;
+ 	active_time = ide_pio_timings[pio_mode].active_time;
+ 	recovery_time = cycle_time - (setup_time + active_time);
+@@ -329,22 +313,33 @@ static void cmd64x_tuneproc (ide_drive_t
+ 	if (active_count > 16)
+ 		active_count = 16; /* maximum allowed by cmd646 */
+ 
+-	/*
+-	 * In a perfect world, we might set the drive pio mode here
+-	 * (using WIN_SETFEATURE) before continuing.
+-	 *
+-	 * But we do not, because:
+-	 *	1) this is the wrong place to do it
+-	 *		(proper is do_special() in ide.c)
+-	 * 	2) in practice this is rarely, if ever, necessary
+-	 */
+ 	program_drive_counts (drive, setup_count, active_count, recovery_count);
+ 
+-	cmdprintk("%s: selected cmd646 PIO mode%d : %d (%dns)%s, "
++	cmdprintk("%s: PIO mode wanted %d, selected %d (%dns)%s, "
+ 		"clocks=%d/%d/%d\n",
+-		drive->name, pio_mode, mode_wanted, cycle_time,
++		drive->name, mode_wanted, pio_mode, cycle_time,
+ 		d.overridden ? " (overriding vendor mode)" : "",
+ 		setup_count, active_count, recovery_count);
++
++	return pio_mode;
++}
++
++/*
++ * Attempts to set drive's PIO mode.
++ * Special cases are 8: prefetch off, 9: prefetch on (both never worked),
++ * and 255: auto-select best mode (used at boot time).
++ */
++static void cmd64x_tune_drive (ide_drive_t *drive, u8 pio)
++{
++	/*
++	 * Filter out the prefetch control values
++	 * to prevent PIO5 from being programmed
++	 */
++	if (pio == 8 || pio == 9)
++		return;
++
++	pio = cmd64x_tune_pio(drive, pio);
++	(void) ide_config_drive_speed(drive, XFER_PIO_0 + pio);
+ }
+ 
+ static u8 cmd64x_ratemask (ide_drive_t *drive)
+@@ -396,22 +391,6 @@ static u8 cmd64x_ratemask (ide_drive_t *
+ 	return mode;
+ }
+ 
+-static void config_cmd64x_chipset_for_pio (ide_drive_t *drive, u8 set_speed)
+-{
+-	u8 speed	= 0x00;
+-	u8 set_pio	= ide_get_best_pio_mode(drive, 4, 5, NULL);
+-
+-	cmd64x_tuneproc(drive, set_pio);
+-	speed = XFER_PIO_0 + set_pio;
+-	if (set_speed)
+-		(void) ide_config_drive_speed(drive, speed);
+-}
+-
+-static void config_chipset_for_pio (ide_drive_t *drive, u8 set_speed)
+-{
+-	config_cmd64x_chipset_for_pio(drive, set_speed);
+-}
+-
+ static int cmd64x_tune_chipset (ide_drive_t *drive, u8 xferspeed)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
+@@ -423,7 +402,7 @@ static int cmd64x_tune_chipset (ide_driv
+ 
+ 	u8 speed	= ide_rate_filter(cmd64x_ratemask(drive), xferspeed);
+ 
+-	if (speed > XFER_PIO_4) {
++	if (speed >= XFER_SW_DMA_0) {
+ 		(void) pci_read_config_byte(dev, pciD, &regD);
+ 		(void) pci_read_config_byte(dev, pciU, &regU);
+ 		regD &= ~(unit ? 0x40 : 0x20);
+@@ -447,17 +426,20 @@ static int cmd64x_tune_chipset (ide_driv
+ 		case XFER_SW_DMA_2:	regD |= (unit ? 0x40 : 0x10); break;
+ 		case XFER_SW_DMA_1:	regD |= (unit ? 0x80 : 0x20); break;
+ 		case XFER_SW_DMA_0:	regD |= (unit ? 0xC0 : 0x30); break;
+-		case XFER_PIO_4:	cmd64x_tuneproc(drive, 4); break;
+-		case XFER_PIO_3:	cmd64x_tuneproc(drive, 3); break;
+-		case XFER_PIO_2:	cmd64x_tuneproc(drive, 2); break;
+-		case XFER_PIO_1:	cmd64x_tuneproc(drive, 1); break;
+-		case XFER_PIO_0:	cmd64x_tuneproc(drive, 0); break;
++		case XFER_PIO_5:
++		case XFER_PIO_4:
++		case XFER_PIO_3:
++		case XFER_PIO_2:
++		case XFER_PIO_1:
++		case XFER_PIO_0:
++			(void) cmd64x_tune_pio(drive, speed - XFER_PIO_0);
++			break;
+ 
+ 		default:
+ 			return 1;
+ 	}
+ 
+-	if (speed > XFER_PIO_4) {
++	if (speed >= XFER_SW_DMA_0) {
+ 		(void) pci_write_config_byte(dev, pciU, regU);
+ 		regD |= (unit ? 0x40 : 0x20);
+ 		(void) pci_write_config_byte(dev, pciD, regD);
+@@ -470,8 +452,6 @@ static int config_chipset_for_dma (ide_d
+ {
+ 	u8 speed	= ide_dma_speed(drive, cmd64x_ratemask(drive));
+ 
+-	config_chipset_for_pio(drive, !speed);
+-
+ 	if (!speed)
+ 		return 0;
+ 
+@@ -500,7 +480,7 @@ static int cmd64x_config_drive_for_dma (
+ 
+ 	} else if ((id->capability & 8) || (id->field_valid & 2)) {
+ fast_ata_pio:
+-		config_chipset_for_pio(drive, 1);
++		cmd64x_tune_drive(drive, 255);
+ 		return hwif->ide_dma_off_quietly(drive);
+ 	}
+ 	/* IORDY not supported */
+@@ -710,14 +690,13 @@ static void __devinit init_hwif_cmd64x(i
+ 	pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_rev);
+ 	class_rev &= 0xff;
+ 
+-	hwif->tuneproc  = &cmd64x_tuneproc;
++	hwif->tuneproc  = &cmd64x_tune_drive;
+ 	hwif->speedproc = &cmd64x_tune_chipset;
+ 
+-	if (!hwif->dma_base) {
+-		hwif->drives[0].autotune = 1;
+-		hwif->drives[1].autotune = 1;
++	hwif->drives[0].autotune = hwif->drives[1].autotune = 1;
++
++	if (!hwif->dma_base)
+ 		return;
+-	}
+ 
+ 	hwif->atapi_dma = 1;
+ 
+Index: linux-2.6.10/mvl_patches/pro-1527.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1527.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1527);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,599 @@
+#! /usr/bin/env bash
+# Patch: -usb_fix_acm_trouble_with_terminals
+# Date: Tue Oct 10 17:10:27 2006
+# MR: 19210
+# From: Oliver Neukum <oliver@neukum.org>
+# Date: Thu, 21 Apr 2005 19:28:02 +0000 (+0200)
+# Subject: [PATCH] USB: fix acm trouble with terminals
+# X-Git-Tag: v2.6.13-rc1
+# commit 884b600f63dc7c646f415a5d8f356df1f66ff6f2
+# 
+# [PATCH] USB: fix acm trouble with terminals
+# 
+# This patch fixes lost LF when ACM device is used with getty/login/bash,
+# in case of a modem which takes calls.
+# 
+# Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+# Signed-off-by: Oliver Neukum <oliver@neukum.name>
+# Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+PATCHNUM=911
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 19210
+From: Oliver Neukum <oliver@neukum.org>
+Date: Thu, 21 Apr 2005 19:28:02 +0000 (+0200)
+Subject: [PATCH] USB: fix acm trouble with terminals
+X-Git-Tag: v2.6.13-rc1
+commit 884b600f63dc7c646f415a5d8f356df1f66ff6f2
+
+[PATCH] USB: fix acm trouble with terminals
+
+This patch fixes lost LF when ACM device is used with getty/login/bash,
+in case of a modem which takes calls.
+
+Signed-off-by: Pete Zaitcev <zaitcev@redhat.com>
+Signed-off-by: Oliver Neukum <oliver@neukum.name>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+Index: linux-2.6.10/drivers/usb/class/cdc-acm.c
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/class/cdc-acm.c
++++ linux-2.6.10/drivers/usb/class/cdc-acm.c
+@@ -106,6 +106,111 @@ static int acm_ctrl_msg(struct acm *acm,
+ 	acm_ctrl_msg(acm, USB_CDC_REQ_SEND_BREAK, ms, NULL, 0)
+ 
+ /*
++ * Write buffer management.
++ * All of these assume proper locks taken by the caller.
++ */
++
++static int acm_wb_alloc(struct acm *acm)
++{
++	int i, wbn;
++	struct acm_wb *wb;
++
++	wbn = acm->write_current;
++	i = 0;
++	for (;;) {
++		wb = &acm->wb[wbn];
++		if (!wb->use) {
++			wb->use = 1;
++			return wbn;
++		}
++		wbn = (wbn + 1) % ACM_NWB;
++		if (++i >= ACM_NWB)
++			return -1;
++	}
++}
++
++static void acm_wb_free(struct acm *acm, int wbn)
++{
++	acm->wb[wbn].use = 0;
++}
++
++static int acm_wb_is_avail(struct acm *acm)
++{
++	int i, n;
++
++	n = 0;
++	for (i = 0; i < ACM_NWB; i++) {
++		if (!acm->wb[i].use)
++			n++;
++	}
++	return n;
++}
++
++static inline int acm_wb_is_used(struct acm *acm, int wbn)
++{
++	return acm->wb[wbn].use;
++}
++
++/*
++ * Finish write.
++ */
++static void acm_write_done(struct acm *acm)
++{
++	unsigned long flags;
++	int wbn;
++
++	spin_lock_irqsave(&acm->write_lock, flags);
++	acm->write_ready = 1;
++	wbn = acm->write_current;
++	acm_wb_free(acm, wbn);
++	acm->write_current = (wbn + 1) % ACM_NWB;
++	spin_unlock_irqrestore(&acm->write_lock, flags);
++}
++
++/*
++ * Poke write.
++ */
++static int acm_write_start(struct acm *acm)
++{
++	unsigned long flags;
++	int wbn;
++	struct acm_wb *wb;
++	int rc;
++
++	spin_lock_irqsave(&acm->write_lock, flags);
++	if (!acm->dev) {
++		spin_unlock_irqrestore(&acm->write_lock, flags);
++		return -ENODEV;
++	}
++
++	if (!acm->write_ready) {
++		spin_unlock_irqrestore(&acm->write_lock, flags);
++		return 0;	/* A white lie */
++	}
++
++	wbn = acm->write_current;
++	if (!acm_wb_is_used(acm, wbn)) {
++		spin_unlock_irqrestore(&acm->write_lock, flags);
++		return 0;
++	}
++	wb = &acm->wb[wbn];
++
++	acm->write_ready = 0;
++	spin_unlock_irqrestore(&acm->write_lock, flags);
++
++	acm->writeurb->transfer_buffer = wb->buf;
++	acm->writeurb->transfer_dma = wb->dmah;
++	acm->writeurb->transfer_buffer_length = wb->len;
++	acm->writeurb->dev = acm->dev;
++
++	if ((rc = usb_submit_urb(acm->writeurb, GFP_ATOMIC)) < 0) {
++		dbg("usb_submit_urb(write bulk) failed: %d", rc);
++		acm_write_done(acm);
++	}
++	return rc;
++}
++
++/*
+  * Interrupt handlers for various ACM device responses
+  */
+ 
+@@ -237,17 +342,13 @@ static void acm_rx_tasklet(unsigned long
+ static void acm_write_bulk(struct urb *urb, struct pt_regs *regs)
+ {
+ 	struct acm *acm = (struct acm *)urb->context;
+-	dbg("Entering acm_write_bulk with status %d\n", urb->status);
+-
+-	if (!ACM_READY(acm))
+-		goto out;
+ 
+-	if (urb->status)
+-		dbg("nonzero write bulk status received: %d", urb->status);
++	dbg("Entering acm_write_bulk with status %d\n", urb->status);
+ 
+-	schedule_work(&acm->work);
+-out:
+-	acm->ready_for_write = 1;
++	acm_write_done(acm);
++	acm_write_start(acm);
++	if (ACM_READY(acm))
++		schedule_work(&acm->work);
+ }
+ 
+ static void acm_softint(void *private)
+@@ -351,32 +452,33 @@ static int acm_tty_write(struct tty_stru
+ {
+ 	struct acm *acm = tty->driver_data;
+ 	int stat;
++	unsigned long flags;
++	int wbn;
++	struct acm_wb *wb;
++
+ 	dbg("Entering acm_tty_write to write %d bytes,\n", count);
+ 
+ 	if (!ACM_READY(acm))
+ 		return -EINVAL;
+-	if (!acm->ready_for_write)
+-		return 0;
+ 	if (!count)
+ 		return 0;
+ 
+-	count = (count > acm->writesize) ? acm->writesize : count;
++	spin_lock_irqsave(&acm->write_lock, flags);
++	if ((wbn = acm_wb_alloc(acm)) < 0) {
++		spin_unlock_irqrestore(&acm->write_lock, flags);
++		acm_write_start(acm);
++		return 0;
++	}
++	wb = &acm->wb[wbn];
+ 
++	count = (count > acm->writesize) ? acm->writesize : count;
+ 	dbg("Get %d bytes...", count);
+-	memcpy(acm->write_buffer, buf, count);
+-	dbg("  Successfully copied.\n");
++	memcpy(wb->buf, buf, count);
++	wb->len = count;
++	spin_unlock_irqrestore(&acm->write_lock, flags);
+ 
+-	acm->writeurb->transfer_buffer_length = count;
+-	acm->writeurb->dev = acm->dev;
+-
+-	acm->ready_for_write = 0;
+-	stat = usb_submit_urb(acm->writeurb, GFP_ATOMIC);
+-	if (stat < 0) {
+-		dbg("usb_submit_urb(write bulk) failed");
+-		acm->ready_for_write = 1;
++	if ((stat = acm_write_start(acm)) < 0)
+ 		return stat;
+-	}
+-
+ 	return count;
+ }
+ 
+@@ -385,7 +487,11 @@ static int acm_tty_write_room(struct tty
+ 	struct acm *acm = tty->driver_data;
+ 	if (!ACM_READY(acm))
+ 		return -EINVAL;
+-	return !acm->ready_for_write ? 0 : acm->writesize;
++	/*
++	 * Do not let the line discipline to know that we have a reserve,
++	 * or it might get too enthusiastic.
++	 */
++	return (acm->write_ready && acm_wb_is_avail(acm)) ? acm->writesize : 0;
+ }
+ 
+ static int acm_tty_chars_in_buffer(struct tty_struct *tty)
+@@ -393,7 +499,10 @@ static int acm_tty_chars_in_buffer(struc
+ 	struct acm *acm = tty->driver_data;
+ 	if (!ACM_READY(acm))
+ 		return -EINVAL;
+-	return !acm->ready_for_write ? acm->writeurb->transfer_buffer_length : 0;
++	/*
++	 * This is inaccurate (overcounts), but it works.
++	 */
++	return (ACM_NWB - acm_wb_is_avail(acm)) * acm->writesize;
+ }
+ 
+ static void acm_tty_throttle(struct tty_struct *tty)
+@@ -526,6 +635,39 @@ static void acm_tty_set_termios(struct t
+  * USB probe and disconnect routines.
+  */
+ 
++/* Little helper: write buffers free */
++static void acm_write_buffers_free(struct acm *acm)
++{
++	int i;
++	struct acm_wb *wb;
++
++	for (wb = &acm->wb[0], i = 0; i < ACM_NWB; i++, wb++) {
++		usb_buffer_free(acm->dev, acm->writesize, wb->buf, wb->dmah);
++	}
++}
++
++/* Little helper: write buffers allocate */
++static int acm_write_buffers_alloc(struct acm *acm)
++{
++	int i;
++	struct acm_wb *wb;
++
++	for (wb = &acm->wb[0], i = 0; i < ACM_NWB; i++, wb++) {
++		wb->buf = usb_buffer_alloc(acm->dev, acm->writesize, GFP_KERNEL,
++		    &wb->dmah);
++		if (!wb->buf) {
++			while (i != 0) {
++				--i;
++				--wb;
++				usb_buffer_free(acm->dev, acm->writesize,
++				    wb->buf, wb->dmah);
++			}
++			return -ENOMEM;
++		}
++	}
++	return 0;
++}
++
+ static int acm_probe (struct usb_interface *intf,
+ 		      const struct usb_device_id *id)
+ {
+@@ -700,7 +842,8 @@ skip_normal_probe:
+ 	acm->bh.data = (unsigned long) acm;
+ 	INIT_WORK(&acm->work, acm_softint, acm);
+ 	spin_lock_init(&acm->throttle_lock);
+-	acm->ready_for_write = 1;
++	spin_lock_init(&acm->write_lock);
++	acm->write_ready = 1;
+ 
+ 	buf = usb_buffer_alloc(usb_dev, ctrlsize, GFP_KERNEL, &acm->ctrl_dma);
+ 	if (!buf) {
+@@ -716,12 +859,10 @@ skip_normal_probe:
+ 	}
+ 	acm->read_buffer = buf;
+ 
+-	buf = usb_buffer_alloc(usb_dev, acm->writesize, GFP_KERNEL, &acm->write_dma);
+-	if (!buf) {
++	if (acm_write_buffers_alloc(acm) < 0) {
+ 		dev_dbg(&intf->dev, "out of memory (write buffer alloc)\n");
+ 		goto alloc_fail4;
+ 	}
+-	acm->write_buffer = buf;	
+ 
+ 	acm->ctrlurb = usb_alloc_urb(0, GFP_KERNEL);
+ 	if (!acm->ctrlurb) {
+@@ -750,9 +891,9 @@ skip_normal_probe:
+ 	acm->readurb->transfer_dma = acm->read_dma;
+ 
+ 	usb_fill_bulk_urb(acm->writeurb, usb_dev, usb_sndbulkpipe(usb_dev, epwrite->bEndpointAddress),
+-			  acm->write_buffer, acm->writesize, acm_write_bulk, acm);
++			  NULL, acm->writesize, acm_write_bulk, acm);
+ 	acm->writeurb->transfer_flags |= URB_NO_FSBR | URB_NO_TRANSFER_DMA_MAP;
+-	acm->writeurb->transfer_dma = acm->write_dma;
++	/* acm->writeurb->transfer_dma = 0; */
+ 
+ 	dev_info(&intf->dev, "ttyACM%d: USB ACM device\n", minor);
+ 
+@@ -775,7 +916,7 @@ alloc_fail7:
+ alloc_fail6:
+ 	usb_free_urb(acm->ctrlurb);
+ alloc_fail5:
+-	usb_buffer_free(usb_dev, acm->writesize, acm->write_buffer, acm->write_dma);
++	acm_write_buffers_free(acm);
+ alloc_fail4:
+ 	usb_buffer_free(usb_dev, readsize, acm->read_buffer, acm->read_dma);
+ alloc_fail3:
+@@ -806,7 +947,7 @@ static void acm_disconnect(struct usb_in
+ 
+ 	flush_scheduled_work(); /* wait for acm_softint */
+ 
+-	usb_buffer_free(usb_dev, acm->writesize, acm->write_buffer, acm->write_dma);
++	acm_write_buffers_free(acm);
+ 	usb_buffer_free(usb_dev, acm->readsize, acm->read_buffer, acm->read_dma);
+ 	usb_buffer_free(usb_dev, acm->ctrlsize, acm->ctrl_buffer, acm->ctrl_dma);
+ 
+Index: linux-2.6.10/drivers/usb/class/cdc-acm.h
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/class/cdc-acm.h
++++ linux-2.6.10/drivers/usb/class/cdc-acm.h
+@@ -51,14 +51,34 @@
+  * Internal driver structures.
+  */
+ 
++/*
++ * The only reason to have several buffers is to accomodate assumptions
++ * in line disciplines. They ask for empty space amount, receive our URB size,
++ * and proceed to issue several 1-character writes, assuming they will fit.
++ * The very first write takes a complete URB. Fortunately, this only happens
++ * when processing onlcr, so we only need 2 buffers.
++ */
++#define ACM_NWB  2
++struct acm_wb {
++	unsigned char *buf;
++	dma_addr_t dmah;
++	int len;
++	int use;
++};
++
+ struct acm {
+ 	struct usb_device *dev;				/* the corresponding usb device */
+ 	struct usb_interface *control;			/* control interface */
+ 	struct usb_interface *data;			/* data interface */
+ 	struct tty_struct *tty;				/* the corresponding tty */
+ 	struct urb *ctrlurb, *readurb, *writeurb;	/* urbs */
+-	u8 *ctrl_buffer, *read_buffer, *write_buffer;	/* buffers of urbs */
+-	dma_addr_t ctrl_dma, read_dma, write_dma;	/* dma handles of buffers */
++	u8 *ctrl_buffer, *read_buffer;			/* buffers of urbs */
++	dma_addr_t ctrl_dma, read_dma;			/* dma handles of buffers */
++	struct acm_wb wb[ACM_NWB];
++	int write_current;				/* current write buffer */
++	int write_used;					/* number of non-empty write buffers */
++	int write_ready;				/* write urb is not running */
++	spinlock_t write_lock;
+ 	struct usb_cdc_line_coding line;		/* bits, stop, parity */
+ 	struct work_struct work;			/* work queue entry for line discipline waking up */
+ 	struct tasklet_struct bh;			/* rx processing */
+@@ -71,7 +91,6 @@ struct acm {
+ 	unsigned int minor;				/* acm minor number */
+ 	unsigned char throttle;				/* throttled by tty layer */
+ 	unsigned char clocal;				/* termios CLOCAL */
+-	unsigned char ready_for_write;			/* write urb can be used */
+ 	unsigned char resubmit_to_unthrottle;		/* throtteling has disabled the read urb */
+ 	unsigned int ctrl_caps;				/* control capabilities from the class specific header */
+ };
+Index: linux-2.6.10/mvl_patches/pro-0911.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0911.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(911);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

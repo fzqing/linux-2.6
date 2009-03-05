@@ -1,0 +1,4002 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_iic
+# Date: Mon Mar  6 15:03:04 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 15265
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list.
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for I2C IP.
+#     Taken from EDK 7.1i SP2.
+# 
+
+PATCHNUM=342
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 15265
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list.
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for I2C IP.
+    Taken from EDK 7.1i SP2.
+
+ drivers/i2c/algos/xilinx_iic/xiic.c         |  777 ++++++++++++++++++++++++++++
+ drivers/i2c/algos/xilinx_iic/xiic.h         |  439 +++++++++++++++
+ drivers/i2c/algos/xilinx_iic/xiic_i.h       |  479 +++++++++++++++++
+ drivers/i2c/algos/xilinx_iic/xiic_intr.c    |  432 +++++++++++++++
+ drivers/i2c/algos/xilinx_iic/xiic_l.c       |  496 +++++++++++++++++
+ drivers/i2c/algos/xilinx_iic/xiic_l.h       |  216 +++++++
+ drivers/i2c/algos/xilinx_iic/xiic_master.c  |  707 +++++++++++++++++++++++++
+ drivers/i2c/algos/xilinx_iic/xiic_options.c |  174 ++++++
+ mvl_patches/pro-0342.c                      |   16 
+ 9 files changed, 3736 insertions(+)
+
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic.c
+@@ -0,0 +1,777 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic.c
++*
++* Contains required functions for the XIic component. See xiic.h for more
++* information on the driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- --- ------- -----------------------------------------------
++* 1.01a rfp  10/19/01 release
++* 1.01c ecm  12/05/02 new rev
++* 1.01c rmm  05/14/03 Fixed diab compiler warnings relating to asserts.
++* 1.01d jhl  10/08/03 Added general purpose output feature
++* </pre>
++*
++****************************************************************************/
++
++/***************************** Include Files *******************************/
++
++#include "xiic.h"
++#include "xiic_i.h"
++#include "xio.h"
++#include "xparameters.h"
++
++/************************** Constant Definitions ***************************/
++
++/**************************** Type Definitions *****************************/
++
++/***************** Macros (Inline Functions) Definitions *******************/
++
++/************************** Function Prototypes ****************************/
++
++static void XIic_StubStatusHandler(void *CallBackRef, XStatus ErrorCode);
++
++static void XIic_StubHandler(void *CallBackRef, int ByteCount);
++
++/************************** Variable Definitions **************************/
++
++/*****************************************************************************/
++/**
++*
++* Initializes a specific XIic instance.  The initialization entails:
++*
++* - Check the device has an entry in the configuration table.
++* - Initialize the driver to allow access to the device registers and
++*   initialize other subcomponents necessary for the operation of the device.
++* - Default options to:
++*     - 7-bit slave addressing
++*     - Send messages as a slave device
++*     - Repeated start off
++*     - General call recognition disabled
++* - Clear messageing and error statistics
++*
++* The XIic_Start() function must be called after this function before the device
++* is ready to send and receive data on the IIC bus.
++*
++* Before XIic_Start() is called, the interrupt control must connect the ISR
++* routine to the interrupt handler. This is done by the user, and not
++* XIic_Start() to allow the user to use an interrupt controller of their choice.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++* @param    DeviceId is the unique id of the device controlled by this XIic
++*           instance.  Passing in a device id associates the generic XIic
++*           instance to a specific device, as chosen by the caller or
++*           application developer.
++*
++* @return
++*
++* - XST_SUCCESS when successful
++* - XST_DEVICE_IS_STARTED indicates the device is started (i.e. interrupts
++*   enabled and messaging is possible). Must stop before re-initialization
++*   is allowed.
++*
++* @note
++*
++* None.
++*
++****************************************************************************/
++XStatus XIic_Initialize(XIic * InstancePtr, u16 DeviceId)
++{
++	XIic_Config *IicConfigPtr;	/* Pointer to configuration data */
++
++	/*
++	 * Asserts test the validity of selected input arguments.
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	InstancePtr->IsReady = 0;
++
++	/*
++	 * If the device is started, disallow the initialize and return a Status
++	 * indicating it is started.  This allows the user to stop the device
++	 * and reinitialize, but prevents a user from inadvertently initializing
++	 */
++	if (InstancePtr->IsStarted == XCOMPONENT_IS_STARTED) {
++		return XST_DEVICE_IS_STARTED;
++	}
++
++	/*
++	 * Lookup the device configuration in the temporary CROM table. Use this
++	 * configuration info down below when initializing this component.
++	 */
++	IicConfigPtr = XIic_LookupConfig(DeviceId);
++	if (IicConfigPtr == NULL) {
++		return XST_DEVICE_NOT_FOUND;
++	}
++	/*
++	 * Set default values and configuration data, including setting the
++	 * callback handlers to stubs  so the system will not crash should the
++	 * application not assign its own callbacks.
++	 */
++	InstancePtr->IsStarted = 0;
++	InstancePtr->BaseAddress = IicConfigPtr->BaseAddress;
++	InstancePtr->RecvHandler = XIic_StubHandler;
++	InstancePtr->SendHandler = XIic_StubHandler;
++	InstancePtr->StatusHandler = XIic_StubStatusHandler;
++	InstancePtr->Has10BitAddr = IicConfigPtr->Has10BitAddr;
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++	InstancePtr->Options = 0;
++	InstancePtr->BNBOnly = FALSE;
++	InstancePtr->GpOutWidth = IicConfigPtr->GpOutWidth;
++
++	/*
++	 * Reset the device so it's in the reset state, this must be after the
++	 * IPIF is initialized since it resets thru the IPIF and clear the stats
++	 */
++	XIic_Reset(InstancePtr);
++
++	XIIC_CLEAR_STATS(InstancePtr);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function starts the IIC device and driver by enabling the proper
++* interrupts such that data may be sent and received on the IIC bus.
++* This function must be called before the functions to send and receive data.
++*
++* Before XIic_Start() is called, the interrupt control must connect the ISR
++* routine to the interrupt handler. This is done by the user, and not
++* XIic_Start() to allow the user to use an interrupt controller of their choice.
++*
++* Start enables:
++*  - IIC device
++*  - Interrupts:
++*     - Addressed as slave to allow messages from another master
++*     - Arbitration Lost to detect Tx arbitration errors
++*     - Global IIC interrupt within the IPIF interface
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* XST_SUCCESS always
++*
++* @note
++*
++* The device interrupt is connected to the interrupt controller, but no
++* "messaging" interrupts are enabled. Addressed as Slave is enabled to
++* reception of messages when this devices address is written to the bus.
++* The correct messaging interrupts are enabled when sending or receiving
++* via the IicSend() and IicRecv() functions. No action is required
++* by the user to control any IIC interrupts as the driver completely
++* manages all 8 interrupts. Start and Stop control the ability
++* to use the device. Stopping the device completely stops all device
++* interrupts from the processor.
++*
++****************************************************************************/
++XStatus XIic_Start(XIic * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/*
++	 * Mask off all interrupts, each is enabled when needed.
++	 */
++	XIIF_V123B_WRITE_IIER(InstancePtr->BaseAddress, 0);
++
++	/*
++	 * Clear all interrupts by reading and rewriting exact value back.
++	 * Only those bits set will get written as 1 (writing 1 clears intr)
++	 */
++	XIic_mClearIntr(InstancePtr->BaseAddress, 0xFFFFFFFF);
++
++	/*
++	 * Enable the device
++	 */
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++		 XIIC_CR_ENABLE_DEVICE_MASK);
++	/*
++	 * Set Rx FIFO Occupancy depth to throttle at first byte(after reset = 0)
++	 */
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_RFD_REG_OFFSET, 0);
++
++	/*
++	 * Clear and enable the interrupts needed
++	 */
++	XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++			      XIIC_INTR_AAS_MASK | XIIC_INTR_ARB_LOST_MASK);
++
++	InstancePtr->IsStarted = XCOMPONENT_IS_STARTED;
++
++	/* Enable all interrupts by the global enable in the IPIF */
++
++	XIIF_V123B_GINTR_ENABLE(InstancePtr->BaseAddress);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function stops the IIC device and driver such that data is no longer
++* sent or received on the IIC bus. This function stops the device by
++* disabling interrupts. This function only disables interrupts within the
++* device such that the caller is responsible for disconnecting the interrupt
++* handler of the device from the interrupt source and disabling interrupts
++* at other levels.
++*
++* Due to bus throttling that could hold the bus between messages when using
++* repeated start option, stop will not occur when the device is actively
++* sending or receiving data from the IIC bus or the bus is being throttled
++* by this device, but instead return XST_IIC_BUS_BUSY.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* - XST_SUCCESS indicates all IIC interrupts are disabled. No messages can
++*   be received or transmitted until XIic_Start() is called.
++* - XST_IIC_BUS_BUSY indicates this device is currently engaged in message
++*   traffic and cannot be stopped.
++*
++* @note
++*
++* None.
++*
++****************************************************************************/
++XStatus XIic_Stop(XIic * InstancePtr)
++{
++	u8 Status;
++	u8 CntlReg;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/*
++	 * Disable all interrupts globally using the IPIF
++	 */
++	XIIF_V123B_GINTR_DISABLE(InstancePtr->BaseAddress);
++
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++	Status = XIo_In8(InstancePtr->BaseAddress + XIIC_SR_REG_OFFSET);
++
++	if ((CntlReg & XIIC_CR_MSMS_MASK)
++	    || (Status & XIIC_SR_ADDR_AS_SLAVE_MASK)) {
++		/* when this device is using the bus
++		 * - re-enable interrupts to finish current messaging
++		 * - return bus busy
++		 */
++		XIIF_V123B_GINTR_ENABLE(InstancePtr->BaseAddress);
++
++		return XST_IIC_BUS_BUSY;
++	}
++
++	InstancePtr->IsStarted = 0;
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++*
++* Resets the IIC device. Reset must only be called after the driver has been
++* initialized. The configuration after this reset is as follows:
++*   - Repeated start is disabled
++*   - General call is disabled
++*
++* The upper layer software is responsible for initializing and re-configuring
++* (if necessary) and restarting the IIC device after the reset.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++* @internal
++*
++* The reset is accomplished by setting the IPIF reset register.  This takes
++* care of resetting all IPIF hardware blocks, including the IIC device.
++*
++****************************************************************************/
++void XIic_Reset(XIic * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	XIIF_V123B_RESET(InstancePtr->BaseAddress);
++}
++
++/*****************************************************************************/
++/**
++*
++* This function sets the bus addresses. The addresses include the device
++* address that the device responds to as a slave, or the slave address
++* to communicate with on the bus.  The IIC device hardware is built to
++* allow either 7 or 10 bit slave addressing only at build time rather
++* than at run time. When this device is a master, slave addressing can
++* be selected at run time to match addressing modes for other bus devices.
++*
++* Addresses are represented as hex values with no adjustment for the data
++* direction bit as the software manages address bit placement.
++* Example: For a 7 address written to the device of 1010 011X where X is
++* the transfer direction (send/recv), the address parameter for this function
++* needs to be 01010011 or 0x53 where the correct bit alllignment will be
++* handled for 7 as well as 10 bit devices. This is especially important as
++* the bit placement is not handled the same depending on which options are
++* used such as repeated start.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++* @param    AddressType indicates which address is being modified; the address
++*           which this device responds to on the IIC bus as a slave, or the
++*           slave address to communicate with when this device is a master. One
++*           of the following values must be contained in this argument.
++* <pre>
++*   XII_ADDRESS_TO_SEND         Slave being addressed by a this master
++*   XII_ADDRESS_TO_RESPOND      Address to respond to as a slave device
++* </pre>
++* @param    Address contains the address to be set; 7 bit or 10 bit address.
++*           A ten bit address must be within the range: 0 - 1023 and a 7 bit
++*           address must be within the range 0 - 127.
++*
++* @return
++*
++* XST_SUCCESS is returned if the address was successfully set, otherwise one
++* of the following errors is returned.
++* - XST_IIC_NO_10_BIT_ADDRESSING indicates only 7 bit addressing supported.
++* - XST_INVALID_PARAM indicates an invalid parameter was specified.
++*
++* @note
++*
++* Upper bits of 10-bit address is written only when current device is built
++* as a ten bit device.
++*
++****************************************************************************/
++XStatus XIic_SetAddress(XIic * InstancePtr, int AddressType, int Address)
++{
++	u8 SendAddr;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(Address < 1023);
++
++	/* Set address to respond to for this device into address registers */
++
++	if (AddressType == XII_ADDR_TO_RESPOND_TYPE) {
++		SendAddr = (u8) ((Address & 0x007F) << 1);	/* Addr in upper 7 bits */
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_ADR_REG_OFFSET,
++			 SendAddr);
++
++		if (InstancePtr->Has10BitAddr == TRUE) {
++			/* Write upper 3 bits of addr to DTR only when 10 bit option
++			 * included in design i.e. register exists
++			 */
++			SendAddr = (u8) ((Address & 0x0380) >> 7);
++			XIo_Out8(InstancePtr->BaseAddress + XIIC_TBA_REG_OFFSET,
++				 SendAddr);
++		}
++
++		return XST_SUCCESS;
++	}
++
++	/* Store address of slave device being read from */
++
++	if (AddressType == XII_ADDR_TO_SEND_TYPE) {
++		InstancePtr->AddrOfSlave = Address;
++		return XST_SUCCESS;
++	}
++
++	return XST_INVALID_PARAM;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function gets the addresses for the IIC device driver. The addresses
++* include the device address that the device responds to as a slave, or the
++* slave address to communicate with on the bus. The address returned has the
++* same format whether 7 or 10 bits.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++* @param    AddressType indicates which address, the address which this
++*           responds to on the IIC bus as a slave, or the slave address to
++*           communicate with when this device is a master. One of the following
++*           values must be contained in this argument.
++* <pre>
++*   XII_ADDRESS_TO_SEND_TYPE         slave being addressed as a master
++*   XII_ADDRESS_TO_RESPOND_TYPE      slave address to respond to as a slave
++* </pre>
++*  If neither of the two valid arguments are used, the function returns
++*  the address of the slave device
++*
++* @return
++*
++* The address retrieved.
++*
++* @note
++*
++* None.
++*
++****************************************************************************/
++u16 XIic_GetAddress(XIic * InstancePtr, int AddressType)
++{
++	u8 LowAddr;
++	u16 HighAddr = 0;
++
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/* return this devices address */
++
++	if (AddressType == XII_ADDR_TO_RESPOND_TYPE) {
++
++		LowAddr =
++		    XIo_In8(InstancePtr->BaseAddress + XIIC_ADR_REG_OFFSET);
++
++		if (InstancePtr->Has10BitAddr == TRUE) {
++			HighAddr = (u16) XIo_In8(InstancePtr->BaseAddress +
++						 XIIC_TBA_REG_OFFSET);
++		}
++		return ((HighAddr << 8) & (u16) LowAddr);
++	}
++
++	/* Otherwise return address of slave device on the IIC bus */
++
++	return InstancePtr->AddrOfSlave;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function sets the contents of the General Purpose Output register
++* for the IIC device driver. Note that the number of bits in this register is
++* parameterizable in the hardware such that it may not exist.  This function
++* checks to ensure that it does exist to prevent bus errors, but does not
++* ensure that the number of bits in the register are sufficient for the
++* value being written (won't cause a bus error).
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @param    OutputValue contains the value to be written to the register.
++*
++* @return
++*
++* A value indicating success, XST_SUCCESS, or XST_NO_FEATURE if the hardware
++* is configured such that this register does not contain any bits to read
++* or write.
++*
++* @note
++*
++* None.
++*
++****************************************************************************/
++XStatus XIic_SetGpOutput(XIic * InstancePtr, u8 OutputValue)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/* If the general purpose output register is implemented by the hardware
++	 * then write the specified value to it, otherwise indicate an error
++	 */
++	if (InstancePtr->GpOutWidth > 0) {
++		XIic_mWriteReg(InstancePtr->BaseAddress, XIIC_GPO_REG_OFFSET,
++			       OutputValue);
++		return XST_SUCCESS;
++	} else {
++		return XST_NO_FEATURE;
++	}
++}
++
++/*****************************************************************************/
++/**
++*
++* This function gets the contents of the General Purpose Output register
++* for the IIC device driver. Note that the number of bits in this register is
++* parameterizable in the hardware such that it may not exist.  This function
++* checks to ensure that it does exist to prevent bus errors.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @param    OutputValuePtr contains the value which was read from the
++*           register.
++*
++* @return
++*
++* A value indicating success, XST_SUCCESS, or XST_NO_FEATURE if the hardware
++* is configured such that this register does not contain any bits to read
++* or write.
++*
++* The OutputValuePtr is also an output as it contains the value read.
++*
++* @note
++*
++* None.
++*
++****************************************************************************/
++XStatus XIic_GetGpOutput(XIic * InstancePtr, u8 * OutputValuePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(OutputValuePtr != NULL);
++
++	/* If the general purpose output register is implemented by the hardware
++	 * then read the value from it, otherwise indicate an error
++	 */
++	if (InstancePtr->GpOutWidth > 0) {
++		*OutputValuePtr = XIic_mReadReg(InstancePtr->BaseAddress,
++						XIIC_GPO_REG_OFFSET);
++		return XST_SUCCESS;
++	} else {
++		return XST_NO_FEATURE;
++	}
++}
++
++/*****************************************************************************/
++/**
++*
++* A function to determine if the device is currently addressed as a slave
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* TRUE if the device is addressed as slave, and FALSE otherwise.
++*
++* @note
++*
++* None.
++*
++****************************************************************************/
++u32 XIic_IsSlave(XIic * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	if ((XIo_In8(InstancePtr->BaseAddress + XIIC_SR_REG_OFFSET) &
++	     XIIC_SR_ADDR_AS_SLAVE_MASK) == 0) {
++		return FALSE;
++	}
++	return TRUE;
++}
++
++/*****************************************************************************/
++/**
++*
++* Sets the receive callback function, the receive handler, which the driver
++* calls when it finishes receiving data. The number of bytes used to signal
++* when the receive is complete is the number of bytes set in the XIic_Recv
++* function.
++*
++* The handler executes in an interrupt context such that it must minimize
++* the amount of processing performed such as transferring data to a thread
++* context.
++*
++* The number of bytes received is passed to the handler as an argument.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++* @param    CallBackRef is the upper layer callback reference passed back when
++*           the callback function is invoked.
++* @param    FuncPtr is the pointer to the callback function.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* The handler is called within interrupt context ...
++*
++****************************************************************************/
++void XIic_SetRecvHandler(XIic * InstancePtr, void *CallBackRef,
++			 XIic_Handler FuncPtr)
++{
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++
++	InstancePtr->RecvHandler = FuncPtr;
++	InstancePtr->RecvCallBackRef = CallBackRef;
++}
++
++/*****************************************************************************/
++/**
++*
++* Sets the send callback function, the send handler, which the driver calls when
++* it receives confirmation of sent data. The handler executes in an interrupt
++* context such that it must minimize the amount of processing performed such
++* as transferring data to a thread context.
++*
++* @param    InstancePtr the pointer to the XIic instance to be worked on.
++* @param    CallBackRef the upper layer callback reference passed back when
++*           the callback function is invoked.
++* @param    FuncPtr the pointer to the callback function.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* The handler is called within interrupt context ...
++*
++****************************************************************************/
++void XIic_SetSendHandler(XIic * InstancePtr, void *CallBackRef,
++			 XIic_Handler FuncPtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XASSERT_VOID(FuncPtr != NULL);
++
++	InstancePtr->SendHandler = FuncPtr;
++	InstancePtr->SendCallBackRef = CallBackRef;
++}
++
++/*****************************************************************************/
++/**
++*
++* Sets the status callback function, the status handler, which the driver calls
++* when it encounters conditions which are not data related. The handler
++* executes in an interrupt context such that it must minimize the amount of
++* processing performed such as transferring data to a thread context. The
++* status events that can be returned are described in xiic.h.
++*
++* @param    InstancePtr points to the XIic instance to be worked on.
++* @param    CallBackRef is the upper layer callback reference passed back when
++*           the callback function is invoked.
++* @param    FuncPtr is the pointer to the callback function.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* The handler is called within interrupt context ...
++*
++****************************************************************************/
++void XIic_SetStatusHandler(XIic * InstancePtr, void *CallBackRef,
++			   XIic_StatusHandler FuncPtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XASSERT_VOID(FuncPtr != NULL);
++
++	InstancePtr->StatusHandler = FuncPtr;
++	InstancePtr->StatusCallBackRef = CallBackRef;
++}
++
++/*****************************************************************************/
++/**
++*
++* Looks up the device configuration based on the unique device ID. The table
++* IicConfigTable contains the configuration info for each device in the system.
++*
++* @param DeviceId is the unique device ID to look for
++*
++* @return
++*
++* A pointer to the configuration data of the device, or NULL if no match is
++* found.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XIic_Config *XIic_LookupConfig(u16 DeviceId)
++{
++	XIic_Config *CfgPtr = NULL;
++	int i;
++
++	for (i = 0; i < XPAR_XIIC_NUM_INSTANCES; i++) {
++		if (XIic_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XIic_ConfigTable[i];
++			break;
++		}
++	}
++
++	return CfgPtr;
++}
++
++/*****************************************************************************
++*
++* This is a stub for the send and recv callbacks. The stub is here in case the
++* upper layers forget to set the handlers.
++*
++* @param    CallBackRef is a pointer to the upper layer callback reference
++* @param    ByteCount is the number of bytes sent or received
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void XIic_StubHandler(void *CallBackRef, int ByteCount)
++{
++	XASSERT_VOID_ALWAYS();
++}
++
++/*****************************************************************************
++*
++* This is a stub for the asynchronous error callback. The stub is here in case
++* the upper layers forget to set the handler.
++*
++* @param    CallBackRef is a pointer to the upper layer callback reference
++* @param    ErrorCode is the Xilinx error code, indicating the cause of the error
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void XIic_StubStatusHandler(void *CallBackRef, XStatus ErrorCode)
++{
++	XASSERT_VOID_ALWAYS();
++}
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic.h
+@@ -0,0 +1,439 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic.h
++*
++* XIic is the driver for an IIC master or slave device.
++
++* In order to reduce the memory requirements of the driver it is partitioned
++* such that there are optional parts of the driver.  Slave, master, and
++* multimaster features are optional such that these files are not required.
++* In order to use the slave and multimaster features of the driver, the user
++* must call functions (XIic_SlaveInclude and XIic_MultiMasterInclude)
++* to dynamically include the code .  These functions may be called at any time.
++*
++* <b>General Purpose Output</b>
++* The IIC hardware provides a General Purpose Output Register that allows the
++* user to connect general purpose outputs to devices, such as a write protect,
++* for an EEPROM. This register is parameterizable in the hardware such that
++* there could be zero bits in this register and in this case it will cause
++* a bus error if read or written.
++*
++* <b>Bus Throttling</b>
++*
++* The IIC hardware provides bus throttling which allows either the device, as
++* either a master or a slave, to stop the clock on the IIC bus. This feature
++* allows the software to perform the appropriate processing for each interrupt
++* without an unreasonable response restriction.  With this design, it is
++* important for the user to understand the implications of bus throttling.
++*
++* <b>Repeated Start</b>
++*
++* An application can send multiple messages, as a master, to a slave device
++* and re-acquire the IIC bus each time a message is sent. The repeated start
++* option allows the application to send multiple messages without re-acquiring
++* the IIC bus for each message. This feature also could cause the application
++* to lock up, or monopolize the IIC bus, should repeated start option be
++* enabled and sequences of messages never end (periodic data collection).
++* Also when repeated start is not disable before the last master message is
++* sent or received, will leave the bus captive to the master, but unused.
++*
++* <b>Addressing</b>
++*
++* The IIC hardware is parameterized such that it can be built for 7 or 10
++* bit addresses. The driver provides the ability to control which address
++* size is sent in messages as a master to a slave device.  The address size
++* which the hardware responds to as a slave is parameterized as 7 or 10 bits
++* but fixed by the hardware build.
++*
++* Addresses are represented as hex values with no adjustment for the data
++* direction bit as the software manages address bit placement. This is
++* especially important as the bit placement is not handled the same depending
++* on which options are used such as repeated start and 7 vs 10 bit addessing.
++*
++* <b>Data Rates</b>
++*
++* The IIC hardware is parameterized such that it can be built to support
++* data rates from DC to 400KBit. The frequency of the interrupts which
++* occur is proportional to the data rate.
++*
++* <b>Polled Mode Operation</b>
++*
++* This driver does not provide a polled mode of operation primarily because
++* polled mode which is non-blocking is difficult with the amount of
++* interaction with the hardware that is necessary.
++*
++* <b>Interrupts</b>
++*
++* The device has many interrupts which allow IIC data transactions as well
++* as bus status processing to occur.
++*
++* The interrupts are divided into two types, data and status. Data interrupts
++* indicate data has been received or transmitted while the status interrupts
++* indicate the status of the IIC bus. Some of the interrupts, such as Not
++* Addressed As Slave and Bus Not Busy, are only used when these specific
++* events must be recognized as opposed to being enabled at all times.
++*
++* Many of the interrupts are not a single event in that they are continuously
++* present such that they must be disabled after recognition or when undesired.
++* Some of these interrupts, which are data related, may be acknowledged by the
++* software by reading or writing data to the appropriate register, or must
++* be disabled. The following interrupts can be continuous rather than single
++* events.
++*   - Data Transmit Register Empty/Transmit FIFO Empty
++*   - Data Receive Register Full/Receive FIFO
++*   - Transmit FIFO Half Empty
++*   - Bus Not Busy
++*   - Addressed As Slave
++*   - Not Addressed As Slave
++*
++* The following interrupts are not passed directly to the application thru the
++* status callback.  These are only used internally for the driver processing
++* and may result in the receive and send handlers being called to indicate
++* completion of an operation.  The following interrupts are data related
++* rather than status.
++*   - Data Transmit Register Empty/Transmit FIFO Empty
++*   - Data Receive Register Full/Receive FIFO
++*   - Transmit FIFO Half Empty
++*   - Slave Transmit Complete
++*
++* <b>Interrupt To Event Mapping</b>
++*
++* The following table provides a mapping of the interrupts to the events which
++* are passed to the status handler and the intended role (master or slave) for
++* the event.  Some interrupts can cause multiple events which are combined
++* together into a single status event such as XII_MASTER_WRITE_EVENT and
++* XII_GENERAL_CALL_EVENT
++* <pre>
++* Interrupt                         Event(s)                     Role
++*
++* Arbitration Lost Interrupt        XII_ARB_LOST_EVENT            Master
++* Transmit Error                    XII_SLAVE_NO_ACK_EVENT        Master
++* IIC Bus Not Busy                  XII_BUS_NOT_BUSY_EVENT        Master
++* Addressed As Slave                XII_MASTER_READ_EVENT,        Slave
++*                                   XII_MASTER_WRITE_EVENT,       Slave
++*                                   XII_GENERAL_CALL_EVENT        Slave
++* </pre>
++* <b>Not Addressed As Slave Interrupt</b>
++*
++* The Not Addressed As Slave interrupt is not passed directly to the
++* application thru the status callback.  It is used to determine the end of
++* a message being received by a slave when there was no stop condition
++* (repeated start).  It will cause the receive handler to be called to
++* indicate completion of the operation.
++*
++* <b>RTOS Independence</b>
++*
++* This driver is intended to be RTOS and processor independent.  It works
++* with physical addresses only.  Any needs for dynamic memory management,
++* threads or thread mutual exclusion, virtual memory, or cache control must
++* be satisfied by the layer above this driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.01a rfp  10/19/01 release
++* 1.01c ecm  12/05/02 new rev
++* 1.01d jhl  10/08/03 Added general purpose output feature
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XIIC_H			/* prevent circular inclusions */
++#define XIIC_H			/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++#include "xipif_v1_23_b.h"
++#include "xiic_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/** @name Configuration options
++ *
++ * The following options may be specified or retrieved for the device and
++ * enable/disable additional features of the IIC bus.  Each of the options
++ * are bit fields such that more than one may be specified.
++ * @{
++ */
++/**
++ * <pre>
++ * XII_GENERAL_CALL_OPTION      The general call option allows an IIC slave to
++ *                              recognized the general call address. The status
++ *                              handler is called as usual indicating the device
++ *                              has been addressed as a slave with a general
++ *                              call. It is the application's responsibility to
++ *                              perform any special processing for the general
++ *                              call.
++ *
++ * XII_REPEATED_START_OPTION    The repeated start option allows multiple
++ *                              messages to be sent/received on the IIC bus
++ *                              without rearbitrating for the bus.  The messages
++ *                              are sent as a series of messages such that the
++ *                              option must be enabled before the 1st message of
++ *                              the series, to prevent an stop condition from
++ *                              being generated on the bus, and disabled before
++ *                              the last message of the series, to allow the
++ *                              stop condition to be generated.
++ *
++ * XII_SEND_10_BIT_OPTION       The send 10 bit option allows 10 bit addresses
++ *                              to be sent on the bus when the device is a
++ *                              master. The device can be configured to respond
++ *                              as to 7 bit addresses even though it may be
++ *                              communicating with other devices that support 10
++ *                              bit addresses.  When this option is not enabled,
++ *                              only 7 bit addresses are sent on the bus.
++ *
++ * </pre>
++ */
++#define XII_GENERAL_CALL_OPTION    0x00000001
++#define XII_REPEATED_START_OPTION  0x00000002
++#define XII_SEND_10_BIT_OPTION     0x00000004
++
++/*@}*/
++
++/** @name Status events
++ *
++ * The following status events occur during IIC bus processing and are passed
++ * to the status callback. Each event is only valid during the appropriate
++ * processing of the IIC bus. Each of these events are bit fields such that
++ * more than one may be specified.
++ * @{
++ */
++/**
++ * <pre>
++ *   XII_BUS_NOT_BUSY_EVENT      bus transitioned to not busy
++ *   XII_ARB_LOST_EVENT          arbitration was lost
++ *   XII_SLAVE_NO_ACK_EVENT      slave did not acknowledge data (had error)
++ *   XII_MASTER_READ_EVENT       master reading from slave
++ *   XII_MASTER_WRITE_EVENT      master writing to slave
++ *   XII_GENERAL_CALL_EVENT      general call to all slaves
++ * </pre>
++ */
++#define XII_BUS_NOT_BUSY_EVENT   0x00000001
++#define XII_ARB_LOST_EVENT       0x00000002
++#define XII_SLAVE_NO_ACK_EVENT   0x00000004
++#define XII_MASTER_READ_EVENT    0x00000008
++#define XII_MASTER_WRITE_EVENT   0x00000010
++#define XII_GENERAL_CALL_EVENT   0x00000020
++/*@}*/
++
++/* The following address types are used when setting and getting the addresses
++ * of the driver. These are mutually exclusive such that only one or the other
++ * may be specified.
++ */
++/** bus address of slave device */
++#define XII_ADDR_TO_SEND_TYPE       1
++/** this device's bus address when slave */
++#define XII_ADDR_TO_RESPOND_TYPE    2
++
++/**************************** Type Definitions *******************************/
++
++/**
++ * This typedef contains configuration information for the device.
++ */
++typedef struct {
++	u16 DeviceId;	/**< Unique ID  of device */
++	u32 BaseAddress;/**< Device base address */
++	u32 Has10BitAddr;
++		       /**< does device have 10 bit address decoding */
++	u8 GpOutWidth;	/**< number of bits in general purpose output */
++} XIic_Config;
++
++/**
++ * This callback function data type is defined to handle the asynchronous
++ * processing of sent and received data of the IIC driver.  The application
++ * using this driver is expected to define a handler of this type to support
++ * interrupt driven mode. The handlers are called in an interrupt context such
++ * that minimal processing should be performed. The handler data type is
++ * utilized for both send and receive handlers.
++ *
++ * @param CallBackRef is a callback reference passed in by the upper layer when
++ *        setting the callback functions, and passed back to the upper layer
++ *        when the callback is invoked. Its type is unimportant to the driver
++ *        component, so it is a void pointer.
++ *
++ * @param ByteCount indicates the number of bytes remaining to be sent or
++ *        received.  A value of zero indicates that the requested number of
++ *        bytes were sent or received.
++ */
++typedef void (*XIic_Handler) (void *CallBackRef, int ByteCount);
++
++/**
++ * This callback function data type is defined to handle the asynchronous
++ * processing of status events of the IIC driver.  The application using
++ * this driver is expected to define a handler of this type to support
++ * interrupt driven mode. The handler is called in an interrupt context such
++ * that minimal processing should be performed.
++ *
++ * @param CallBackRef is a callback reference passed in by the upper layer when
++ *        setting the callback functions, and passed back to the upper layer
++ *        when the callback is invoked. Its type is unimportant to the driver
++ *        component, so it is a void pointer.
++ *
++ * @param StatusEvent indicates one or more status events that occurred.  See
++ *        the definition of the status events above.
++ */
++typedef void (*XIic_StatusHandler) (void *CallBackRef, XStatus StatusEvent);
++
++/**
++ * XIic statistics
++ */
++typedef struct {
++	u8 ArbitrationLost;/**< Number of times arbitration was lost */
++	u8 RepeatedStarts; /**< Number of repeated starts */
++	u8 BusBusy;	   /**< Number of times bus busy status returned */
++	u8 RecvBytes;	   /**< Number of bytes received */
++	u8 RecvInterrupts; /**< Number of receive interrupts */
++	u8 SendBytes;	   /**< Number of transmit bytes received */
++	u8 SendInterrupts; /**< Number of transmit interrupts */
++	u8 TxErrors;	   /**< Number of transmit errors (no ack) */
++	u8 IicInterrupts;  /**< Number of IIC (device) interrupts */
++} XIicStats;
++
++/**
++ * The XIic driver instance data. The user is required to allocate a
++ * variable of this type for every IIC device in the system. A pointer
++ * to a variable of this type is then passed to the driver API functions.
++ */
++typedef struct {
++	XIicStats Stats;	/* Statistics                              */
++	u32 BaseAddress;	/* Device base address                     */
++	u32 Has10BitAddr;	/* TRUE when 10 bit addressing in design  */
++	u32 IsReady;		/* Device is initialized and ready         */
++	u32 IsStarted;		/* Device has been started                 */
++	int AddrOfSlave;	/* Slave addr writing to                   */
++
++	u32 Options;		/* current operating options               */
++	u8 *SendBufferPtr;	/* Buffer to send (state)                  */
++	u8 *RecvBufferPtr;	/* Buffer to receive (state)               */
++	u8 TxAddrMode;		/* State of Tx Address transmission        */
++	int SendByteCount;	/* Number of data bytes in buffer (state)  */
++	int RecvByteCount;	/* Number of empty bytes in buffer (state) */
++
++	u32 BNBOnly;		/* TRUE when BNB interrupt needs to   */
++	/* call callback  */
++	u8 GpOutWidth;		/* General purpose output width            */
++
++	XIic_StatusHandler StatusHandler;
++	void *StatusCallBackRef;	/* Callback reference for status handler */
++	XIic_Handler RecvHandler;
++	void *RecvCallBackRef;	/* Callback reference for recv handler */
++	XIic_Handler SendHandler;
++	void *SendCallBackRef;	/* Callback reference for send handler */
++
++} XIic;
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/*
++ * Required functions in xiic.c
++ */
++XStatus XIic_Initialize(XIic * InstancePtr, u16 DeviceId);
++
++XStatus XIic_Start(XIic * InstancePtr);
++XStatus XIic_Stop(XIic * InstancePtr);
++
++void XIic_Reset(XIic * InstancePtr);
++
++XStatus XIic_SetAddress(XIic * InstancePtr, int AddressType, int Address);
++u16 XIic_GetAddress(XIic * InstancePtr, int AddressType);
++
++XStatus XIic_SetGpOutput(XIic * InstancePtr, u8 OutputValue);
++XStatus XIic_GetGpOutput(XIic * InstancePtr, u8 * OutputValuePtr);
++
++u32 XIic_IsSlave(XIic * InstancePtr);
++
++void XIic_SetRecvHandler(XIic * InstancePtr, void *CallBackRef,
++			 XIic_Handler FuncPtr);
++void XIic_SetSendHandler(XIic * InstancePtr, void *CallBackRef,
++			 XIic_Handler FuncPtr);
++void XIic_SetStatusHandler(XIic * InstancePtr, void *CallBackRef,
++			   XIic_StatusHandler FuncPtr);
++
++XIic_Config *XIic_LookupConfig(u16 DeviceId);
++
++/*
++ * Interrupt functions in xiic_intr.c
++ */
++void XIic_InterruptHandler(void *InstancePtr);
++/*
++ * Master send and receive functions in xiic_master.c
++ */
++XStatus XIic_MasterRecv(XIic * InstancePtr, u8 * RxMsgPtr, int ByteCount);
++XStatus XIic_MasterSend(XIic * InstancePtr, u8 * TxMsgPtr, int ByteCount);
++
++/*
++ * Slave send and receive functions in xiic_slave.c
++ */
++void XIic_SlaveInclude(void);
++XStatus XIic_SlaveRecv(XIic * InstancePtr, u8 * RxMsgPtr, int ByteCount);
++XStatus XIic_SlaveSend(XIic * InstancePtr, u8 * TxMsgPtr, int ByteCount);
++
++/*
++ * Statistics functions in xiic_stats.c
++ */
++void XIic_GetStats(XIic * InstancePtr, XIicStats * StatsPtr);
++void XIic_ClearStats(XIic * InstancePtr);
++
++/*
++ * Self test functions in xiic_selftest.c
++ */
++XStatus XIic_SelfTest(XIic * InstancePtr);
++
++/*
++ * Options functions in xiic_options.c
++ */
++void XIic_SetOptions(XIic * InstancePtr, u32 Options);
++u32 XIic_GetOptions(XIic * InstancePtr);
++
++/*
++ * Multi-master functions in xiic_multi_master.c
++ */
++void XIic_MultiMasterInclude(void);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_i.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_i.h
+@@ -0,0 +1,479 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic_i.h
++*
++* This header file contains internal identifiers, which are those shared
++* between XIic components.  The identifiers in this file are not intended for
++* use external to the driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.01a rfp  10/19/01 release
++* 1.01c ecm  12/05/02 new rev
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XIIC_I_H		/* prevent circular inclusions */
++#define XIIC_I_H		/* by using protection macros */
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/******************************************************************************
++*
++* This macro sends the first byte of the address for a 10 bit address during
++* both read and write operations. It takes care of the details to format the
++* address correctly.
++*
++* address = 1111_0xxD   xx = address MSBits
++*                        D = Tx direction = 0 = write
++*
++* @param    SlaveAddress contains the address of the slave to send to.
++*
++* @param    Operation indicates XIIC_READ_OPERATION or XIIC_WRITE_OPERATION
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mSend10BitAddrByte1(u16 SlaveAddress, u8 Operation);
++*
++******************************************************************************/
++#define XIic_mSend10BitAddrByte1(SlaveAddress, Operation)                  \
++{                                                                            \
++    u8 LocalAddr = (u8)((SlaveAddress) >> 7);                        \
++    LocalAddr = (LocalAddr & 0xF6) | 0xF0 | (Operation);                     \
++    XIo_Out8(InstancePtr->BaseAddress + XIIC_DTR_REG_OFFSET, LocalAddr);  \
++}
++
++/******************************************************************************
++*
++* This macro sends the second byte of the address for a 10 bit address during
++* both read and write operations. It takes care of the details to format the
++* address correctly.
++*
++* @param    SlaveAddress contains the address of the slave to send to.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mSend10BitAddrByte2(u16 SlaveAddress,
++*                                            u8 Operation);
++*
++******************************************************************************/
++#define XIic_mSend10BitAddrByte2(SlaveAddress)                        \
++    XIo_Out8(InstancePtr->BaseAddress + XIIC_DTR_REG_OFFSET,         \
++             (u8)(SlaveAddress));
++
++/******************************************************************************
++*
++* This macro sends the address for a 7 bit address during both read and write
++* operations. It takes care of the details to format the address correctly.
++*
++* @param    SlaveAddress contains the address of the slave to send to.
++*
++* @param    Operation indicates XIIC_READ_OPERATION or XIIC_WRITE_OPERATION
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mSend7BitAddr(u16 SlaveAddress, u8 Operation);
++*
++******************************************************************************/
++#define XIic_mSend7BitAddr(SlaveAddress, Operation)                          \
++{                                                                            \
++    u8 LocalAddr = (u8)(SlaveAddress << 1);                          \
++    LocalAddr = (LocalAddr & 0xFE) | (Operation);                            \
++    XIo_Out8(InstancePtr->BaseAddress + XIIC_DTR_REG_OFFSET, LocalAddr);  \
++}
++
++/******************************************************************************
++*
++* This macro disables the specified interrupts in the IPIF interrupt enable
++* register.  It is non-destructive in that the register is read and only the
++* interrupts specified is changed.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @param    InterruptMask contains the interrupts to be disabled
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mDisableIntr(u32 BaseAddress,
++*                                        u32 InterruptMask);
++*
++******************************************************************************/
++#define XIic_mDisableIntr(BaseAddress, InterruptMask)           \
++    XIIF_V123B_WRITE_IIER((BaseAddress),                        \
++        XIIF_V123B_READ_IIER(BaseAddress) & ~(InterruptMask))
++
++/******************************************************************************
++*
++* This macro enables the specified interrupts in the IPIF interrupt enable
++* register.  It is non-destructive in that the register is read and only the
++* interrupts specified is changed.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @param    InterruptMask contains the interrupts to be disabled
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mEnableIntr(u32 BaseAddress,
++*                                  u32 InterruptMask);
++*
++******************************************************************************/
++#define XIic_mEnableIntr(BaseAddress, InterruptMask)           \
++    XIIF_V123B_WRITE_IIER((BaseAddress),                       \
++        XIIF_V123B_READ_IIER(BaseAddress) | (InterruptMask))
++
++/******************************************************************************
++*
++* This macro clears the specified interrupt in the IPIF interrupt status
++* register.  It is non-destructive in that the register is read and only the
++* interrupt specified is cleared.  Clearing an interrupt acknowledges it.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @param    InterruptMask contains the interrupts to be disabled
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mClearIntr(u32 BaseAddress,
++*                                 u32 InterruptMask);
++*
++******************************************************************************/
++#define XIic_mClearIntr(BaseAddress, InterruptMask)                 \
++    XIIF_V123B_WRITE_IISR((BaseAddress),                            \
++        XIIF_V123B_READ_IISR(BaseAddress) & (InterruptMask))
++
++/******************************************************************************
++*
++* This macro clears and enables the specified interrupt in the IPIF interrupt
++* status and enable registers.  It is non-destructive in that the registers are
++* read and only the interrupt specified is modified.
++* Clearing an interrupt acknowledges it.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @param    InterruptMask contains the interrupts to be cleared and enabled
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mClearEnableIntr(u32 BaseAddress,
++*                                             u32 InterruptMask);
++*
++******************************************************************************/
++#define XIic_mClearEnableIntr(BaseAddress, InterruptMask)          \
++{                                                                       \
++    XIIF_V123B_WRITE_IISR(BaseAddress,                              \
++        (XIIF_V123B_READ_IISR(BaseAddress) & (InterruptMask)));     \
++                                                                        \
++    XIIF_V123B_WRITE_IIER(BaseAddress,                              \
++        (XIIF_V123B_READ_IIER(BaseAddress) | (InterruptMask)));     \
++}
++
++/******************************************************************************
++*
++* This macro flushes the receive FIFO such that all bytes contained within it
++* are discarded.
++*
++* @param    InstancePtr is a pointer to the IIC instance containing the FIFO
++*           to be flushed.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mFlushRxFifo(XIic *InstancePtr);
++*
++******************************************************************************/
++#define XIic_mFlushRxFifo(InstancePtr)                                     \
++{                                                                           \
++    int LoopCnt;                                                            \
++    u8 Temp;                                                            \
++    u8 BytesToRead = XIo_In8(InstancePtr->BaseAddress +              \
++                                 XIIC_RFO_REG_OFFSET) + 1;                  \
++    for(LoopCnt = 0; LoopCnt < BytesToRead; LoopCnt++)                      \
++    {                                                                       \
++        Temp = XIo_In8(InstancePtr->BaseAddress + XIIC_DRR_REG_OFFSET);  \
++    }                                                                       \
++}
++
++/******************************************************************************
++*
++* This macro flushes the transmit FIFO such that all bytes contained within it
++* are discarded.
++*
++* @param    InstancePtr is a pointer to the IIC instance containing the FIFO
++*           to be flushed.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mFlushTxFifo(XIic *InstancePtr);
++*
++******************************************************************************/
++#define XIic_mFlushTxFifo(InstancePtr);                                    \
++{                                                                           \
++    u8 CntlReg = XIo_In8(InstancePtr->BaseAddress +                  \
++                             XIIC_CR_REG_OFFSET);                           \
++    XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,              \
++             CntlReg | XIIC_CR_TX_FIFO_RESET_MASK);                         \
++    XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET, CntlReg);    \
++}
++
++/******************************************************************************
++*
++* This macro reads the next available received byte from the receive FIFO
++* and updates all the data structures to reflect it.
++*
++* @param    InstancePtr is a pointer to the IIC instance to be operated on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mReadRecvByte(XIic *InstancePtr);
++*
++******************************************************************************/
++#define XIic_mReadRecvByte(InstancePtr)                                    \
++{                                                                           \
++    *InstancePtr->RecvBufferPtr++ =                                         \
++        XIo_In8(InstancePtr->BaseAddress + XIIC_DRR_REG_OFFSET);         \
++    InstancePtr->RecvByteCount--;                                           \
++    InstancePtr->Stats.RecvBytes++;                                         \
++}
++
++/******************************************************************************
++*
++* This macro writes the next byte to be sent to the transmit FIFO
++* and updates all the data structures to reflect it.
++*
++* @param    InstancePtr is a pointer to the IIC instance to be operated on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mWriteSendByte(XIic *InstancePtr);
++*
++******************************************************************************/
++#define XIic_mWriteSendByte(InstancePtr)                                   \
++{                                                                           \
++    XIo_Out8(InstancePtr->BaseAddress + XIIC_DTR_REG_OFFSET,             \
++        *InstancePtr->SendBufferPtr++);                                     \
++    InstancePtr->SendByteCount--;                                           \
++    InstancePtr->Stats.SendBytes++;                                         \
++}
++
++/******************************************************************************
++*
++* This macro sets up the control register for a master receive operation.
++* A write is necessary if a 10 bit operation is being performed.
++*
++* @param    InstancePtr is a pointer to the IIC instance to be operated on.
++*
++* @param    ControlRegister contains the contents of the IIC device control
++*           register
++*
++* @param    ByteCount contains the number of bytes to be received for the
++*           master receive operation
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mSetControlRegister(XIic *InstancePtr,
++*                                           u8 ControlRegister,
++*                                           int ByteCount);
++*
++******************************************************************************/
++#define XIic_mSetControlRegister(InstancePtr, ControlRegister, ByteCount)  \
++{                                                                           \
++    (ControlRegister) &= ~(XIIC_CR_NO_ACK_MASK | XIIC_CR_DIR_IS_TX_MASK);   \
++    if (InstancePtr->Options & XII_SEND_10_BIT_OPTION)                      \
++    {                                                                       \
++        (ControlRegister) |= XIIC_CR_DIR_IS_TX_MASK;                        \
++    }                                                                       \
++    else                                                                    \
++    {                                                                       \
++        if ((ByteCount) == 1)                                               \
++        {                                                                   \
++            (ControlRegister) |= XIIC_CR_NO_ACK_MASK;                       \
++        }                                                                   \
++    }                                                                       \
++}
++
++/******************************************************************************
++*
++* This macro enters a critical region by disabling the global interrupt bit
++* in the IPIF.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mEnterCriticalRegion(u32 BaseAddress)
++*
++******************************************************************************/
++#define XIic_mEnterCriticalRegion(BaseAddress)  \
++    XIIF_V123B_GINTR_DISABLE(BaseAddress)
++
++/******************************************************************************
++*
++* This macro exits a critical region by enabling the global interrupt bit
++* in the IPIF.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mExitCriticalRegion(u32 BaseAddress)
++*
++******************************************************************************/
++#define XIic_mExitCriticalRegion(BaseAddress)  \
++    XIIF_V123B_GINTR_ENABLE(BaseAddress)
++
++/******************************************************************************
++*
++* This macro clears the statistics of an instance such that it can be common
++* such that some parts of the driver may be optional.
++*
++* @param    InstancePtr is a pointer to the IIC instance to be operated on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIIC_CLEAR_STATS(XIic *InstancePtr)
++*
++******************************************************************************/
++#define XIIC_CLEAR_STATS(InstancePtr)                                   \
++{                                                                       \
++    u8 NumBytes;                                                    \
++    u8 *DestPtr;                                                    \
++                                                                        \
++    DestPtr = (u8 *)&InstancePtr->Stats;                            \
++    for (NumBytes = 0; NumBytes < sizeof(XIicStats); NumBytes++)        \
++    {                                                                   \
++        *DestPtr++ = 0;                                                 \
++    }                                                                   \
++}
++
++/************************** Function Prototypes ******************************/
++
++extern XIic_Config XIic_ConfigTable[];
++
++/* The following variables are shared across files of the driver and
++ * are function pointers that are necessary to break dependencies allowing
++ * optional parts of the driver to be used without condition compilation
++ */
++extern void (*XIic_AddrAsSlaveFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_NotAddrAsSlaveFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_RecvSlaveFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_SendSlaveFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_RecvMasterFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_SendMasterFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_ArbLostFuncPtr) (XIic * InstancePtr);
++extern void (*XIic_BusNotBusyFuncPtr) (XIic * InstancePtr);
++
++void XIic_TransmitFifoFill(XIic * InstancePtr, int Role);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_intr.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_intr.c
+@@ -0,0 +1,432 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic_intr.c
++*
++* Contains interrupt functions of the XIic driver.  This file is required
++* for the driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.01a rfp  10/19/01 release
++* 1.01c ecm  12/05/02 new rev
++* 1.01c rmm  05/14/03 Fixed diab compiler warnings relating to asserts.
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xiic.h"
++#include "xiic_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions ******************/
++
++/*************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Function Prototypes ****************************/
++
++static void StubFunction(XIic * InstancePtr);
++static void TxErrorHandler(XIic * InstancePtr);
++
++/************************** Variable Definitions *****************************/
++
++/* The following function pointers are used to help allow finer partitioning
++ * of the driver such that some parts of it are optional. These pointers are
++ * setup by functions in the optional parts of the driver.
++ */
++void (*XIic_AddrAsSlaveFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_NotAddrAsSlaveFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_RecvSlaveFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_SendSlaveFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_RecvMasterFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_SendMasterFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_ArbLostFuncPtr) (XIic * InstancePtr) = StubFunction;
++void (*XIic_BusNotBusyFuncPtr) (XIic * InstancePtr) = StubFunction;
++
++/*****************************************************************************/
++/**
++*
++* This function is the interrupt handler for the XIic driver. This function
++* should be connected to the interrupt system.
++*
++* Only one interrupt source is handled for each interrupt allowing
++* higher priority system interrupts quicker response time.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @internal
++*
++* The XIIC_INTR_ARB_LOST_MASK and XIIC_INTR_TX_ERROR_MASK interrupts must have
++* higher priority than the other device interrupts so that the IIC device does
++* not get into a potentially confused state. The remaining interrupts may be
++* rearranged with no harm.
++*
++* All XIic device interrupts are ORed into one device interrupt. This routine
++* reads the pending interrupts via the IpIf interface and masks that with the
++* interrupt mask to evaluate only the interrupts enabled.
++*
++******************************************************************************/
++void XIic_InterruptHandler(void *InstancePtr)
++{
++	u8 Status;
++	u32 IntrStatus;
++	u32 IntrPending;
++	u32 IntrEnable;
++	XIic *IicPtr = NULL;
++	u32 Clear = 0;
++
++	/*
++	 * Verify that each of the inputs are valid.
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++
++	/*
++	 * Convert the non-typed pointer to an IIC instance pointer
++	 */
++	IicPtr = (XIic *) InstancePtr;
++
++	/* Get the interrupt Status from the IPIF. There is no clearing of
++	 * interrupts in the IPIF. Interrupts must be cleared at the source.
++	 * To find which interrupts are pending; AND interrupts pending with
++	 * interrupts masked.
++	 */
++	IntrPending = XIIF_V123B_READ_IISR(IicPtr->BaseAddress);
++	IntrEnable = XIIF_V123B_READ_IIER(IicPtr->BaseAddress);
++	IntrStatus = IntrPending & IntrEnable;
++
++	/* Do not processes a devices interrupts if the device has no
++	 * interrupts pending or the global interrupts have been disabled
++	 */
++
++	if ((IntrStatus == 0) |
++	    (XIIF_V123B_IS_GINTR_ENABLED(IicPtr->BaseAddress) == FALSE)) {
++		return;
++	}
++
++	/* Update interrupt stats and get the contents of the status register
++	 */
++	IicPtr->Stats.IicInterrupts++;
++	Status = XIo_In8(IicPtr->BaseAddress + XIIC_SR_REG_OFFSET);
++
++	/* Service requesting interrupt
++	 */
++	if (IntrStatus & XIIC_INTR_ARB_LOST_MASK) {
++		/* Bus Arbritration Lost */
++
++		IicPtr->Stats.ArbitrationLost++;
++		XIic_ArbLostFuncPtr(IicPtr);
++
++		Clear = XIIC_INTR_ARB_LOST_MASK;
++	}
++
++	else if (IntrStatus & XIIC_INTR_TX_ERROR_MASK) {
++		/* Transmit errors (no acknowledge) received */
++
++		IicPtr->Stats.TxErrors++;
++		TxErrorHandler(IicPtr);
++
++		Clear = XIIC_INTR_TX_ERROR_MASK;
++	}
++
++	else if (IntrStatus & XIIC_INTR_NAAS_MASK) {
++		/* Not Addressed As Slave */
++
++		XIic_NotAddrAsSlaveFuncPtr(IicPtr);
++		Clear = XIIC_INTR_NAAS_MASK;
++	}
++
++	else if (IntrStatus & XIIC_INTR_RX_FULL_MASK) {
++		/* Receive register/FIFO is full */
++
++		IicPtr->Stats.RecvInterrupts++;
++
++		if (Status & XIIC_SR_ADDR_AS_SLAVE_MASK) {
++			XIic_RecvSlaveFuncPtr(InstancePtr);
++		} else {
++			XIic_RecvMasterFuncPtr(InstancePtr);
++		}
++
++		Clear = XIIC_INTR_RX_FULL_MASK;
++	}
++
++	else if (IntrStatus & XIIC_INTR_AAS_MASK) {
++		/* Addressed As Slave */
++
++		XIic_AddrAsSlaveFuncPtr(IicPtr);
++		Clear = XIIC_INTR_AAS_MASK;
++	}
++
++	else if (IntrStatus & XIIC_INTR_BNB_MASK) {
++		/* IIC bus has transitioned to not busy */
++
++		/* check if send callback needs to run */
++		if (IicPtr->BNBOnly == TRUE) {
++			XIic_BusNotBusyFuncPtr(IicPtr);
++			IicPtr->BNBOnly = FALSE;
++		} else {
++			IicPtr->SendHandler(IicPtr->SendCallBackRef, 0);
++		}
++
++		Clear = XIIC_INTR_BNB_MASK;
++
++		/* The bus is not busy, disable BusNotBusy interrupt */
++		XIic_mDisableIntr(IicPtr->BaseAddress, XIIC_INTR_BNB_MASK);
++
++	}
++
++	else if ((IntrStatus & XIIC_INTR_TX_EMPTY_MASK) ||
++		 (IntrStatus & XIIC_INTR_TX_HALF_MASK)) {
++		/* Transmit register/FIFO is empty or ½ empty *
++		 */
++		IicPtr->Stats.SendInterrupts++;
++
++		if (Status & XIIC_SR_ADDR_AS_SLAVE_MASK) {
++			XIic_SendSlaveFuncPtr(InstancePtr);
++		} else {
++			XIic_SendMasterFuncPtr(InstancePtr);
++		}
++
++		/* Clear Interrupts
++		 */
++		IntrStatus = XIIF_V123B_READ_IISR(IicPtr->BaseAddress);
++		Clear = IntrStatus & (XIIC_INTR_TX_EMPTY_MASK |
++				      XIIC_INTR_TX_HALF_MASK);
++	}
++
++	XIIF_V123B_WRITE_IISR(IicPtr->BaseAddress, Clear);
++}
++
++/******************************************************************************
++*
++* This function fills the FIFO using the occupancy register to determine the
++* available space to be filled. When the repeated start option is on, the last
++* byte is withheld to allow the control register to be properly set on the last
++* byte.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @param    Role indicates the role of this IIC device, a slave or a master, on
++*           the IIC bus (XIIC_SLAVE_ROLE or XIIC_MASTER_ROLE)
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XIic_TransmitFifoFill(XIic * InstancePtr, int Role)
++{
++	u8 AvailBytes;
++	s32 LoopCnt;
++	s32 NumBytesToSend;
++
++	/* Determine number of bytes to write to FIFO. Number of bytes that can be
++	 * put into the FIFO is (FIFO depth) - (current occupancy + 1)
++	 * When more room in FIFO than msg bytes put all of message in the FIFO.
++	 */
++	AvailBytes = IIC_TX_FIFO_DEPTH -
++	    (XIo_In8(InstancePtr->BaseAddress + XIIC_TFO_REG_OFFSET) + 1);
++
++	if (InstancePtr->SendByteCount > AvailBytes) {
++		NumBytesToSend = AvailBytes;
++	} else {
++		/* More space in FIFO than bytes in message
++		 */
++		if ((InstancePtr->Options & XII_REPEATED_START_OPTION) ||
++		    (Role == XIIC_SLAVE_ROLE)) {
++			NumBytesToSend = InstancePtr->SendByteCount;
++		} else {
++			NumBytesToSend = InstancePtr->SendByteCount - 1;
++		}
++	}
++
++	/* fill FIFO with amount determined above */
++
++	for (LoopCnt = 0; LoopCnt < NumBytesToSend; LoopCnt++) {
++		XIic_mWriteSendByte(InstancePtr);
++	}
++}
++
++/*****************************************************************************/
++/**
++*
++* This interrupt occurs four different ways: Two as master and two as slave.
++* Master:
++* <pre>
++*  (1) Transmitter (IMPLIES AN ERROR)
++*      The slave receiver did not acknowledge properly.
++*  (2) Receiver (Implies tx complete)
++*      Interrupt caused by setting TxAck high in the IIC to indicate to the
++*      the last byte has been transmitted.
++* </pre>
++*
++* Slave:
++* <pre>
++*  (3) Transmitter (Implies tx complete)
++*      Interrupt caused by master device indicating last byte of the message
++*      has been transmitted.
++*  (4) Receiver (IMPLIES AN ERROR)
++*      Interrupt caused by setting TxAck high in the IIC to indicate Rx
++*      IIC had a problem - set by this device and condition already known
++*      and interrupt is not enabled.
++* </pre>
++*
++* This interrupt is enabled during Master send and receive and disabled
++* when this device knows it is going to send a negative acknowledge (Ack = No).
++*
++* Signals user of Tx error via status callback sending: XII_TX_ERROR_EVENT
++*
++* When MasterRecv has no message to send and only receives one byte of data
++* from the salve device, the TxError must be enabled to catch addressing
++* errors, yet there is not opportunity to disable TxError when there is no
++* data to send allowing disabling on last byte. When the slave sends the
++* only byte the NOAck causes a Tx Error. To disregard this as no real error,
++* when there is data in the Receive FIFO/register then the error was not
++* a device address write error, but a NOACK read error - to be ignored.
++* To work with or without FIFO's, the Rx Data interrupt is used to indicate
++* data is in the rx register.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* No action is required to clear this interrupt in the device as it is a
++* pulse. The interrupt need only be cleared in the IpIf interface.
++*
++******************************************************************************/
++static void TxErrorHandler(XIic * InstancePtr)
++{
++	u32 IntrStatus;
++	u8 CntlReg;
++
++	/* When Sending as a slave, Tx error signals end of msg. Not Addressed As
++	 * Slave will handle the callbacks. this is used to only flush the Tx fifo.
++	 * The addressed as slave bit is gone as soon as the bus has been released
++	 * such that the buffer pointers are used to determine the direction of
++	 * transfer (send or receive).
++	 */
++	if (InstancePtr->RecvBufferPtr == NULL) {
++		/* Master Receiver finished reading message. Flush Tx fifo to remove an
++		 * 0xFF that was written to prevent bus throttling, and disable all
++		 * transmit and receive interrupts
++		 */
++		XIic_mFlushTxFifo(InstancePtr);
++		XIic_mDisableIntr(InstancePtr->BaseAddress,
++				  XIIC_TX_RX_INTERRUPTS);
++
++		return;
++	}
++
++	/* Data in the receive register from either master or slave receive
++	 * When:slave, indicates master sent last byte, message completed.
++	 * When:master, indicates a master Receive with one byte received. When a
++	 * byte is in Rx reg then the Tx error indicates the Rx data was recovered
++	 * normally Tx errors are not enabled such that this should not occur.
++	 */
++	IntrStatus = XIIF_V123B_READ_IISR(InstancePtr->BaseAddress);
++	if (IntrStatus & XIIC_INTR_RX_FULL_MASK) {
++		/* Rx Reg/FIFO has data,  Disable tx error interrupts */
++
++		XIic_mDisableIntr(InstancePtr->BaseAddress,
++				  XIIC_INTR_TX_ERROR_MASK);
++		return;
++	}
++
++	XIic_mFlushTxFifo(InstancePtr);
++
++	/* Disable and clear tx empty, ½ empty, Rx Full or tx error interrupts
++	 */
++	XIic_mDisableIntr(InstancePtr->BaseAddress, XIIC_TX_RX_INTERRUPTS);
++	XIic_mClearIntr(InstancePtr->BaseAddress, XIIC_TX_RX_INTERRUPTS);
++
++	/* Clear MSMS as on TX error when Rxing, the bus will be
++	 * stopped but MSMS bit is still set. Reset to proper state
++	 */
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++	CntlReg &= ~XIIC_CR_MSMS_MASK;
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET, CntlReg);
++
++	/* set FIFO occupancy depth = 1 so that the first byte will throttle
++	 * next recieve msg
++	 */
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_RFD_REG_OFFSET, 0);
++
++	/* make event callback */
++
++	InstancePtr->StatusHandler(InstancePtr->StatusCallBackRef,
++				   XII_SLAVE_NO_ACK_EVENT);
++}
++
++/*****************************************************************************/
++/**
++*
++* This function is a stub function that is used for the default function for
++* events that are handled optionally only when the appropriate modules are
++* linked in.  Function pointers are used to handle some events to allow
++* some events to be optionally handled.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++******************************************************************************/
++static void StubFunction(XIic * InstancePtr)
++{
++	XASSERT_VOID_ALWAYS();
++}
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_l.c
+@@ -0,0 +1,496 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic_l.c
++*
++* This file contains low-level driver functions that can be used to access the
++* device.  The user should refer to the hardware device specification for more
++* details of the device operation.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- --- -------  -----------------------------------------------
++* 1.01b jhl 5/13/02  First release
++* 1.01b jhl 10/14/02 Corrected bug in the receive function, the setup of the
++* 						 interrupt status mask was not being done in the loop such
++*						 that a read would sometimes fail on the last byte because
++*						 the transmit error which should have been ignored was
++*						 being used.  This would leave an extra byte in the FIFO
++*						 and the bus throttled such that the next operation would
++*						 also fail.  Also updated the receive function to not
++*						 disable the device after the last byte until after the
++*						 bus transitions to not busy which is more consistent
++*						 with the expected behavior.
++* 1.01c ecm  12/05/02 new rev
++* </pre>
++*
++****************************************************************************/
++
++/***************************** Include Files *******************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++#include "xipif_v1_23_b.h"
++#include "xiic_l.h"
++
++/************************** Constant Definitions ***************************/
++
++/**************************** Type Definitions *****************************/
++
++/***************** Macros (Inline Functions) Definitions *******************/
++
++/******************************************************************************
++*
++* This macro clears the specified interrupt in the IPIF interrupt status
++* register.  It is non-destructive in that the register is read and only the
++* interrupt specified is cleared.  Clearing an interrupt acknowledges it.
++*
++* @param    BaseAddress contains the IPIF registers base address.
++*
++* @param    InterruptMask contains the interrupts to be disabled
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mClearIisr(u32 BaseAddress,
++*                                 u32 InterruptMask);
++*
++******************************************************************************/
++#define XIic_mClearIisr(BaseAddress, InterruptMask)                 \
++    XIIF_V123B_WRITE_IISR((BaseAddress),                            \
++        XIIF_V123B_READ_IISR(BaseAddress) & (InterruptMask))
++
++/******************************************************************************
++*
++* This macro sends the address for a 7 bit address during both read and write
++* operations. It takes care of the details to format the address correctly.
++* This macro is designed to be called internally to the drivers.
++*
++* @param    SlaveAddress contains the address of the slave to send to.
++*
++* @param    Operation indicates XIIC_READ_OPERATION or XIIC_WRITE_OPERATION
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mSend7BitAddr(u16 SlaveAddress, u8 Operation);
++*
++******************************************************************************/
++#define XIic_mSend7BitAddress(BaseAddress, SlaveAddress, Operation)         \
++{                                                                           \
++    u8 LocalAddr = (u8)(SlaveAddress << 1);                         \
++    LocalAddr = (LocalAddr & 0xFE) | (Operation);                           \
++    XIo_Out8(BaseAddress + XIIC_DTR_REG_OFFSET, LocalAddr);                 \
++}
++
++/************************** Function Prototypes ****************************/
++
++static unsigned RecvData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount);
++static unsigned SendData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount);
++
++/************************** Variable Definitions **************************/
++
++/****************************************************************************/
++/**
++* Receive data as a master on the IIC bus.  This function receives the data
++* using polled I/O and blocks until the data has been received.  It only
++* supports 7 bit addressing and non-repeated start modes of operation.  The
++* user is responsible for ensuring the bus is not busy if multiple masters
++* are present on the bus.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    Address contains the 7 bit IIC address of the device to send the
++*           specified data to.
++* @param    BufferPtr points to the data to be sent.
++* @param    ByteCount is the number of bytes to be sent.
++*
++* @return
++*
++* The number of bytes received.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++unsigned XIic_Recv(u32 BaseAddress, u8 Address,
++		   u8 * BufferPtr, unsigned ByteCount)
++{
++	u8 CntlReg;
++	unsigned RemainingByteCount;
++
++	/* Tx error is enabled incase the address (7 or 10) has no device to answer
++	 * with Ack. When only one byte of data, must set NO ACK before address goes
++	 * out therefore Tx error must not be enabled as it will go off immediately
++	 * and the Rx full interrupt will be checked.  If full, then the one byte
++	 * was received and the Tx error will be disabled without sending an error
++	 * callback msg.
++	 */
++	XIic_mClearIisr(BaseAddress,
++			XIIC_INTR_RX_FULL_MASK | XIIC_INTR_TX_ERROR_MASK |
++			XIIC_INTR_ARB_LOST_MASK);
++
++	/* Set receive FIFO occupancy depth for 1 byte (zero based)
++	 */
++	XIo_Out8(BaseAddress + XIIC_RFD_REG_OFFSET, 0);
++
++	/* 7 bit slave address, send the address for a read operation
++	 * and set the state to indicate the address has been sent
++	 */
++	XIic_mSend7BitAddress(BaseAddress, Address, XIIC_READ_OPERATION);
++
++	/* MSMS gets set after putting data in FIFO. Start the master receive
++	 * operation by setting CR Bits MSMS to Master, if the buffer is only one
++	 * byte, then it should not be acknowledged to indicate the end of data
++	 */
++	CntlReg = XIIC_CR_MSMS_MASK | XIIC_CR_ENABLE_DEVICE_MASK;
++	if (ByteCount == 1) {
++		CntlReg |= XIIC_CR_NO_ACK_MASK;
++	}
++
++	/* Write out the control register to start receiving data and call the
++	 * function to receive each byte into the buffer
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET, CntlReg);
++
++	/* Clear the latched interrupt status for the bus not busy bit which must
++	 * be done while the bus is busy
++	 */
++	XIic_mClearIisr(BaseAddress, XIIC_INTR_BNB_MASK);
++
++	/* Try to receive the data from the IIC bus */
++
++	RemainingByteCount = RecvData(BaseAddress, BufferPtr, ByteCount);
++	/*
++	 * The receive is complete, disable the IIC device and return the number of
++	 * bytes that was received
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET, 0);
++
++	/* Return the number of bytes that was received */
++
++	return ByteCount - RemainingByteCount;
++}
++
++/******************************************************************************
++*
++* Receive the specified data from the device that has been previously addressed
++* on the IIC bus.  This function assumes that the 7 bit address has been sent
++* and it should wait for the transmit of the address to complete.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    BufferPtr points to the buffer to hold the data that is received.
++* @param    ByteCount is the number of bytes to be received.
++*
++* @return
++*
++* The number of bytes remaining to be received.
++*
++* @note
++*
++* This function does not take advantage of the receive FIFO because it is
++* designed for minimal code space and complexity.  It contains loops that
++* that could cause the function not to return if the hardware is not working.
++*
++* This function assumes that the calling function will disable the IIC device
++* after this function returns.
++*
++******************************************************************************/
++static unsigned RecvData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount)
++{
++	u8 CntlReg;
++	u32 IntrStatusMask;
++	u32 IntrStatus;
++
++	/* Attempt to receive the specified number of bytes on the IIC bus */
++
++	while (ByteCount > 0) {
++		/* Setup the mask to use for checking errors because when receiving one
++		 * byte OR the last byte of a multibyte message an error naturally
++		 * occurs when the no ack is done to tell the slave the last byte
++		 */
++		if (ByteCount == 1) {
++			IntrStatusMask =
++			    XIIC_INTR_ARB_LOST_MASK | XIIC_INTR_BNB_MASK;
++		} else {
++			IntrStatusMask =
++			    XIIC_INTR_ARB_LOST_MASK | XIIC_INTR_TX_ERROR_MASK |
++			    XIIC_INTR_BNB_MASK;
++		}
++
++		/* Wait for the previous transmit and the 1st receive to complete
++		 * by checking the interrupt status register of the IPIF
++		 */
++		while (1) {
++			IntrStatus = XIIF_V123B_READ_IISR(BaseAddress);
++			if (IntrStatus & XIIC_INTR_RX_FULL_MASK) {
++				break;
++			}
++			/* Check the transmit error after the receive full because when
++			 * sending only one byte transmit error will occur because of the
++			 * no ack to indicate the end of the data
++			 */
++			if (IntrStatus & IntrStatusMask) {
++				return ByteCount;
++			}
++		}
++
++		CntlReg = XIo_In8(BaseAddress + XIIC_CR_REG_OFFSET);
++
++		/* Special conditions exist for the last two bytes so check for them
++		 * Note that the control register must be setup for these conditions
++		 * before the data byte which was already received is read from the
++		 * receive FIFO (while the bus is throttled
++		 */
++		if (ByteCount == 1) {
++			/* For the last data byte, it has already been read and no ack
++			 * has been done, so clear MSMS while leaving the device enabled
++			 * so it can get off the IIC bus appropriately with a stop.
++			 */
++			XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++				 XIIC_CR_ENABLE_DEVICE_MASK);
++		}
++
++		/* Before the last byte is received, set NOACK to tell the slave IIC
++		 * device that it is the end, this must be done before reading the byte
++		 * from the FIFO
++		 */
++		if (ByteCount == 2) {
++			/* Write control reg with NO ACK allowing last byte to
++			 * have the No ack set to indicate to slave last byte read.
++			 */
++			XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++				 CntlReg | XIIC_CR_NO_ACK_MASK);
++		}
++
++		/* Read in data from the FIFO and unthrottle the bus such that the
++		 * next byte is read from the IIC bus
++		 */
++		*BufferPtr++ = XIo_In8(BaseAddress + XIIC_DRR_REG_OFFSET);
++
++		/* Clear the latched interrupt status so that it will be updated with
++		 * the new state when it changes, this must be done after the receive
++		 * register is read
++		 */
++		XIic_mClearIisr(BaseAddress, XIIC_INTR_RX_FULL_MASK |
++				XIIC_INTR_TX_ERROR_MASK |
++				XIIC_INTR_ARB_LOST_MASK);
++		ByteCount--;
++	}
++
++	/* Wait for the bus to transition to not busy before returning, the IIC
++	 * device cannot be disabled until this occurs.  It should transition as
++	 * the MSMS bit of the control register was cleared before the last byte
++	 * was read from the FIFO.
++	 */
++	while (1) {
++		if (XIIF_V123B_READ_IISR(BaseAddress) & XIIC_INTR_BNB_MASK) {
++			break;
++		}
++	}
++
++	return ByteCount;
++}
++
++/****************************************************************************/
++/**
++* Send data as a master on the IIC bus.  This function sends the data
++* using polled I/O and blocks until the data has been sent.  It only supports
++* 7 bit addressing and non-repeated start modes of operation.  The user is
++* responsible for ensuring the bus is not busy if multiple masters are present
++* on the bus.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    Address contains the 7 bit IIC address of the device to send the
++*           specified data to.
++* @param    BufferPtr points to the data to be sent.
++* @param    ByteCount is the number of bytes to be sent.
++*
++* @return
++*
++* The number of bytes sent.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++unsigned XIic_Send(u32 BaseAddress, u8 Address,
++		   u8 * BufferPtr, unsigned ByteCount)
++{
++	unsigned RemainingByteCount;
++
++	/* Put the address into the FIFO to be sent and indicate that the operation
++	 * to be performed on the bus is a write operation
++	 */
++	XIic_mSend7BitAddress(BaseAddress, Address, XIIC_WRITE_OPERATION);
++
++	/* Clear the latched interrupt status so that it will be updated with the
++	 * new state when it changes, this must be done after the address is put
++	 * in the FIFO
++	 */
++	XIic_mClearIisr(BaseAddress, XIIC_INTR_TX_EMPTY_MASK |
++			XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK);
++
++	/* MSMS must be set after putting data into transmit FIFO, indicate the
++	 * direction is transmit, this device is master and enable the IIC device
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++		 XIIC_CR_MSMS_MASK | XIIC_CR_DIR_IS_TX_MASK |
++		 XIIC_CR_ENABLE_DEVICE_MASK);
++
++	/* Clear the latched interrupt
++	 * status for the bus not busy bit which must be done while the bus is busy
++	 */
++	XIic_mClearIisr(BaseAddress, XIIC_INTR_BNB_MASK);
++
++	/* Send the specified data to the device on the IIC bus specified by the
++	 * the address
++	 */
++	RemainingByteCount = SendData(BaseAddress, BufferPtr, ByteCount);
++
++	/*
++	 * The send is complete, disable the IIC device and return the number of
++	 * bytes that was sent
++	 */
++	XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET, 0);
++
++	return ByteCount - RemainingByteCount;
++}
++
++/******************************************************************************
++*
++* Send the specified buffer to the device that has been previously addressed
++* on the IIC bus.  This function assumes that the 7 bit address has been sent
++* and it should wait for the transmit of the address to complete.
++*
++* @param    BaseAddress contains the base address of the IIC device.
++* @param    BufferPtr points to the data to be sent.
++* @param    ByteCount is the number of bytes to be sent.
++*
++* @return
++*
++* The number of bytes remaining to be sent.
++*
++* @note
++*
++* This function does not take advantage of the transmit FIFO because it is
++* designed for minimal code space and complexity.  It contains loops that
++* that could cause the function not to return if the hardware is not working.
++*
++******************************************************************************/
++static unsigned SendData(u32 BaseAddress, u8 * BufferPtr, unsigned ByteCount)
++{
++	u32 IntrStatus;
++
++	/* Send the specified number of bytes in the specified buffer by polling
++	 * the device registers and blocking until complete
++	 */
++	while (ByteCount > 0) {
++		/* Wait for the transmit to be empty before sending any more data
++		 * by polling the interrupt status register
++		 */
++		while (1) {
++			IntrStatus = XIIF_V123B_READ_IISR(BaseAddress);
++
++			if (IntrStatus & (XIIC_INTR_TX_ERROR_MASK |
++					  XIIC_INTR_ARB_LOST_MASK |
++					  XIIC_INTR_BNB_MASK)) {
++				return ByteCount;
++			}
++
++			if (IntrStatus & XIIC_INTR_TX_EMPTY_MASK) {
++				break;
++			}
++		}
++		/* If there is more than one byte to send then put the next byte to send
++		 * into the transmit FIFO
++		 */
++		if (ByteCount > 1) {
++			XIo_Out8(BaseAddress + XIIC_DTR_REG_OFFSET,
++				 *BufferPtr++);
++		} else {
++			/* Set the stop condition before sending the last byte of data so that
++			 * the stop condition will be generated immediately following the data
++			 * This is done by clearing the MSMS bit in the control register.
++			 */
++			XIo_Out8(BaseAddress + XIIC_CR_REG_OFFSET,
++				 XIIC_CR_ENABLE_DEVICE_MASK |
++				 XIIC_CR_DIR_IS_TX_MASK);
++
++			/* Put the last byte to send in the transmit FIFO */
++
++			XIo_Out8(BaseAddress + XIIC_DTR_REG_OFFSET,
++				 *BufferPtr++);
++		}
++
++		/* Clear the latched interrupt status register and this must be done after
++		 * the transmit FIFO has been written to or it won't clear
++		 */
++		XIic_mClearIisr(BaseAddress, XIIC_INTR_TX_EMPTY_MASK);
++
++		/* Update the byte count to reflect the byte sent and clear the latched
++		 * interrupt status so it will be updated for the new state
++		 */
++		ByteCount--;
++	}
++
++	/* Wait for the bus to transition to not busy before returning, the IIC
++	 * device cannot be disabled until this occurs.
++	 * Note that this is different from a receive operation because the stop
++	 * condition causes the bus to go not busy.
++	 */
++	while (1) {
++		if (XIIF_V123B_READ_IISR(BaseAddress) & XIIC_INTR_BNB_MASK) {
++			break;
++		}
++	}
++
++	return ByteCount;
++}
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_l.h
+@@ -0,0 +1,216 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xiic_l.h
++*
++* This header file contains identifiers and low-level driver functions (or
++* macros) that can be used to access the device.  High-level driver functions
++* are defined in xiic.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00b jhl  05/07/02 First release
++* 1.01c ecm  12/05/02 new rev
++* 1.01d jhl  10/08/03 Added general purpose output feature
++* </pre>
++*
++*****************************************************************************/
++
++#ifndef XIIC_L_H		/* prevent circular inclusions */
++#define XIIC_L_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++
++/************************** Constant Definitions ****************************/
++
++#define XIIC_MSB_OFFSET                3
++
++#define XIIC_REG_OFFSET 0x100 + XIIC_MSB_OFFSET
++
++/*
++ * Register offsets in bytes from RegisterBase. Three is added to the
++ * base offset to access LSB (IBM style) of the word
++ */
++#define XIIC_CR_REG_OFFSET   0x00+XIIC_REG_OFFSET	/* Control Register   */
++#define XIIC_SR_REG_OFFSET   0x04+XIIC_REG_OFFSET	/* Status Register    */
++#define XIIC_DTR_REG_OFFSET  0x08+XIIC_REG_OFFSET	/* Data Tx Register   */
++#define XIIC_DRR_REG_OFFSET  0x0C+XIIC_REG_OFFSET	/* Data Rx Register   */
++#define XIIC_ADR_REG_OFFSET  0x10+XIIC_REG_OFFSET	/* Address Register   */
++#define XIIC_TFO_REG_OFFSET  0x14+XIIC_REG_OFFSET	/* Tx FIFO Occupancy  */
++#define XIIC_RFO_REG_OFFSET  0x18+XIIC_REG_OFFSET	/* Rx FIFO Occupancy  */
++#define XIIC_TBA_REG_OFFSET  0x1C+XIIC_REG_OFFSET	/* 10 Bit Address reg */
++#define XIIC_RFD_REG_OFFSET  0x20+XIIC_REG_OFFSET	/* Rx FIFO Depth reg  */
++#define XIIC_GPO_REG_OFFSET  0x24+XIIC_REG_OFFSET	/* Output Register    */
++
++/* Control Register masks */
++
++#define XIIC_CR_ENABLE_DEVICE_MASK        0x01	/* Device enable = 1      */
++#define XIIC_CR_TX_FIFO_RESET_MASK        0x02	/* Transmit FIFO reset=1  */
++#define XIIC_CR_MSMS_MASK                 0x04	/* Master starts Txing=1  */
++#define XIIC_CR_DIR_IS_TX_MASK            0x08	/* Dir of tx. Txing=1     */
++#define XIIC_CR_NO_ACK_MASK               0x10	/* Tx Ack. NO ack = 1     */
++#define XIIC_CR_REPEATED_START_MASK       0x20	/* Repeated start = 1     */
++#define XIIC_CR_GENERAL_CALL_MASK         0x40	/* Gen Call enabled = 1   */
++
++/* Status Register masks */
++
++#define XIIC_SR_GEN_CALL_MASK             0x01	/* 1=a mstr issued a GC   */
++#define XIIC_SR_ADDR_AS_SLAVE_MASK        0x02	/* 1=when addr as slave   */
++#define XIIC_SR_BUS_BUSY_MASK             0x04	/* 1 = bus is busy        */
++#define XIIC_SR_MSTR_RDING_SLAVE_MASK     0x08	/* 1=Dir: mstr <-- slave  */
++#define XIIC_SR_TX_FIFO_FULL_MASK         0x10	/* 1 = Tx FIFO full       */
++#define XIIC_SR_RX_FIFO_FULL_MASK         0x20	/* 1 = Rx FIFO full       */
++#define XIIC_SR_RX_FIFO_EMPTY_MASK        0x40	/* 1 = Rx FIFO empty      */
++
++/* IPIF Interrupt Status Register masks    Interrupt occurs when...       */
++
++#define XIIC_INTR_ARB_LOST_MASK           0x01	/* 1 = arbitration lost   */
++#define XIIC_INTR_TX_ERROR_MASK           0x02	/* 1=Tx error/msg complete */
++#define XIIC_INTR_TX_EMPTY_MASK           0x04	/* 1 = Tx FIFO/reg empty  */
++#define XIIC_INTR_RX_FULL_MASK            0x08	/* 1=Rx FIFO/reg=OCY level */
++#define XIIC_INTR_BNB_MASK                0x10	/* 1 = Bus not busy       */
++#define XIIC_INTR_AAS_MASK                0x20	/* 1 = when addr as slave */
++#define XIIC_INTR_NAAS_MASK               0x40	/* 1 = not addr as slave  */
++#define XIIC_INTR_TX_HALF_MASK            0x80	/* 1 = TX FIFO half empty */
++
++/* IPIF Device Interrupt Register masks */
++
++#define XIIC_IPIF_IIC_MASK          0x00000004UL	/* 1=inter enabled */
++#define XIIC_IPIF_ERROR_MASK        0x00000001UL	/* 1=inter enabled */
++#define XIIC_IPIF_INTER_ENABLE_MASK  (XIIC_IPIF_IIC_MASK |  \
++                                      XIIC_IPIF_ERROR_MASK)
++
++#define XIIC_TX_ADDR_SENT             0x00
++#define XIIC_TX_ADDR_MSTR_RECV_MASK   0x02
++
++/* The following constants specify the depth of the FIFOs */
++
++#define IIC_RX_FIFO_DEPTH         16	/* Rx fifo capacity               */
++#define IIC_TX_FIFO_DEPTH         16	/* Tx fifo capacity               */
++
++/* The following constants specify groups of interrupts that are typically
++ * enabled or disables at the same time
++ */
++#define XIIC_TX_INTERRUPTS                                          \
++            (XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_TX_EMPTY_MASK |    \
++             XIIC_INTR_TX_HALF_MASK)
++
++#define XIIC_TX_RX_INTERRUPTS (XIIC_INTR_RX_FULL_MASK | XIIC_TX_INTERRUPTS)
++
++/* The following constants are used with the following macros to specify the
++ * operation, a read or write operation.
++ */
++#define XIIC_READ_OPERATION  1
++#define XIIC_WRITE_OPERATION 0
++
++/* The following constants are used with the transmit FIFO fill function to
++ * specify the role which the IIC device is acting as, a master or a slave.
++ */
++#define XIIC_MASTER_ROLE     1
++#define XIIC_SLAVE_ROLE      0
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/******************************************************************************
++*
++* This macro reads a register in the IIC device using an 8 bit read operation.
++* This macro does not do any checking to ensure that the register exists if the
++* register may be excluded due to parameterization, such as the GPO Register.
++*
++* @param    BaseAddress of the IIC device.
++*
++* @param    RegisterOffset contains the offset of the register from the device
++*           base address.
++*
++* @return
++*
++* The value read from the register.
++*
++* @note
++*
++* Signature: u8 XIic_mReadReg(u32 BaseAddress, int RegisterOffset);
++*
++******************************************************************************/
++#define XIic_mReadReg(BaseAddress, RegisterOffset) \
++   XIo_In8((BaseAddress) + (RegisterOffset))
++
++/******************************************************************************
++*
++* This macro writes a register in the IIC device using an 8 bit write operation.
++* This macro does not do any checking to ensure that the register exists if the
++* register may be excluded due to parameterization, such as the GPO Register.
++*
++* @param    BaseAddress of the IIC device
++*
++* @param    RegisterOffset contains the offset of the register from the device
++*           base address
++*
++* @param    Data contains the data to be written to the register.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XIic_mWriteReg(u32 BaseAddress,
++*                                int RegisterOffset, u8 Data);
++*
++******************************************************************************/
++#define XIic_mWriteReg(BaseAddress, RegisterOffset, Data) \
++   XIo_Out8((BaseAddress) + (RegisterOffset), (Data))
++
++/************************** Function Prototypes *****************************/
++
++unsigned XIic_Recv(u32 BaseAddress, u8 Address,
++		   u8 * BufferPtr, unsigned ByteCount);
++
++unsigned XIic_Send(u32 BaseAddress, u8 Address,
++		   u8 * BufferPtr, unsigned ByteCount);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_master.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_master.c
+@@ -0,0 +1,707 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic_master.c
++*
++* Contains master functions for the XIic component. This file is necessary to
++* send or receive as a master on the IIC bus.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- --- ------- -----------------------------------------------
++* 1.01b jhl 3/27/02 Reparitioned the driver
++* 1.01c ecm 12/05/02 new rev
++* </pre>
++*
++****************************************************************************/
++
++/***************************** Include Files *******************************/
++
++#include "xiic.h"
++#include "xiic_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions ***************************/
++
++/**************************** Type Definitions *****************************/
++
++/***************** Macros (Inline Functions) Definitions *******************/
++
++/*****************************************************************************
++*
++* This macro includes master code such that master operations, sending
++* and receiving data, may be used.  This function hooks the master processing
++* to the driver such that events are handled properly and allows master
++* processing to be optional.  It must be called before any functions which
++* are contained in this file are called, such as after the driver is
++* initialized.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++#define XIIC_MASTER_INCLUDE                                             \
++{                                                                       \
++    XIic_RecvMasterFuncPtr = RecvMasterData;                            \
++    XIic_SendMasterFuncPtr = SendMasterData;                            \
++}
++
++/************************** Function Prototypes ****************************/
++
++static void SendSlaveAddr(XIic * InstancePtr);
++static void RecvMasterData(XIic * InstancePtr);
++static void SendMasterData(XIic * InstancePtr);
++static u32 IsBusBusy(XIic * InstancePtr);
++
++/************************** Variable Definitions **************************/
++
++/****************************************************************************/
++/**
++* This function sends data as a master on the IIC bus. If the bus is busy, it
++* will indicate so and then enable an interrupt such that the status handler
++* will be called when the bus is no longer busy.  The slave address which has
++* been set with the XIic_SetAddress() function is the address to which the
++* specific data is sent.  Sending data on the bus performs a write operation.
++*
++* @param    InstancePtr points to the Iic instance to be worked on.
++* @param    TxMsgPtr points to the data to be transmitted
++* @param    ByteCount is the number of message bytes to be sent
++*
++* @return
++*
++* - XST_SUCCESS indicates the message transmission has been initiated.
++* - XST_IIC_BUS_BUSY indicates the bus was in use and that the BusNotBusy
++*   interrupt is enabled which will update the EventStatus when the bus is no
++*   longer busy.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++XStatus XIic_MasterSend(XIic * InstancePtr, u8 * TxMsgPtr, int ByteCount)
++{
++	u8 CntlReg;
++
++	XIic_mEnterCriticalRegion(InstancePtr->BaseAddress);
++
++	/* Ensure that the master processing has been included such that events
++	 * will be properly handled
++	 */
++	XIIC_MASTER_INCLUDE;
++
++	/*
++	 * If the busy is busy, then exit the critical region and wait for the
++	 * bus to not be busy, the function enables the bus not busy interrupt
++	 */
++	if (IsBusBusy(InstancePtr)) {
++		XIic_mExitCriticalRegion(InstancePtr->BaseAddress);
++
++		return XST_IIC_BUS_BUSY;
++	}
++
++	/* If it is already a master on the bus (repeated start), the direction was
++	 * set to tx which is throttling bus.  The control register needs to be set
++	 * before putting data into the FIFO
++	 */
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++
++	if (CntlReg & XIIC_CR_MSMS_MASK) {
++		CntlReg &= ~XIIC_CR_NO_ACK_MASK;
++		CntlReg |=
++		    (XIIC_CR_DIR_IS_TX_MASK | XIIC_CR_REPEATED_START_MASK);
++
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 CntlReg);
++		InstancePtr->Stats.RepeatedStarts++;
++	}
++
++	/* Save message state
++	 */
++	InstancePtr->SendByteCount = ByteCount;
++	InstancePtr->SendBufferPtr = TxMsgPtr;
++
++	/* Put the address into the FIFO to be sent and indicate that the operation
++	 * to be performed on the bus is a write operation, a general call address
++	 * handled the same as a 7 bit address even if 10 bit address is selected
++	 * Set the transmit address state to indicate the address has been sent
++	 */
++	if ((InstancePtr->Options & XII_SEND_10_BIT_OPTION) &&
++	    (InstancePtr->AddrOfSlave != 0)) {
++		XIic_mSend10BitAddrByte1(InstancePtr->AddrOfSlave,
++					 XIIC_WRITE_OPERATION);
++		XIic_mSend10BitAddrByte2(InstancePtr->AddrOfSlave);
++	} else {
++		XIic_mSend7BitAddr(InstancePtr->AddrOfSlave,
++				   XIIC_WRITE_OPERATION);
++	}
++	/* Set the transmit address state to indicate the address has been sent
++	 * for communication with event driven processing
++	 */
++	InstancePtr->TxAddrMode = XIIC_TX_ADDR_SENT;
++
++	/* Fill remaining available FIFO with message data
++	 */
++	if (InstancePtr->SendByteCount > 1) {
++		XIic_TransmitFifoFill(InstancePtr, XIIC_MASTER_ROLE);
++	}
++
++	/* After filling fifo, if data yet to send > 1, enable Tx ½ empty interrupt
++	 */
++	if (InstancePtr->SendByteCount > 1) {
++		XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++				      XIIC_INTR_TX_HALF_MASK);
++	}
++
++	/* Clear any pending Tx empty, Tx Error and then enable them.
++	 */
++	XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++			      XIIC_INTR_TX_ERROR_MASK |
++			      XIIC_INTR_TX_EMPTY_MASK);
++
++	/* When repeated start not used, MSMS must be set after putting data into
++	 * transmit FIFO, start the transmitter
++	 */
++
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++	if ((CntlReg & XIIC_CR_MSMS_MASK) == 0) {
++		CntlReg &= ~XIIC_CR_NO_ACK_MASK;
++		CntlReg |= XIIC_CR_MSMS_MASK | XIIC_CR_DIR_IS_TX_MASK;
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 CntlReg);
++	}
++
++	XIic_mExitCriticalRegion(InstancePtr->BaseAddress);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************/
++/**
++* This function receives data as a master from a slave device on the IIC bus.
++* If the bus is busy, it will indicate so and then enable an interrupt such
++* that the status handler will be called when the bus is no longer busy.  The
++* slave address which has been set with the XIic_SetAddress() function is the
++* address from which data is received. Receiving data on the bus performs a
++* read operation.
++*
++* @param    InstancePtr is a pointer to the Iic instance to be worked on.
++* @param    RxMsgPtr is a pointer to the data to be transmitted
++* @param    ByteCount is the number of message bytes to be sent
++*
++* @return
++*
++* - XST_SUCCESS indicates the message reception processes has been initiated.
++* - XST_IIC_BUS_BUSY indicates the bus was in use and that the BusNotBusy
++*   interrupt is enabled which will update the EventStatus when the bus is no
++*   longer busy.
++* - XST_IIC_GENERAL_CALL_ADDRESS indicates the slave address is set to the
++*   the general call address. This is not allowed for Master receive mode.
++*
++* @internal
++*
++* The receive FIFO threshold is a zero based count such that 1 must be
++* subtracted from the desired count to get the correct value. When receiving
++* data it is also necessary to not receive the last byte with the prior bytes
++* because the acknowledge must be setup before the last byte is received.
++*
++******************************************************************************/
++XStatus XIic_MasterRecv(XIic * InstancePtr, u8 * RxMsgPtr, int ByteCount)
++{
++	u8 CntlReg;
++	u8 Temp;
++
++	/* If the slave address is zero (general call) the master can't perform
++	 * receive operations, indicate an error
++	 */
++	if (InstancePtr->AddrOfSlave == 0) {
++		return XST_IIC_GENERAL_CALL_ADDRESS;
++	}
++
++	XIic_mEnterCriticalRegion(InstancePtr->BaseAddress);
++
++	/* Ensure that the master processing has been included such that events
++	 * will be properly handled
++	 */
++	XIIC_MASTER_INCLUDE;
++	/*
++	 * If the busy is busy, then exit the critical region and wait for the
++	 * bus to not be busy, the function enables the bus not busy interrupt
++	 */
++	if (IsBusBusy(InstancePtr)) {
++		XIic_mExitCriticalRegion(InstancePtr->BaseAddress);
++
++		return XST_IIC_BUS_BUSY;
++	}
++
++	/* Save message state for event driven processing
++	 */
++	InstancePtr->RecvByteCount = ByteCount;
++	InstancePtr->RecvBufferPtr = RxMsgPtr;
++
++	/* Clear and enable Rx full interrupt if using 7 bit, If 10 bit, wait until
++	 * last address byte sent incase arbitration gets lost while sending out
++	 * address.
++	 */
++	if ((InstancePtr->Options & XII_SEND_10_BIT_OPTION) == 0) {
++		XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++				      XIIC_INTR_RX_FULL_MASK);
++	}
++
++	/* If already a master on the bus, the direction was set by Rx Interrupt
++	 * routine to tx which is throttling bus because during Rxing, Tx reg is
++	 * empty = throttle. CR needs setting before putting data or the address
++	 * written will go out as Tx instead of receive. Start Master Rx by setting
++	 * CR Bits MSMS to Master and msg direction.
++	 */
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++
++	if (CntlReg & XIIC_CR_MSMS_MASK) {
++		CntlReg |= XIIC_CR_REPEATED_START_MASK;
++		XIic_mSetControlRegister(InstancePtr, CntlReg, ByteCount);
++
++		InstancePtr->Stats.RepeatedStarts++;	/* increment stats counts */
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 CntlReg);
++
++	}
++
++	/* Set receive FIFO occupancy depth which must be done prior to writing the
++	 * address in the FIFO because the transmitter will immediatedly start when
++	 * in repeated start mode followed by the receiver such that the number of
++	 * bytes to receive should be set 1st.
++	 */
++	if (ByteCount == 1) {
++		Temp = 0;
++	} else {
++		if (ByteCount < IIC_RX_FIFO_DEPTH) {
++			Temp = ByteCount - 2;
++		} else {
++			Temp = IIC_RX_FIFO_DEPTH - 1;
++		}
++	}
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_RFD_REG_OFFSET, Temp);
++
++	if (InstancePtr->Options & XII_SEND_10_BIT_OPTION) {
++		/* Send the 1st and 2nd byte of the 10 bit address of a write
++		 * operation, write because it's a 10 bit address
++		 */
++		XIic_mSend10BitAddrByte1(InstancePtr->AddrOfSlave,
++					 XIIC_WRITE_OPERATION);
++		XIic_mSend10BitAddrByte2(InstancePtr->AddrOfSlave);
++
++		/* Set flag to indicate the next byte of the address needs to be
++		 * send, clear and enable tx empty interrupt
++		 */
++		InstancePtr->TxAddrMode = XIIC_TX_ADDR_MSTR_RECV_MASK;
++		XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++				      XIIC_INTR_TX_EMPTY_MASK);
++	} else {
++		/* 7 bit slave address, send the address for a read operation
++		 * and set the state to indicate the address has been sent
++		 */
++		XIic_mSend7BitAddr(InstancePtr->AddrOfSlave,
++				   XIIC_READ_OPERATION);
++		InstancePtr->TxAddrMode = XIIC_TX_ADDR_SENT;
++	}
++
++	/* Tx error is enabled incase the address (7 or 10) has no device to answer
++	 * with Ack. When only one byte of data, must set NO ACK before address goes
++	 * out therefore Tx error must not be enabled as it will go off immediately
++	 * and the Rx full interrupt will be checked.  If full, then the one byte
++	 * was received and the Tx error will be disabled without sending an error
++	 * callback msg.
++	 */
++	XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++			      XIIC_INTR_TX_ERROR_MASK);
++
++	/*  When repeated start not used, MSMS gets set after putting data
++	 *  in Tx reg. Start Master Rx by setting CR Bits MSMS to Master and
++	 *  msg direction.
++	 */
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++	if ((CntlReg & XIIC_CR_MSMS_MASK) == 0) {
++		CntlReg |= XIIC_CR_MSMS_MASK;
++		XIic_mSetControlRegister(InstancePtr, CntlReg, ByteCount);
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 CntlReg);
++	}
++
++	XIic_mExitCriticalRegion(InstancePtr->BaseAddress);
++
++	return XST_SUCCESS;
++}
++
++/*****************************************************************************
++*
++* This function checks to see if the IIC bus is busy.  If so, it will enable
++* the bus not busy interrupt such that the driver is notified when the bus
++* is no longer busy.
++*
++* @param    InstancePtr points to the Iic instance to be worked on.
++*
++* @return
++*
++* - FALSE indicates the IIC bus is not busy.
++* - TRUE indicates the bus was in use and that the BusNotBusy
++*   interrupt is enabled which will update the EventStatus when the bus is no
++*   longer busy.
++*
++* @note
++*
++* None
++*
++******************************************************************************/
++static u32 IsBusBusy(XIic * InstancePtr)
++{
++	u8 ControlReg;
++	u8 StatusReg;
++
++	ControlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++	StatusReg = XIo_In8(InstancePtr->BaseAddress + XIIC_SR_REG_OFFSET);
++
++	/* If this device is already master of the bus as when using the repeated
++	 * start and the bus is busy setup to wait for it to not be busy
++	 */
++	if (((ControlReg & XIIC_CR_MSMS_MASK) == 0) &&	/* not master */
++	    (StatusReg & XIIC_SR_BUS_BUSY_MASK)) {	/* is busy    */
++		/* The bus is busy, clear pending BNB interrupt incase previously set
++		 * and then enable BusNotBusy interrupt
++		 */
++		InstancePtr->BNBOnly = TRUE;
++		XIic_mClearEnableIntr(InstancePtr->BaseAddress,
++				      XIIC_INTR_BNB_MASK);
++		InstancePtr->Stats.BusBusy++;
++
++		return TRUE;
++	}
++
++	return FALSE;
++}
++
++/******************************************************************************
++*
++* This function sends the proper byte of the address as well as generate the
++* proper address bit fields depending on the address byte required and the
++* direction of the data (write or read).
++*
++* A master receiving has the restriction that the direction must be switched
++* from write to read when the third address byte is transmitted.
++* For the last byte of the 10 bit address, repeated start must be set prior
++* to writing the address. If repeated start options is enabled, the
++* control register is written before the address is written to the tx reg.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* This function does read/modify/write to the device control register. Calling
++* functions must ensure critical sections are used.
++*
++******************************************************************************/
++static void SendSlaveAddr(XIic * InstancePtr)
++{
++	u8 CRreg;
++
++	/* Set the control register for Master Receive, repeated start must be set
++	 * before writing the address, MSMS should be already set, don't set here
++	 * so if arbitration is lost or some other reason we don't want MSMS set
++	 * incase of error
++	 */
++	CRreg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++
++	CRreg |= XIIC_CR_REPEATED_START_MASK;
++	CRreg &= ~XIIC_CR_DIR_IS_TX_MASK;
++
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET, CRreg);
++
++	/* Send the 1st byte of the 10 bit address as a read operation, enable the
++	 * receive interrupt to know when data is received, assuming that the
++	 * receive FIFO threshold has been previously set
++	 */
++	XIic_mSend10BitAddrByte1(InstancePtr->AddrOfSlave, XIIC_READ_OPERATION);
++
++	XIic_mClearEnableIntr(InstancePtr->BaseAddress, XIIC_INTR_RX_FULL_MASK);
++}
++
++/******************************************************************************
++*
++* When the IIC Tx FIFO/register goes empty, this routine is called by the
++* interrupt service routine to fill the transmit FIFO with data to be sent.
++*
++* This function also is called by the Tx ½ empty interrupt as the data handling
++* is identical when you don't assume the FIFO is empty but use the Tx_FIFO_OCY
++* register to indicate the available free FIFO bytes.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void SendMasterData(XIic * InstancePtr)
++{
++	u8 CntlReg;
++
++	/* The device is a master on the bus.  If there is still more address bytes
++	 * to send when in master receive operation and the slave device is 10 bit
++	 * addressed. This requires the lower 7 bits of address to be resent when
++	 * the mode switches to Read instead of write (while sending addresses).
++	 */
++	if (InstancePtr->TxAddrMode & XIIC_TX_ADDR_MSTR_RECV_MASK) {
++		/* Send the 1st byte of the slave address in the read operation
++		 * and change the state to indicate this has been done
++		 */
++		SendSlaveAddr(InstancePtr);
++		InstancePtr->TxAddrMode = XIIC_TX_ADDR_SENT;
++	}
++
++	/* In between 1st and last byte of message, fill the FIFO with more data
++	 * to send, disable the 1/2 empty interrupt based upon data left to send
++	 */
++	else if (InstancePtr->SendByteCount > 1) {
++		XIic_TransmitFifoFill(InstancePtr, XIIC_MASTER_ROLE);
++
++		if (InstancePtr->SendByteCount < 2) {
++			XIic_mDisableIntr(InstancePtr->BaseAddress,
++					  XIIC_INTR_TX_HALF_MASK);
++		}
++	}
++	/*
++	 * If there is only one byte left to send, processing differs between
++	 * repeated start and normal messages
++	 */
++	else if (InstancePtr->SendByteCount == 1) {
++		/* When using repeated start, another interrupt is expected after the
++		 * last byte has been sent, so the message is not done yet
++		 */
++		if (InstancePtr->Options & XII_REPEATED_START_OPTION) {
++			XIic_mWriteSendByte(InstancePtr);
++		}
++
++		/* When not using repeated start, the stop condition must be generated
++		 * after the last byte is written. The bus is throttled waiting for the last
++		 * byte.
++		 */
++		else {
++			/* Set the stop condition before sending the last byte of data so that
++			 * the stop condition will be generated immediately following the data
++			 * another transmit interrupt is not expected so the message is done
++			 */
++
++			CntlReg =
++			    XIo_In8(InstancePtr->BaseAddress +
++				    XIIC_CR_REG_OFFSET);
++			CntlReg &= ~XIIC_CR_MSMS_MASK;
++			XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++				 CntlReg);
++
++			XIic_mWriteSendByte(InstancePtr);
++
++			/* Wait for bus to not be busy before declaring message has
++			 * been sent for the no repeated start operation. The callback
++			 * will be called from the BusNotBusy part of the Interrupt
++			 * handler to ensure that the message is completely sent.
++			 * Disable the TX interrupts and enable the BNB interrupt
++			 */
++
++			InstancePtr->BNBOnly = FALSE;
++			XIic_mDisableIntr(InstancePtr->BaseAddress,
++					  XIIC_TX_INTERRUPTS);
++			XIic_mEnableIntr(InstancePtr->BaseAddress,
++					 XIIC_INTR_BNB_MASK);
++
++		}
++	} else {
++		if (InstancePtr->Options & XII_REPEATED_START_OPTION) {
++			/* The message being sent has completed. When using repeated start
++			 * with no more bytes to send repeated start needs to be set in
++			 * the control register so that the bus will still be held by this
++			 * master
++			 */
++
++			CntlReg =
++			    XIo_In8(InstancePtr->BaseAddress +
++				    XIIC_CR_REG_OFFSET);
++			CntlReg |= XIIC_CR_REPEATED_START_MASK;
++			XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++				 CntlReg);
++
++			/* If the message that was being sent has finished, disable all
++			 *transmit interrupts and call the callback that was setup to
++			 * indicate the message was sent, with 0 bytes remaining
++			 */
++
++			XIic_mDisableIntr(InstancePtr->BaseAddress,
++					  XIIC_TX_INTERRUPTS);
++			InstancePtr->SendHandler(InstancePtr->SendCallBackRef,
++						 0);
++		}
++	}
++
++	return;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function is called when the receive register is full. The number
++* of bytes received to cause the interrupt is adjustable using the Receive FIFO
++* Depth register. The number of bytes in the register is read in the Receive
++* FIFO occupancy register. Both these registers are zero based values (0-15)
++* such that a value of zero indicates 1 byte.
++*
++* For a Master Receiver to properly signal the end of a message, the data must
++* be read in up to the message length - 1, where control register bits will be
++* set for bus controls to occur on reading of the last byte.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++static void RecvMasterData(XIic * InstancePtr)
++{
++	u8 LoopCnt;
++	int BytesInFifo;
++	int BytesToRead;
++	u8 CntlReg;
++
++	/* Device is a master receiving, get the contents of the control register
++	 * and determine the number of bytes in fifo to be read out
++	 */
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++	BytesInFifo = XIo_In8(InstancePtr->BaseAddress + XIIC_RFO_REG_OFFSET)
++	    + 1;
++
++	/* If data in FIFO holds all data to be retrieved - 1, set NOACK and
++	 * disable the tx error
++	 */
++	if ((InstancePtr->RecvByteCount - BytesInFifo) == 1) {
++		/* Disable tx error interrupt to prevent interrupt
++		 * as this device will cause it when it set NO ACK next
++		 */
++		XIic_mDisableIntr(InstancePtr->BaseAddress,
++				  XIIC_INTR_TX_ERROR_MASK);
++		XIic_mClearIntr(InstancePtr->BaseAddress,
++				XIIC_INTR_TX_ERROR_MASK);
++
++		/* Write control reg with NO ACK allowing last byte to
++		 * have the No ack set to indicate to slave last byte read.
++		 */
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 (CntlReg | XIIC_CR_NO_ACK_MASK));
++
++		/* Read one byte to clear a place for the last byte to be read
++		 * which will set the NO ACK
++		 */
++		XIic_mReadRecvByte(InstancePtr);
++	}
++
++	/* If data in FIFO is all the data to be received then get the data
++	 * and also leave the device in a good state for the next transaction
++	 */
++	else if ((InstancePtr->RecvByteCount - BytesInFifo) == 0) {
++		/* If repeated start option is off then the master should stop
++		 * using the bus, otherwise hold the bus, setting repeated start
++		 * stops the slave from transmitting data when the FIFO is read
++		 */
++		if ((InstancePtr->Options & XII_REPEATED_START_OPTION) == 0) {
++			CntlReg &= ~XIIC_CR_MSMS_MASK;
++		} else {
++			CntlReg |= XIIC_CR_REPEATED_START_MASK;
++		}
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 CntlReg);
++
++		/* Read data from the FIFO then set zero based FIFO read depth for a byte
++		 */
++		for (LoopCnt = 0; LoopCnt < BytesInFifo; LoopCnt++) {
++			XIic_mReadRecvByte(InstancePtr);
++		}
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_RFD_REG_OFFSET, 0);
++
++		/* Disable Rx full interrupt and write the control reg with ACK allowing
++		 * next byte sent to be acknowledged automatically
++		 */
++		XIic_mDisableIntr(InstancePtr->BaseAddress,
++				  XIIC_INTR_RX_FULL_MASK);
++
++		XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET,
++			 (CntlReg & ~XIIC_CR_NO_ACK_MASK));
++
++		/* Send notification of msg Rx complete in RecvHandler callback
++		 */
++		InstancePtr->RecvHandler(InstancePtr->RecvCallBackRef, 0);
++	} else {
++		/* Fifo data not at n-1, read all but the last byte of data from the
++		 * slave, if more than a FIFO full yet to receive read a FIFO full
++		 */
++		BytesToRead = InstancePtr->RecvByteCount - BytesInFifo - 1;
++		if (BytesToRead > IIC_RX_FIFO_DEPTH) {
++			BytesToRead = IIC_RX_FIFO_DEPTH;
++		}
++
++		/* Read in data from the FIFO */
++
++		for (LoopCnt = 0; LoopCnt < BytesToRead; LoopCnt++) {
++			XIic_mReadRecvByte(InstancePtr);
++		}
++	}
++}
+Index: linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_options.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/i2c/algos/xilinx_iic/xiic_options.c
+@@ -0,0 +1,174 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xiic_options.c
++*
++* Contains options functions for the XIic component. This file is not required
++* unless the functions in this file are called.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- --- ------- -----------------------------------------------
++* 1.01b jhl 3/26/02 repartioned the driver
++* 1.01c ecm 12/05/02 new rev
++* </pre>
++*
++****************************************************************************/
++
++/***************************** Include Files *******************************/
++
++#include "xiic.h"
++#include "xiic_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions ***************************/
++
++/**************************** Type Definitions *****************************/
++
++/***************** Macros (Inline Functions) Definitions *******************/
++
++/************************** Function Prototypes ****************************/
++
++/************************** Variable Definitions **************************/
++
++/*****************************************************************************/
++/**
++*
++* This function sets the options for the IIC device driver. The options control
++* how the device behaves relative to the IIC bus. If an option applies to
++* how messages are sent or received on the IIC bus, it must be set prior to
++* calling functions which send or receive data.
++*
++* To set multiple options, the values must be ORed together. To not change
++* existing options, read/modify/write with the current options using
++* XIic_GetOptions().
++*
++* <b>USAGE EXAMPLE:</b>
++*
++* Read/modify/write to enable repeated start:
++* <pre>
++*   u8 Options;
++*   Options = XIic_GetOptions(&Iic);
++*   XIic_SetOptions(&Iic, Options | XII_REPEATED_START_OPTION);
++* </pre>
++*
++* Disabling General Call:
++* <pre>
++*   Options = XIic_GetOptions(&Iic);
++*   XIic_SetOptions(&Iic, Options &= ~XII_GENERAL_CALL_OPTION);
++* </pre>
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @param    NewOptions are the options to be set.  See xiic.h for a list of
++*           the available options.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Sending or receiving messages with repeated start enabled, and then
++* disabling repeated start, will not take effect until another master
++* transaction is completed. i.e. After using repeated start, the bus will
++* continue to be throttled after repeated start is disabled until a master
++* transaction occurs allowing the IIC to release the bus.
++* <br><br>
++* Options enabled will have a 1 in its appropriate bit position.
++*
++****************************************************************************/
++void XIic_SetOptions(XIic * InstancePtr, u32 NewOptions)
++{
++	u8 CntlReg;
++
++	XASSERT_VOID(InstancePtr != NULL);
++
++	XIic_mEnterCriticalRegion(InstancePtr->BaseAddress);
++
++	/* Update the options in the instance and get the contents of the control
++	 * register such that the general call option can be modified
++	 */
++	InstancePtr->Options = NewOptions;
++	CntlReg = XIo_In8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET);
++
++	/* The general call option is the only option that maps directly to
++	 * a hardware register feature
++	 */
++	if (NewOptions & XII_GENERAL_CALL_OPTION) {
++		CntlReg |= XIIC_CR_GENERAL_CALL_MASK;
++	} else {
++		CntlReg &= ~XIIC_CR_GENERAL_CALL_MASK;
++	}
++
++	/* Write the new control register value to the register */
++
++	XIo_Out8(InstancePtr->BaseAddress + XIIC_CR_REG_OFFSET, CntlReg);
++
++	XIic_mExitCriticalRegion(InstancePtr->BaseAddress);
++}
++
++/*****************************************************************************/
++/**
++*
++* This function gets the current options for the IIC device. Options control
++* the how the device behaves on the IIC bus. See SetOptions for more information
++* on options.
++*
++* @param    InstancePtr is a pointer to the XIic instance to be worked on.
++*
++* @return
++*
++* The options of the IIC device. See xiic.h for a list of available options.
++*
++* @note
++*
++* Options enabled will have a 1 in its appropriate bit position.
++*
++****************************************************************************/
++u32 XIic_GetOptions(XIic * InstancePtr)
++{
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	return InstancePtr->Options;
++}
+Index: linux-2.6.10/mvl_patches/pro-0342.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0342.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(342);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

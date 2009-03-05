@@ -1,0 +1,598 @@
+#! /usr/bin/env bash
+# Patch: -pro_sh_sh7780_hrt
+# Date: Fri May  4 10:08:26 2007
+# Source: MontaVista Software, Inc. 
+# MR: 20464
+# Type: Enhancement 
+# Disposition: MontaVista
+# Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+# Description:
+# 	Implementatiom of high-resolution timers for sh7780
+# 
+
+PATCHNUM=1323
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 20464
+Type: Enhancement 
+Disposition: MontaVista
+Signed-off-by: dmitry pervushin <dpervushin@ru.mvista.com>
+Description:
+	Implementatiom of high-resolution timers for sh7780
+
+Index: linux-2.6.10/arch/sh/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/sh/Kconfig
++++ linux-2.6.10/arch/sh/Kconfig
+@@ -659,6 +659,22 @@ config SH_PCLK_FREQ
+ 	  with an auto-probed frequency which should be considered the proper
+ 	  value for your hardware.
+ 
++config HIGH_RES_TIMERS
++	bool "Configure High-Resolution-Timers"
++	help
++	  POSIX timers are available by default.  This option enables
++	  high-resolution POSIX timers.  With this option the resolution
++	  is about 10 microsecond.  High resolution is not free.  If
++	  enabled this option will add a small overhead each time a
++	  timer expires that is not on a 1/HZ tick boundary.  If no such
++	  timers are used the overhead is nil.
++
++	  This option enables two additional POSIX CLOCKS,
++	  CLOCK_REALTIME_HR and CLOCK_MONOTONIC_HR.  Note that this
++	  option does not change the resolution of CLOCK_REALTIME or
++	  CLOCK_MONOTONIC which remain at 1/HZ resolution.
++
++
+ menu "CPU Frequency scaling"
+ 
+ source "drivers/cpufreq/Kconfig"
+Index: linux-2.6.10/arch/sh/kernel/time.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/time.c
++++ linux-2.6.10/arch/sh/kernel/time.c
+@@ -25,6 +25,12 @@
+ #include <linux/smp.h>
+ #include <linux/profile.h>
+ 
++#ifdef CONFIG_HIGH_RES_TIMERS
++#include <linux/module.h>
++#include <linux/hrtime.h>
++#include <linux/cpumask.h>
++#endif
++
+ #include <asm/processor.h>
+ #include <asm/uaccess.h>
+ #include <asm/io.h>
+@@ -33,6 +39,9 @@
+ #include <asm/machvec.h>
+ #include <asm/rtc.h>
+ #include <asm/freq.h>
++#ifdef CONFIG_HIGH_RES_TIMERS
++#include <asm/div64.h>
++#endif
+ 
+ #include <linux/timex.h>
+ #include <linux/irq.h>
+@@ -46,6 +55,9 @@
+ #define TMU1_TCR_INIT	0x0000	/* Clock/4, rising edge; no interrupt */
+ #define TMU1_TSTR_INIT	0x02	/* Bit to turn on TMU1 */
+ 
++#define TMU2_TCR_INIT	0x0020	/* Clock/4, rising edge; interrupt on */
++#define TMU2_TSTR_INIT  0x04	/* Bit to turn on TMU2 */
++
+ #if defined(CONFIG_CPU_SH3)
+ #if defined(CONFIG_CPU_SUBTYPE_SH7300)
+ #define TMU_TSTR        0xA412FE92      /* Byte access */
+@@ -83,6 +95,10 @@
+ #define TMU1_TCNT	0xffd80018	/* Long access */
+ #define TMU1_TCR	0xffd8001c	/* Word access */
+ 
++#define TMU2_TCOR	0xffd80020	/* Long access */
++#define TMU2_TCNT	0xffd80024	/* Long access */
++#define TMU2_TCR	0xffd80028	/* Word access */
++
+ #ifdef CONFIG_CPU_SUBTYPE_ST40STB1
+ #define CLOCKGEN_MEMCLKCR 0xbb040038
+ #define MEMCLKCR_RATIO_MASK 0x7
+@@ -154,6 +170,23 @@ unsigned long long sched_clock(void)
+ 	return (unsigned long long)jiffies * (1000000000 / HZ);
+ }
+ 
++#ifdef CONFIG_HIGH_RES_TIMERS
++/* Updated to native timebase value at each jiffy interrupt */
++static unsigned volatile int last_stamp;
++
++/* Get the current value of the time base counter */
++#define read_tmu1() ((unsigned int)ctrl_inl(TMU1_TCNT))
++
++static unsigned long do_gettimeoffset(void)
++{
++	int count;
++
++	count = get_arch_cycles(jiffies) * TICK_SIZE;
++	count = (count + LATCH/2) / LATCH;
++
++	return(count);
++}
++#else
+ static unsigned long do_gettimeoffset(void)
+ {
+ 	int count;
+@@ -205,6 +238,7 @@ static unsigned long do_gettimeoffset(vo
+ 
+ 	return count;
+ }
++#endif
+ 
+ void do_gettimeofday(struct timeval *tv)
+ {
+@@ -287,7 +321,7 @@ static inline void do_timer_interrupt(in
+ 	profile_tick(CPU_PROFILING, regs);
+ 
+ #ifdef CONFIG_HEARTBEAT
+-	if (sh_mv.mv_heartbeat != NULL) 
++	if (sh_mv.mv_heartbeat != NULL)
+ 		sh_mv.mv_heartbeat();
+ #endif
+ 
+@@ -329,6 +363,9 @@ static irqreturn_t timer_interrupt(int i
+ 	 * locally disabled. -arca
+ 	 */
+ 	write_seqlock(&xtime_lock);
++#ifdef CONFIG_HIGH_RES_TIMERS
++	last_stamp = read_tmu1();
++#endif
+ 	do_timer_interrupt(irq, NULL, regs);
+ 	write_sequnlock(&xtime_lock);
+ 
+@@ -587,6 +624,125 @@ static void st40_specific_time_init(unsi
+ }
+ #endif
+ 
++#ifdef CONFIG_HIGH_RES_TIMERS
++int get_arch_cycles(unsigned long ref_jiffies)
++{
++	int ret;
++	unsigned temp_jiffies;
++
++	do {
++		temp_jiffies = jiffies;
++		barrier();
++
++		if (unlikely(ref_jiffies > jiffies)) {
++			ret = (jiffies - ref_jiffies) * arch_cycles_per_jiffy;
++			ret -= read_tmu1() - last_stamp;
++		} else {
++			ret = last_stamp - read_tmu1();
++			if (unlikely(ref_jiffies < temp_jiffies))
++				ret += (temp_jiffies - ref_jiffies) *
++						arch_cycles_per_jiffy;
++		}
++		barrier();
++
++	} while(unlikely(temp_jiffies != jiffies));
++
++	return ret;
++}
++
++int schedule_hr_timer_int(unsigned long ref_jiffies, int ref_cycles)
++{
++	int temp_cycles;
++
++	if (ref_cycles < 0) {
++		printk(KERN_ERR "ref_cycles < 0 in schedule_hr_timer_int()\n");
++	}
++
++	temp_cycles = (ref_jiffies - jiffies) * arch_cycles_per_jiffy +
++	                                ref_cycles - get_arch_cycles(jiffies);
++
++	if(unlikely(temp_cycles <= 0))
++		return -ETIME;
++
++	ctrl_outl(temp_cycles, TMU2_TCNT);
++	ctrl_outb((ctrl_inb(TMU_TSTR) | TMU2_TSTR_INIT), TMU_TSTR);
++
++	return 0;
++}
++
++static irqreturn_t hr_timer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
++{
++	unsigned long timer_status;
++
++	/* Clear UNF bit */
++	timer_status = ctrl_inw(TMU2_TCR);
++	timer_status &= ~0x100;
++	ctrl_outw(timer_status, TMU2_TCR);
++
++	/* Turn off timer so it won't fire again, until reset by
++	 * a call to schedule_hr_timer_int()
++	 */
++        ctrl_outb((ctrl_inb(TMU_TSTR) & ~TMU2_TSTR_INIT), TMU_TSTR);
++	do_hr_timer_int();
++	return IRQ_HANDLED;
++}
++
++static struct irqaction irq2  = {
++	.handler = hr_timer_interrupt,
++	.flags = SA_INTERRUPT,
++	.mask = CPU_MASK_NONE,
++	.dev_id = "hr timer",
++};
++
++#define nsec2cycle_shift	32
++#define cycle2nsec_shift	24
++unsigned int scaled_cycles_per_nsec, scaled_nsecs_per_cycle;
++int arch_cycles_per_jiffy;
++int hr_time_resolution = 1000;
++
++int arch_cycle_to_nsec(int cycles) {
++	return mpy_sc_n(cycle2nsec_shift, cycles, scaled_nsecs_per_cycle);
++}
++
++int nsec_to_arch_cycle(int nsec) {
++	return mpy_sc_n(nsec2cycle_shift, nsec, scaled_cycles_per_nsec);
++}
++
++static void hr_time_init(void)
++{
++        u64 temp;
++	unsigned int counter_freq = arch_cycles_per_jiffy * HZ;
++	int ret;
++
++        /* make sure no overflow for the scale factors */
++        if (! ((counter_freq >> (32- nsec2cycle_shift)) < 1000000000))
++		printk(KERN_ERR "nsec2cycle_shift is too big\n");
++        if (! ((1000000000 >> (32 - cycle2nsec_shift)) < counter_freq))
++		printk(KERN_ERR "cycle2nsec_shift is too big\n");
++
++        /*
++         * the current setting allow counter freq to range from
++         * a few MHz to 1GHz.
++         */
++
++        temp = (u64)counter_freq << nsec2cycle_shift;
++        do_div(temp, 1000000000);
++        scaled_cycles_per_nsec = (unsigned int)temp;
++
++        temp = (u64) 1000000000 << cycle2nsec_shift;
++        do_div(temp, counter_freq);
++        scaled_nsecs_per_cycle = (unsigned int) temp;
++
++	ret = setup_irq(TIMER2_IRQ, &irq2);
++
++	if (ret)
++		printk(KERN_ERR "can't register IRQ for high res timer\n");
++
++	return;
++}
++#endif /* CONFIG_HIGH_RES_TIMERS */
++
++
+ void __init time_init(void)
+ {
+ 	unsigned int timer_freq = 0;
+@@ -695,6 +851,11 @@ void __init time_init(void)
+ 	ctrl_outb(TMU_TOCR_INIT, TMU_TOCR);
+ #endif
+ 
++#if defined(CONFIG_HIGH_RES_TIMERS)
++	arch_cycles_per_jiffy = interval;
++	hr_time_init();
++#endif /* CONFIG_HIGH_RES_TIMERS */
++
+ #if defined(CONFIG_START_TMU1)
+         /* Start TMU1 (free-running)
+          * TMU1 must be running before the first jiffy interrupt
+@@ -711,4 +872,26 @@ void __init time_init(void)
+ 	ctrl_outl(interval, TMU0_TCOR);
+ 	ctrl_outl(interval, TMU0_TCNT);
+ 	ctrl_outb(TMU_TSTR_INIT, TMU_TSTR);
++#if defined(CONFIG_HIGH_RES_TIMERS)
++	last_stamp = read_tmu1();
++	/* Initialize TMU2, but don't start it running.  That is only
++	 * done by schedule_hr_timer_int()
++	 */
++	ctrl_outw(TMU2_TCR_INIT, TMU2_TCR);
++	/* Set the constant reload register to a big number.  When the timer
++	 * underflows, this gets loaded back into the timer, and it keeps
++	 * on counting.  A big number prevents the timer from expiring again
++	 * before the previous interrupt was serviced.  Setting the register
++	 * to all '1's gives us about 5 minutes. :-)
++	 */
++	ctrl_outl(0xffffffff, TMU2_TCOR);
++#endif /* CONFIG_HIGH_RES_TIMERS */
++
++
+ }
++
++#ifdef CONFIG_HIGH_RES_TIMERS
++EXPORT_SYMBOL(arch_cycles_per_jiffy);
++EXPORT_SYMBOL(nsec_to_arch_cycle);
++EXPORT_SYMBOL(arch_cycle_to_nsec);
++#endif /* CONFIG_HIGH_RES_TIMERS */
+Index: linux-2.6.10/include/asm-sh/hrtime.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/include/asm-sh/hrtime.h
+@@ -0,0 +1,32 @@
++/*
++ * High-resolution timer header file for SH.
++ *
++ * Copyright (C) 2003 MontaVista Software Inc.
++ * Author: Ken Sumrall, ken@mvista.com, stolen from asm-mips/hrtime.h
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ */
++#ifndef _ASM_HRTIMER_H
++#define _ASM_HRTIMER_H
++
++#include <linux/sc_math.h>
++
++extern int schedule_hr_timer_int(unsigned long ref_jiffies, int cycles);
++extern int get_arch_cycles(unsigned long ref_jiffies);
++
++extern int arch_cycles_per_jiffy;
++
++extern int nsec_to_arch_cycle(int nsecs);
++extern int arch_cycle_to_nsec(int cycles);
++
++extern int hr_time_resolution;
++
++#define schedule_jiffies_int(x)	(get_arch_cycles(x) >= arch_cycles_per_jiffy)
++
++#define hrtimer_use (1)
++
++#endif /* _ASM_HRTIMER_H */
+Index: linux-2.6.10/include/asm-sh/cpu-sh4/sh7780.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/cpu-sh4/sh7780.h
++++ linux-2.6.10/include/asm-sh/cpu-sh4/sh7780.h
+@@ -49,6 +49,8 @@
+ 
+ /* Timer IRQ */
+ #define TIMER_IRQ	INTEVT2_TO_IRQ(0x580)
++#define TIMER1_IRQ	INTEVT2_TO_IRQ(0x5A0)
++#define TIMER2_IRQ	INTEVT2_TO_IRQ(0x5C0)
+ 
+ /* SH DMAC */
+ #define DMTE0_IRQ	INTEVT2_TO_IRQ(0x640)
+@@ -62,8 +64,8 @@
+ { \
+ 	/* IPRA */ \
+ 	{TIMER_IRQ, INTC_INT2MSKRG, INTC_INT2MSKCR, 0}, /* TMU0 */ \
+-	{INTEVT2_TO_IRQ(0x5A0), INTC_INT2MSKRG, INTC_INT2MSKCR, 0}, /* TMU1 */ \
+-	{INTEVT2_TO_IRQ(0x5C0), INTC_INT2MSKRG, INTC_INT2MSKCR, 0}, /* TMU2 */ \
++	{TIMER1_IRQ, INTC_INT2MSKRG, INTC_INT2MSKCR, 0}, /* TMU1 */ \
++	{TIMER2_IRQ, INTC_INT2MSKRG, INTC_INT2MSKCR, 0}, /* TMU2 */ \
+ 	{INTEVT2_TO_IRQ(0x5E0), INTC_INT2MSKRG, INTC_INT2MSKCR, 0}, /* TMU2IC */ \
+ \
+ 	{INTEVT2_TO_IRQ(0xE00), INTC_INT2MSKRG, INTC_INT2MSKCR, 1}, /* TMU3 */ \
+Index: linux-2.6.10/include/asm-sh/irq.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/irq.h
++++ linux-2.6.10/include/asm-sh/irq.h
+@@ -88,6 +88,12 @@ extern void make_sh4a_intc_irq(unsigned 
+ #define TIMER1_IPR_POS	 2
+ #define TIMER1_PRIORITY	 4
+ 
++#define TIMER2_IRQ	18
++#define TIMER2_IPR_ADDR	INTC_IPRA
++#define TIMER2_IPR_POS	 2
++#define TIMER2_PRIORITY	 TIMER_PRIORITY
++
++
+ #define RTC_IRQ		22
+ #define RTC_IPR_ADDR	INTC_IPRA
+ #define RTC_IPR_POS	 0
+Index: linux-2.6.10/mvl_patches/pro-1323.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1323.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1323);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

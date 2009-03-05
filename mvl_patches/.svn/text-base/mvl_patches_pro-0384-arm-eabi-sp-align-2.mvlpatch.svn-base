@@ -1,0 +1,303 @@
+#! /usr/bin/env bash
+# Patch: -arm-eabi-sp-align-2
+# Date: Mon Mar 20 17:13:14 2006
+
+PATCHNUM=384
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree 499b2ea11ff00c624d63af23516404fa2156639a (from 2dede2d8e925f4c2cb4e136b14df127685e15dd3)
+Author: Nicolas Pitre <nico@cam.org>
+Date:   Sat Jan 14 16:18:09 2006 +0000
+
+    [ARM] 3103/1: ARM EABI: stack pointer must be 64-bit aligned (part 2)
+    
+    Patch from Nicolas Pitre
+    
+    We must make sure that assembly code that modifies the stack pointer
+    before calling a C function does it so it remains 64-bit aligned.
+    
+    Signed-off-by: Nicolas Pitre <nico@cam.org>
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+ arch/arm/kernel/semaphore.c |   17 +++++++++--------
+ arch/arm/lib/lib1funcs.S    |    4 ++--
+ mvl_patches/pro-0384.c      |   16 ++++++++++++++++
+ 3 files changed, 27 insertions(+), 10 deletions(-)
+
+Index: linux-2.6.10/arch/arm/kernel/semaphore.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/kernel/semaphore.c
++++ linux-2.6.10/arch/arm/kernel/semaphore.c
+@@ -190,41 +190,42 @@ EXPORT_SYMBOL(compat_sem_is_locked);
+  * ip contains the semaphore pointer on entry. Save the C-clobbered
+  * registers (r0 to r3 and lr), but not ip, as we use it as a return
+  * value in some cases..
++ * To remain AAPCS compliant (64-bit stack align) we save r4 as well.
+  */
+ asm("	.section .sched.text,\"ax\"		\n\
+ 	.align	5				\n\
+ 	.globl	__compat_down_failed		\n\
+ __compat_down_failed:				\n\
+-	stmfd	sp!, {r0 - r3, lr}		\n\
++	stmfd	sp!, {r0 - r4, lr}		\n\
+ 	mov	r0, ip				\n\
+ 	bl	__compat_down			\n\
+-	ldmfd	sp!, {r0 - r3, pc}		\n\
++	ldmfd	sp!, {r0 - r4, pc}		\n\
+ 						\n\
+ 	.align	5				\n\
+ 	.globl	__compat_down_interruptible_failed \n\
+ __compat_down_interruptible_failed:			\n\
+-	stmfd	sp!, {r0 - r3, lr}		\n\
++	stmfd	sp!, {r0 - r4, lr}		\n\
+ 	mov	r0, ip				\n\
+ 	bl	__compat_down_interruptible	\n\
+ 	mov	ip, r0				\n\
+-	ldmfd	sp!, {r0 - r3, pc}		\n\
++	ldmfd	sp!, {r0 - r4, pc}		\n\
+ 						\n\
+ 	.align	5				\n\
+ 	.globl	__compat_down_trylock_failed	\n\
+ __compat_down_trylock_failed:			\n\
+-	stmfd	sp!, {r0 - r3, lr}		\n\
++	stmfd	sp!, {r0 - r4, lr}		\n\
+ 	mov	r0, ip				\n\
+ 	bl	__compat_down_trylock		\n\
+ 	mov	ip, r0				\n\
+-	ldmfd	sp!, {r0 - r3, pc}		\n\
++	ldmfd	sp!, {r0 - r4, pc}		\n\
+ 						\n\
+ 	.align	5				\n\
+ 	.globl	__compat_up_wakeup		\n\
+ __compat_up_wakeup:				\n\
+-	stmfd	sp!, {r0 - r3, lr}		\n\
++	stmfd	sp!, {r0 - r4, lr}		\n\
+ 	mov	r0, ip				\n\
+ 	bl	__compat_up			\n\
+-	ldmfd	sp!, {r0 - r3, pc}		\n\
++	ldmfd	sp!, {r0 - r4, pc}		\n\
+ 	");
+ 
+ EXPORT_SYMBOL(__compat_down_failed);
+Index: linux-2.6.10/arch/arm/lib/lib1funcs.S
+===================================================================
+--- linux-2.6.10.orig/arch/arm/lib/lib1funcs.S
++++ linux-2.6.10/arch/arm/lib/lib1funcs.S
+@@ -306,9 +306,9 @@ ENTRY(__modsi3)
+ 
+ Ldiv0:
+ 
+-	str	lr, [sp, #-4]!
++	str	lr, [sp, #-8]!
+ 	bl	__div0
+ 	mov	r0, #0			@ About as wrong as it could be.
+-	ldr	pc, [sp], #4
++	ldr	pc, [sp], #8
+ 
+ 
+Index: linux-2.6.10/mvl_patches/pro-0384.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0384.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(384);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

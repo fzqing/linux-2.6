@@ -1,0 +1,456 @@
+#! /usr/bin/env bash
+# Patch: -Always_add_a_fragment_header_after_receiving
+# Date: Mon Jul  9 11:54:31 2007
+# Source: Kernel.org
+# MR: 23329
+# Type: Bugfix
+# Disposition: backport
+# Signed-off-by: Armin Kuster <AKuster@mvista.com>
+# Description:
+# I needed to move some code to our customer api rt6_tb_pmtu_discovery() instead
+# of the communities rt6_pmtu_discovery(). Also required a bit of hand patching
+# 
+# From 8b123d00b713465bb5d262cdfa9a05d3e34f612d Mon Sep 17 00:00:00 2001
+# From: Hideaki Yoshifuji <yoshfuji@linux-ipv6.org>
+# Date: Fri, 4 Mar 2005 08:38:31 +0900
+# Subject: [PATCH 1/1] [IPV6] Always add a fragment header after receiving TOO BIG w/ pmtu < 1280.
+# 
+# According to RFC2460, PMTU is set to the IPv6 Minimum Link
+# MTU (1280) and a fragment header should always be included
+# after a node receiving Too Big message reporting PMTU is
+# less than the IPv6 Minimum Link MTU (1280).
+# 
+# Signed-off-by: Hideaki YOSHIFUJI <yoshfuji@linux-ipv6.org>
+#  include/linux/ip.h        |    1 +
+#  include/linux/rtnetlink.h |    1 +
+#  include/net/dst.h         |    9 +++++++++
+#  net/ipv6/ip6_output.c     |   10 +++++++---
+#  net/ipv6/route.c          |   32 ++++++++++++++++++++++----------
+#  5 files changed, 40 insertions(+), 13 deletions(-)
+# 
+
+PATCHNUM=1349
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Kernel.org
+MR: 23329
+Type: Bugfix
+Disposition: backport
+Signed-off-by: Armin Kuster <AKuster@mvista.com>
+Description:
+I needed to move some code to our customer api rt6_tb_pmtu_discovery() instead
+of the communities rt6_pmtu_discovery(). Also required a bit of hand patching
+
+From 8b123d00b713465bb5d262cdfa9a05d3e34f612d Mon Sep 17 00:00:00 2001
+From: Hideaki Yoshifuji <yoshfuji@linux-ipv6.org>
+Date: Fri, 4 Mar 2005 08:38:31 +0900
+Subject: [PATCH 1/1] [IPV6] Always add a fragment header after receiving TOO BIG w/ pmtu < 1280.
+
+According to RFC2460, PMTU is set to the IPv6 Minimum Link
+MTU (1280) and a fragment header should always be included
+after a node receiving Too Big message reporting PMTU is
+less than the IPv6 Minimum Link MTU (1280).
+
+Signed-off-by: Hideaki YOSHIFUJI <yoshfuji@linux-ipv6.org>
+ include/linux/ip.h        |    1 +
+ include/linux/rtnetlink.h |    1 +
+ include/net/dst.h         |    9 +++++++++
+ mvl_patches/pro-1349.c    |   16 ++++++++++++++++
+ net/ipv6/ip6_output.c     |   10 +++++++---
+ net/ipv6/route.c          |   32 ++++++++++++++++++++++----------
+ 6 files changed, 56 insertions(+), 13 deletions(-)
+
+Index: linux-2.6.10/include/linux/rtnetlink.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/rtnetlink.h
++++ linux-2.6.10/include/linux/rtnetlink.h
+@@ -346,6 +346,7 @@ enum
+ #define RTAX_FEATURE_ECN	0x00000001
+ #define RTAX_FEATURE_SACK	0x00000002
+ #define RTAX_FEATURE_TIMESTAMP	0x00000004
++#define RTAX_FEATURE_ALLFRAG	0x00000008
+ 
+ struct rta_session
+ {
+Index: linux-2.6.10/include/net/dst.h
+===================================================================
+--- linux-2.6.10.orig/include/net/dst.h
++++ linux-2.6.10/include/net/dst.h
+@@ -123,6 +123,15 @@ dst_pmtu(const struct dst_entry *dst)
+ 	return mtu;
+ }
+ 
++static inline u32
++dst_allfrag(const struct dst_entry *dst)
++{
++	int ret = dst_path_metric(dst, RTAX_FEATURES) & RTAX_FEATURE_ALLFRAG;
++	/* Yes, _exactly_. This is paranoia. */
++	barrier();
++	return ret;
++}
++
+ static inline int
+ dst_metric_locked(struct dst_entry *dst, int metric)
+ {
+Index: linux-2.6.10/net/ipv6/ip6_output.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/ip6_output.c
++++ linux-2.6.10/net/ipv6/ip6_output.c
+@@ -169,7 +169,7 @@ static int ip6_output2(struct sk_buff *s
+ 
+ int ip6_output(struct sk_buff *skb)
+ {
+-	if (skb->len > dst_pmtu(skb->dst))
++	if (skb->len > dst_pmtu(skb->dst) || dst_allfrag(skb->dst))
+ 		return ip6_fragment(skb, ip6_output2);
+ 	else
+ 		return ip6_output2(skb);
+@@ -1144,6 +1144,8 @@ int ip6_append_data(struct sock *sk, int
+ 		np->cork.hop_limit = hlimit;
+ 		np->cork.tclass = tclass;
+ 		inet->cork.fragsize = mtu = dst_pmtu(&rt->u.dst);
++		if (dst_allfrag(&rt->u.dst))
++			inet->cork.flags |= IPCORK_ALLFRAG;
+ 		inet->cork.length = 0;
+ 		sk->sk_sndmsg_page = NULL;
+ 		sk->sk_sndmsg_off = 0;
+@@ -1195,7 +1197,7 @@ int ip6_append_data(struct sock *sk, int
+ 
+ 	while (length > 0) {
+ 		/* Check if the remaining data fits into current packet. */
+-		copy = mtu - skb->len;
++		copy = (inet->cork.length <= mtu && !(inet->cork.flags & IPCORK_ALLFRAG) ? mtu : maxfraglen) - skb->len;
+ 		if (copy < length)
+ 			copy = maxfraglen - skb->len;
+ 
+@@ -1220,7 +1222,7 @@ alloc_new_skb:
+ 			 * we know we need more fragment(s).
+ 			 */
+ 			datalen = length + fraggap;
+-			if (datalen > mtu - fragheaderlen)
++			if (datalen > (inet->cork.length <= mtu && !(inet->cork.flags & IPCORK_ALLFRAG) ? mtu : maxfraglen) - fragheaderlen)
+ 				datalen = maxfraglen - fragheaderlen;
+ 
+ 			fraglen = datalen + fragheaderlen;
+@@ -1466,6 +1468,7 @@ out:
+ 	if (np->cork.rt) {
+ 		dst_release(&np->cork.rt->u.dst);
+ 		np->cork.rt = NULL;
++		inet->cork.flags &= ~IPCORK_ALLFRAG;
+ 	}
+ 	memset(&inet->cork.fl, 0, sizeof(inet->cork.fl));
+ 	return err;
+@@ -1503,6 +1506,7 @@ void ip6_flush_pending_frames(struct soc
+ 	if (np->cork.rt) {
+ 		dst_release(&np->cork.rt->u.dst);
+ 		np->cork.rt = NULL;
++		inet->cork.flags &= ~IPCORK_ALLFRAG;
+ 	}
+ 	memset(&inet->cork.fl, 0, sizeof(inet->cork.fl));
+ }
+Index: linux-2.6.10/net/ipv6/route.c
+===================================================================
+--- linux-2.6.10.orig/net/ipv6/route.c
++++ linux-2.6.10/net/ipv6/route.c
+@@ -838,8 +838,10 @@ static void ip6_rt_update_pmtu(struct ds
+ 
+ 	if (mtu < dst_pmtu(dst) && rt6->rt6i_dst.plen == 128) {
+ 		rt6->rt6i_flags |= RTF_MODIFIED;
+-		if (mtu < IPV6_MIN_MTU)
++		if (mtu < IPV6_MIN_MTU) {
+ 			mtu = IPV6_MIN_MTU;
++			dst->metrics[RTAX_FEATURES-1] |= RTAX_FEATURE_ALLFRAG;
++		}
+ 		dst->metrics[RTAX_MTU-1] = mtu;
+ 	}
+ }
+@@ -1396,7 +1398,8 @@ static inline void rt6_tb_pmtu_discovery
+ 					 struct rt6_info *rt, 
+ 					 struct in6_addr *daddr, 
+ 					 struct in6_addr *saddr,
+-					 struct net_device *dev, u32 pmtu)
++					 struct net_device *dev, u32 pmtu,
++					 int allfrag)
+ {
+ 	struct rt6_info *nrt;
+ 
+@@ -1416,6 +1419,8 @@ static inline void rt6_tb_pmtu_discovery
+ 	 */
+ 	if (rt->rt6i_flags & RTF_CACHE) {
+ 		rt->u.dst.metrics[RTAX_MTU-1] = pmtu;
++		if (allfrag)
++			rt->u.dst.metrics[RTAX_FEATURES-1] |= RTAX_FEATURE_ALLFRAG;
+ 		dst_set_expires(&rt->u.dst, ip6_rt_mtu_expires);
+ 		rt->rt6i_flags |= RTF_MODIFIED|RTF_EXPIRES;
+ 		return;
+@@ -1430,6 +1435,9 @@ static inline void rt6_tb_pmtu_discovery
+ 		nrt = rt6_cow(rt, daddr, NULL);
+ 		if (!nrt->u.dst.error) {
+ 			nrt->u.dst.metrics[RTAX_MTU-1] = pmtu;
++		if (allfrag)
++			nrt->u.dst.metrics[RTAX_FEATURES-1] |= RTAX_FEATURE_ALLFRAG;
++
+ 			/* According to RFC 1981, detecting PMTU increase shouldn't
+ 			   happen within 5 mins, the recommended timer is 10 mins.
+ 			   Here this route expiration time is set to ip6_rt_mtu_expires
+@@ -1454,6 +1462,8 @@ static inline void rt6_tb_pmtu_discovery
+ 		dst_set_expires(&nrt->u.dst, ip6_rt_mtu_expires);
+ 		nrt->rt6i_flags |= RTF_DYNAMIC|RTF_CACHE|RTF_EXPIRES;
+ 		nrt->u.dst.metrics[RTAX_MTU-1] = pmtu;
++		if (allfrag)
++			nrt->u.dst.metrics[RTAX_FEATURES-1] |= RTAX_FEATURE_ALLFRAG;
+ 		rt6_tb_ins(table, nrt, NULL, NULL);
+ 	}
+ }
+@@ -1467,15 +1477,17 @@ void rt6_pmtu_discovery(struct in6_addr 
+ 			struct net_device *dev, u32 pmtu)
+ {
+ 	int i;
++	int allfrag = 0;
++
+ 	if (pmtu < IPV6_MIN_MTU) {
+-		if (net_ratelimit())
+-			printk(KERN_DEBUG "rt6_pmtu_discovery: invalid MTU value %d\n",
+-			       pmtu);
+-		/* According to RFC1981, the PMTU is set to the IPv6 minimum
+-		   link MTU if the node receives a Packet Too Big message
+-		   reporting next-hop MTU that is less than the IPv6 minimum MTU.
+-		*/
++		/*
++		 * According to RFC2460, PMTU is set to the IPv6 Minimum Link
++		 * MTU (1280) and a fragment header should always be included
++		 * after a node receiving Too Big message reporting PMTU is
++		 * less than the IPv6 Minimum Link MTU.
++		 */
+ 		pmtu = IPV6_MIN_MTU;
++		allfrag = 1;
+ 	}
+ 	read_lock(&rt6_lock);
+ 
+@@ -1496,7 +1508,7 @@ void rt6_pmtu_discovery(struct in6_addr 
+ 			read_unlock(&table->lock);
+ 			
+ 			rt6_tb_pmtu_discovery(table, rt, daddr, saddr,
+-					      dev, pmtu);
++					      dev, pmtu, allfrag);
+ 			
+ 			dst_release(&rt->u.dst);
+ 			rt = nrt;
+Index: linux-2.6.10/include/linux/ip.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/ip.h
++++ linux-2.6.10/include/linux/ip.h
+@@ -145,6 +145,7 @@ struct inet_opt {
+ };
+ 
+ #define IPCORK_OPT	1	/* ip-options has been held in ipcork.opt */
++#define IPCORK_ALLFRAG	2	/* always fragment (for ipv6 for now) */
+ 
+ struct ipv6_pinfo;
+ 
+Index: linux-2.6.10/mvl_patches/pro-1349.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1349.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1349);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

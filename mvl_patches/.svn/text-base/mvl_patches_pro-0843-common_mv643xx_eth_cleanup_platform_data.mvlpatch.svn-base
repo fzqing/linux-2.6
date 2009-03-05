@@ -1,0 +1,435 @@
+#! /usr/bin/env bash
+# Patch: -common_mv643xx_eth_cleanup_platform_data
+# Date: Tue Aug  8 20:56:50 2006
+# Source: MontaVista Software, Inc.
+# MR: 16579
+# Type: Cleanup
+# Disposition: Submitted to netdev@vger.kernel.org
+# Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+# Description:
+# Clean up platform_data configuration
+# 
+# We shouldn't have exposed hardware register layout to the platform_data.
+# The only things we allow the user to configure are autoneg, speed, and
+# duplex.  Add specific platform_data fields for these values and remove
+# the registers.
+# 
+# Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+# 
+
+PATCHNUM=843
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16579
+Type: Cleanup
+Disposition: Submitted to netdev@vger.kernel.org
+Signed-off-by: Dale Farnsworth <dfarnsworth@mvista.com>
+Description:
+Clean up platform_data configuration
+
+We shouldn't have exposed hardware register layout to the platform_data.
+The only things we allow the user to configure are autoneg, speed, and
+duplex.  Add specific platform_data fields for these values and remove
+the registers.
+
+Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -264,13 +264,14 @@ static void mv643xx_eth_update_mac_addre
+ static void mv643xx_eth_set_rx_mode(struct net_device *dev)
+ {
+ 	struct mv643xx_private *mp = netdev_priv(dev);
++	u32 config_reg;
+ 
++	config_reg = mv_read(MV643XX_ETH_PORT_CONFIG_REG(mp->port_num));
+ 	if (dev->flags & IFF_PROMISC)
+-		mp->port_config |= (u32) MV643XX_ETH_UNICAST_PROMISCUOUS_MODE;
++		config_reg |= (u32) MV643XX_ETH_UNICAST_PROMISCUOUS_MODE;
+ 	else
+-		mp->port_config &= ~(u32) MV643XX_ETH_UNICAST_PROMISCUOUS_MODE;
+-
+-	mv_write(MV643XX_ETH_PORT_CONFIG_REG(mp->port_num), mp->port_config);
++		config_reg &= ~(u32) MV643XX_ETH_UNICAST_PROMISCUOUS_MODE;
++	mv_write(MV643XX_ETH_PORT_CONFIG_REG(mp->port_num), config_reg);
+ 
+ 	eth_port_set_multicast_list(dev);
+ }
+@@ -1453,9 +1454,8 @@ static int mv643xx_eth_probe(struct devi
+ 	struct resource *res;
+ 	int err;
+ 	struct ethtool_cmd cmd;
+-	u32 pscr;
+-	int duplex;
+-	int speed;
++	int duplex = DUPLEX_HALF;
++	int speed = 0;			/* default to auto-negotiation */
+ 
+ 	dev = alloc_etherdev(sizeof(struct mv643xx_private));
+ 	if (!dev)
+@@ -1514,33 +1514,17 @@ static int mv643xx_eth_probe(struct devi
+ 
+ 	/* set default config values */
+ 	eth_port_uc_addr_get(dev, dev->dev_addr);
+-	mp->port_config = MV643XX_ETH_PORT_CONFIG_DEFAULT_VALUE;
+-	mp->port_config_extend = MV643XX_ETH_PORT_CONFIG_EXTEND_DEFAULT_VALUE;
+-	mp->port_sdma_config = MV643XX_ETH_PORT_SDMA_CONFIG_DEFAULT_VALUE;
+-	mp->port_serial_control = MV643XX_ETH_PORT_SERIAL_CONTROL_DEFAULT_VALUE;
+ 	mp->rx_ring_size = MV643XX_ETH_PORT_DEFAULT_RECEIVE_QUEUE_SIZE;
+ 	mp->tx_ring_size = MV643XX_ETH_PORT_DEFAULT_TRANSMIT_QUEUE_SIZE;
+ 
+ 	pd = pdev->dev.platform_data;
+ 	if (pd) {
+-		if (pd->mac_addr != NULL)
++		if (pd->mac_addr)
+ 			memcpy(dev->dev_addr, pd->mac_addr, 6);
+ 
+ 		if (pd->phy_addr || pd->force_phy_addr)
+ 			ethernet_phy_set(port_num, pd->phy_addr);
+ 
+-		if (pd->port_config || pd->force_port_config)
+-			mp->port_config = pd->port_config;
+-
+-		if (pd->port_config_extend || pd->force_port_config_extend)
+-			mp->port_config_extend = pd->port_config_extend;
+-
+-		if (pd->port_sdma_config || pd->force_port_sdma_config)
+-			mp->port_sdma_config = pd->port_sdma_config;
+-
+-		if (pd->port_serial_control || pd->force_port_serial_control)
+-			mp->port_serial_control = pd->port_serial_control;
+-
+ 		if (pd->rx_queue_size)
+ 			mp->rx_ring_size = pd->rx_queue_size;
+ 
+@@ -1556,6 +1540,9 @@ static int mv643xx_eth_probe(struct devi
+ 			mp->rx_sram_size = pd->rx_sram_size;
+ 			mp->rx_sram_addr = pd->rx_sram_addr;
+ 		}
++
++		duplex = pd->duplex;
++		speed = pd->speed;
+ 	}
+ 
+ 	/* Hook up MII support for ethtool */
+@@ -1574,28 +1561,7 @@ static int mv643xx_eth_probe(struct devi
+ 		goto out;
+ 	}
+ 
+-	pscr = mv_read(MV643XX_ETH_PORT_SERIAL_CONTROL_REG(port_num));
+-	pscr &= ~MV643XX_ETH_SERIAL_PORT_ENABLE;
+-	mv_write(MV643XX_ETH_PORT_SERIAL_CONTROL_REG(port_num), pscr);
+-	pscr = mp->port_serial_control;
+-	mv_write(MV643XX_ETH_PORT_SERIAL_CONTROL_REG(port_num), pscr);
+-
+-	if (!(pscr & MV643XX_ETH_DISABLE_AUTO_NEG_FOR_DUPLX) &&
+-	    !(pscr & MV643XX_ETH_DISABLE_AUTO_NEG_SPEED_GMII))
+-		speed = 0;
+-	else if (pscr & MV643XX_ETH_PORT_STATUS_GMII_1000)
+-		speed = SPEED_1000;
+-	else if (pscr & MV643XX_ETH_PORT_STATUS_MII_100)
+-		speed = SPEED_100;
+-	else
+-		speed = SPEED_10;
+-
+-	if (pscr & MV643XX_ETH_PORT_STATUS_FULL_DUPLEX)
+-		duplex = DUPLEX_FULL;
+-	else
+-		duplex = DUPLEX_HALF;
+-
+-	ethernet_phy_reset(mp->port_num);
++	ethernet_phy_reset(port_num);
+ 	mp->mii.supports_gmii = mii_check_gmii_support(&mp->mii);
+ 	mv643xx_init_ethtool_cmd(dev, mp->mii.phy_id, speed, duplex, &cmd);
+ 	mv643xx_eth_update_pscr(dev, &cmd);
+@@ -1969,13 +1935,17 @@ static void eth_port_start(struct net_de
+ 	eth_port_uc_addr_set(port_num, dev->dev_addr);
+ 
+ 	/* Assign port configuration and command. */
+-	mv_write(MV643XX_ETH_PORT_CONFIG_REG(port_num), mp->port_config);
++	mv_write(MV643XX_ETH_PORT_CONFIG_REG(port_num),
++			  MV643XX_ETH_PORT_CONFIG_DEFAULT_VALUE);
++
++	mv_write(MV643XX_ETH_PORT_CONFIG_EXTEND_REG(port_num),
++			  MV643XX_ETH_PORT_CONFIG_EXTEND_DEFAULT_VALUE);
+ 
+ 	pscr = mv_read(MV643XX_ETH_PORT_SERIAL_CONTROL_REG(port_num));
+-	pscr &= ~MV643XX_ETH_SERIAL_PORT_ENABLE;
++
++	pscr &= ~(MV643XX_ETH_SERIAL_PORT_ENABLE | MV643XX_ETH_FORCE_LINK_PASS);
+ 	mv_write(MV643XX_ETH_PORT_SERIAL_CONTROL_REG(port_num), pscr);
+ 
+-	pscr &= ~MV643XX_ETH_FORCE_LINK_PASS;
+ 	pscr |= MV643XX_ETH_DISABLE_AUTO_NEG_FOR_FLOW_CTRL |
+ 		MV643XX_ETH_DISABLE_AUTO_NEG_SPEED_GMII    |
+ 		MV643XX_ETH_DISABLE_AUTO_NEG_FOR_DUPLX     |
+@@ -1988,7 +1958,8 @@ static void eth_port_start(struct net_de
+ 	mv_write(MV643XX_ETH_PORT_SERIAL_CONTROL_REG(port_num), pscr);
+ 
+ 	/* Assign port SDMA configuration */
+-	mv_write(MV643XX_ETH_SDMA_CONFIG_REG(port_num), mp->port_sdma_config);
++	mv_write(MV643XX_ETH_SDMA_CONFIG_REG(port_num),
++			  MV643XX_ETH_PORT_SDMA_CONFIG_DEFAULT_VALUE);
+ 
+ 	/* Enable port Rx. */
+ 	mv643xx_eth_port_enable_rx(port_num, mp->port_rx_queue_command);
+Index: linux-2.6.10/drivers/net/mv643xx_eth.h
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.h
++++ linux-2.6.10/drivers/net/mv643xx_eth.h
+@@ -322,10 +322,6 @@ struct mv643xx_mib_counters {
+ 
+ struct mv643xx_private {
+ 	int port_num;			/* User Ethernet port number	*/
+-	u32 port_config;		/* User port configuration value*/
+-	u32 port_config_extend;		/* User port config extend value*/
+-	u32 port_sdma_config;		/* User port SDMA config value	*/
+-	u32 port_serial_control;	/* User port serial control value */
+ 	u32 port_tx_queue_command;	/* Port active Tx queues summary*/
+ 	u32 port_rx_queue_command;	/* Port active Rx queues summary*/
+ 
+Index: linux-2.6.10/include/linux/mv643xx.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/mv643xx.h
++++ linux-2.6.10/include/linux/mv643xx.h
+@@ -1288,23 +1288,15 @@ struct mv64xxx_i2c_pdata {
+ #define MV643XX_ETH_NAME	"mv643xx_eth"
+ 
+ struct mv643xx_eth_platform_data {
+-	/* 
+-	 * Non-values for mac_addr, phy_addr, port_config, etc.
+-	 * override the default value.  Setting the corresponding
+-	 * force_* field, causes the default value to be overridden
+-	 * even when zero.
+-	 */
+-	unsigned int	force_phy_addr:1;
+-	unsigned int	force_port_config:1;
+-	unsigned int	force_port_config_extend:1;
+-	unsigned int	force_port_sdma_config:1;
+-	unsigned int	force_port_serial_control:1;
+-	int		phy_addr;
+ 	char		*mac_addr;	/* pointer to mac address */
+-	u32		port_config;
+-	u32		port_config_extend;
+-	u32		port_sdma_config;
+-	u32		port_serial_control;
++	u16		force_phy_addr;	/* force override if phy_addr == 0 */
++	u16		phy_addr;
++
++	/* If speed is 0, then speed and duplex are autonegotiated. */
++	int		speed;		/* 0, SPEED_10, SPEED_100, SPEED_1000 */
++	int		duplex;		/* DUPLEX_HALF or DUPLEX_FULL */
++
++	/* non-zero values of the following fields override defaults */
+ 	u32		tx_queue_size;
+ 	u32		rx_queue_size;
+ 	u32		tx_sram_addr;
+Index: linux-2.6.10/mvl_patches/pro-0843.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0843.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(843);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

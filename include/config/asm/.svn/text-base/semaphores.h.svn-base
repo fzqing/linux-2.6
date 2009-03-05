@@ -1,0 +1,1 @@
+#define CONFIG_ASM_SEMAPHORES 1

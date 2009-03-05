@@ -1,0 +1,646 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_ps2
+# Date: Mon Mar  6 15:02:43 2006
+# Source: MontaVista Software, Inc.
+# MR: 15265
+# Type: Enhancement
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     Linux driver (aka "adapter") for Xilinx PS/2 IP.
+# 
+
+PATCHNUM=337
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 15265
+Type: Enhancement
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    Linux driver (aka "adapter") for Xilinx PS/2 IP.
+
+ drivers/input/serio/Kconfig              |    7 
+ drivers/input/serio/Makefile             |    1 
+ drivers/input/serio/xilinx_ps2/Makefile  |   13 +
+ drivers/input/serio/xilinx_ps2/adapter.c |  359 +++++++++++++++++++++++++++++++
+ mvl_patches/pro-0337.c                   |   16 +
+ 5 files changed, 396 insertions(+)
+
+Index: linux-2.6.10/drivers/input/serio/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/input/serio/Kconfig
++++ linux-2.6.10/drivers/input/serio/Kconfig
+@@ -131,6 +131,13 @@ config SERIO_MACEPS2
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called maceps2.
+ 
++config SERIO_XILINXPS2
++	tristate "Xilinx PS/2 Controller Support"
++	depends on XILINX_VIRTEX && SERIO
++	select XILINX_EDK
++	help
++	  This driver supports PS/2 IP from Xilinx EDK.
++
+ config SERIO_RAW
+ 	tristate "Raw access to serio ports"
+ 	depends on SERIO
+Index: linux-2.6.10/drivers/input/serio/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/input/serio/Makefile
++++ linux-2.6.10/drivers/input/serio/Makefile
+@@ -17,4 +17,5 @@ obj-$(CONFIG_SERIO_98KBD)	+= 98kbd-io.o
+ obj-$(CONFIG_SERIO_GSCPS2)	+= gscps2.o
+ obj-$(CONFIG_SERIO_PCIPS2)	+= pcips2.o
+ obj-$(CONFIG_SERIO_MACEPS2)	+= maceps2.o
++obj-$(CONFIG_SERIO_XILINXPS2)	+= xilinx_ps2/
+ obj-$(CONFIG_SERIO_RAW)		+= serio_raw.o
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/Makefile
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/Makefile
+@@ -0,0 +1,13 @@
++#
++# Makefile for the Xilinx PS/2 driver
++#
++
++EXTRA_CFLAGS		+= -Idrivers/xilinx_edk
++
++# The Linux adapter for the Xilinx driver code.
++xilinx_ps2-objs	:= adapter.o
++
++# The Xilinx OS independent code.
++xilinx_ps2-objs	+= xps2.o xps2_intr.o xps2_l.o
++
++obj-$(CONFIG_SERIO_XILINXPS2) += xilinx_ps2.o
+Index: linux-2.6.10/drivers/input/serio/xilinx_ps2/adapter.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/input/serio/xilinx_ps2/adapter.c
+@@ -0,0 +1,359 @@
++/*
++ * adapter.c
++ *
++ * Xilinx PS/2 Adapter component to interface PS/2 component to Linux
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2005 (c)MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++/*
++ * This driver is a bit unusual in that it is composed of two logical
++ * parts where one part is the OS independent code and the other part is
++ * the OS dependent code.  Xilinx provides their drivers split in this
++ * fashion.  This file represents the Linux OS dependent part known as
++ * the Linux adapter.  The other files in this directory are the OS
++ * independent files as provided by Xilinx with no changes made to them.
++ * The names exported by those files begin with XPs2_.  All functions
++ * in this file that are called by Linux have names that begin with
++ * xps2_.  Any other functions are static helper functions.
++ */
++
++#include <linux/module.h>
++#include <linux/serio.h>
++#include <linux/interrupt.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/xilinx_devices.h>
++
++#include <asm/io.h>
++
++#include "xps2.h"
++
++#define DRIVER_NAME		"xilinx_ps2"
++#define DRIVER_DESCRIPTION	"Xilinx PS/2 driver"
++
++#define XPS2_NAME_DESC		"Xilinx PS/2 Port #%d"
++#define XPS2_PHYS_DESC		"xilinxps2/serio%d"
++
++struct xps2data{
++	int			irq;
++	u32			phys_addr;
++	u32			remap_size;
++	struct pt_regs		*saved_regs;
++	spinlock_t		lock;
++	u8			rxb;	/* Rx buffer */
++	/*
++	 * The underlying OS independent code needs space as well.  A
++	 * pointer to the following XPs2 structure will be passed to
++	 * any XPs2_ function that requires it.  However, we treat the
++	 * data as an opaque object in this file (meaning that we never
++	 * reference any of the fields inside of the structure).
++	 */
++	XPs2			ps2;
++	/*
++	 * serio
++	 */
++	struct serio		serio;
++};
++
++/*******************************************************************************
++ * This configuration stuff should become unnecessary after EDK version 8.x is
++ * released.
++ ******************************************************************************/
++
++static DECLARE_MUTEX(cfg_sem);
++static XPs2_Config * p_xps2_cfg;
++
++/*
++ * Lookup the device configuration based on the unique device ID.
++ * Prototyped in xps2.h.
++ * We rely on that p_xps2_cfg is set properly right before XPs2_Initialize()
++ * calls XPs2_LookupConfig().
++ */
++XPs2_Config * XPs2_LookupConfig(u16 DeviceId)
++{
++	return p_xps2_cfg;
++}
++
++static XStatus XPs2_CfgInitialize(XPs2 * InstancePtr, XPs2_Config * CfgPtr)
++{
++	XStatus retval;
++
++	down(&cfg_sem);
++	p_xps2_cfg = CfgPtr;
++	retval = XPs2_Initialize(InstancePtr, 0);
++	up(&cfg_sem);
++
++	return retval;
++}
++
++/*********************/
++/* Interrupt handler */
++/*********************/
++
++static irqreturn_t xps2_interrupt(int irq, void *dev_id, struct pt_regs *regs)
++{
++	struct xps2data *drvdata = (struct xps2data *) dev_id;
++
++	/* We will need to pass pt_regs *regs to input subsystem */
++	drvdata->saved_regs = regs;
++	/* Call EDK handler */
++	XPs2_InterruptHandler(&drvdata->ps2);
++
++	return IRQ_HANDLED;
++}
++
++static void sxps2_handler(void *CallbackRef, u32 Event, unsigned int EventData)
++{
++	struct xps2data *drvdata = (struct xps2data *) CallbackRef;
++	static unsigned int dfl = 0;
++	u8 c;
++
++	switch (Event) {
++	case XPS2_EVENT_RECV_OVF:
++		printk(KERN_ERR "%s: receive overrun error.\n",
++		       drvdata->serio.name);
++	case XPS2_EVENT_RECV_ERROR:
++		dfl |= SERIO_PARITY;
++		break;
++	case XPS2_EVENT_SENT_NOACK:
++	case XPS2_EVENT_TIMEOUT:
++		dfl |= SERIO_TIMEOUT;
++		break;
++	case XPS2_EVENT_RECV_DATA:
++		if (EventData > 0) {
++			if (EventData != 1) {
++				printk(KERN_ERR
++				       "%s: wrong rcvd byte count (%d).\n",
++				       drvdata->serio.name, EventData);
++			}
++			c = drvdata->rxb;
++
++			XPs2_Recv(&drvdata->ps2, &drvdata->rxb, 1);
++			serio_interrupt(&drvdata->serio, c, dfl,
++					drvdata->saved_regs);
++			dfl = 0;
++		}
++		break;
++	case XPS2_EVENT_SENT_DATA:
++		break;
++	default:
++		printk(KERN_ERR "%s: unrecognized event %u.\n",
++		       drvdata->serio.name, Event);
++	}
++}
++
++
++/*******************/
++/* serio callbacks */
++/*******************/
++
++/*
++ * sxps2_write() sends a byte out through the PS/2 interface.
++ */
++static int sxps2_write(struct serio *pserio, unsigned char c)
++{
++	struct xps2data *drvdata = pserio->port_data;
++	unsigned long flags;
++	int retval;
++
++	do {
++		spin_lock_irqsave(&drvdata->lock, flags);
++		retval = XPs2_Send(&drvdata->ps2, &c, 1);
++		spin_unlock_irqrestore(&drvdata->lock, flags);
++	} while (retval != 1);
++
++	return 0;	/* success */
++}
++
++/*
++ * sxps2_open() is called when a port is open by the higher layer.
++ */
++
++static int sxps2_open(struct serio *pserio)
++{
++	struct xps2data *drvdata = pserio->port_data;
++	int retval;
++
++	retval = request_irq(drvdata->irq, &xps2_interrupt, 0,
++			     "xilinx_ps2", drvdata);
++	if (retval) {
++		printk(KERN_ERR
++		       "%s: Couldn't allocate interrupt %d.\n",
++		       drvdata->serio.name, drvdata->irq);
++		return retval;
++	}
++
++	/* start receiption */
++	XPs2_EnableInterrupt(&drvdata->ps2);
++	XPs2_Recv(&drvdata->ps2, &drvdata->rxb, 1);
++
++	return 0; /* success */
++}
++
++/*
++ * sxps2_close() frees the interrupt.
++ */
++
++static void sxps2_close(struct serio *pserio)
++{
++	struct xps2data *drvdata = pserio->port_data;
++
++	XPs2_DisableInterrupt(&drvdata->ps2);
++	free_irq(drvdata->irq, drvdata);
++}
++
++/******************************
++ * The platform device driver *
++ ******************************/
++
++static int xps2_probe(struct device *dev)
++{
++	XPs2_Config xps2_cfg;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct xps2data *drvdata;
++	struct resource *irq_res, *regs_res;
++	unsigned long remap_size;
++	int retval;
++
++	if (!dev)
++		return -EINVAL;
++
++	drvdata = kzalloc(sizeof(struct xps2data), GFP_KERNEL);
++	if (!drvdata) {
++		printk(KERN_ERR
++		       "%s #%d: Couldn't allocate device private record\n",
++		       DRIVER_NAME, pdev->id);
++		return -ENOMEM;
++	}
++	spin_lock_init(&drvdata->lock);
++	dev_set_drvdata(dev, (void *)drvdata);
++
++	/* Find irq number, map the control registers in */
++	irq_res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	regs_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!regs_res || !irq_res) {
++		printk(KERN_ERR "%s #%d: IO resource(s) not found\n",
++		       DRIVER_NAME, pdev->id);
++		retval = -EFAULT;
++		goto failed1;
++	}
++	drvdata->irq = irq_res->start;
++
++	remap_size = regs_res->end - regs_res->start + 1;
++	if (!request_mem_region(regs_res->start, remap_size, DRIVER_NAME)) {
++		printk(KERN_ERR
++		       "%s #%d: Couldn't lock memory region at 0x%08lX\n",
++		       DRIVER_NAME, pdev->id, regs_res->start);
++		retval = -EBUSY;
++		goto failed1;
++	}
++
++	/* Fill in cfg data and add them to the list */
++	drvdata->phys_addr = regs_res->start;
++	drvdata->remap_size = remap_size;
++	xps2_cfg.DeviceId = pdev->id;
++	xps2_cfg.BaseAddress = (u32) ioremap(regs_res->start, remap_size);
++	if (xps2_cfg.BaseAddress == 0) {
++		printk(KERN_ERR
++		       "%s #%d: Couldn't ioremap memory at 0x%08lX\n",
++		       DRIVER_NAME, pdev->id, regs_res->start);
++		retval = -EFAULT;
++		goto failed2;
++	}
++
++	/* Tell the Xilinx code to bring this PS/2 interface up. */
++	if (XPs2_CfgInitialize(&drvdata->ps2, &xps2_cfg) != XST_SUCCESS) {
++		printk(KERN_ERR
++		       "%s #%d: Could not initialize device.\n",
++		       DRIVER_NAME, pdev->id);
++		retval = -ENODEV;
++		goto failed3;
++	}
++
++	/* Set up the interrupt handler. */
++	XPs2_SetHandler(&drvdata->ps2, sxps2_handler, drvdata);
++
++	printk(KERN_INFO "%s #%d at 0x%08X mapped to 0x%08X\n",
++	       DRIVER_NAME, pdev->id,
++	       drvdata->phys_addr, drvdata->ps2.BaseAddress);
++
++	drvdata->serio.type		= SERIO_8042;
++	drvdata->serio.write		= sxps2_write;
++	drvdata->serio.open		= sxps2_open;
++	drvdata->serio.close		= sxps2_close;
++	drvdata->serio.port_data	= drvdata;
++	drvdata->serio.dev.parent	= dev;
++	snprintf(drvdata->serio.name, sizeof(drvdata->serio.name),
++		 XPS2_NAME_DESC, pdev->id);
++	snprintf(drvdata->serio.phys, sizeof(drvdata->serio.phys),
++		 XPS2_PHYS_DESC, pdev->id);
++	serio_register_port(&drvdata->serio);
++
++	return 0;	/* success */
++
++failed3:
++	iounmap((void *) (xps2_cfg.BaseAddress));
++
++failed2:
++	release_mem_region(regs_res->start, remap_size);
++
++failed1:
++	kfree(drvdata);
++	dev_set_drvdata(dev, NULL);
++
++	return retval;
++}
++
++static int xps2_remove(struct device *dev)
++{
++	struct xps2data *drvdata;
++
++	if (!dev)
++		return -EINVAL;
++
++	drvdata = (struct xps2drvdata *) dev_get_drvdata(dev);
++
++	serio_unregister_port(&drvdata->serio);
++
++	iounmap((void *) (drvdata->ps2.BaseAddress));
++
++	release_mem_region(drvdata->phys_addr, drvdata->remap_size);
++
++	kfree(drvdata);
++	dev_set_drvdata(dev, NULL);
++
++	return 0;	/* success */
++}
++
++
++static struct device_driver xps2_driver = {
++	.name		= DRIVER_NAME,
++	.bus		= &platform_bus_type,
++	.probe		= xps2_probe,
++	.remove		= xps2_remove
++};
++
++static int __init xps2_init(void)
++{
++	return driver_register(&xps2_driver);
++}
++
++static void __exit xps2_cleanup(void)
++{
++	driver_unregister(&xps2_driver);
++}
++
++module_init(xps2_init);
++module_exit(xps2_cleanup);
++
++MODULE_AUTHOR("MontaVista Software, Inc. <source@mvista.com>");
++MODULE_DESCRIPTION(DRIVER_DESCRIPTION);
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/mvl_patches/pro-0337.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0337.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(337);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

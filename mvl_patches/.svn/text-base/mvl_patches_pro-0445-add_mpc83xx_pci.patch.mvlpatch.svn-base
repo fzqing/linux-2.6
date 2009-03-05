@@ -1,0 +1,894 @@
+#! /usr/bin/env bash
+# Patch: -add_mpc83xx_pci.patch
+# Date: Thu Apr 20 12:18:46 2006
+# [PATCH] ppc32: Added PCI support MPC83xx
+# 
+# Adds support for the two PCI busses on MPC83xx and the MPC834x SYS/PIBS
+# reference board.
+# 
+# The code initializes PCI inbound/outbound windows, allocates and registers
+# PCI memory/io space.  Be aware that setup of the PCI buses on the PIBs
+# board is expected to be done by the firmware.
+# 
+# Signed-off-by: Tony Li <tony.li@freescale.com>
+# Signed-off-by: Kumar Gala <kumar.gala@freescale.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+# commit 66d2cc95d14b5d750a9c58209fddb62eb139eaab
+# tree 7397b11eeb20801423e88975ecc1a79a81cf70e4
+# parent cc9c540b6c4c883d7ff250c17647dedfa4184ca6
+# author Kumar Gala <galak@freescale.com> Sat, 03 Sep 2005 15:55:50 -0700
+# committer Linus Torvalds <torvalds@evo.osdl.org> Mon, 05 Sep 2005 00:05:59 -0700
+# 
+#  arch/ppc/Kconfig                      |   10 +
+#  arch/ppc/platforms/83xx/mpc834x_sys.c |   35 ++++
+#  arch/ppc/platforms/83xx/mpc834x_sys.h |   40 ++---
+#  arch/ppc/syslib/ppc83xx_pci.h         |  151 ++++++++++++++++++++
+#  arch/ppc/syslib/ppc83xx_setup.c       |  250 +++++++++++++++++++++++++++++++++-
+#  arch/ppc/syslib/ppc83xx_setup.h       |   19 +-
+#  6 files changed, 474 insertions(+), 31 deletions(-)
+# 
+
+PATCHNUM=445
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+[PATCH] ppc32: Added PCI support MPC83xx
+
+Adds support for the two PCI busses on MPC83xx and the MPC834x SYS/PIBS
+reference board.
+
+The code initializes PCI inbound/outbound windows, allocates and registers
+PCI memory/io space.  Be aware that setup of the PCI buses on the PIBs
+board is expected to be done by the firmware.
+
+Signed-off-by: Tony Li <tony.li@freescale.com>
+Signed-off-by: Kumar Gala <kumar.gala@freescale.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+commit 66d2cc95d14b5d750a9c58209fddb62eb139eaab
+tree 7397b11eeb20801423e88975ecc1a79a81cf70e4
+parent cc9c540b6c4c883d7ff250c17647dedfa4184ca6
+author Kumar Gala <galak@freescale.com> Sat, 03 Sep 2005 15:55:50 -0700
+committer Linus Torvalds <torvalds@evo.osdl.org> Mon, 05 Sep 2005 00:05:59 -0700
+
+ arch/ppc/Kconfig                      |   10 +
+ arch/ppc/platforms/83xx/mpc834x_sys.c |   35 ++++
+ arch/ppc/platforms/83xx/mpc834x_sys.h |   40 ++---
+ arch/ppc/syslib/ppc83xx_pci.h         |  151 ++++++++++++++++++++
+ arch/ppc/syslib/ppc83xx_setup.c       |  250 +++++++++++++++++++++++++++++++++-
+ arch/ppc/syslib/ppc83xx_setup.h       |   19 +-
+ mvl_patches/pro-0445.c                |   16 ++
+ 7 files changed, 490 insertions(+), 31 deletions(-)
+
+diff --git a/arch/ppc/Kconfig b/arch/ppc/Kconfig
+index 9b849e2..36dee0f 100644
+Index: linux-2.6.10/arch/ppc/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig
++++ linux-2.6.10/arch/ppc/Kconfig
+@@ -497,6 +497,11 @@ config WINCEPT
+ 	  The Wincept 100/110 is a Motorola single-board computer based on the
+ 	  MPC821 PowerPC, introduced in 1998 and designed to be used in
+ 	  thin-client machines.  Say Y to support it directly.
++  
++	  Be aware that PCI buses can only function when SYS board is plugged
++	  into the PIB (Platform IO Board) board from Freescale which provide
++	  3 PCI slots.  The PIBs PCI initialization is the bootloader's
++	  responsiblilty.
+ 
+ endchoice
+ 
+@@ -1184,6 +1189,11 @@ config PCI_DOMAINS
+ 	bool
+ 	default PCI
+ 
++config MPC83xx_PCI2
++	bool "  Supprt for 2nd PCI host controller"
++	depends on PCI && MPC834x
++	default y if MPC834x_SYS
++
+ config PCI_QSPAN
+ 	bool "QSpan PCI"
+ 	depends on !4xx && !CPM2 && 8xx
+Index: linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/83xx/mpc834x_sys.c
++++ linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.c
+@@ -65,9 +65,29 @@ extern void gen550_init(int, struct uart
+ unsigned char __res[sizeof (bd_t)];
+ 
+ #ifdef CONFIG_PCI
+-#error "PCI is not supported"
+-/* NEED mpc83xx_map_irq & mpc83xx_exclude_device
+-   see platforms/85xx/mpc85xx_ads_common.c */
++int
++mpc83xx_map_irq(struct pci_dev *dev, unsigned char idsel, unsigned char pin)
++{
++	static char pci_irq_table[][4] =
++	    /*
++	     *      PCI IDSEL/INTPIN->INTLINE
++	     *       A      B      C      D
++	     */
++	{
++		{PIRQA, PIRQB,  PIRQC,  PIRQD}, /* idsel 0x11 */
++		{PIRQC, PIRQD,  PIRQA,  PIRQB}, /* idsel 0x12 */
++		{PIRQD, PIRQA,  PIRQB,  PIRQC}  /* idsel 0x13 */
++	};
++
++	const long min_idsel = 0x11, max_idsel = 0x13, irqs_per_slot = 4;
++	return PCI_IRQ_TABLE_LOOKUP;
++}
++
++int
++mpc83xx_exclude_device(u_char bus, u_char devfn)
++{
++	return PCIBIOS_SUCCESSFUL;
++}
+ #endif /* CONFIG_PCI */
+ 
+ /* ************************************************************************
+@@ -91,7 +111,7 @@ mpc834x_sys_setup_arch(void)
+ 
+ #ifdef CONFIG_PCI
+ 	/* setup PCI host bridges */
+-	mpc83xx_sys_setup_hose();
++	mpc83xx_setup_hose();
+ #endif
+ 	mpc83xx_early_serial_map();
+ 
+@@ -174,10 +194,17 @@ mpc834x_sys_init_IRQ(void)
+ 		IRQ_SENSE_LEVEL,	/* EXT 1 */
+ 		IRQ_SENSE_LEVEL,	/* EXT 2 */
+ 		0,			/* EXT 3 */
++#ifdef CONFIG_PCI
++		IRQ_SENSE_LEVEL,	/* EXT 4 */
++		IRQ_SENSE_LEVEL,	/* EXT 5 */
++		IRQ_SENSE_LEVEL,	/* EXT 6 */
++		IRQ_SENSE_LEVEL,	/* EXT 7 */
++#else
+ 		0,			/* EXT 4 */
+ 		0,			/* EXT 5 */
+ 		0,			/* EXT 6 */
+ 		0,			/* EXT 7 */
++#endif
+ 	};
+ 
+ 	ipic_init(binfo->bi_immr_base + 0x00700, 0, MPC83xx_IPIC_IRQ_OFFSET, senses, 8);
+Index: linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.h
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/platforms/83xx/mpc834x_sys.h
++++ linux-2.6.10/arch/ppc/platforms/83xx/mpc834x_sys.h
+@@ -26,7 +26,7 @@
+ #define VIRT_IMMRBAR		((uint)0xfe000000)
+ 
+ #define BCSR_PHYS_ADDR		((uint)0xf8000000)
+-#define BCSR_SIZE		((uint)(32 * 1024))
++#define BCSR_SIZE		((uint)(128 * 1024))
+ 
+ #define BCSR_MISC_REG2_OFF	0x07
+ #define BCSR_MISC_REG2_PORESET	0x01
+@@ -34,23 +34,25 @@
+ #define BCSR_MISC_REG3_OFF	0x08
+ #define BCSR_MISC_REG3_CNFLOCK	0x80
+ 
+-#ifdef CONFIG_PCI
+-/* PCI interrupt controller */
+-#define PIRQA        MPC83xx_IRQ_IRQ4
+-#define PIRQB        MPC83xx_IRQ_IRQ5
+-#define PIRQC        MPC83xx_IRQ_IRQ6
+-#define PIRQD        MPC83xx_IRQ_IRQ7
+-
+-#define MPC834x_SYS_PCI1_LOWER_IO        0x00000000
+-#define MPC834x_SYS_PCI1_UPPER_IO        0x00ffffff
+-
+-#define MPC834x_SYS_PCI1_LOWER_MEM       0x80000000
+-#define MPC834x_SYS_PCI1_UPPER_MEM       0x9fffffff
+-
+-#define MPC834x_SYS_PCI1_IO_BASE         0xe2000000
+-#define MPC834x_SYS_PCI1_MEM_OFFSET      0x00000000
+-
+-#define MPC834x_SYS_PCI1_IO_SIZE         0x01000000
+-#endif /* CONFIG_PCI */
++#define PIRQA	MPC83xx_IRQ_EXT4
++#define PIRQB	MPC83xx_IRQ_EXT5
++#define PIRQC	MPC83xx_IRQ_EXT6
++#define PIRQD	MPC83xx_IRQ_EXT7
++
++#define MPC83xx_PCI1_LOWER_IO	0x00000000
++#define MPC83xx_PCI1_UPPER_IO	0x00ffffff
++#define MPC83xx_PCI1_LOWER_MEM	0x80000000
++#define MPC83xx_PCI1_UPPER_MEM	0x9fffffff
++#define MPC83xx_PCI1_IO_BASE	0xe2000000
++#define MPC83xx_PCI1_MEM_OFFSET	0x00000000
++#define MPC83xx_PCI1_IO_SIZE	0x01000000
++
++#define MPC83xx_PCI2_LOWER_IO	0x00000000
++#define MPC83xx_PCI2_UPPER_IO	0x00ffffff
++#define MPC83xx_PCI2_LOWER_MEM	0xa0000000
++#define MPC83xx_PCI2_UPPER_MEM	0xbfffffff
++#define MPC83xx_PCI2_IO_BASE	0xe3000000
++#define MPC83xx_PCI2_MEM_OFFSET	0x00000000
++#define MPC83xx_PCI2_IO_SIZE	0x01000000
+ 
+ #endif                /* __MACH_MPC83XX_SYS_H__ */
+Index: linux-2.6.10/arch/ppc/syslib/ppc83xx_pci.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/arch/ppc/syslib/ppc83xx_pci.h
+@@ -0,0 +1,151 @@
++/* Created by Tony Li <tony.li@freescale.com>
++ * Copyright (c) 2005 freescale semiconductor
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the  GNU General Public License along
++ * with this program; if not, write  to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#ifndef __PPC_SYSLIB_PPC83XX_PCI_H
++#define __PPC_SYSLIB_PPC83XX_PCI_H
++
++typedef struct immr_clk {
++	u32 spmr; /* system PLL mode Register  */
++	u32 occr; /* output clock control Register  */
++	u32 sccr; /* system clock control Register  */
++	u8 res0[0xF4];
++} immr_clk_t;
++
++/*
++ * Sequencer
++ */
++typedef struct immr_ios {
++	u32	potar0;
++	u8	res0[4];
++	u32	pobar0;
++	u8	res1[4];
++	u32	pocmr0;
++	u8	res2[4];
++	u32	potar1;
++	u8	res3[4];
++	u32	pobar1;
++	u8	res4[4];
++	u32	pocmr1;
++	u8	res5[4];
++	u32	potar2;
++	u8	res6[4];
++	u32	pobar2;
++	u8	res7[4];
++	u32	pocmr2;
++	u8	res8[4];
++	u32	potar3;
++	u8	res9[4];
++	u32	pobar3;
++	u8	res10[4];
++	u32	pocmr3;
++	u8	res11[4];
++	u32	potar4;
++	u8	res12[4];
++	u32	pobar4;
++	u8	res13[4];
++	u32	pocmr4;
++	u8	res14[4];
++	u32	potar5;
++	u8	res15[4];
++	u32	pobar5;
++	u8	res16[4];
++	u32	pocmr5;
++	u8	res17[4];
++	u8	res18[0x60];
++	u32	pmcr;
++	u8	res19[4];
++	u32	dtcr;
++	u8	res20[4];
++} immr_ios_t;
++#define POTAR_TA_MASK	0x000fffff
++#define POBAR_BA_MASK	0x000fffff
++#define POCMR_EN	0x80000000
++#define POCMR_IO	0x40000000 /* 0--memory space 1--I/O space */
++#define POCMR_SE	0x20000000 /* streaming enable */
++#define POCMR_DST	0x10000000 /* 0--PCI1 1--PCI2 */
++#define POCMR_CM_MASK	0x000fffff
++
++/*
++ * PCI Controller Control and Status Registers
++ */
++typedef struct immr_pcictrl {
++	u32	esr;
++	u32	ecdr;
++	u32	eer;
++	u32	eatcr;
++	u32	eacr;
++	u32	eeacr;
++	u32	edlcr;
++	u32	edhcr;
++	u32	gcr;
++	u32	ecr;
++	u32	gsr;
++	u8	res0[12];
++	u32	pitar2;
++	u8	res1[4];
++	u32	pibar2;
++	u32	piebar2;
++	u32	piwar2;
++	u8	res2[4];
++	u32	pitar1;
++	u8	res3[4];
++	u32	pibar1;
++	u32	piebar1;
++	u32	piwar1;
++	u8	res4[4];
++	u32	pitar0;
++	u8	res5[4];
++	u32	pibar0;
++	u8	res6[4];
++	u32	piwar0;
++	u8	res7[132];
++} immr_pcictrl_t;
++#define PITAR_TA_MASK	0x000fffff
++#define PIBAR_MASK	0xffffffff
++#define PIEBAR_EBA_MASK	0x000fffff
++#define PIWAR_EN	0x80000000
++#define PIWAR_PF	0x20000000
++#define PIWAR_RTT_MASK	0x000f0000
++#define PIWAR_RTT_NO_SNOOP	0x00040000
++#define PIWAR_RTT_SNOOP	0x00050000
++#define PIWAR_WTT_MASK	0x0000f000
++#define PIWAR_WTT_NO_SNOOP	0x00004000
++#define PIWAR_WTT_SNOOP	0x00005000
++#define PIWAR_IWS_MASK	0x0000003F
++#define PIWAR_IWS_4K	0x0000000B
++#define PIWAR_IWS_8K	0x0000000C
++#define PIWAR_IWS_16K	0x0000000D
++#define PIWAR_IWS_32K	0x0000000E
++#define PIWAR_IWS_64K	0x0000000F
++#define PIWAR_IWS_128K	0x00000010
++#define PIWAR_IWS_256K	0x00000011
++#define PIWAR_IWS_512K	0x00000012
++#define PIWAR_IWS_1M	0x00000013
++#define PIWAR_IWS_2M	0x00000014
++#define PIWAR_IWS_4M	0x00000015
++#define PIWAR_IWS_8M	0x00000016
++#define PIWAR_IWS_16M	0x00000017
++#define PIWAR_IWS_32M	0x00000018
++#define PIWAR_IWS_64M	0x00000019
++#define PIWAR_IWS_128M	0x0000001A
++#define PIWAR_IWS_256M	0x0000001B
++#define PIWAR_IWS_512M	0x0000001C
++#define PIWAR_IWS_1G	0x0000001D
++#define PIWAR_IWS_2G	0x0000001E
++
++#endif /* __PPC_SYSLIB_PPC83XX_PCI_H */
+Index: linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc83xx_setup.c
++++ linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.c
+@@ -11,6 +11,17 @@
+  * under  the terms of  the GNU General  Public License as published by the
+  * Free Software Foundation;  either version 2 of the  License, or (at your
+  * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the  GNU General Public License along
++ * with this program; if not, write  to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ * Added PCI support -- Tony Li <tony.li@freescale.com>
+  */
+ 
+ #include <linux/config.h>
+@@ -32,6 +43,10 @@
+ #include <asm/delay.h>
+ 
+ #include <syslib/ppc83xx_setup.h>
++#if defined(CONFIG_PCI)
++#include <asm/delay.h>
++#include <syslib/ppc83xx_pci.h>
++#endif
+ 
+ phys_addr_t immrbar;
+ 
+@@ -163,4 +178,237 @@ mpc83xx_halt(void)
+ 	for(;;);
+ }
+ 
+-/* PCI SUPPORT DOES NOT EXIT, MODEL after ppc85xx_setup.c */
++#if defined(CONFIG_PCI)
++void __init
++mpc83xx_setup_pci1(struct pci_controller *hose)
++{
++	u16 reg16;
++	volatile immr_pcictrl_t * pci_ctrl;
++	volatile immr_ios_t * ios;
++	bd_t *binfo = (bd_t *) __res;
++
++	pci_ctrl = ioremap(binfo->bi_immr_base + 0x8500, sizeof(immr_pcictrl_t));
++	ios = ioremap(binfo->bi_immr_base + 0x8400, sizeof(immr_ios_t));
++
++	/*
++	 * Configure PCI Outbound Translation Windows
++	 */
++	ios->potar0 = (MPC83xx_PCI1_LOWER_MEM >> 12) & POTAR_TA_MASK;
++	ios->pobar0 = (MPC83xx_PCI1_LOWER_MEM >> 12) & POBAR_BA_MASK;
++	ios->pocmr0 = POCMR_EN |
++		(((0xffffffff - (MPC83xx_PCI1_UPPER_MEM -
++				MPC83xx_PCI1_LOWER_MEM)) >> 12) & POCMR_CM_MASK);
++
++	/* mapped to PCI1 IO space */
++	ios->potar1 = (MPC83xx_PCI1_LOWER_IO >> 12) & POTAR_TA_MASK;
++	ios->pobar1 = (MPC83xx_PCI1_IO_BASE >> 12) & POBAR_BA_MASK;
++	ios->pocmr1 = POCMR_EN | POCMR_IO |
++		(((0xffffffff - (MPC83xx_PCI1_UPPER_IO -
++				MPC83xx_PCI1_LOWER_IO)) >> 12) & POCMR_CM_MASK);
++
++	/*
++	 * Configure PCI Inbound Translation Windows
++	 */
++	pci_ctrl->pitar1 = 0x0;
++	pci_ctrl->pibar1 = 0x0;
++	pci_ctrl->piebar1 = 0x0;
++	pci_ctrl->piwar1 = PIWAR_EN | PIWAR_RTT_SNOOP | PIWAR_WTT_SNOOP | PIWAR_IWS_2G;
++
++	/*
++	 * Release PCI RST signal
++	 */
++	pci_ctrl->gcr = 0;
++	udelay(2000);
++	pci_ctrl->gcr = 1;
++	udelay(2000);
++
++	reg16 = 0xff;
++	early_read_config_word(hose, hose->first_busno, 0, PCI_COMMAND, &reg16);
++	reg16 |= PCI_COMMAND_SERR | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
++	early_write_config_word(hose, hose->first_busno, 0, PCI_COMMAND, reg16);
++
++	/*
++	 * Clear non-reserved bits in status register.
++	 */
++	early_write_config_word(hose, hose->first_busno, 0, PCI_STATUS, 0xffff);
++	early_write_config_byte(hose, hose->first_busno, 0, PCI_LATENCY_TIMER, 0x80);
++
++	iounmap(pci_ctrl);
++	iounmap(ios);
++}
++
++void __init
++mpc83xx_setup_pci2(struct pci_controller *hose)
++{
++	u16 reg16;
++	volatile immr_pcictrl_t * pci_ctrl;
++	volatile immr_ios_t * ios;
++	bd_t *binfo = (bd_t *) __res;
++
++	pci_ctrl = ioremap(binfo->bi_immr_base + 0x8600, sizeof(immr_pcictrl_t));
++	ios = ioremap(binfo->bi_immr_base + 0x8400, sizeof(immr_ios_t));
++
++	/*
++	 * Configure PCI Outbound Translation Windows
++	 */
++	ios->potar3 = (MPC83xx_PCI2_LOWER_MEM >> 12) & POTAR_TA_MASK;
++	ios->pobar3 = (MPC83xx_PCI2_LOWER_MEM >> 12) & POBAR_BA_MASK;
++	ios->pocmr3 = POCMR_EN | POCMR_DST |
++		(((0xffffffff - (MPC83xx_PCI2_UPPER_MEM -
++				MPC83xx_PCI2_LOWER_MEM)) >> 12) & POCMR_CM_MASK);
++
++	/* mapped to PCI2 IO space */
++	ios->potar4 = (MPC83xx_PCI2_LOWER_IO >> 12) & POTAR_TA_MASK;
++	ios->pobar4 = (MPC83xx_PCI2_IO_BASE >> 12) & POBAR_BA_MASK;
++	ios->pocmr4 = POCMR_EN | POCMR_DST | POCMR_IO |
++		(((0xffffffff - (MPC83xx_PCI2_UPPER_IO -
++				MPC83xx_PCI2_LOWER_IO)) >> 12) & POCMR_CM_MASK);
++
++	/*
++	 * Configure PCI Inbound Translation Windows
++	 */
++	pci_ctrl->pitar1 = 0x0;
++	pci_ctrl->pibar1 = 0x0;
++	pci_ctrl->piebar1 = 0x0;
++	pci_ctrl->piwar1 = PIWAR_EN | PIWAR_RTT_SNOOP | PIWAR_WTT_SNOOP | PIWAR_IWS_2G;
++
++	/*
++	 * Release PCI RST signal
++	 */
++	pci_ctrl->gcr = 0;
++	udelay(2000);
++	pci_ctrl->gcr = 1;
++	udelay(2000);
++
++	reg16 = 0xff;
++	early_read_config_word(hose, hose->first_busno, 0, PCI_COMMAND, &reg16);
++	reg16 |= PCI_COMMAND_SERR | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
++	early_write_config_word(hose, hose->first_busno, 0, PCI_COMMAND, reg16);
++
++	/*
++	 * Clear non-reserved bits in status register.
++	 */
++	early_write_config_word(hose, hose->first_busno, 0, PCI_STATUS, 0xffff);
++	early_write_config_byte(hose, hose->first_busno, 0, PCI_LATENCY_TIMER, 0x80);
++
++	iounmap(pci_ctrl);
++	iounmap(ios);
++}
++
++/*
++ * PCI buses can be enabled only if SYS board combinates with PIB
++ * (Platform IO Board) board which provide 3 PCI slots. There is 2 PCI buses
++ * and 3 PCI slots, so people must configure the routes between them before
++ * enable PCI bus. This routes are under the control of PCA9555PW device which
++ * can be accessed via I2C bus 2 and are configured by firmware. Refer to
++ * Freescale to get more information about firmware configuration.
++ */
++
++extern int mpc83xx_exclude_device(u_char bus, u_char devfn);
++extern int mpc83xx_map_irq(struct pci_dev *dev, unsigned char idsel,
++		unsigned char pin);
++void __init
++mpc83xx_setup_hose(void)
++{
++	u32 val32;
++	volatile immr_clk_t * clk;
++	struct pci_controller * hose1;
++#ifdef CONFIG_MPC83xx_PCI2
++	struct pci_controller * hose2;
++#endif
++	bd_t * binfo = (bd_t *)__res;
++
++	clk = ioremap(binfo->bi_immr_base + 0xA00,
++			sizeof(immr_clk_t));
++
++	/*
++	 * Configure PCI controller and PCI_CLK_OUTPUT both in 66M mode
++	 */
++	val32 = clk->occr;
++	udelay(2000);
++	clk->occr = 0xff000000;
++	udelay(2000);
++
++	iounmap(clk);
++
++	hose1 = pcibios_alloc_controller();
++	if(!hose1)
++		return;
++
++	ppc_md.pci_swizzle = common_swizzle;
++	ppc_md.pci_map_irq = mpc83xx_map_irq;
++
++	hose1->bus_offset = 0;
++	hose1->first_busno = 0;
++	hose1->last_busno = 0xff;
++
++	setup_indirect_pci(hose1, binfo->bi_immr_base + PCI1_CFG_ADDR_OFFSET,
++			binfo->bi_immr_base + PCI1_CFG_DATA_OFFSET);
++	hose1->set_cfg_type = 1;
++
++	mpc83xx_setup_pci1(hose1);
++
++	hose1->pci_mem_offset = MPC83xx_PCI1_MEM_OFFSET;
++	hose1->mem_space.start = MPC83xx_PCI1_LOWER_MEM;
++	hose1->mem_space.end = MPC83xx_PCI1_UPPER_MEM;
++
++	hose1->io_base_phys = MPC83xx_PCI1_IO_BASE;
++	hose1->io_space.start = MPC83xx_PCI1_LOWER_IO;
++	hose1->io_space.end = MPC83xx_PCI1_UPPER_IO;
++#ifdef CONFIG_MPC83xx_PCI2
++	isa_io_base = (unsigned long)ioremap(MPC83xx_PCI1_IO_BASE,
++			MPC83xx_PCI1_IO_SIZE + MPC83xx_PCI2_IO_SIZE);
++#else
++	isa_io_base = (unsigned long)ioremap(MPC83xx_PCI1_IO_BASE,
++			MPC83xx_PCI1_IO_SIZE);
++#endif /* CONFIG_MPC83xx_PCI2 */
++	hose1->io_base_virt = (void *)isa_io_base;
++	/* setup resources */
++	pci_init_resource(&hose1->io_resource,
++			MPC83xx_PCI1_LOWER_IO,
++			MPC83xx_PCI1_UPPER_IO,
++			IORESOURCE_IO, "PCI host bridge 1");
++	pci_init_resource(&hose1->mem_resources[0],
++			MPC83xx_PCI1_LOWER_MEM,
++			MPC83xx_PCI1_UPPER_MEM,
++			IORESOURCE_MEM, "PCI host bridge 1");
++
++	ppc_md.pci_exclude_device = mpc83xx_exclude_device;
++	hose1->last_busno = pciauto_bus_scan(hose1, hose1->first_busno);
++
++#ifdef CONFIG_MPC83xx_PCI2
++	hose2 = pcibios_alloc_controller();
++	if(!hose2)
++		return;
++
++	hose2->bus_offset = hose1->last_busno + 1;
++	hose2->first_busno = hose1->last_busno + 1;
++	hose2->last_busno = 0xff;
++	setup_indirect_pci(hose2, binfo->bi_immr_base + PCI2_CFG_ADDR_OFFSET,
++			binfo->bi_immr_base + PCI2_CFG_DATA_OFFSET);
++	hose2->set_cfg_type = 1;
++
++	mpc83xx_setup_pci2(hose2);
++
++	hose2->pci_mem_offset = MPC83xx_PCI2_MEM_OFFSET;
++	hose2->mem_space.start = MPC83xx_PCI2_LOWER_MEM;
++	hose2->mem_space.end = MPC83xx_PCI2_UPPER_MEM;
++
++	hose2->io_base_phys = MPC83xx_PCI2_IO_BASE;
++	hose2->io_space.start = MPC83xx_PCI2_LOWER_IO;
++	hose2->io_space.end = MPC83xx_PCI2_UPPER_IO;
++	hose2->io_base_virt = (void *)(isa_io_base + MPC83xx_PCI1_IO_SIZE);
++	/* setup resources */
++	pci_init_resource(&hose2->io_resource,
++			MPC83xx_PCI2_LOWER_IO,
++			MPC83xx_PCI2_UPPER_IO,
++			IORESOURCE_IO, "PCI host bridge 2");
++	pci_init_resource(&hose2->mem_resources[0],
++			MPC83xx_PCI2_LOWER_MEM,
++			MPC83xx_PCI2_UPPER_MEM,
++			IORESOURCE_MEM, "PCI host bridge 2");
++
++	hose2->last_busno = pciauto_bus_scan(hose2, hose2->first_busno);
++#endif /* CONFIG_MPC83xx_PCI2 */
++}
++#endif /*CONFIG_PCI*/
+Index: linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.h
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/ppc83xx_setup.h
++++ linux-2.6.10/arch/ppc/syslib/ppc83xx_setup.h
+@@ -12,6 +12,14 @@
+  * Free Software Foundation;  either version 2 of the  License, or (at your
+  * option) any later version.
+  *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the  GNU General Public License along
++ * with this program; if not, write  to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
+ #ifndef __PPC_SYSLIB_PPC83XX_SETUP_H
+@@ -19,7 +27,6 @@
+ 
+ #include <linux/config.h>
+ #include <linux/init.h>
+-#include <asm/ppcboot.h>
+ 
+ extern unsigned long mpc83xx_find_end_of_memory(void) __init;
+ extern long mpc83xx_time_init(void) __init;
+@@ -31,13 +38,11 @@ extern void mpc83xx_halt(void);
+ extern void mpc83xx_setup_hose(void) __init;
+ 
+ /* PCI config */
+-#if 0
+-#define PCI1_CFG_ADDR_OFFSET	(FIXME)
+-#define PCI1_CFG_DATA_OFFSET	(FIXME)
++#define PCI1_CFG_ADDR_OFFSET (0x8300)
++#define PCI1_CFG_DATA_OFFSET (0x8304)
+ 
+-#define PCI2_CFG_ADDR_OFFSET	(FIXME)
+-#define PCI2_CFG_DATA_OFFSET	(FIXME)
+-#endif
++#define PCI2_CFG_ADDR_OFFSET (0x8380)
++#define PCI2_CFG_DATA_OFFSET (0x8384)
+ 
+ /* Serial Config */
+ #ifdef CONFIG_SERIAL_MANY_PORTS
+Index: linux-2.6.10/mvl_patches/pro-0445.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0445.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(445);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

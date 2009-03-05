@@ -1,0 +1,392 @@
+#! /usr/bin/env bash
+# Patch: -common_jbd_catchup_integration
+# Date: Thu Jun 29 13:42:35 2006
+# Source: MontaVista Software, Inc.
+# MR: 17090
+# Type: Integration
+# Disposition: merged from public GIT tree
+# Signed-off-by: Drew Moseley <dmoseley@mvista.com>
+# Description:
+#         The previous 16 patches bring our fs/jbd code mostly up-to-date with the
+# 	2.6.16.20 kernel.  Several bugs and race conditions have been fixed.  This
+# 	patch adapts this set of patches to our kernel.
+# 
+
+PATCHNUM=696
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 17090
+Type: Integration
+Disposition: merged from public GIT tree
+Signed-off-by: Drew Moseley <dmoseley@mvista.com>
+Description:
+        The previous 16 patches bring our fs/jbd code mostly up-to-date with the
+	2.6.16.20 kernel.  Several bugs and race conditions have been fixed.  This
+	patch adapts this set of patches to our kernel.
+
+Index: linux-2.6.10/fs/buffer.c
+===================================================================
+--- linux-2.6.10.orig/fs/buffer.c
++++ linux-2.6.10/fs/buffer.c
+@@ -2745,11 +2745,11 @@ int submit_bh(int rw, struct buffer_head
+  * generic_make_request() which ll_rw_block() calls.
+  *
+  * This function drops any buffer that it cannot get a lock on (with the
+- * BH_Lock state bit), any buffer that appears to be clean when doing a
+- * write request, and any buffer that appears to be up-to-date when doing
+- * read request.  Further it marks as clean buffers that are processed for
+- * writing (the buffer cache won't assume that they are actually clean until
+- * the buffer gets unlocked).
++ * BH_Lock state bit) unless SWRITE is required, any buffer that appears to be
++ * clean when doing a write request, and any buffer that appears to be
++ * up-to-date when doing read request.  Further it marks as clean buffers that
++ * are processed for writing (the buffer cache won't assume that they are
++ * actually clean until the buffer gets unlocked).
+  *
+  * ll_rw_block sets b_end_io to simple completion handler that marks
+  * the buffer up-to-date (if approriate), unlocks the buffer and wakes
+@@ -2765,25 +2765,27 @@ void ll_rw_block(int rw, int nr, struct 
+ 	for (i = 0; i < nr; i++) {
+ 		struct buffer_head *bh = bhs[i];
+ 
+-		if (test_set_buffer_locked(bh))
++		if (rw == SWRITE)
++			lock_buffer(bh);
++		else if (test_set_buffer_locked(bh))
+ 			continue;
+ 
+-		get_bh(bh);
+-		if (rw == WRITE) {
+-			bh->b_end_io = end_buffer_write_sync;
++		if (rw == WRITE || rw == SWRITE) {
+ 			if (test_clear_buffer_dirty(bh)) {
++				bh->b_end_io = end_buffer_write_sync;
++				get_bh(bh);
+ 				submit_bh(WRITE, bh);
+ 				continue;
+ 			}
+ 		} else {
+-			bh->b_end_io = end_buffer_read_sync;
+ 			if (!buffer_uptodate(bh)) {
++				bh->b_end_io = end_buffer_read_sync;
++				get_bh(bh);
+ 				submit_bh(rw, bh);
+ 				continue;
+ 			}
+ 		}
+ 		unlock_buffer(bh);
+-		put_bh(bh);
+ 	}
+ }
+ 
+Index: linux-2.6.10/fs/ext3/xattr.c
+===================================================================
+--- linux-2.6.10.orig/fs/ext3/xattr.c
++++ linux-2.6.10/fs/ext3/xattr.c
+@@ -95,8 +95,7 @@ static int ext3_xattr_set_handle2(handle
+ 
+ static int ext3_xattr_cache_insert(struct buffer_head *);
+ static struct buffer_head *ext3_xattr_cache_find(handle_t *, struct inode *,
+-						 struct ext3_xattr_header *,
+-						 int *);
++						 struct ext3_xattr_header *);
+ static void ext3_xattr_cache_remove(struct buffer_head *);
+ static void ext3_xattr_rehash(struct ext3_xattr_header *,
+ 			      struct ext3_xattr_entry *);
+@@ -500,15 +499,12 @@ bad_block:		ext3_error(sb, "ext3_xattr_s
+ 	/* Here we know that we can set the new attribute. */
+ 
+ 	if (header) {
+-		int credits = 0;
+-
+ 		/* assert(header == HDR(bh)); */
+ 		if (header->h_refcount != cpu_to_le32(1))
+ 			goto skip_get_write_access;
+ 		/* ext3_journal_get_write_access() requires an unlocked bh,
+ 		   which complicates things here. */
+-		error = ext3_journal_get_write_access_credits(handle, bh,
+-							      &credits);
++		error = ext3_journal_get_write_access(handle, bh);
+ 		if (error)
+ 			goto cleanup;
+ 		lock_buffer(bh);
+@@ -520,7 +516,7 @@ bad_block:		ext3_error(sb, "ext3_xattr_s
+ 			int offset;
+ 
+ 			unlock_buffer(bh);
+-			journal_release_buffer(handle, bh, credits);
++			journal_release_buffer(handle, bh);
+ 		skip_get_write_access:
+ 			ea_bdebug(bh, "cloning");
+ 			header = kmalloc(bh->b_size, GFP_KERNEL);
+@@ -648,10 +644,10 @@ ext3_xattr_set_handle2(handle_t *handle,
+ {
+ 	struct super_block *sb = inode->i_sb;
+ 	struct buffer_head *new_bh = NULL;
+-	int credits = 0, error;
++	int error;
+ 
+ 	if (header) {
+-		new_bh = ext3_xattr_cache_find(handle, inode, header, &credits);
++		new_bh = ext3_xattr_cache_find(handle, inode, header);
+ 		if (new_bh) {
+ 			/* We found an identical block in the cache. */
+ 			if (new_bh == old_bh)
+@@ -664,8 +660,7 @@ ext3_xattr_set_handle2(handle_t *handle,
+ 				error = -EDQUOT;
+ 				if (DQUOT_ALLOC_BLOCK(inode, 1)) {
+ 					unlock_buffer(new_bh);
+-					journal_release_buffer(handle, new_bh,
+-							       credits);
++					journal_release_buffer(handle, new_bh);
+ 					goto cleanup;
+ 				}
+ 				HDR(new_bh)->h_refcount = cpu_to_le32(1 +
+@@ -943,7 +938,7 @@ ext3_xattr_cmp(struct ext3_xattr_header 
+  */
+ static struct buffer_head *
+ ext3_xattr_cache_find(handle_t *handle, struct inode *inode,
+-		      struct ext3_xattr_header *header, int *credits)
++		      struct ext3_xattr_header *header)
+ {
+ 	__u32 hash = le32_to_cpu(header->h_hash);
+ 	struct mb_cache_entry *ce;
+@@ -960,8 +955,7 @@ ext3_xattr_cache_find(handle_t *handle, 
+ 			ext3_error(inode->i_sb, "ext3_xattr_cache_find",
+ 				"inode %ld: block %ld read error",
+ 				inode->i_ino, (unsigned long) ce->e_block);
+-		} else if (ext3_journal_get_write_access_credits(
+-				handle, bh, credits) == 0) {
++		} else if (ext3_journal_get_write_access(handle, bh) == 0) {
+ 			/* ext3_journal_get_write_access() requires an unlocked
+ 			 * bh, which complicates things here. */
+ 			lock_buffer(bh);
+@@ -977,8 +971,7 @@ ext3_xattr_cache_find(handle_t *handle, 
+ 				return bh;
+ 			}
+ 			unlock_buffer(bh);
+-			journal_release_buffer(handle, bh, *credits);
+-			*credits = 0;
++			journal_release_buffer(handle, bh);
+ 			brelse(bh);
+ 		}
+ 		ce = mb_cache_entry_find_next(ce, 0, inode->i_sb->s_bdev, hash);
+Index: linux-2.6.10/include/linux/fs.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/fs.h
++++ linux-2.6.10/include/linux/fs.h
+@@ -71,6 +71,7 @@ extern int dir_notify_enable;
+ #define READ 0
+ #define WRITE 1
+ #define READA 2		/* read-ahead  - don't block if no resources */
++#define SWRITE 3	/* for ll_rw_block() - wait for buffer lock */
+ #define SPECIAL 4	/* For non-blockdevice requests in request queue */
+ #define READ_SYNC	(READ | (1 << BIO_RW_SYNC))
+ #define WRITE_SYNC	(WRITE | (1 << BIO_RW_SYNC))
+Index: linux-2.6.10/mvl_patches/pro-0696.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0696.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(696);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

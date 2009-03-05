@@ -1,0 +1,487 @@
+#! /usr/bin/env bash
+# Patch: -pxa_disable_ssp_irq
+# Date: Fri Dec  7 11:50:44 2007
+# MR: 22807
+# 
+# From: Liam Girdwood <Liam.Girdwood@wolfsonmicro.com>
+# Date: Thu, 10 Nov 2005 17:45:39 +0000 (+0000)
+# Subject: [ARM] 3098/1: pxa2xx disable ssp irq
+# X-Git-Tag: v2.6.15~522^2
+# X-Git-Url: http://git.kernel.org/?p=linux%2Fkernel%2Fgit%2Fstable%2Flinux-2.6.20.y.git;a=commitdiff_plain;h=b216c01829d0b73a468204e2e763c0a818b77a46
+# 
+# [ARM] 3098/1: pxa2xx disable ssp irq
+# 
+# Patch from Liam Girdwood
+# 
+# This patch allows users of the pxa SSP driver to register their own irq
+# handlers instead of using the default SSP handler. It also cleans up the
+# CKEN clock and irq detection as the values are now stored in a table.
+# 
+# This patch replaces 2845/1
+# 
+# Changes:-
+# o Added flags parameter to ssp_init()
+# o Added SSP_NO_IRQ flag to disable registering of ssp irq handler (for
+# drivers that want to register their own handler)
+# o Cleaned up clock and irq detection, values are now stored in table.
+# o Added build changes to allow other drivers (e.g audio) to select the
+# ssp driver.
+# o corgi_ssp.c changed to use new interface.
+# 
+# Signed-off-by: Liam Girdwood <liam.girdwood@wolfsonmicro.com>
+# Signed-off-by: Richard Purdie <rpurdie@rpsys.net>
+# Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+# 
+
+PATCHNUM=1419
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 22807
+
+From: Liam Girdwood <Liam.Girdwood@wolfsonmicro.com>
+Date: Thu, 10 Nov 2005 17:45:39 +0000 (+0000)
+Subject: [ARM] 3098/1: pxa2xx disable ssp irq
+X-Git-Tag: v2.6.15~522^2
+X-Git-Url: http://git.kernel.org/?p=linux%2Fkernel%2Fgit%2Fstable%2Flinux-2.6.20.y.git;a=commitdiff_plain;h=b216c01829d0b73a468204e2e763c0a818b77a46
+
+[ARM] 3098/1: pxa2xx disable ssp irq
+
+Patch from Liam Girdwood
+
+This patch allows users of the pxa SSP driver to register their own irq
+handlers instead of using the default SSP handler. It also cleans up the
+CKEN clock and irq detection as the values are now stored in a table.
+
+This patch replaces 2845/1
+
+Changes:-
+o Added flags parameter to ssp_init()
+o Added SSP_NO_IRQ flag to disable registering of ssp irq handler (for
+drivers that want to register their own handler)
+o Cleaned up clock and irq detection, values are now stored in table.
+o Added build changes to allow other drivers (e.g audio) to select the
+ssp driver.
+o corgi_ssp.c changed to use new interface.
+
+Signed-off-by: Liam Girdwood <liam.girdwood@wolfsonmicro.com>
+Signed-off-by: Richard Purdie <rpurdie@rpsys.net>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+
+diff --git a/arch/arm/mach-pxa/ssp.c b/arch/arm/mach-pxa/ssp.c
+index 4d826c0..a68b30e 100644
+Index: linux-2.6.10/arch/arm/mach-pxa/ssp.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mach-pxa/ssp.c
++++ linux-2.6.10/arch/arm/mach-pxa/ssp.c
+@@ -19,6 +19,8 @@
+  *   22nd Aug 2003 Initial version.
+  *   20th Dec 2004 Added ssp_config for changing port config without
+  *                 closing the port.
++ *    4th Aug 2005 Added option to disable irq handler registration and
++ *                 cleaned up irq and clock detection.
+  */
+ 
+ #include <linux/module.h>
+@@ -37,6 +39,26 @@
+ 
+ #define PXA_SSP_PORTS 	3
+ 
++struct ssp_info_ {
++	int irq;
++	u32 clock;
++};
++
++/*
++ * SSP port clock and IRQ settings
++ */
++static const struct ssp_info_ ssp_info[PXA_SSP_PORTS] = {
++#if defined (CONFIG_PXA27x)
++	{IRQ_SSP,	CKEN23_SSP1},
++	{IRQ_SSP2,	CKEN3_SSP2},
++	{IRQ_SSP3,	CKEN4_SSP3},
++#else
++	{IRQ_SSP,	CKEN3_SSP},
++	{IRQ_NSSP,	CKEN9_NSSP},
++	{IRQ_ASSP,	CKEN10_ASSP},
++#endif
++};
++
+ static DECLARE_MUTEX(sem);
+ static int use_count[PXA_SSP_PORTS] = {0, 0, 0};
+ 
+@@ -210,9 +232,9 @@ int ssp_config(struct ssp_dev *dev, u32 
+  *   %-EBUSY	if the resources are already in use
+  *   %0		on success
+  */
+-int ssp_init(struct ssp_dev *dev, u32 port)
++int ssp_init(struct ssp_dev *dev, u32 port, u32 init_flags)
+ {
+-	int ret, irq;
++	int ret;
+ 
+ 	if (port > PXA_SSP_PORTS || port == 0)
+ 		return -ENODEV;
+@@ -229,61 +251,20 @@ int ssp_init(struct ssp_dev *dev, u32 po
+ 		up(&sem);
+ 		return -EBUSY;
+ 	}
+-
+-	switch (port) {
+-		case 1:
+-			irq = IRQ_SSP;
+-			break;
+-#if defined (CONFIG_PXA27x)
+-		case 2:
+-			irq = IRQ_SSP2;
+-			break;
+-		case 3:
+-			irq = IRQ_SSP3;
+-			break;
+-#else
+-		case 2:
+-			irq = IRQ_NSSP;
+-			break;
+-		case 3:
+-			irq = IRQ_ASSP;
+-			break;
+-#endif
+-		default:
+-			return -ENODEV;
+-	}
+-
+ 	dev->port = port;
+ 
+-	ret = request_irq(irq, ssp_interrupt, 0, "SSP", dev);
+-	if (ret)
+-		goto out_region;
++	/* do we need to get irq */
++	if (!(init_flags & SSP_NO_IRQ)) {
++		ret = request_irq(ssp_info[port-1].irq, ssp_interrupt,
++				0, "SSP", dev);
++	    	if (ret)
++			goto out_region;
++	    	dev->irq = ssp_info[port-1].irq;
++	} else
++		dev->irq = 0;
+ 
+ 	/* turn on SSP port clock */
+-	switch (dev->port) {
+-#if defined (CONFIG_PXA27x)
+-		case 1:
+-			pxa_set_cken(CKEN23_SSP1, 1);
+-			break;
+-		case 2:
+-			pxa_set_cken(CKEN3_SSP2, 1);
+-			break;
+-		case 3:
+-			pxa_set_cken(CKEN4_SSP3, 1);
+-			break;
+-#else
+-		case 1:
+-			pxa_set_cken(CKEN3_SSP, 1);
+-			break;
+-		case 2:
+-			pxa_set_cken(CKEN9_NSSP, 1);
+-			break;
+-		case 3:
+-			pxa_set_cken(CKEN10_ASSP, 1);
+-			break;
+-#endif
+-	}
+-
++	pxa_set_cken(ssp_info[port-1].clock, 1);
+ 	up(&sem);
+ 	return 0;
+ 
+@@ -301,46 +282,17 @@ out_region:
+  */
+ void ssp_exit(struct ssp_dev *dev)
+ {
+-	int irq;
+-
+ 	down(&sem);
+ 	SSCR0_P(dev->port) &= ~SSCR0_SSE;
+ 
+-	/* find irq, save power and turn off SSP port clock */
+-	switch (dev->port) {
+-#if defined (CONFIG_PXA27x)
+-		case 1:
+-			irq = IRQ_SSP;
+-			pxa_set_cken(CKEN23_SSP1, 0);
+-			break;
+-		case 2:
+-			irq = IRQ_SSP2;
+-			pxa_set_cken(CKEN3_SSP2, 0);
+-			break;
+-		case 3:
+-			irq = IRQ_SSP3;
+-			pxa_set_cken(CKEN4_SSP3, 0);
+-			break;
+-#else
+-		case 1:
+-			irq = IRQ_SSP;
+-			pxa_set_cken(CKEN3_SSP, 0);
+-			break;
+-		case 2:
+-			irq = IRQ_NSSP;
+-			pxa_set_cken(CKEN9_NSSP, 0);
+-			break;
+-		case 3:
+-			irq = IRQ_ASSP;
+-			pxa_set_cken(CKEN10_ASSP, 0);
+-			break;
+-#endif
+-		default:
+-			printk(KERN_WARNING "SSP: tried to close invalid port\n");
+-			return;
++    	if (dev->port > PXA_SSP_PORTS || dev->port == 0) {
++		printk(KERN_WARNING "SSP: tried to close invalid port\n");
++		return;
+ 	}
+ 
+-	free_irq(irq, dev);
++	pxa_set_cken(ssp_info[dev->port-1].clock, 0);
++	if (dev->irq)
++		free_irq(dev->irq, dev);
+ 	release_mem_region(__PREG(SSCR0_P(dev->port)), 0x2c);
+ 	use_count[dev->port - 1]--;
+ 	up(&sem);
+Index: linux-2.6.10/include/asm-arm/arch-pxa/ssp.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/arch-pxa/ssp.h
++++ linux-2.6.10/include/asm-arm/arch-pxa/ssp.h
+@@ -18,6 +18,11 @@
+ #ifndef SSP_H
+ #define SSP_H
+ 
++/*
++ * SSP initialisation flags
++ */
++#define SSP_NO_IRQ	0x1		/* don't register an irq handler in SSP driver */
++
+ struct ssp_state {
+ 	u32	cr0;
+ 	u32 cr1;
+@@ -31,6 +36,7 @@ struct ssp_dev {
+ 	u32 flags;
+ 	u32 psp_flags;
+ 	u32 speed;
++	int irq;
+ };
+ 
+ int ssp_write_word(struct ssp_dev *dev, u32 data);
+@@ -40,7 +46,7 @@ void ssp_enable(struct ssp_dev *dev);
+ void ssp_disable(struct ssp_dev *dev);
+ void ssp_save_state(struct ssp_dev *dev, struct ssp_state *ssp);
+ void ssp_restore_state(struct ssp_dev *dev, struct ssp_state *ssp);
+-int ssp_init(struct ssp_dev *dev, u32 port);
++int ssp_init(struct ssp_dev *dev, u32 port, u32 init_flags);
+ int ssp_config(struct ssp_dev *dev, u32 mode, u32 flags, u32 psp_flags, u32 speed);
+ void ssp_exit(struct ssp_dev *dev);
+ 
+Index: linux-2.6.10/mvl_patches/pro-1419.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1419.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1419);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

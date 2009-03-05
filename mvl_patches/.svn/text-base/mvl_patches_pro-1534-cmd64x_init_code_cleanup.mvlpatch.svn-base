@@ -1,0 +1,515 @@
+#! /usr/bin/env bash
+# Patch: -cmd64x_init_code_cleanup
+# Date: Fri Jan  4 18:40:48 2008
+# Source: MontaVista Software, Inc.
+# MR: 23989
+# Type: Enhancement
+# Disposition: accepted into 2.6.23-rc1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# cmd64x: init. code cleanup
+# 
+# Fix two minor issues with PCI0646 chip reporting in the init_chipset() method:
+# "IRQ workaround enabled" message printed out not only for revision 0x01 and
+# "CMD646: chipset revision" printed twice (by IDE core and the driver itself).
+# Also, remove empty/pointless switch cases for the chips other than PCI0646,
+# duplicate write to the MRDMODE register when enabling interrupts and MEMORY
+# READ LINE cycles, and needless/misplaced initialization of the timing registers
+# in this method.
+# Switch to reading only the PCI revision ID register itself, not the whole 32
+# bits at its address in init_chipset() and init_hwif() methods; in addition,
+# get rid of the useless clearing of hwif->autodma and perform some cosmetic
+# style changes in the latter method.
+# Refactor ata66_cmd64x() by moving all the code into the 'switch' statement,
+# renaming/adding variables, and fixing the coding style.
+# While at it, finally get rid of the meaningless aliasing register #define's...
+# 
+# This patch differs for the mainline version because of the patch introducing
+# the 'udma_mask' field into the 'ide_pci_device_t' that went into 2.6.21-rc1 --
+# here I moved the code setting the hwif->ultra_mask into the switch statement.
+# 
+# commit 83a6d4ab3b09c0c1921b657bbaac5ada3c9c3623
+# tree 21f86005466a0c9f87f60e13ffc3e7135e24818e
+# parent 2648e5d9a80d8a020feb343c52a8704e978e60c6
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Mon, 09 Jul 2007 23:17:55 +0200
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Mon, 09 Jul 2007 23:17:55 +0200
+# 
+#  drivers/ide/pci/cmd64x.c |  137 +++++++++++++++++------------------------------
+#  1 files changed, 50 insertions(+), 87 deletions(-)
+# 
+
+PATCHNUM=1534
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 23989
+Type: Enhancement
+Disposition: accepted into 2.6.23-rc1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+cmd64x: init. code cleanup
+
+Fix two minor issues with PCI0646 chip reporting in the init_chipset() method:
+"IRQ workaround enabled" message printed out not only for revision 0x01 and
+"CMD646: chipset revision" printed twice (by IDE core and the driver itself).
+Also, remove empty/pointless switch cases for the chips other than PCI0646,
+duplicate write to the MRDMODE register when enabling interrupts and MEMORY
+READ LINE cycles, and needless/misplaced initialization of the timing registers
+in this method.
+Switch to reading only the PCI revision ID register itself, not the whole 32
+bits at its address in init_chipset() and init_hwif() methods; in addition,
+get rid of the useless clearing of hwif->autodma and perform some cosmetic
+style changes in the latter method.
+Refactor ata66_cmd64x() by moving all the code into the 'switch' statement,
+renaming/adding variables, and fixing the coding style.
+While at it, finally get rid of the meaningless aliasing register #define's...
+
+This patch differs for the mainline version because of the patch introducing
+the 'udma_mask' field into the 'ide_pci_device_t' that went into 2.6.21-rc1 --
+here I moved the code setting the hwif->ultra_mask into the switch statement.
+
+commit 83a6d4ab3b09c0c1921b657bbaac5ada3c9c3623
+tree 21f86005466a0c9f87f60e13ffc3e7135e24818e
+parent 2648e5d9a80d8a020feb343c52a8704e978e60c6
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Mon, 09 Jul 2007 23:17:55 +0200
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Mon, 09 Jul 2007 23:17:55 +0200
+
+ drivers/ide/pci/cmd64x.c |  137 +++++++++++++++++------------------------------
+ mvl_patches/pro-1534.c   |   16 +++++
+ 2 files changed, 66 insertions(+), 87 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/cmd64x.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/cmd64x.c
++++ linux-2.6.10/drivers/ide/pci/cmd64x.c
+@@ -1,5 +1,5 @@
+ /*
+- * linux/drivers/ide/pci/cmd64x.c		Version 1.47	Mar 19, 2007
++ * linux/drivers/ide/pci/cmd64x.c		Version 1.50	May 10, 2007
+  *
+  * cmd64x.c: Enable interrupts at initialization time on Ultra/PCI machines.
+  *           Due to massive hardware bugs, UltraDMA is only supported
+@@ -54,9 +54,6 @@
+ #define   ARTTIM23_DIS_RA2	0x04
+ #define   ARTTIM23_DIS_RA3	0x08
+ #define   ARTTIM23_INTR_CH1	0x10
+-#define ARTTIM2		0x57
+-#define ARTTIM3		0x57
+-#define DRWTIM23	0x58
+ #define DRWTIM2		0x58
+ #define BRST		0x59
+ #define DRWTIM3		0x5b
+@@ -556,12 +553,8 @@ static int cmd646_1_ide_dma_end (ide_dri
+ 
+ static unsigned int __devinit init_chipset_cmd64x(struct pci_dev *dev, const char *name)
+ {
+-	u32 class_rev = 0;
+ 	u8 mrdmode = 0;
+ 
+-	pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_rev);
+-	class_rev &= 0xff;
+-
+ #ifdef __i386__
+ 	if (dev->resource[PCI_ROM_RESOURCE].start) {
+ 		pci_write_config_byte(dev, PCI_ROM_ADDRESS, dev->resource[PCI_ROM_RESOURCE].start | PCI_ROM_ADDRESS_ENABLE);
+@@ -569,65 +562,41 @@ static unsigned int __devinit init_chips
+ 	}
+ #endif
+ 
+-	switch(dev->device) {
+-		case PCI_DEVICE_ID_CMD_643:
+-			break;
+-		case PCI_DEVICE_ID_CMD_646:
+-			printk(KERN_INFO "%s: chipset revision 0x%02X, ", name, class_rev);
+-			switch(class_rev) {
+-				case 0x07:
+-				case 0x05:
+-					printk("UltraDMA Capable");
+-					break;
+-				case 0x03:
+-					printk("MultiWord DMA Force Limited");
+-					break;
+-				case 0x01:
+-				default:
+-					printk("MultiWord DMA Limited, IRQ workaround enabled");
+-					break;
+-				}
+-			printk("\n");
+-                        break;
+-		case PCI_DEVICE_ID_CMD_648:
+-		case PCI_DEVICE_ID_CMD_649:
++	if (dev->device == PCI_DEVICE_ID_CMD_646) {
++		u8 rev = 0;
++
++		pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
++
++		switch (rev) {
++		case 0x07:
++		case 0x05:
++			printk("%s: UltraDMA capable", name);
+ 			break;
++		case 0x03:
+ 		default:
++			printk("%s: MultiWord DMA force limited", name);
+ 			break;
++		case 0x01:
++			printk("%s: MultiWord DMA limited, "
++			       "IRQ workaround enabled\n", name);
++			break;
++		}
+ 	}
+ 
+ 	/* Set a good latency timer and cache line size value. */
+ 	(void) pci_write_config_byte(dev, PCI_LATENCY_TIMER, 64);
+ 	/* FIXME: pci_set_master() to ensure a good latency timer value */
+ 
+-	/* Setup interrupts. */
+-	(void) pci_read_config_byte(dev, MRDMODE, &mrdmode);
+-	mrdmode &= ~(0x30);
+-	(void) pci_write_config_byte(dev, MRDMODE, mrdmode);
+-
+-	/* Use MEMORY READ LINE for reads.
+-	 * NOTE: Although not mentioned in the PCI0646U specs,
+-	 *       these bits are write only and won't be read
+-	 *       back as set or not.  The PCI0646U2 specs clarify
+-	 *       this point.
++	/*
++	 * Enable interrupts, select MEMORY READ LINE for reads.
++	 *
++	 * NOTE: although not mentioned in the PCI0646U specs,
++	 * bits 0-1 are write only and won't be read back as
++	 * set or not -- PCI0646U2 specs clarify this point.
+ 	 */
+-	(void) pci_write_config_byte(dev, MRDMODE, mrdmode | 0x02);
+-
+-	/* Set reasonable active/recovery/address-setup values. */
+-	(void) pci_write_config_byte(dev, ARTTIM0,  0x40);
+-	(void) pci_write_config_byte(dev, DRWTIM0,  0x3f);
+-	(void) pci_write_config_byte(dev, ARTTIM1,  0x40);
+-	(void) pci_write_config_byte(dev, DRWTIM1,  0x3f);
+-#ifdef __i386__
+-	(void) pci_write_config_byte(dev, ARTTIM23, 0x1c);
+-#else
+-	(void) pci_write_config_byte(dev, ARTTIM23, 0x5c);
+-#endif
+-	(void) pci_write_config_byte(dev, DRWTIM23, 0x3f);
+-	(void) pci_write_config_byte(dev, DRWTIM3,  0x3f);
+-#ifdef CONFIG_PPC
+-	(void) pci_write_config_byte(dev, UDIDETCR0, 0xf0);
+-#endif /* CONFIG_PPC */
++	(void) pci_read_config_byte (dev, MRDMODE, &mrdmode);
++	mrdmode &= ~0x30;
++	(void) pci_write_config_byte(dev, MRDMODE, (mrdmode | 0x02));
+ 
+ #if defined(DISPLAY_CMD64X_TIMINGS) && defined(CONFIG_PROC_FS)
+ 
+@@ -644,27 +613,25 @@ static unsigned int __devinit init_chips
+ 
+ static unsigned int __devinit ata66_cmd64x(ide_hwif_t *hwif)
+ {
+-	u8 ata66 = 0, mask = (hwif->channel) ? 0x02 : 0x01;
++	struct pci_dev  *dev	= hwif->pci_dev;
++	u8 bmidecsr = 0, mask	= hwif->channel ? 0x02 : 0x01;
+ 
+-	switch(hwif->pci_dev->device) {
+-		case PCI_DEVICE_ID_CMD_643:
+-		case PCI_DEVICE_ID_CMD_646:
+-			return ata66;
+-		default:
+-			break;
++	switch (dev->device) {
++	case PCI_DEVICE_ID_CMD_648:
++	case PCI_DEVICE_ID_CMD_649:
++ 		pci_read_config_byte(dev, BMIDECSR, &bmidecsr);
++		return (bmidecsr & mask) ? 1 : 0;
++	default:
++		return 0;
+ 	}
+-	pci_read_config_byte(hwif->pci_dev, BMIDECSR, &ata66);
+-	return (ata66 & mask) ? 1 : 0;
+ }
+ 
+ static void __devinit init_hwif_cmd64x(ide_hwif_t *hwif)
+ {
+ 	struct pci_dev *dev	= hwif->pci_dev;
+-	unsigned int class_rev;
++	u8 rev			= 0;
+ 
+-	hwif->autodma = 0;
+-	pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_rev);
+-	class_rev &= 0xff;
++	pci_read_config_byte(dev, PCI_REVISION_ID, &rev);
+ 
+ 	hwif->tuneproc  = &cmd64x_tune_drive;
+ 	hwif->speedproc = &cmd64x_tune_chipset;
+@@ -674,35 +641,33 @@ static void __devinit init_hwif_cmd64x(i
+ 	if (!hwif->dma_base)
+ 		return;
+ 
+-	hwif->atapi_dma = 1;
+-
+-	hwif->ultra_mask = 0x3f;
++	hwif->atapi_dma  = 1;
+ 	hwif->mwdma_mask = 0x07;
+ 
+-	if (dev->device == PCI_DEVICE_ID_CMD_643)
+-		hwif->ultra_mask = 0x80;
+-	if (dev->device == PCI_DEVICE_ID_CMD_646)
+-		hwif->ultra_mask = (class_rev > 0x04) ? 0x07 : 0x80;
+-	if (dev->device == PCI_DEVICE_ID_CMD_648)
+-		hwif->ultra_mask = 0x1f;
+-
+ 	hwif->ide_dma_check = &cmd64x_config_drive_for_dma;
+-	if (!(hwif->udma_four))
++
++	if (!hwif->udma_four)
+ 		hwif->udma_four = ata66_cmd64x(hwif);
+ 
+-	switch(dev->device) {
++	switch (dev->device) {
+ 	case PCI_DEVICE_ID_CMD_648:
++		hwif->ultra_mask = 0x1f;
++		goto alt_irq_bits;
+ 	case PCI_DEVICE_ID_CMD_649:
++		hwif->ultra_mask = 0x3f;
+ 	alt_irq_bits:
+ 		hwif->ide_dma_end	= &cmd648_ide_dma_end;
+ 		hwif->ide_dma_test_irq	= &cmd648_ide_dma_test_irq;
+ 		break;
+ 	case PCI_DEVICE_ID_CMD_646:
+ 		hwif->chipset = ide_cmd646;
+-		if (class_rev == 0x01) {
++		if (rev == 0x01) {
+ 			hwif->ide_dma_end = &cmd646_1_ide_dma_end;
+ 			break;
+-		} else if (class_rev >= 0x03)
++		} else if (rev == 0x05 || rev == 0x07) {
++			hwif->ultra_mask = 0x07;
++			goto alt_irq_bits;
++		} else if (rev == 0x03)
+ 			goto alt_irq_bits;
+ 		/* fall thru */
+ 	default:
+@@ -711,11 +676,9 @@ static void __devinit init_hwif_cmd64x(i
+ 		break;
+ 	}
+ 
+-
+ 	if (!noautodma)
+ 		hwif->autodma = 1;
+-	hwif->drives[0].autodma = hwif->autodma;
+-	hwif->drives[1].autodma = hwif->autodma;
++	hwif->drives[0].autodma = hwif->drives[1].autodma = hwif->autodma;
+ }
+ 
+ static void __devinit init_setup_cmd64x(struct pci_dev *dev, ide_pci_device_t *d)
+Index: linux-2.6.10/mvl_patches/pro-1534.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1534.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1534);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

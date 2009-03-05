@@ -1,0 +1,680 @@
+#! /usr/bin/env bash
+# Patch: -initramfs_unprivileged_image_creation
+# Date: Fri May 26 10:17:32 2006
+# MR: 17477
+# Commit: a363b37930df6678d816b3711b07acbc0e566b04
+# Author: Thayne Harbaugh <tharbaugh@lnxi.com>
+# Date:   Fri Jan 7 21:43:14 2005 -0800
+# 
+#     [PATCH] initramfs: unprivileged image creation
+#     
+#     This patch makes several tweaks so that an initramfs image can be
+#     completely created by an unprivileged user.  It should maintain
+#     compatibility with previous initramfs early userspace cpio/image creation
+#     and it updates documentation.
+#     
+#     There are a few very important tweaks:
+#     
+#     CONFIG_INITRAMFS_SOURCE is now either a single cpio archive that is
+#     directly used or a list of directories and files for building a cpio
+#     archive for the initramfs image.  Making the cpio archive listable in
+#     CONFIG_INITRAMFS_SOURCE makes the cpio step more official and automated so
+#     that it doesn't have to be copied by hand to usr/initramfs_data.cpio (I
+#     think this was broken anyway and would be overwritten).  The alternative
+#     list of directories *and* files means that files can be install in a "root"
+#     directory and device-special files can be listed in a file list.
+#     
+#     CONFIG_ROOT_UID and CONFIG_ROOT_GID are now available for doing simple
+#     user/group ID translation.  That means that user ID 500, group ID 500 can
+#     create all the files in the "root" directory, but that they can all be
+#     owned by user ID 0, group ID 0 in the cpio image.
+#     
+#     Various documentation updates to pull it all together.
+#     
+#     Removal of old cruft that was unused/misleading.
+#     
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=564
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 17477
+Commit: a363b37930df6678d816b3711b07acbc0e566b04
+Author: Thayne Harbaugh <tharbaugh@lnxi.com>
+Date:   Fri Jan 7 21:43:14 2005 -0800
+
+    [PATCH] initramfs: unprivileged image creation
+    
+    This patch makes several tweaks so that an initramfs image can be
+    completely created by an unprivileged user.  It should maintain
+    compatibility with previous initramfs early userspace cpio/image creation
+    and it updates documentation.
+    
+    There are a few very important tweaks:
+    
+    CONFIG_INITRAMFS_SOURCE is now either a single cpio archive that is
+    directly used or a list of directories and files for building a cpio
+    archive for the initramfs image.  Making the cpio archive listable in
+    CONFIG_INITRAMFS_SOURCE makes the cpio step more official and automated so
+    that it doesn't have to be copied by hand to usr/initramfs_data.cpio (I
+    think this was broken anyway and would be overwritten).  The alternative
+    list of directories *and* files means that files can be install in a "root"
+    directory and device-special files can be listed in a file list.
+    
+    CONFIG_ROOT_UID and CONFIG_ROOT_GID are now available for doing simple
+    user/group ID translation.  That means that user ID 500, group ID 500 can
+    create all the files in the "root" directory, but that they can all be
+    owned by user ID 0, group ID 0 in the cpio image.
+    
+    Various documentation updates to pull it all together.
+    
+    Removal of old cruft that was unused/misleading.
+    
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/Documentation/early-userspace/README b/Documentation/early-userspace/README
+index 77eaa58..270a88e 100644
+
+ Documentation/early-userspace/README |   69 +++++++++++++++---
+ drivers/block/Kconfig                |   42 ++++++++++-
+ mvl_patches/pro-0564.c               |   16 ++++
+ scripts/gen_initramfs_list.sh        |  129 +++++++++++++++++++++++++++--------
+ usr/Makefile                         |   50 +++++++++----
+ 5 files changed, 245 insertions(+), 61 deletions(-)
+
+Index: linux-2.6.10/Documentation/early-userspace/README
+===================================================================
+--- linux-2.6.10.orig/Documentation/early-userspace/README
++++ linux-2.6.10/Documentation/early-userspace/README
+@@ -1,7 +1,7 @@
+ Early userspace support
+ =======================
+ 
+-Last update: 2004-11-12
++Last update: 2004-12-20 tlh
+ 
+ 
+ "Early userspace" is a set of libraries and programs that provide
+@@ -21,19 +21,62 @@ It consists of several major infrastruct
+ 
+ The cpio file format used by initramfs is the "newc" (aka "cpio -c")
+ format, and is documented in the file "buffer-format.txt".  There are
+-three ways to add an early userspace filesystem:
+-
+-1) Put your gzip'ed cpio in usr/initramfs_data.cpio.gz.
+-
+-2) Set CONFIG_INITRAMFS_SOURCE to the filename of a gen_init_cpio
+-input file.  This provides the most flexibility and allows creation of
+-archives with files not owned by the build user.  This means that an
+-unprivileged user can create an early userspace with files owned by
+-root.
+-
+-3) Set CONFIG_INITRAMFS_SOURCE to point to a directory containing the
+-files for your filesystem.
++two ways to add an early userspace image: specify an existing cpio
++archive to be used as the image or have the kernel build process build
++the image from specifications.
++
++CPIO ARCHIVE method
++
++You can create a cpio archive that contains the early userspace image.
++Youre cpio archive should be specified in CONFIG_INITRAMFS_SOURCE and it
++will be used directly.  Only a single cpio file may be specified in
++CONFIG_INITRAMFS_SOURCE and directory and file names are not allowed in
++combination with a cpio archive.
++
++IMAGE BUILDING method
++
++The kernel build process can also build an early userspace image from
++source parts rather than supplying a cpio archive.  This method provides
++a way to create images with root-owned files even though the image was
++built by an unprivileged user.
++
++The image is specified as one or more sources in
++CONFIG_INITRAMFS_SOURCE.  Sources can be either directories or files -
++cpio archives are *not* allowed when building from sources.
++
++A source directory will have it and all of it's contents packaged.  The
++specified directory name will be mapped to '/'.  When packaging a
++directory, limited user and group ID translation can be performed.
++INITRAMFS_ROOT_UID can be set to a user ID that needs to be mapped to
++user root (0).  INITRAMFS_ROOT_GID can be set to a group ID that needs
++to be mapped to group root (0).
++
++A source file must be directives in the format required by the
++usr/gen_init_cpio utility (run 'usr/gen_init_cpio --help' to get the
++file format).  The directives in the file will be passed directly to
++usr/gen_init_cpio.
++
++When a combination of directories and files are specified then the
++initramfs image will be an aggregate of all of them.  In this way a user
++can create a 'root-image' directory and install all files into it.
++Because device-special files cannot be created by a unprivileged user,
++special files can be listed in a 'root-files' file.  Both 'root-image'
++and 'root-files' can be listed in CONFIG_INITRAMFS_SOURCE and a complete
++early userspace image can be built by an unprivileged user.
++
++As a technical note, when directories and files are specified, the
++entire CONFIG_INITRAMFS_SOURCE is passed to
++scripts/gen_initramfs_list.sh.  This means that CONFIG_INITRAMFS_SOURCE
++can really be interpreted as any legal argument to
++gen_initramfs_list.sh.  If a directory is specified as an argument then
++the contents are scanned, uid/gid translation is performed, and
++usr/gen_init_cpio file directives are output.  If a directory is
++specified as an arugemnt to scripts/gen_initramfs_list.sh then the
++contents of the file are simply copied to the output.  All of the output
++directives from directory scanning and file contents copying are
++processed by usr/gen_init_cpio.
+ 
++See also 'scripts/gen_initramfs_list.sh -h'.
+ 
+ Where's this all leading?
+ =========================
+Index: linux-2.6.10/drivers/block/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/block/Kconfig
++++ linux-2.6.10/drivers/block/Kconfig
+@@ -364,16 +364,48 @@ config BLK_DEV_INITRD
+ 	  for details.
+ 
+ config INITRAMFS_SOURCE
+-	string "Source directory of cpio_list"
++	string "Initramfs source file(s)"
+ 	default ""
+ 	help
+-	  This can be set to either a directory containing files, etc to be
+-	  included in the initramfs archive, or a file containing  entries
+-	  according to the format described by the "usr/gen_init_cpio"
+-	  program in the kernel tree.
++	  This can be either a single cpio archive with a .cpio suffix or a
++	  space-separated list of directories and files for building the
++	  initramfs image.  A cpio archive should contain a filesystem archive
++	  to be used as an initramfs image.  Directories should contain a
++	  filesystem layout to be included in the initramfs image.  Files
++	  should contain entries according to the format described by the
++	  "usr/gen_init_cpio" program in the kernel tree.
++
++	  When multiple directories and files are specified then the
++	  initramfs image will be the aggregate of all of them.
++
++	  See <file:Documentation/early-userspace/README for more details.
+ 
+ 	  If you are not sure, leave it blank.
+ 
++config INITRAMFS_ROOT_UID
++	int "User ID to map to 0 (user root)"
++	depends on INITRAMFS_SOURCE!=""
++	default "0"
++	help
++	  This setting is only meaningful if the INITRAMFS_SOURCE is
++	  contains a directory.  Setting this user ID (UID) to something
++	  other than "0" will cause all files owned by that UID to be
++	  owned by user root in the initial ramdisk image.
++
++	  If you are not sure, leave it set to "0".
++
++config INITRAMFS_ROOT_GID
++	int "Group ID to map to 0 (group root)"
++	depends on INITRAMFS_SOURCE!=""
++	default "0"
++	help
++	  This setting is only meaningful if the INITRAMFS_SOURCE is
++	  contains a directory.  Setting this group ID (GID) to something
++	  other than "0" will cause all files owned by that GID to be
++	  owned by group root in the initial ramdisk image.
++
++	  If you are not sure, leave it set to "0".
++
+ config LBD
+ 	bool "Support for Large Block Devices"
+ 	depends on X86 || MIPS32 || PPC32 || ARCH_S390_31 || SUPERH
+Index: linux-2.6.10/scripts/gen_initramfs_list.sh
+===================================================================
+--- linux-2.6.10.orig/scripts/gen_initramfs_list.sh
++++ linux-2.6.10/scripts/gen_initramfs_list.sh
+@@ -2,17 +2,17 @@
+ # Copyright (C) Martin Schlemmer <azarah@nosferatu.za.org>
+ # Released under the terms of the GNU GPL
+ #
+-# Generate a newline separated list of entries from the file/directory pointed
+-# out by the environment variable: CONFIG_INITRAMFS_SOURCE
++# Generate a newline separated list of entries from the file/directory
++# supplied as an argument.
+ #
+-# If CONFIG_INITRAMFS_SOURCE is non-existing then generate a small dummy file.
++# If a file/directory is not supplied then generate a small dummy file.
+ #
+-# The output is suitable for gen_init_cpio as found in usr/Makefile.
++# The output is suitable for gen_init_cpio built from usr/gen_init_cpio.c.
+ #
+ 
+-simple_initramfs() {
++default_initramfs() {
+ 	cat <<-EOF
+-		# This is a very simple initramfs
++		# This is a very simple, default initramfs
+ 
+ 		dir /dev 0755 0 0
+ 		nod /dev/console 0600 0 0 c 5 1
+@@ -63,6 +63,9 @@ parse() {
+ 	local uid="$3"
+ 	local gid="$4"
+ 	local ftype=$(filetype "${location}")
++	# remap uid/gid to 0 if necessary
++	[ "$uid" -eq "$root_uid" ] && uid=0
++	[ "$gid" -eq "$root_gid" ] && gid=0
+ 	local str="${mode} ${uid} ${gid}"
+ 
+ 	[ "${ftype}" == "invalid" ] && return 0
+@@ -101,30 +104,100 @@ parse() {
+ 	return 0
+ }
+ 
+-if [ -z "$1" ]; then
+-	simple_initramfs
+-elif [ -f "$1" ]; then
+-	print_mtime "$1"
+-	cat "$1"
+-elif [ -d "$1" ]; then
+-	srcdir=$(echo "$1" | sed -e 's://*:/:g')
+-	dirlist=$(find "${srcdir}" -printf "%p %m %U %G\n" 2>/dev/null)
+-
+-	# If $dirlist is only one line, then the directory is empty
+-	if [  "$(echo "${dirlist}" | wc -l)" -gt 1 ]; then
+-		print_mtime "$1"
++usage() {
++	printf    "Usage:\n"
++	printf    "$0 [ [-u <root_uid>] [-g <root_gid>] [-d | <cpio_source>] ] . . .\n"
++	printf    "\n"
++	printf -- "-u <root_uid>  User ID to map to user ID 0 (root).\n"
++	printf    "               <root_uid> is only meaningful if <cpio_source>\n"
++	printf    "               is a directory.\n"
++	printf -- "-g <root_gid>  Group ID to map to group ID 0 (root).\n"
++	printf    "               <root_gid> is only meaningful if <cpio_source>\n"
++	printf    "               is a directory.\n"
++	printf    "<cpio_source>  File list or directory for cpio archive.\n"
++	printf    "               If <cpio_source> is not provided then a\n"
++	printf    "               a default list will be output.\n"
++	printf -- "-d             Output the default cpio list.  If no <cpio_source>\n"
++	printf    "               is given then the default cpio list will be output.\n"
++	printf    "\n"
++	printf    "All options may be repeated and are interpreted sequentially\n"
++	printf    "and immediately.  -u and -g states are preserved across\n"
++	printf    "<cpio_source> options so an explicit \"-u 0 -g 0\" is required\n"
++	printf    "to reset the root/group mapping.\n"
++}
++
++build_list() {
++	printf "\n#####################\n# $cpio_source\n"
++
++	if [ -f "$cpio_source" ]; then
++		print_mtime "$cpio_source"
++		cat "$cpio_source"
++	elif [ -d "$cpio_source" ]; then
++		srcdir=$(echo "$cpio_source" | sed -e 's://*:/:g')
++		dirlist=$(find "${srcdir}" -printf "%p %m %U %G\n" 2>/dev/null)
++
++		# If $dirlist is only one line, then the directory is empty
++		if [  "$(echo "${dirlist}" | wc -l)" -gt 1 ]; then
++			print_mtime "$cpio_source"
+ 		
+-		echo "${dirlist}" | \
+-		while read x; do
+-			parse ${x}
+-		done
++			echo "${dirlist}" | \
++			while read x; do
++				parse ${x}
++			done
++		else
++			# Failsafe in case directory is empty
++			default_initramfs
++		fi
+ 	else
+-		# Failsafe in case directory is empty
+-		simple_initramfs
++		echo "  $0: Cannot open '$cpio_source'" >&2
++		exit 1
+ 	fi
+-else
+-	echo "  $0: Cannot open '$1' (CONFIG_INITRAMFS_SOURCE)" >&2
+-	exit 1
+-fi
++}
++
++
++root_uid=0
++root_gid=0
++
++while [ $# -gt 0 ]; do
++	arg="$1"
++	shift
++	case "$arg" in
++		"-u")
++			root_uid="$1"
++			shift
++			;;
++		"-g")
++			root_gid="$1"
++			shift
++			;;
++		"-d")
++			default_list="$arg"
++			default_initramfs
++			;;
++		"-h")
++			usage
++			exit 0
++			;;
++		*)
++			case "$arg" in
++				"-"*)
++					printf "ERROR: unknown option \"$arg\"\n" >&2
++					printf "If the filename validly begins with '-', then it must be prefixed\n" >&2
++					printf "by './' so that it won't be interpreted as an option." >&2
++					printf "\n" >&2
++					usage >&2
++					exit 1
++					;;
++				*)
++					cpio_source="$arg"
++					build_list
++					;;
++			esac
++			;;
++	esac
++done
++
++# spit out the default cpio list if a source hasn't been specified
++[ -z "$cpio_source" -a -z "$default_list" ] && default_initramfs
+ 
+ exit 0
+Index: linux-2.6.10/usr/Makefile
+===================================================================
+--- linux-2.6.10.orig/usr/Makefile
++++ linux-2.6.10/usr/Makefile
+@@ -5,40 +5,60 @@ hostprogs-y  := gen_init_cpio
+ 
+ clean-files := initramfs_data.cpio.gz initramfs_list
+ 
+-# If you want a different list of files in the initramfs_data.cpio
+-# then you can either overwrite the cpio_list in this directory
+-# or set INITRAMFS_LIST to another filename.
+-INITRAMFS_LIST := $(obj)/initramfs_list
+-
+ # initramfs_data.o contains the initramfs_data.cpio.gz image.
+ # The image is included using .incbin, a dependency which is not
+ # tracked automatically.
+ $(obj)/initramfs_data.o: $(obj)/initramfs_data.cpio.gz FORCE
+ 
+-# initramfs-y are the programs which will be copied into the CPIO
+-# archive. Currently, the filenames are hardcoded in gen_init_cpio,
+-# but we need the information for the build as well, so it's duplicated
+-# here.
+-
+-# Commented out for now
+-# initramfs-y := $(obj)/root/hello
++ifdef CONFIG_INITRAMFS_ROOT_UID
++gen_initramfs_args += -u $(CONFIG_INITRAMFS_ROOT_UID)
++endif
++
++ifdef CONFIG_INITRAMFS_ROOT_GID
++gen_initramfs_args += -g $(CONFIG_INITRAMFS_ROOT_GID)
++endif
++
++# The $(shell echo $(CONFIG_INITRAMFS_SOURCE)) is to remove the
++# gratuitous begin and end quotes from the Kconfig string type.
++# Internal, escaped quotes in the Kconfig string will loose the
++# escape and become active quotes.
++quotefixed_initramfs_source := $(shell echo $(CONFIG_INITRAMFS_SOURCE))
+ 
+ filechk_initramfs_list = $(CONFIG_SHELL) \
+- $(srctree)/scripts/gen_initramfs_list.sh $(CONFIG_INITRAMFS_SOURCE)
+-			   
++ $(srctree)/scripts/gen_initramfs_list.sh $(gen_initramfs_args) $(quotefixed_initramfs_source)
++
+ $(obj)/initramfs_list: FORCE
+ 	$(call filechk,initramfs_list)
+ 
+ quiet_cmd_cpio = CPIO    $@
+       cmd_cpio = ./$< $(obj)/initramfs_list > $@
+ 
++
++# Check if the INITRAMFS_SOURCE is a cpio archive
++ifneq (,$(findstring .cpio,$(quotefixed_initramfs_source)))
++
++# INITRAMFS_SOURCE has a cpio archive - verify that it's a single file
++ifneq (1,$(words $(quotefixed_initramfs_source)))
++$(error Only a single file may be specified in CONFIG_INITRAMFS_SOURCE (="$(quotefixed_initramfs_source)") when a cpio archive is directly specified.)
++endif
++# Now use the cpio archive directly
++initramfs_data_cpio = $(quotefixed_initramfs_source)
++targets += $(quotefixed_initramfs_source)
++
++else
++
++# INITRAMFS_SOURCE is not a cpio archive - create one
+ $(obj)/initramfs_data.cpio: $(obj)/gen_init_cpio \
+                             $(initramfs-y) $(obj)/initramfs_list FORCE
+ 	$(call if_changed,cpio)
+ 
+ targets += initramfs_data.cpio
++initramfs_data_cpio = $(obj)/initramfs_data.cpio
++
++endif
++
+ 
+-$(obj)/initramfs_data.cpio.gz: $(obj)/initramfs_data.cpio FORCE
++$(obj)/initramfs_data.cpio.gz: $(initramfs_data_cpio) FORCE
+ 	$(call if_changed,gzip)
+ 
+ targets += initramfs_data.cpio.gz
+Index: linux-2.6.10/mvl_patches/pro-0564.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0564.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(564);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

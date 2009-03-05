@@ -1,0 +1,1 @@
+#define CONFIG_TI_DAVINCI_EMAC 1

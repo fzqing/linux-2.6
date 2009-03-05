@@ -1,0 +1,2015 @@
+#! /usr/bin/env bash
+# Patch: -pro_mpc8272_usb_driver
+# Date: Wed Dec 28 15:03:55 2005
+# Source: MontaVista Software, Inc.
+# MR: 
+# Type: Enhancement
+# Disposition: MontaVista
+# Signed-off-by: Gennadiy Kurtsman <gkurtsman@ru.mvista.com>
+# Description:
+#         Freescale MPC8272_ADS USB driver. It services periferal USB device,
+#     intended to support USB serial gadget.
+#         Modified drivers/usb/gadget/serial.c gadget file can now be used on big endian
+#     platforms. 
+# 
+
+PATCHNUM=276
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 
+Type: Enhancement
+Disposition: MontaVista
+Signed-off-by: Gennadiy Kurtsman <gkurtsman@ru.mvista.com>
+Description:
+        Freescale MPC8272_ADS USB driver. It services periferal USB device,
+    intended to support USB serial gadget.
+        Modified drivers/usb/gadget/serial.c gadget file can now be used on big endian
+    platforms. 
+
+Index: linux-2.6.10/drivers/usb/gadget/mpc8272_udc.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/gadget/mpc8272_udc.c
+@@ -0,0 +1,859 @@
++/*
++ * Driver for the MPC8272 on-chip peripheral USB device controller.
++ * Specs and errata are available from <http://www.freescale.com>.
++ *
++ * This driver should work well with Serial "gadget" driver.
++ *
++ * Author: Gennadiy Kurtsman <source@mvista.com>
++ *
++ * Based on:
++ * Montavista Pro 3.1 PQ2 USB-based tty device driver, by Vitaly Bordug
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ *
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/ioport.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/smp_lock.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/timer.h>
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/moduleparam.h>
++#include <linux/device.h>
++#include <linux/usb_ch9.h>
++#include <linux/usb_gadget.h>
++
++#include <asm/byteorder.h>
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++#include <asm/system.h>
++#include <asm/unaligned.h>
++#include <asm/immap_cpm2.h>
++#include <asm/cpm2.h>
++#include <asm/mpc8260.h>
++#include "mpc8272_udc.h"
++
++#define	DRIVER_DESC		"MPC8272_ADS USB Peripheral Controller"
++#define	DRIVER_VERSION		"2005 Sept 19"
++
++static struct _mpc8272_udc_dev* the_controller = NULL;
++
++static const char driver_name [] = "mpc8272_udc";
++static const char driver_desc [] = DRIVER_DESC;
++
++#define EP0_NAME "ep0"
++#define EP_IN_NAME "ep-in"
++#define EP_OUT_NAME "ep-out"
++
++static const char ep0name [] = EP0_NAME;
++static const char *ep_name [] = {
++	ep0name,
++	EP_IN_NAME,
++	EP_OUT_NAME,
++};
++
++static void mpc8272_usbc_kick_tx(struct _mpc8272_udc_dev *usbc_dev);
++static int mpc8272_usbc_rx_ctrl(struct mpc8272_usbc_ep *ep, int pid, __u8 * data,
++		__u16 len, int is_error);
++static int mpc8272_usbc_rx_data_in(struct mpc8272_usbc_ep *ep, int pid,
++		__u8 * data, __u16 len, int is_error);
++static int mpc8272_usbc_rx_data_out(struct mpc8272_usbc_ep *ep, int pid,
++		__u8 * data, __u16 len, int is_error);
++static void mpc8272_usbc_txconf_ctrl(struct mpc8272_usbc_ep *ep, __u16 len,
++		int is_error);
++static void mpc8272_usbc_txconf_data_in(struct mpc8272_usbc_ep *ep,
++		__u16 len, int is_error);
++static void mpc8272_usbc_txconf_data_out(struct mpc8272_usbc_ep *ep,
++		__u16 len, int is_error);
++
++static mpc8272_usbc_rx_callback rx_cb[] = {
++	mpc8272_usbc_rx_ctrl,
++	mpc8272_usbc_rx_data_in,
++	mpc8272_usbc_rx_data_out,
++};
++
++static mpc8272_usbc_txconf_callback txconf_cb[] = {
++        mpc8272_usbc_txconf_ctrl,
++        mpc8272_usbc_txconf_data_in,
++        mpc8272_usbc_txconf_data_out,
++};
++
++/* when a driver is successfully registered, it will receive
++ * control requests including set_configuration(), which enables
++ * non-control requests.  then usb traffic follows until a
++ * disconnect is reported.  then a host may connect again, or
++ * the driver might get unbound.
++ */
++int usb_gadget_register_driver(struct usb_gadget_driver *driver)
++{
++	struct _mpc8272_udc_dev *usbc_dev = the_controller;
++	int retval;
++	if (!driver
++			|| !driver->bind
++			|| !driver->unbind
++			|| !driver->disconnect
++			|| !driver->setup)
++		return -EINVAL;
++	if (!usbc_dev)
++		return -ENODEV;
++	if (usbc_dev->driver)
++		return -EBUSY;
++
++        /* hook up the driver */
++	driver->driver.bus = NULL;
++	usbc_dev->driver = driver;
++	usbc_dev->gadget.dev.driver = &driver->driver;
++	retval = driver->bind(&usbc_dev->gadget);
++	if (retval) {
++		usbc_dev->driver = NULL;
++		usbc_dev->gadget.dev.driver = NULL;
++		return retval;
++	}
++	/* then enable host detection and ep0; and we're ready
++	 * for set_configuration as well as eventual disconnect.
++	 */
++
++        return 0;
++}
++
++int usb_gadget_unregister_driver (struct usb_gadget_driver *driver)
++{
++	struct _mpc8272_udc_dev	*dev = the_controller;
++
++	if (!dev)
++		return -ENODEV;
++	if (!driver || driver != dev->driver)
++		return -EINVAL;
++
++	driver->unbind (&dev->gadget);
++	dev->gadget.dev.driver = NULL;
++	dev->driver = NULL;
++
++	return 0;
++}
++
++static int mpc8272_disable (struct usb_ep *ep)
++{
++	return 0;
++}
++
++static int
++mpc8272_enable (struct usb_ep *_ep, const struct usb_endpoint_descriptor *desc)
++{
++	struct _mpc8272_udc_dev	*dev;
++	struct mpc8272_usbc_ep *ep;
++	u16 max;
++	unsigned long flags = 0;
++
++	ep = container_of(_ep, struct mpc8272_usbc_ep, ep);
++	if (!_ep || !desc || ep->desc
++			|| desc->bDescriptorType != USB_DT_ENDPOINT)
++		return -EINVAL;
++	dev = ep->dev;
++	if (ep == &dev->eps[0])
++		return -EINVAL;
++	if (!dev->driver)
++		return -ESHUTDOWN;
++	if (ep->ep_num != (desc->bEndpointAddress & 0x0f))
++		return -EINVAL;
++
++	switch (desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
++	case USB_ENDPOINT_XFER_BULK:
++	case USB_ENDPOINT_XFER_INT:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* enabling the no-toggle interrupt mode would need an api hook */
++
++	max = UDC_USBC_PACKET_SIZE;
++	if (!max)
++		return -EINVAL;
++
++	if (!in_irq()) {
++		save_and_cli(flags);
++		spin_lock(&ep->lock);
++	}
++
++	ep->ep.maxpacket = max;
++	ep->desc = (struct usb_endpoint_descriptor *)desc;
++	if (!in_irq())	{
++		spin_unlock(&ep->lock);
++		restore_flags(flags);
++	}
++	return 0;
++};
++
++static int
++mpc8272_queue(struct usb_ep *_ep, struct usb_request *_req, int gfp_flags)
++{
++	struct mpc8272_request *req;
++	struct mpc8272_usbc_ep *ep;
++	struct _mpc8272_udc_dev *usbc_dev;
++        unsigned long flags = 0;
++        int count;
++
++	/* always require a cpu-view buffer so pio works */
++	req = container_of(_req, struct mpc8272_request, req);
++	if (unlikely(!_req || !_req->complete
++		|| !_req->buf || !list_empty(&req->queue)))
++			return -EINVAL;
++	ep = (struct mpc8272_usbc_ep*)container_of(_ep, struct mpc8272_usbc_ep, ep);
++	if (unlikely(!_ep))
++		return -EINVAL;
++	usbc_dev = ep->dev;
++	if (!strcmp(_ep->name, EP0_NAME)) {
++		memcpy (usbc_dev->ctrl_data, _req->buf, _req->length);
++		usbc_dev->ctrl_length = _req->length;
++		_req->status = 0;
++		_req->actual = _req->length;
++		_req->complete(&ep->ep,_req);
++	}
++	if (!strcmp(_ep->name, EP_IN_NAME)) {
++		if (!in_irq()) {
++        		spin_lock_irqsave(&ep->lock,flags);
++		}
++		count = __mpc8272_usbc_buf_room(&usbc_dev->write_buf);
++		if (count < _req->length) {
++			_req->status = -EINPROGRESS;
++			_req->actual = 0;
++			list_add_tail(&req->queue, &ep->queue);
++			if (!in_irq()) {
++		        	spin_unlock_irqrestore(&ep->lock,flags);
++			}
++		 } else {
++			count = __mpc8272_usbc_buf_write (&usbc_dev->write_buf, _req->buf, _req->length);
++			if ((count = __mpc8272_usbc_buf_room(&usbc_dev->write_buf)) ==
++					(usbc_dev->write_buf.size - _req->length) - 1)
++				mpc8272_usbc_kick_tx(usbc_dev);
++			if (!in_irq()) {
++		        	spin_unlock_irqrestore(&ep->lock,flags);
++			}
++			_req->status = 0;
++			_req->actual = count;
++			_req->complete(&ep->ep,_req);
++		}
++	}
++	if (!strcmp(_ep->name, EP_OUT_NAME)) {
++		if (!in_irq()) {
++        		spin_lock_irqsave(&ep->lock,flags);
++		}
++		count = __mpc8272_usbc_buf_len(&usbc_dev->read_buf);
++		if (!count) {
++			_req->status = -EINPROGRESS;
++			_req->actual = 0;
++			list_add_tail(&req->queue, &ep->queue);
++			if (!in_irq()) {
++		        	spin_unlock_irqrestore(&ep->lock,flags);
++			}
++		} else {
++			count = __mpc8272_usbc_buf_read(&usbc_dev->read_buf, _req->buf, _req->length);
++			if (!in_irq()) {
++		        	spin_unlock_irqrestore(&ep->lock,flags);
++			}
++			_req->status = 0;
++			_req->actual = count;
++			_req->complete(&ep->ep,_req);
++		}
++	}
++
++        return 0;
++}
++
++static struct usb_request *
++mpc8272_alloc_request(struct usb_ep *_ep, int gfp_flags)
++{
++	struct mpc8272_request     *req;
++
++	if (!_ep)
++		return NULL;
++	req = kmalloc(sizeof *req, gfp_flags);
++	if (!req)
++		return NULL;
++
++	memset(req, 0, sizeof *req);
++	INIT_LIST_HEAD(&req->queue);
++	return &req->req;
++}
++
++static void
++mpc8262_free_request(struct usb_ep *_ep, struct usb_request *_req)
++{
++	struct mpc8272_request     *req;
++
++	if (!_ep || !_req)
++		return;
++
++	req = container_of(_req, struct mpc8272_request, req);
++	WARN_ON(!list_empty(&req->queue));
++	kfree(req);
++}
++
++static struct usb_ep_ops mpc8272_ep_ops = {
++	.enable = mpc8272_enable,
++	.disable = mpc8272_disable,
++	.alloc_request = mpc8272_alloc_request,
++	.free_request = mpc8262_free_request,
++	.queue = mpc8272_queue,
++}
++
++MODULE_DESCRIPTION (DRIVER_DESC);
++MODULE_AUTHOR ("Gennadiy Kurtsman");
++MODULE_LICENSE ("GPL");
++
++static int  mpc8272_udc_get_frame (struct usb_gadget *_gadget)
++{
++	return 0;
++}
++
++static const struct usb_gadget_ops mpc8272_udc_ops = {
++	.get_frame	= mpc8272_udc_get_frame,
++};
++
++/**********************************************************************************
++ * Callbacks and helpers called from ISR
++ *********************************************************************************/
++
++/* Parse standard setup request */
++static inline int
++mpc8272_usbc_setup(struct mpc8272_usbc_ep *ep, __u8 * data, int len)
++{
++	struct _mpc8272_udc_dev *usbc_dev = ep->dev;
++	struct usb_ctrlrequest *cmd = (struct usb_ctrlrequest *) data;
++	__u16 typeReq, wValue, wIndex, wLength;
++	int ret = -EINVAL;
++	int handshake;
++
++	if (len != 8)
++		return ret;
++
++	typeReq = (cmd->bRequestType << 8) | cmd->bRequest;
++	wValue = le16_to_cpu(cmd->wValue);
++	wIndex = le16_to_cpu(cmd->wIndex);
++	wLength = le16_to_cpu(cmd->wLength);
++	handshake = 1;
++
++	data = usbc_dev->ctrl_data;
++
++	switch (typeReq) {
++	case DeviceRequest | USB_REQ_GET_STATUS:
++	case EndpointRequest | USB_REQ_GET_STATUS:
++	case InterfaceRequest | USB_REQ_GET_STATUS:
++		data[0] = 0;
++		data[1] = 0;
++		len = 2;
++		ret = 0;
++		break;
++
++	case DeviceOutRequest | USB_REQ_SET_ADDRESS:
++		/* Assign address */
++		usbc_dev->address = (__u8) wValue;
++		len = 0;
++		ret = 0;
++		handshake = 0;
++		break;
++
++	default:
++        	spin_unlock (&ep->lock);
++		if (cmd->bRequest == USB_REQ_SET_CONFIGURATION) {
++                        /* according to USB Spec */
++                        usbc_dev->eps[1].pid = UDC_BD_PID1;
++                        usbc_dev->eps[2].pid = UDC_BD_RXPID_0;
++		}
++		ret = usbc_dev->driver->setup (&usbc_dev->gadget, cmd);
++		if (ret >= 0)
++			len=usbc_dev->ctrl_length;
++        	spin_lock (&ep->lock);
++	}
++	if (ret < 0)
++		return ret;
++	else {
++		if (len > wLength)
++			len = wLength;
++		/* this for setup packet must start from DATA1 */
++		ep->pid = UDC_BD_PID1;
++		if ((cmd->bRequest == USB_REQ_GET_DESCRIPTOR) && ((wValue >> 8) == USB_DT_DEVICE)) {
++			((struct usb_device_descriptor*)data)->bMaxPacketSize0 = UDC_USBC_CTL_PACKET_SIZE;
++			if (wLength > 8) {
++				((struct usb_device_descriptor*)data)->idVendor = cpu_to_le16(0x6655);
++				((struct usb_device_descriptor*)data)->idProduct = cpu_to_le16(0xffff);
++			}
++		}
++		if ((cmd->bRequest == USB_REQ_GET_DESCRIPTOR) &&
++			((wValue >> 8) == USB_DT_CONFIG) &&
++			(len == sizeof(struct usb_config_descriptor) +
++				sizeof(struct usb_interface_descriptor) +
++				(sizeof(struct usb_endpoint_descriptor) - 2) * (UDC_USBC_MAX_EPS - 1))) {
++			struct usb_endpoint_descriptor* ed = (struct usb_endpoint_descriptor*)(data +
++				sizeof(struct usb_config_descriptor) +
++				sizeof(struct usb_interface_descriptor));
++			int i;
++
++			for (i=0; i<(UDC_USBC_MAX_EPS - 1); i++) {
++				ed->wMaxPacketSize = cpu_to_le16(UDC_USBC_PACKET_SIZE);
++				ed = (struct usb_endpoint_descriptor*)((u8*)ed + sizeof(struct usb_endpoint_descriptor) -2);
++			}
++		}
++		mpc8272_usbc_tx_data(ep, data, len);
++	}
++	return ret;
++}
++
++/* Prepares for transmit on BULK-IN EP.
++   Called from TX conf ISR and from char/write target
++*/
++static void
++mpc8272_usbc_kick_tx(struct _mpc8272_udc_dev *usbc_dev)
++{
++
++	struct mpc8272_usbc_ep *ep = &usbc_dev->eps[1];	/* bulk-in */
++	int len = __mpc8272_usbc_buf_len_flat(&ep->dev->write_buf);
++
++	if (!len)
++		return;
++	if (len > UDC_USBC_PACKET_SIZE)
++		len = UDC_USBC_PACKET_SIZE;
++	mpc8272_usbc_tx_data(ep, __mpc8272_usbc_buf_data(&ep->dev->write_buf), len);
++}
++
++/* EP0 0 control receive callback */
++static int
++mpc8272_usbc_rx_ctrl(struct mpc8272_usbc_ep *ep, int pid, __u8 * data, __u16 len,
++		 int is_error)
++{
++	int ret;
++
++	if (is_error)
++		return 0;
++
++	if (!len)
++		return 0;	/* It was a setup status. No action required */
++
++	/* Current packet is rejected, new one will be initiated in mpc8272_usbc_setup() */
++	if (ep->data)
++		mpc8272_usbc_tx_recover(ep);
++
++	if (pid != UDC_BD_RXPID_SETUP)
++		ret = -EINVAL;
++	else
++		ret = mpc8272_usbc_setup(ep, data, len);
++
++	if (ret)
++		mpc8272_usbc_tx_handshake(ep->dev, 0, USB_PID_STALL);
++
++	return 0;
++}
++
++/* EP0 1 - bulk in receive callback */
++static int
++mpc8272_usbc_rx_data_in(struct mpc8272_usbc_ep *ep, int pid, __u8 * data, __u16 len,
++		    int is_error)
++{
++	return 0;
++}
++
++/* EP0 2 - bulk out receive callback */
++static int
++mpc8272_usbc_rx_data_out(struct mpc8272_usbc_ep *ep, int pid, __u8 * data, __u16 len,
++		     int is_error)
++{
++	int room_len;
++	struct mpc8272_request *req;
++	int count;
++	struct _mpc8272_udc_dev *usbc_dev = (struct _mpc8272_udc_dev *)ep->dev;
++
++	mpc8272_usbc_tx_handshake(ep->dev, 2, USB_PID_NAK);
++	if (is_error) {
++		goto mpc8272_handshake_exit;
++	}
++
++	/* If pid is not what expected - do nothing */
++	if (pid != ep->pid) {
++		goto mpc8272_handshake_exit;
++	}
++
++	ep->pid = (pid == UDC_BD_RXPID_0) ? UDC_BD_RXPID_1 : UDC_BD_RXPID_0;
++
++	room_len = __mpc8272_usbc_buf_room(&ep->dev->read_buf);
++	if (room_len < len) {
++		return 1;	/* no room */
++	}
++	__mpc8272_usbc_buf_write(&ep->dev->read_buf, data, len);
++	count = __mpc8272_usbc_buf_len(&usbc_dev->read_buf);
++	if (!count)
++		goto mpc8272_handshake_exit;
++	if (list_empty(&ep->queue))
++		goto mpc8272_handshake_exit;
++	req = list_entry(ep->queue.next, struct mpc8272_request, queue);
++	list_del_init(&req->queue);
++	count = __mpc8272_usbc_buf_read(&usbc_dev->read_buf, req->req.buf, req->req.length);
++	req->req.status = 0;
++	req->req.actual = count;
++	req->req.complete (&ep->ep, &req->req);
++
++      mpc8272_handshake_exit:
++	mpc8272_usbc_tx_handshake(ep->dev, 2, USB_PID_ACK);
++
++	return 0;
++}
++
++/* EP0 0 control transmit confirmation callback */
++static void
++mpc8272_usbc_txconf_ctrl(struct mpc8272_usbc_ep *ep, __u16 len, int is_error)
++{
++	if (is_error) {
++		return;
++	}
++	if (ep->dev->address) {	/* Set address pending */
++		ep->dev->usb_rgs->usb_usadr = ep->dev->address;
++		ep->dev->address = 0;
++	}
++	ep->ack_len += len;
++	if (ep->ack_len < ep->data_len) {
++		ep->pid = (ep->pid == UDC_BD_PID1) ? UDC_BD_PID0 : UDC_BD_PID1;
++		mpc8272_usbc_tx(ep, &ep->data[ep->ack_len],
++			    ep->data_len - ep->ack_len,
++			    UDC_BD_TC | UDC_BD_CNF | BD_SC_INTRPT);
++	} else if ((ep->ack_len == ep->data_len)
++		   && !(ep->data_len % ep->max_len)) {
++		ep->pid = (ep->pid == UDC_BD_PID1) ? UDC_BD_PID0 : UDC_BD_PID1;
++		mpc8272_usbc_tx(ep, ep->data, 0,
++			    UDC_BD_TC | UDC_BD_CNF | BD_SC_INTRPT);
++	} else {
++		/* All done */
++		ep->data = NULL;
++	}
++	return;
++}
++
++/* EP0 1 - bulk in transmit confirmation callback */
++static void
++mpc8272_usbc_txconf_data_in(struct mpc8272_usbc_ep *ep, __u16 len, int is_error)
++{
++	struct mpc8272_request *req = NULL;
++	int count;
++	struct _mpc8272_udc_dev *usbc_dev = (struct _mpc8272_udc_dev *)ep->dev;
++
++	if (!is_error) {
++		__mpc8272_usbc_buf_inc_read(&ep->dev->write_buf, len);
++		ep->pid = (ep->pid == UDC_BD_PID0) ? UDC_BD_PID1 : UDC_BD_PID0;
++		while (!(list_empty(&ep->queue))) {
++			req = list_entry(ep->queue.next, struct mpc8272_request, queue);
++			count = __mpc8272_usbc_buf_room(&usbc_dev->write_buf);
++			if (count >= req->req.length) {
++				list_del_init(&req->queue);
++				count = __mpc8272_usbc_buf_write (&usbc_dev->write_buf, req->req.buf,
++					req->req.length);
++				req->req.status = 0;
++				req->req.actual = count;
++				req->req.complete(&ep->ep,&req->req);
++			} else
++			break;
++		}
++	}
++	mpc8272_usbc_kick_tx(ep->dev);
++}
++
++/* EP0 2 - bulk out transmit confirmation callback */
++static void
++mpc8272_usbc_txconf_data_out(struct mpc8272_usbc_ep *ep, __u16 len, int is_error)
++{
++	return;
++}
++
++/* Reset Interrupt handler */
++static void
++mpc8272_usbc_reset_isr(struct _mpc8272_udc_dev *usbc_dev)
++{
++	int i;
++
++	for (i = 0; i < UDC_USBC_MAX_EPS; i++) {
++        	spin_lock(&usbc_dev->eps[i].lock);
++		mpc8272_usbc_tx_recover(&usbc_dev->eps[i]);
++        	spin_unlock(&usbc_dev->eps[i].lock);
++	}
++	usbc_dev->usb_rgs->usb_usadr = 0;
++}
++
++static irqreturn_t mpc8272_usbc_isr (int irq, void *_dev, struct pt_regs * r)
++{
++	struct _mpc8272_udc_dev* usbc_dev = _dev;
++	__u16 usb_usber = usbc_dev->usb_rgs->usb_usber;
++	int i;
++
++	/* Confirm */
++	usbc_dev->usb_rgs->usb_usber = usb_usber;
++
++	if ((usb_usber & UDC_USBE_RXB)) {
++		/* Handle receive */
++		for (i = 0; i < UDC_USBC_MAX_EPS; i++)
++			mpc8272_usbc_rx_isr(usbc_dev, i);
++	}
++	if ((usb_usber & UDC_USBE_TXB)) {
++		/* Handle transmit confirmation */
++		for (i = 0; i < UDC_USBC_MAX_EPS; i++)
++			mpc8272_usbc_tx_isr(usbc_dev, i);
++	}
++	if ((usb_usber & UDC_USBE_RESET)) {
++		/* Reset. Clear address and kill all transactions in progress */
++		mpc8272_usbc_reset_isr(usbc_dev);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int
++mpc8272_usbc_hw_ep_init(struct _mpc8272_udc_dev *usbc_dev, int ep_idx,
++		    int ep_num, __u16 ep_type, int max_len)
++{
++	struct mpc8272_usbc_ep *ep;
++	usb_ep_parms *ep_parms;
++	__u16 ep_parms_offset;
++	volatile __u16 *p_usep_reg;
++	__u16 usep_reg;
++
++	if (ep_idx >= UDC_USBC_MAX_EPS)
++		return -EINVAL;
++
++	ep = &(usbc_dev->eps[ep_idx]);
++	ep->ep.name = ep_name [ep_idx];
++	if (ep_idx)
++		list_add_tail (&usbc_dev->eps[ep_idx].ep.ep_list, &usbc_dev->gadget.ep_list);
++	ep->ep.ops = &mpc8272_ep_ops;
++
++	ep->ep_idx = ep_idx;
++	ep->ep_num = ep_num;
++	ep->dev = usbc_dev;
++	ep->max_len = max_len;
++	p_usep_reg = &usbc_dev->usb_rgs->usb_usep1 + ep_idx;
++	INIT_LIST_HEAD(&ep->queue);
++
++	/* Allocate memory for buffer descriptors */
++	ep->tx_base_offset = cpm_dpalloc(UDC_USBC_TX_BDS * sizeof (mpc8272_cpm_bd),
++			sizeof (mpc8272_cpm_bd));
++	ep->tx_base = (mpc8272_cpm_bd*)(cpm_dpram_addr(ep->tx_base_offset));
++	if (!(ep->tx_base)) {
++		cpm_dpfree(ep->tx_base_offset);
++		ep->tx_base_offset = 0;
++		BUG_ON(ep->tx_base == NULL);
++		return -ENOMEM;
++	}
++	ep->rx_base_offset = cpm_dpalloc(UDC_USBC_RX_BDS * sizeof (mpc8272_cpm_bd),
++                              sizeof (mpc8272_cpm_bd));
++	ep->rx_base = (mpc8272_cpm_bd*)(cpm_dpram_addr(ep->rx_base_offset));
++	if (!(ep->rx_base)) {
++		cpm_dpfree(ep->tx_base_offset);
++		ep->tx_base_offset = 0;
++		ep->tx_base = NULL;
++		cpm_dpfree(ep->rx_base_offset);
++		ep->rx_base_offset = 0;
++		BUG_ON(ep->rx_base == NULL);
++		return -ENOMEM;
++	}
++	ep->tx_bd = ep->conf_bd = ep->tx_base;
++	ep->rx_bd = ep->rx_base;
++	ep_parms_offset = cpm_dpalloc(sizeof (usb_ep_parms),
++			sizeof (usb_ep_parms));
++	ep_parms = (usb_ep_parms*) cpm_dpram_addr(ep_parms_offset);
++	if (ep_parms == NULL) {
++		cpm_dpfree(ep->tx_base_offset);
++		ep->tx_base_offset = 0;
++		ep->tx_base = NULL;
++		cpm_dpfree(ep->rx_base_offset);
++		ep->rx_base_offset = 0;
++		ep->rx_base = NULL;
++		cpm_dpfree(ep_parms_offset);
++		BUG_ON(ep->ep_parms == NULL);
++		return -ENOMEM;
++	}
++	ep->ep_parms = ep_parms;
++	ep->ep_parms_offset = ep_parms_offset;
++	memset((void *) ep_parms, 0, sizeof (usb_ep_parms));
++
++	*(__u16 *) ((unsigned long) &usbc_dev->usb_prms->ep0_ptr +
++		    ep_idx * sizeof (__u16)) =
++	    mpc8272_dpram_offset((void *) ep_parms);
++	ep_parms->rbase = ep_parms->rbptr =
++	    mpc8272_dpram_offset((void *) ep->rx_base);
++	ep_parms->tbase = ep_parms->tbptr =
++	    mpc8272_dpram_offset((void *) ep->tx_base);
++
++	/* for control and bulk pipe, rx buffer is 8 bytes data and 2 bytes CRC */
++	ep_parms->mrblr = UDC_USBC_PACKET_SIZE + 2;
++	ep_parms->tfcr = ep_parms->rfcr = CPMFCR_GBL | UDC_USB_FCR_BO_BE;
++
++	/* Init Tx BD ring */
++	{
++		mpc8272_cpm_bd *_bd = ep->tx_base;
++		memset(ep->tx_base, 0, UDC_USBC_TX_BDS * sizeof (mpc8272_cpm_bd));
++		UDC_BD_STATUS_SET(_bd + UDC_USBC_TX_BDS - 1, BD_SC_WRAP);
++	}
++	/* Allocate Rx buffer pool and init Rx BD ring */
++	ep->rx_pool =
++	    kmalloc(UDC_USBC_RX_BDS * (UDC_USBC_PACKET_SIZE + 4), SLAB_KERNEL);
++	if (!ep->rx_pool) {
++		return -ENOMEM;
++	}
++	/* Init Rx BD ring */
++	{
++		mpc8272_cpm_bd *_bd = ep->rx_base;
++		__u8 *_buf = ep->rx_pool;
++		int _i;
++		for (_i = 0; _i < UDC_USBC_RX_BDS; _i++) {
++			UDC_BD_DATA_SET(_bd, _buf);
++			UDC_BD_LENGTH_SET(_bd, 0);
++			UDC_BD_STATUS_SET(_bd, BD_SC_INTRPT | BD_SC_EMPTY);
++			_bd++;
++			_buf += UDC_USBC_PACKET_SIZE + 4;
++		}
++		UDC_BD_STATUS_SET((--_bd),
++				 BD_SC_INTRPT | BD_SC_WRAP | BD_SC_EMPTY);
++	}
++
++	ep->rx_cb = rx_cb[ep_idx];
++	ep->txconf_cb = txconf_cb[ep_idx];
++
++	ep->ep_type = ep_type;
++	usep_reg = (ep_num << UDC_USEP_NUM_SHIFT) | ep_type;
++	/* IT: */
++	usep_reg |= UDC_USEP_RTE;
++
++	*p_usep_reg = usep_reg;
++
++	mpc8272_usbc_cmd(ep, UDC_CP_CMD_USB_RESTART_TX);
++
++	return 0;
++}
++
++static void
++mpc8272_usbc_hw_deinit(struct _mpc8272_udc_dev *usbc_dev)
++{
++	int i;
++
++	mpc8272_board_usb_iface_deconfig();
++	usbc_dev->usb_rgs->usb_usmod = 0;
++	free_irq(UDC_VEC_USB, usbc_dev);
++	for (i=0; i<ARRAY_SIZE(usbc_dev->eps); i++) {
++		if (usbc_dev->eps[i].tx_base_offset) {
++			cpm_dpfree(usbc_dev->eps[i].tx_base_offset);
++			usbc_dev->eps[i].tx_base_offset = 0;
++		}
++		usbc_dev->eps[i].tx_base = NULL;
++		if (usbc_dev->eps[i].rx_base_offset) {
++			cpm_dpfree(usbc_dev->eps[i].rx_base_offset);
++			usbc_dev->eps[i].rx_base_offset = 0;
++		}
++		usbc_dev->eps[i].rx_base = NULL;
++		if (usbc_dev->eps[i].ep_parms_offset) {
++			cpm_dpfree(usbc_dev->eps[i].ep_parms_offset);
++			usbc_dev->eps[i].ep_parms_offset = 0;
++		}
++		usbc_dev->eps[i].ep_parms = NULL;
++	}
++}
++
++static int
++mpc8272_usbc_hw_init(struct _mpc8272_udc_dev *usbc_dev)
++{
++	cpm2_map_t *intram;
++	usb_parms *usb_prms;
++	usb_cpm2_t *usb_rgs;
++	int ret;
++
++	/* Get IMMR address, USB params */
++	intram = usbc_dev->intram = (cpm2_map_t *) CPM_MAP_ADDR;
++	usb_prms = usbc_dev->usb_prms = &intram->pram.usb;
++	usb_rgs = usbc_dev->usb_rgs = &intram->im_usb;
++
++	/*relevant parallel IO ports & CPM MUX configuration */
++	mpc8272_usb_hw_config(usbc_dev->intram);
++
++	/* Enable i/f on board level */
++	mpc8272_board_usb_iface_config();
++
++	/* Initialize USB parameters RAM and registers */
++	memset((void *) usb_prms, 0, sizeof (usb_parms));
++
++	/* Initialize endpoints */
++	INIT_LIST_HEAD (&usbc_dev->gadget.ep_list);
++	usbc_dev->gadget.ep0 = &usbc_dev->eps[0].ep;
++	ret = mpc8272_usbc_hw_ep_init(usbc_dev, 0, 0, UDC_USEP_TM_CTRL,
++				 UDC_USBC_CTL_PACKET_SIZE);
++	ret = ret ? ret : mpc8272_usbc_hw_ep_init(usbc_dev, 1, 1, UDC_USEP_TM_BULK,
++					   UDC_USBC_PACKET_SIZE);
++	ret = ret ? ret : mpc8272_usbc_hw_ep_init(usbc_dev, 2, 2, UDC_USEP_TM_BULK,
++					   UDC_USBC_PACKET_SIZE);
++	usbc_dev->eps[1].pid = UDC_BD_PID0;
++	usbc_dev->eps[2].pid = UDC_BD_RXPID_0;
++	usb_rgs->usb_usber = 0xffff;
++	usb_rgs->usb_usbmr = UDC_USBE_TXE0 | UDC_USBE_BSY | UDC_USBE_TXB
++			| UDC_USBE_RXB | UDC_USBE_RESET;
++
++	ret = ret ? ret : request_irq(UDC_VEC_USB, mpc8272_usbc_isr, SA_RESTART, "usbtty",
++				   usbc_dev);
++
++	if (!ret)
++		usbc_dev->usb_rgs->usb_usmod = UDC_USMOD_ENABLE;
++
++	return ret;
++}
++
++static int __init init (void)
++{
++	int ret = 0;
++
++	if (the_controller) {
++		WARN_ON(the_controller);
++                return -EBUSY;
++	}
++        the_controller = kmalloc(sizeof (struct _mpc8272_udc_dev), SLAB_KERNEL);
++        if (!the_controller) {
++		WARN_ON(!the_controller);
++                return -ENOMEM;
++	}
++        memset(the_controller, 0, sizeof (struct _mpc8272_udc_dev));
++	the_controller->gadget.ops = &mpc8272_udc_ops;
++	spin_lock_init(&the_controller->eps[0].lock);
++	spin_lock_init(&the_controller->eps[1].lock);
++	spin_lock_init(&the_controller->eps[2].lock);
++	strcpy (the_controller->gadget.dev.bus_id, "gadget");
++	the_controller->gadget.name = driver_name;
++	__mpc8272_usbc_buf_init(&the_controller->read_buf, MPC8272_USBC_BUF_SIZE);
++	__mpc8272_usbc_buf_init(&the_controller->write_buf, MPC8272_USBC_BUF_SIZE);
++	ret = mpc8272_usbc_hw_init(the_controller);
++	if (ret) {
++		mpc8272_usbc_hw_deinit(the_controller);
++		kfree(the_controller);
++		the_controller = NULL;
++		printk("Unable to initialize USB peripheral device\n");
++	} else
++		printk("MPC8272 USB peripheral device\n");
++	device_register (&the_controller->gadget.dev);
++	return ret;
++
++}
++module_init (init);
++
++static void __exit cleanup (void)
++{
++	if (!the_controller)
++		return;
++	mpc8272_usbc_hw_deinit(the_controller);
++	kfree (the_controller);
++	the_controller = NULL;
++}
++module_exit (cleanup);
+Index: linux-2.6.10/drivers/usb/gadget/mpc8272_usb_hw.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/gadget/mpc8272_usb_hw.c
+@@ -0,0 +1,209 @@
++/*******************************************************************
++ * mpc8272_usb_hw.c 2004/04/20
++ *
++ * mpc8272ads reference board usb hardware initialization
++ *
++ * Author: Vitaly Bordug <source@mvista.com>
++ *
++ * Copyright (c) 2004 Motorola, Dave Liu (Daveliu@motorola.com)
++ *
++ * Copyright (c) 2005 MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++  *******************************************************************/
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/ioport.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/smp_lock.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/timer.h>
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/moduleparam.h>
++#include <linux/device.h>
++#include <linux/usb_ch9.h>
++#include <linux/usb_gadget.h>
++
++#include <asm/byteorder.h>
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <asm/irq.h>
++#include <asm/system.h>
++#include <asm/unaligned.h>
++#include <asm/immap_cpm2.h>
++#include <asm/cpm2.h>
++#include <asm/mpc8260.h>
++#include "mpc8272_udc.h"
++
++#define USB_HIGHSPEED            1
++#define USB_LOWSPEED             0
++#define USB_VCC_SUPPLY           1
++#define USB_VCC_NOT_SUPPLY       0
++#define USB_ENABLE               1
++#define USB_DISABLE              0
++
++static void
++mpc8272_usb_clock_cmxscr_set(cpm2_map_t * immr)
++{
++	unsigned int tmp, cpm_mux_cmxscr;
++
++	/* 111 SCC3 receive clock is CLK8, 111 SCC3 transmit/USB clock is CLK8 */
++	tmp = 0x00003f00;
++	cpm_mux_cmxscr = immr->im_cpmux.cmx_scr;
++	cpm_mux_cmxscr &= ~0x00ff3f00;
++	cpm_mux_cmxscr |= tmp;
++	immr->im_cpmux.cmx_scr = cpm_mux_cmxscr;
++
++}
++
++static void
++mpc8272_usb_clock_io_pin_connect(cpm2_map_t * immr)
++{
++	unsigned int tmp;
++
++	/* USB clock use port c */
++	tmp = immr->im_ioport.iop_pdirc;
++	immr->im_ioport.iop_pdirc = tmp & ~0x00000080;
++	tmp = immr->im_ioport.iop_pparc;
++	immr->im_ioport.iop_pparc = tmp | 0x00000080;
++	tmp = immr->im_ioport.iop_psorc;
++	immr->im_ioport.iop_psorc = tmp & ~0x00000080;
++
++}
++
++static void
++mpc8272_usb_clock_config(cpm2_map_t * immr)
++{
++	mpc8272_usb_clock_cmxscr_set(immr);
++	mpc8272_usb_clock_io_pin_connect(immr);
++}
++
++static void
++mpc8272_usb_io_pin_config(cpm2_map_t * immr)
++{
++	unsigned int tmp = 0;
++
++	/*
++	   port      signal    par    sor    odr    dir
++
++	   pd[23]      TP        1      0      0      1
++	   pd[24]      TN        1      0      0      1
++	   pd[25]      RXD       1      0      0      0
++	   pc[10]      RN        1      0      1      0
++	   pc[11]      RP        1      0      1      0
++	   pc[20]      OE        1      0      0      1
++
++	 */
++
++	tmp = immr->im_ioport.iop_pdird;
++	immr->im_ioport.iop_pdird = tmp & ~0x00000040;	/* pdird[25] = 0 */
++	tmp = immr->im_ioport.iop_ppard;
++	immr->im_ioport.iop_ppard = tmp | 0x00000040;	/* ppard[25] = 1 */
++	tmp = immr->im_ioport.iop_pdirc;
++	immr->im_ioport.iop_pdirc = tmp & ~0x00300000;	/* pdirc[10,11] = 0 */
++	tmp = immr->im_ioport.iop_pparc;
++	immr->im_ioport.iop_pparc = tmp | 0x00300000;	/* pparc[10,11] = 1 */
++	tmp = immr->im_ioport.iop_psorc;
++	immr->im_ioport.iop_psorc = tmp & ~0x00300000;	/* psorc[10,11] = 0 */
++	tmp = immr->im_ioport.iop_podrc;
++	immr->im_ioport.iop_podrc = tmp | 0x00300000;	/* podrc[10,11] = 1 */
++	tmp = immr->im_ioport.iop_pdird;
++	immr->im_ioport.iop_pdird = tmp | 0x00000180;	/* pdird[23,24] = 1 */
++	tmp = immr->im_ioport.iop_ppard;
++	immr->im_ioport.iop_ppard = tmp | 0x00000180;	/* ppard[23,24] = 1 */
++	tmp = immr->im_ioport.iop_psord;
++	immr->im_ioport.iop_psord = tmp & ~0x000001c0;	/* psord[23,24,25] = 0 */
++	tmp = immr->im_ioport.iop_pdirc;
++	immr->im_ioport.iop_pdirc = tmp | 0x00000800;	/* pdirc[20] = 1 */
++	tmp = immr->im_ioport.iop_pparc;
++	immr->im_ioport.iop_pparc = tmp | 0x00000800;	/* pparc[20] = 1 */
++
++}
++
++void
++mpc8272_usb_hw_config(cpm2_map_t * immr)
++{
++	mpc8272_usb_clock_config(immr);
++	mpc8272_usb_io_pin_config(immr);
++}
++
++void
++mpc8272_board_usb_iface_speed(int speed)
++{
++	unsigned int *bscr3;
++	unsigned int bscr3_val;
++	bscr3 = (unsigned int *) (BCSR_ADDR + 0x0c);
++	bscr3_val = *bscr3;
++
++	if (speed == USB_HIGHSPEED)
++		bscr3_val &= ~BCSR3_USB_LOW_SPEED;
++	else
++		bscr3_val |= BCSR3_USB_LOW_SPEED;
++
++	*bscr3 = bscr3_val;
++
++}
++
++void
++mpc8272_board_usb_iface_vcc_supply(int supply)
++{
++	unsigned int *bscr3;
++	unsigned int bscr3_val;
++	bscr3 = (unsigned int *) (BCSR_ADDR + 0x0c);
++	bscr3_val = *bscr3;
++
++	if (supply == USB_VCC_SUPPLY)
++		bscr3_val |= BCSR3_USB_SUPPLY_VCC5V;
++	else
++		bscr3_val &= ~BCSR3_USB_SUPPLY_VCC5V;
++
++	*bscr3 = bscr3_val;
++}
++
++void
++mpc8272_board_usb_iface_enable(int enable)
++{
++	unsigned int *bscr3;
++	unsigned int bscr3_val;
++	bscr3 = (unsigned int *) (BCSR_ADDR + 0x0c);
++	bscr3_val = *bscr3;
++
++	if (enable == USB_ENABLE)
++		bscr3_val &= ~BCSR3_USB_DISABLE;
++	else
++		bscr3_val |= BCSR3_USB_DISABLE;
++
++	*bscr3 = bscr3_val;
++}
++
++void
++mpc8272_board_usb_iface_config(void)
++{
++	/* high speed, vcc supply disable, usb enable */
++	mpc8272_board_usb_iface_speed(USB_HIGHSPEED);
++	mpc8272_board_usb_iface_vcc_supply(USB_VCC_NOT_SUPPLY);
++	mpc8272_board_usb_iface_enable(USB_ENABLE);
++
++}
++
++unsigned short
++mpc8272_dpram_offset(void *addr)
++{
++	unsigned long base = (unsigned long) (CPM_MAP_ADDR);
++	unsigned long offset = (unsigned long) ((unsigned long) addr - base);
++	return (unsigned short) offset;
++}
++
++void
++mpc8272_board_usb_iface_deconfig(void)
++{
++	mpc8272_board_usb_iface_enable(USB_DISABLE);
++}
+Index: linux-2.6.10/include/asm-ppc/immap_cpm2.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/immap_cpm2.h
++++ linux-2.6.10/include/asm-ppc/immap_cpm2.h
+@@ -10,6 +10,16 @@
+ #ifndef __IMMAP_CPM2__
+ #define __IMMAP_CPM2__
+ 
++/* RISC Timer table parameters*/
++typedef struct rtimer_params {
++	ushort  tm_base;
++	ushort  tm_ptr;
++	ushort  r_tmr;
++	ushort  r_tmv;
++	uint    tm_cmd;
++	uint tm_cnt;
++} rtmr_parms;
++
+ /* System configuration registers.
+ */
+ typedef	struct sys_82xx_conf {
+@@ -545,6 +555,41 @@ typedef struct comm_proc {
+ 	u8	res4[12];
+ } cpm_cpm2_t;
+ 
++/* USB parameters table*/
++typedef struct usb_params {
++	ushort 	ep0_ptr;
++	ushort 	ep1_ptr;
++	ushort 	ep2_ptr;
++	ushort 	ep3_ptr;
++	uint 	rstate;
++	uint 	rptr;
++	ushort	frame_n;
++	ushort	rbcnt; /*receive internal byte count*/
++	uint 	rtemp;
++	uint	rxusb_data;
++	ushort	rxuptr;
++	ushort 	res1;
++} __attribute__ ((packed)) usb_parms;
++
++/* USB Endpoint parameters*/
++typedef struct usb_ep_params
++{
++	u16 	rbase; /* RX BD ring */
++	u16 	tbase; /* TX BD ring */
++	u8 	rfcr;
++	u8	tfcr;
++	u16	mrblr; /* max RX packet */
++	u16	rbptr; /* RX BD pointer */
++	u16	tbptr; /* TX --//--  */
++	u32	tstate;
++	u32	tptr;
++	u16 	tcrc;
++	u16	tbcnt;
++	u32 	ttemp;
++	u16	tx_usbuptr;
++	u16 	res1;
++} __attribute__ ((packed)) usb_ep_parms;
++
+ /* USB Controller.
+ */
+ typedef struct usb_ctlr {
+@@ -574,7 +619,35 @@ typedef struct immap {
+ #define im_dprambase	im_dpram1
+ 	u8		im_dpram1[16*1024];
+ 	u8		res1[16*1024];
++#ifdef CONFIG_ADS8272
++	struct ads_pram_t {
++		u8	scc[4][256];
++		u8	fcc[3][256];
++		u8	mcc[128];
++		u8	res1[124];
++		u16	smc1_base;
++		u16	idma1_base;
++		u8	mcc2[128];
++		u8	res2[124];
++		u16	smc2_base;
++		u16	idma2_base;
++		u8	res3[252];
++		u16	spi_base;
++		u16	idma3_base;
++		u8	res4[224];
++		rtmr_parms	r_tmr;
++		u16	rev_num;
++		u8	res5[2];
++		u8	res6[4];
++		u32	rand;
++		u16	i2c_base;
++		u16	idma4_base;
++		usb_parms	usb;
++		u8	res7[1248];
++	} __attribute__ ((packed)) pram;
++#else
+ 	u8		im_dpram2[4*1024];
++#endif
+ 	u8		res2[8*1024];
+ 	u8		im_dpram3[4*1024];
+ 	u8		res3[16*1024];
+Index: linux-2.6.10/drivers/usb/gadget/Makefile
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/Makefile
++++ linux-2.6.10/drivers/usb/gadget/Makefile
+@@ -1,6 +1,8 @@
+ #
+ # USB peripheral controller drivers
+ #
++mpc8272_udcper-objs		:= mpc8272_udc.o mpc8272_usb_hw.o
++
+ obj-$(CONFIG_USB_DUMMY_HCD)	+= dummy_hcd.o
+ obj-$(CONFIG_USB_NET2280)	+= net2280.o
+ obj-$(CONFIG_USB_PXA2XX)	+= pxa2xx_udc.o
+@@ -8,6 +10,7 @@ obj-$(CONFIG_USB_GOKU)		+= goku_udc.o
+ obj-$(CONFIG_USB_OMAP)		+= omap_udc.o
+ obj-$(CONFIG_USB_LH7A40X)	+= lh7a40x_udc.o
+ obj-$(CONFIG_USB_PXA27X)	+= pxa27x_udc.o
++obj-$(CONFIG_USB_MPC8272ADS)	+= mpc8272_udcper.o
+ obj-$(CONFIG_USB_MUSBHSFC)	+= musbhsfc_udc.o
+ 
+ #
+Index: linux-2.6.10/drivers/usb/gadget/Kconfig
+===================================================================
+--- linux-2.6.10.orig/drivers/usb/gadget/Kconfig
++++ linux-2.6.10/drivers/usb/gadget/Kconfig
+@@ -238,6 +238,12 @@ config USB_OTG
+ 
+ 	   Select this only if your OMAP board has a Mini-AB connector.
+ 
++config USB_MPC8272ADS
++	boolean "MPC8272ADS Support"
++	depends on ADS8272
++	help
++	   Intended to support USB serial gadget.
++
+ config USB_GADGET_MUSBHSFC
+ 	boolean "Inventra MUSBHSFC"
+ 	depends on 440EP
+Index: linux-2.6.10/drivers/usb/gadget/mpc8272_udc.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/usb/gadget/mpc8272_udc.h
+@@ -0,0 +1,547 @@
++/*
++ * drivers/usb/gadget/mpc8272_udc.h
++ *
++ * MPC8272ADS USB peripheral device TTY driver necessary defines
++ *
++ * Author: Gennadiy Kurtsman <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++#ifndef __MPC8272_UDC_H__
++#define __MPC8272_UDC_H__
++
++/* mpc8272ads controls */
++#define BCSR3_USB_SUPPLY_VCC5V	0x20000000
++#define BCSR3_USB_LOW_SPEED	0x40000000
++#define BCSR3_USB_DISABLE	0x80000000
++
++/* USB rx status fields */
++#define UDC_BD_RXPID_MASK   0x00c0
++#define UDC_BD_RXPID_0      0x0000
++#define UDC_BD_RXPID_1      0x0040
++#define UDC_BD_RXPID_SETUP  0x0080
++#define UDC_BD_NO    0x0010	/* Rx non-octet aligned packet */
++#define UDC_BD_AB    0x0008	/* Frame aborted (bit stuff error) */
++#define UDC_BD_CRC   0x0004	/* CRC error */
++#define UDC_BD_OV    0x0002	/* Overrun */
++#define UDC_BD_CLEAN 0x3000
++#define UDC_BD_LAST  0x0800
++
++/* USB tx status fields */
++#define UDC_BD_TC    0x0400	/* Transmit CRC */
++#define UDC_BD_CNF   0x0200	/* Expect for confirmation before sending the next packet */
++#define UDC_BD_LSP   0x0100	/* Low-speed transaction */
++#define UDC_BD_PID0  0x0080	/* Transmit DATA0 PID */
++#define UDC_BD_PID1  0x00c0	/* Transmit DATA1 PID */
++#define UDC_BD_NAK   0x0010	/* NAK received */
++#define UDC_BD_STAL  0x0008	/* STALL received */
++#define UDC_BD_TO    0x0004	/* Timeout */
++#define UDC_BD_UN    0x0002	/* Underrun */
++#define UDC_BD_USB_TXERR   (UDC_BD_NAK | UDC_BD_STAL | UDC_BD_TO | UDC_BD_UN)
++#define UDC_BD_USB_RXERR   (UDC_BD_NO | UDC_BD_AB | UDC_BD_CRC | UDC_BD_OV)
++
++/*--------------------------------*/
++/*  BD access macros              */
++/*--------------------------------*/
++#define UDC_BD_STATUS(_bd)                (((mpc8272_cpm_bd *)(_bd))->status)
++#define UDC_BD_STATUS_SET(_bd, _val)      (((mpc8272_cpm_bd *)(_bd))->status = _val)
++#define UDC_BD_LENGTH(_bd)                (((mpc8272_cpm_bd *)(_bd))->len)
++#define UDC_BD_LENGTH_SET(_bd, _val)      (((mpc8272_cpm_bd *)(_bd))->len = _val)
++#define UDC_BD_DATA_CLEAR(_bd)            (((mpc8272_cpm_bd *)(_bd))->data = 0)
++#define UDC_BD_IS_DATA(_bd)               (&((mpc8272_cpm_bd *)(_bd))->data)
++#define UDC_BD_DATA(_bd)                  ((u8*) (__va(((mpc8272_cpm_bd *)(_bd))->data)))
++#define UDC_BD_DATA_SET(_bd, _data)       (((mpc8272_cpm_bd *)(_bd))->data = __pa(_data))
++#define UDC_BD_ADVANCE(_bd,_status,_base) (((_status) & BD_SC_WRAP) ? (_bd)=(_base) : ++((mpc8272_cpm_bd *)(_bd)))
++
++/* USB related CPM commands */
++#define UDC_CP_CMD_USB_STOP_TX    10
++#define UDC_CP_CMD_USB_RESTART_TX 11
++
++/* USB registers values */
++#define UDC_USMOD_LSS       0x80	/* Low-speed operation */
++#define UDC_USMOD_RESUME    0x40	/* Generate resume condition (function only) */
++#define UDC_USMOD_TEST      0x04	/* Test (loopback) mode */
++#define UDC_USMOD_HOST      0x02	/* USB host mode */
++#define UDC_USMOD_ENABLE    0x01	/* USB enable */
++
++#define UDC_USEP_NUM_MASK   0xf000	/* Endpoint number mask */
++#define UDC_USEP_NUM_SHIFT  12
++#define UDC_USEP_TM_CTRL    0x0000	/* Transfer mode: control */
++#define UDC_USEP_TM_ISO     0x0300	/* Transfer mode: isochronous */
++#define UDC_USEP_TM_BULK    0x0200	/* Transfer mode: bulk (function only) */
++#define UDC_USEP_TM_INT     0x0100	/* Transfer mode: interrupt (function only) */
++#define UDC_USEP_MF         0x0020	/* Multiframe enable */
++#define UDC_USEP_RTE        0x0010	/* Retransmit enable (function only) */
++#define UDC_USEP_THS_NORMAL 0x0000	/* Tx handshake: 0-normal, 1-ignore IN, 2-force NACK, 11-force STALL */
++#define UDC_USEP_RHS_NORMAL 0x0000	/* Rx handshake: 0-normal, 1-ignore OUT, 2-force NACK, 11-force STALL */
++
++#define UDC_USCOM_STR       0x80	/* Start FIFO fill */
++#define UDC_USCOM_FLUSH     0x40	/* Flush FIFO */
++
++#define UDC_USBE_RESET      0x0200	/* Reset condition detected */
++#define UDC_USBE_IDLE       0x0100	/* Idle status changed */
++#define UDC_USBE_TXE3       0x0080	/* Tx error: EP3 */
++#define UDC_USBE_TXE2       0x0040	/* Tx error: EP2 */
++#define UDC_USBE_TXE1       0x0020	/* Tx error: EP1 */
++#define UDC_USBE_TXE0       0x0010	/* Tx error: EP0 */
++#define UDC_USBE_SOF        0x0008	/* SOF received */
++#define UDC_USBE_BSY        0x0004	/* Busy condition (no rx buffer) */
++#define UDC_USBE_TXB        0x0002	/* A buffer has been transmitted */
++#define UDC_USBE_RXB        0x0001	/* A buffer has been received */
++
++/* RFCR/TFCR fields */
++#define UDC_USB_FCR_BO_PPC   0x08	/* PPC little endian (dword byte swapping) */
++#define UDC_USB_FCR_BO_BE    0x18	/* MOT mode: big endian */
++
++#define UDC_VEC_USB   11
++
++/* USB Console stuff*/
++#define UDC_USBC_DEVICE_NAME    "usb-tty"
++#define UDC_USBC_BUF_SIZE       128
++#define UDC_USBC_BUS_CLOCK      mpc8272_xclk8
++#define UDC_USBC_TX_BDS         4	/* Tx BD ring size */
++#define UDC_USBC_RX_BDS         16	/* Rx BD ring size */
++#define UDC_USBC_PACKET_SIZE    8	/* Max packet size */
++#define UDC_USBC_CTL_PACKET_SIZE 16	/* Max packet size for CTL endpoint */
++#define UDC_USBC_MAX_EPS        3	/* Max number of endpoints */
++#define UDC_USBC_PQID           0
++#define UDC_USBC_CTL_DATA_LEN   80
++#define UDC_USBC_TRACE_SIZE     64
++#define UDC_SERIAL_TTY_MAJOR    189
++#define UDC_SERIAL_TTY_MINORS   1
++
++#define UDC_USEP_RHS_MASK   0x0003
++#define UDC_USEP_RHS_ACK    0x0000
++#define UDC_USEP_RHS_NAK    0x0002
++#define UDC_USEP_RHS_STALL  0x0003
++
++#define MPC8272_USBC_BUF_SIZE		128
++#define MPC8272_USBC_MAX_EPS		3       /* Max number of endpoints */
++#define MPC8272_USBC_CTL_DATA_LEN	80
++
++/*
++ * USB Packet IDs (PIDs)
++ */
++#define USB_PID_UNDEF_0			0xf0
++#define USB_PID_OUT			0xe1
++#define USB_PID_ACK			0xd2
++#define USB_PID_DATA0			0xc3
++#define USB_PID_PING			0xb4	/* USB 2.0 */
++#define USB_PID_SOF			0xa5
++#define USB_PID_NYET			0x96	/* USB 2.0 */
++#define USB_PID_DATA2			0x87	/* USB 2.0 */
++#define USB_PID_SPLIT			0x78	/* USB 2.0 */
++#define USB_PID_IN			0x69
++#define USB_PID_NAK			0x5a
++#define USB_PID_DATA1			0x4b
++#define USB_PID_PREAMBLE		0x3c	/* Token mode */
++#define USB_PID_ERR			0x3c	/* USB 2.0: handshake mode */
++#define USB_PID_SETUP			0x2d
++#define USB_PID_STALL			0x1e
++#define USB_PID_MDATA			0x0f	/* USB 2.0 */
++
++/* (shifted) direction/type/recipient from the USB 2.0 spec, table 9.2 */
++#define DeviceRequest \
++	((USB_DIR_IN|USB_TYPE_STANDARD|USB_RECIP_DEVICE)<<8)
++#define DeviceOutRequest \
++	((USB_DIR_OUT|USB_TYPE_STANDARD|USB_RECIP_DEVICE)<<8)
++
++#define InterfaceRequest \
++	((USB_DIR_IN|USB_TYPE_STANDARD|USB_RECIP_INTERFACE)<<8)
++
++#define EndpointRequest \
++	((USB_DIR_IN|USB_TYPE_STANDARD|USB_RECIP_ENDPOINT)<<8)
++#define EndpointOutRequest \
++	((USB_DIR_OUT|USB_TYPE_STANDARD|USB_RECIP_ENDPOINT)<<8)
++
++/* Struct definitions */
++
++struct mpc8272_request {
++        struct usb_request              req;
++        struct list_head                queue;
++};
++
++typedef struct mpc8272_cpm_bd_s {
++	u16 status;
++	u16 len;
++	u32 data;
++} mpc8272_cpm_bd;
++
++/* IO buf:
++   empty: read==write
++   full: next_write==read
++*/
++struct mpc8272_usbc_buf {
++	int read_pos;
++	int write_pos;
++	int size;
++	__u8 buffer[MPC8272_USBC_BUF_SIZE];
++	struct semaphore sem;
++};
++
++struct mpc8272_usbc_ep;
++typedef int (*mpc8272_usbc_rx_callback) (struct mpc8272_usbc_ep * ep, int pid,
++			__u8 * data, __u16 len, int is_error);
++typedef void (*mpc8272_usbc_txconf_callback) (struct mpc8272_usbc_ep * ep, __u16 len,
++			int is_error);
++
++/* Endpoint */
++struct mpc8272_usbc_ep {
++	struct usb_ep ep;
++	struct _mpc8272_udc_dev *dev;
++	int ep_idx;		/* Endpoint index */
++	int ep_num;		/* Number of the endpoint */
++	__u16 ep_type;		/* Endpoint type: bulk, control, interrupt, iso */
++	struct usb_endpoint_descriptor* desc;
++	usb_ep_parms *ep_parms;	/* EP parameters area */
++	__u16 ep_parms_offset;	/* dual-port memory offset */
++	mpc8272_cpm_bd *tx_base;	/* 1st BD in Tx BD ring */
++	__u16 tx_base_offset;		/* dual-port memory offset */
++	mpc8272_cpm_bd *rx_base;	/* 1st BD in Rx BD ring */
++	__u16 rx_base_offset;		/* dual-port memory offset */
++	mpc8272_cpm_bd *conf_bd;	/* Next bd to confirm */
++	mpc8272_cpm_bd *tx_bd;	/* Next tx bd */
++	mpc8272_cpm_bd *rx_bd;	/* Next rx bd */
++	__u8 *rx_pool;
++	mpc8272_usbc_rx_callback rx_cb;
++	mpc8272_usbc_txconf_callback txconf_cb;
++	spinlock_t lock;
++	struct list_head queue;
++	/* State variables */
++	__u8 *data;
++	__u16 pid;
++	int max_len;
++	int data_len;
++	int ack_len;
++};
++
++struct _mpc8272_udc_dev {
++	struct usb_gadget		gadget;
++	struct usb_gadget_driver 	*driver;
++
++	struct mpc8272_usbc_ep eps[MPC8272_USBC_MAX_EPS];
++
++	/* Useful addresses */
++	cpm2_map_t *intram;
++	usb_parms *usb_prms;
++	usb_cpm2_t *usb_rgs;
++
++	/* IO buffers */
++	struct mpc8272_usbc_buf read_buf;
++	struct mpc8272_usbc_buf write_buf;
++
++	/* Control variables */
++	__u8 ctrl_data[MPC8272_USBC_CTL_DATA_LEN];
++	int ctrl_length;
++	int address;
++};
++
++static inline void
++__mpc8272_usbc_buf_init(struct mpc8272_usbc_buf *buf, int size)
++{
++	buf->size = size;
++	buf->read_pos = buf->write_pos = 0;
++	init_MUTEX(&buf->sem);
++}
++
++static inline int
++__mpc8272_usbc_buf_len(struct mpc8272_usbc_buf *buf)
++{
++	int len;
++	if (buf->write_pos >= buf->read_pos)
++		len = buf->write_pos - buf->read_pos;
++	else
++		len = buf->size - buf->read_pos + buf->write_pos;
++	return len;
++}
++
++static inline int
++__mpc8272_usbc_buf_len_flat(struct mpc8272_usbc_buf *buf)
++{
++	int len;
++	if (buf->write_pos >= buf->read_pos)
++		len = buf->write_pos - buf->read_pos;
++	else
++		len = buf->size - buf->read_pos;
++	return len;
++}
++
++static inline __u8 *
++__mpc8272_usbc_buf_data(struct mpc8272_usbc_buf *buf)
++{
++	return buf->buffer + buf->read_pos;
++}
++
++static inline int
++__mpc8272_usbc_buf_room(struct mpc8272_usbc_buf *buf)
++{
++	int len;
++	if (buf->write_pos >= buf->read_pos)
++		len = buf->size - buf->write_pos + buf->read_pos - 1;
++	else
++		len = buf->read_pos - buf->write_pos - 1;
++	return len;
++}
++
++static inline int
++__mpc8272_usbc_buf_inc_read(struct mpc8272_usbc_buf *buf, int len)
++{
++	int pos = buf->read_pos + len;
++	buf->read_pos = pos % buf->size;
++	return buf->read_pos;
++}
++
++static inline int
++__mpc8272_usbc_buf_inc_write(struct mpc8272_usbc_buf *buf, int len)
++{
++	int pos = buf->write_pos + len;
++	buf->write_pos = pos % buf->size;
++	return buf->write_pos;
++}
++
++/**********************************************************************************
++ * IO buffer helpers
++ *********************************************************************************/
++
++static inline int
++__mpc8272_usbc_buf_write(struct mpc8272_usbc_buf *buf, const __u8 * data, int len)
++{
++	int buf_len = __mpc8272_usbc_buf_room(buf);
++	int tail_len = buf->size - buf->write_pos;
++
++	if (len > buf_len) {
++		len = buf_len;
++	}
++	if (tail_len > len)
++		tail_len = len;
++	memcpy(&buf->buffer[buf->write_pos], data, tail_len);
++	__mpc8272_usbc_buf_inc_write(buf, tail_len);
++	data += tail_len;
++	if (len > tail_len) {
++		memcpy(&buf->buffer[0], data, len - tail_len);
++		__mpc8272_usbc_buf_inc_write(buf, len - tail_len);
++	}
++	return len;
++}
++
++static inline int
++__mpc8272_usbc_buf_writeuser(struct mpc8272_usbc_buf *buf, const __u8 * data, int len)
++{
++	int buf_len = __mpc8272_usbc_buf_room(buf);
++	int tail_len = buf->size - buf->write_pos;
++
++	if (len > buf_len)
++		len = buf_len;
++	if (tail_len > len)
++		tail_len = len;
++	copy_from_user(&buf->buffer[buf->write_pos], data, tail_len);
++	__mpc8272_usbc_buf_inc_write(buf, tail_len);
++	data += tail_len;
++	if (len > tail_len) {
++		copy_from_user(&buf->buffer[0], data, len - tail_len);
++		__mpc8272_usbc_buf_inc_write(buf, len - tail_len);
++	}
++	return len;
++}
++
++static inline int
++__mpc8272_usbc_buf_read(struct mpc8272_usbc_buf *buf, __u8 * data, int len)
++{
++	int buf_len = __mpc8272_usbc_buf_len(buf);
++	int tail_len = buf->size - buf->read_pos;
++
++	if (len > buf_len)
++		len = buf_len;
++	if (tail_len > len)
++		tail_len = len;
++	memcpy(data, &buf->buffer[buf->read_pos], tail_len);
++	__mpc8272_usbc_buf_inc_read(buf, tail_len);
++	data += tail_len;
++	if (len > tail_len) {
++		memcpy(data, &buf->buffer[0], len - tail_len);
++		__mpc8272_usbc_buf_inc_read(buf, len - tail_len);
++	}
++	return len;
++}
++
++#define UDC_CP_USB_DEV 0x2e600000	/* See UM, 5.3.1 */
++static inline void
++mpc8272_usbc_cmd(struct mpc8272_usbc_ep *ep, __u32 cmd)
++{
++	unsigned long flags = 0;
++
++	if (!in_irq()) {
++		save_and_cli(flags);
++		spin_lock(&ep->lock);
++	}
++	(volatile unsigned __iomem )ep->dev->intram->im_cpm.cp_cpcr = (cmd | CPM_CR_FLG | UDC_CP_USB_DEV | ep->ep_idx << 4);
++	mb();
++	/* Wait for the CR_FLG to clear */
++	while ((volatile unsigned __iomem)ep->dev->intram->im_cpm.cp_cpcr & CPM_CR_FLG)
++		mb();
++	if (!in_irq()) {
++		spin_unlock(&ep->lock);
++		restore_flags(flags);
++	}
++}
++
++static inline void
++mpc8272_usbc_tx_recover(struct mpc8272_usbc_ep *ep)
++{
++	mpc8272_cpm_bd *bd = ep->conf_bd;
++	/* Stop TX (just in case - should have stopped by itself) */
++	mpc8272_usbc_cmd(ep, UDC_CP_CMD_USB_STOP_TX);
++	ep->dev->usb_rgs->usb_uscom = UDC_USCOM_FLUSH | ep->ep_idx;
++
++	while (bd->data) {
++		__u16 status = UDC_BD_STATUS(bd);
++		status &= BD_SC_WRAP;
++		UDC_BD_STATUS_SET(bd, status);
++		UDC_BD_DATA_CLEAR(bd);
++		UDC_BD_ADVANCE(bd, status, ep->tx_base);
++	}
++
++	ep->tx_bd = ep->conf_bd = ep->tx_base;
++	ep->ep_parms->tbptr =
++	    (__u16) ((unsigned long) ep->tx_base -
++		     (unsigned long) ep->dev->intram);
++	ep->data = NULL;
++	ep->ack_len = ep->data_len = 0;
++	mpc8272_usbc_cmd(ep, UDC_CP_CMD_USB_RESTART_TX);
++}
++
++/* Transmit data or handshake */
++static inline void
++mpc8272_usbc_tx(struct mpc8272_usbc_ep *ep, __u8 * data, int len, __u16 flags)
++{
++	mpc8272_cpm_bd *tx_bd = ep->tx_bd;
++	__u16 status = UDC_BD_STATUS(tx_bd);
++	if ((status & BD_SC_READY)) {
++		return;
++	}
++	if (len > ep->max_len)
++		len = ep->max_len;
++	UDC_BD_DATA_SET(tx_bd, data);
++	UDC_BD_LENGTH_SET(tx_bd, len);
++	status &= BD_SC_WRAP;
++	mb();
++	status |= flags | BD_SC_READY | UDC_BD_LAST;
++	mb();
++	status |= ep->pid;
++	mb();
++	UDC_BD_STATUS_SET(tx_bd, status);
++	mb();
++	ep->tx_bd = UDC_BD_ADVANCE(tx_bd, status, ep->tx_base);
++	mb();
++	ep->dev->usb_rgs->usb_uscom = (UDC_USCOM_STR | ep->ep_idx);
++}
++
++/* Transmit handshake */
++static inline void
++mpc8272_usbc_tx_handshake(struct _mpc8272_udc_dev *usbc_dev, int ep_idx, __u8 handshake)
++{
++	volatile __u16 *p_usep_reg;
++	__u16 usep_reg;
++
++	if (ep_idx >= UDC_USBC_MAX_EPS)
++		return;
++
++	p_usep_reg = &usbc_dev->usb_rgs->usb_usep1 + ep_idx;
++	usep_reg = *p_usep_reg & (~UDC_USEP_RHS_MASK);
++
++	switch (handshake) {
++	case USB_PID_ACK:
++		*p_usep_reg = (usep_reg | UDC_USEP_RHS_ACK);
++		break;
++	case USB_PID_NAK:
++		*p_usep_reg = (usep_reg | UDC_USEP_RHS_NAK);
++		break;
++	case USB_PID_STALL:
++		*p_usep_reg = (usep_reg | UDC_USEP_RHS_STALL);
++		break;
++	default:
++		*p_usep_reg = (usep_reg | UDC_USEP_RHS_ACK);
++		break;
++	}
++
++}
++
++/* Transmit handshake */
++static inline void
++mpc8272_usbc_tx_data(struct mpc8272_usbc_ep *ep, __u8 * data, int len)
++{
++	ep->data = data;
++	ep->data_len = len;
++	ep->ack_len = 0;
++	mpc8272_usbc_tx(ep, data, len,
++		    UDC_BD_TC | UDC_BD_CNF | BD_SC_INTRPT | ep->pid);
++}
++
++/* Rx Interrupt handler */
++static inline void
++mpc8272_usbc_rx_isr(struct _mpc8272_udc_dev *usbc_dev, int ep_idx)
++{
++	struct mpc8272_usbc_ep *ep = &usbc_dev->eps[ep_idx];
++	mpc8272_cpm_bd *rx_bd = ep->rx_bd;
++	__u16 status = UDC_BD_STATUS(rx_bd);
++	__u8 *data;
++	__u16 len;
++	int pid;
++
++	spin_lock(&ep->lock);
++	while (!(status & BD_SC_EMPTY)) {
++		data = (__u8 *) UDC_BD_DATA(rx_bd);
++		len = UDC_BD_LENGTH(rx_bd);
++		if (len >= 2)
++			len -= 2;	/* Strip CRC16 */
++		pid = status & UDC_BD_RXPID_MASK;
++		if (ep->rx_cb(ep, pid, data, len, (status & UDC_BD_USB_RXERR)))
++			break;
++		status &= UDC_BD_CLEAN;
++		UDC_BD_LENGTH_SET(rx_bd, 0);
++		UDC_BD_STATUS_SET(rx_bd, status | BD_SC_EMPTY);
++		UDC_BD_ADVANCE(rx_bd, status, ep->rx_base);
++		status = UDC_BD_STATUS(rx_bd);
++	}
++	ep->rx_bd = rx_bd;
++	spin_unlock(&ep->lock);
++}
++
++/* Tx Interrupt handler */
++static inline void
++mpc8272_usbc_tx_isr(struct _mpc8272_udc_dev *usbc_dev, int ep_idx)
++{
++	struct mpc8272_usbc_ep *ep = &usbc_dev->eps[ep_idx];
++	mpc8272_cpm_bd *tx_bd = ep->conf_bd;
++	__u16 status = UDC_BD_STATUS(tx_bd);
++	int is_error;
++	__u16 len;
++
++	spin_lock(&ep->lock);
++	while (!(status & BD_SC_READY)) {
++		if (!tx_bd->data) {
++			break;
++		}
++		len = UDC_BD_LENGTH(tx_bd);
++		is_error = (status & UDC_BD_USB_TXERR);
++		if ((status & (UDC_BD_TO | UDC_BD_UN)))
++			mpc8272_usbc_tx_recover(ep);
++		ep->txconf_cb(ep, len, is_error);
++		UDC_BD_DATA_CLEAR(tx_bd);
++		UDC_BD_ADVANCE(tx_bd, status, ep->tx_base);
++		status = UDC_BD_STATUS(tx_bd);
++	}
++	ep->conf_bd = tx_bd;
++	spin_unlock(&ep->lock);
++}
++
++void mpc8272_usb_hw_config(cpm2_map_t * immr);
++void mpc8272_board_usb_iface_config(void);
++void mpc8272_board_usb_iface_deconfig(void);
++unsigned short mpc8272_dpram_offset(void *addr);
++
++#endif /* __MPC8272_UDC_H__ */
+Index: linux-2.6.10/include/asm-ppc/mpc8260.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/mpc8260.h
++++ linux-2.6.10/include/asm-ppc/mpc8260.h
+@@ -36,7 +36,7 @@
+ #include <platforms/tqm8260.h>
+ #endif
+ 
+-#if defined(CONFIG_PQ2ADS) || defined (CONFIG_PQ2FADS)
++#if defined(CONFIG_PQ2ADS) || defined (CONFIG_PQ2FADS) || defined(CONFIG_ADS8272)
+ #include <platforms/pq2ads.h>
+ #endif
+ 
+Index: linux-2.6.10/mvl_patches/pro-0276.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0276.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(276);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,397 @@
+#! /usr/bin/env bash
+# Patch: -pro_hpt366_cleanup_dma_timeout_handling_for_hpt370
+# Date: Mon Nov 26 16:56:18 2007
+# Source: MontaVista Software, Inc.
+# MR: 14142
+# Type: Defect Fix
+# Disposition: accepted into 2.6.17-mm1
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+# Description:
+# 
+# Clean up DMA timeout handling for HPT370:
+# 
+# - hpt370_lostirq_timeout() cleared the DMA status which made __ide_dma_end()
+#   called afterwards return the incorrect result, and the DMA engine was reset
+#   both before and after stopping DMA while the HighPoint drivers only do it
+#   after (which seems logical) -- fix this and also rename the function;
+# 
+# - get rid of the needless mutual recursion in hpt370_ide_dma_end() and
+#   hpt370_ide_dma_timeout();
+# 
+# - get rid of hpt370_ide_dma_lostirq() since hwif->ide_dma_end() called from
+#   the driver's interrupt handler later does all its work.
+# 
+# commit 4bf63de27e9fd9c0926ba3bb773de076b324a955
+# tree 69f2ab89ad78a5aa40b911d8bc79ca74ef8e4871
+# parent 26ccb802ee3f9a1f1fd5bc6abf38f124bfbd9cb2
+# author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 07 Feb 2007 18:18:13 +0100
+# committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Wed, 07 Feb 2007 18:18:13 +0100
+# 
+#  drivers/ide/pci/hpt366.c |   62 ++++++++++++++++++-----------------------------
+#  1 files changed, 25 insertions(+), 37 deletions(-)
+# 
+
+PATCHNUM=1394
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 14142
+Type: Defect Fix
+Disposition: accepted into 2.6.17-mm1
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Bartlomiej Zolnierkiewicz <bzolnier@gmail.com>
+Description:
+
+Clean up DMA timeout handling for HPT370:
+
+- hpt370_lostirq_timeout() cleared the DMA status which made __ide_dma_end()
+  called afterwards return the incorrect result, and the DMA engine was reset
+  both before and after stopping DMA while the HighPoint drivers only do it
+  after (which seems logical) -- fix this and also rename the function;
+
+- get rid of the needless mutual recursion in hpt370_ide_dma_end() and
+  hpt370_ide_dma_timeout();
+
+- get rid of hpt370_ide_dma_lostirq() since hwif->ide_dma_end() called from
+  the driver's interrupt handler later does all its work.
+
+commit 4bf63de27e9fd9c0926ba3bb773de076b324a955
+tree 69f2ab89ad78a5aa40b911d8bc79ca74ef8e4871
+parent 26ccb802ee3f9a1f1fd5bc6abf38f124bfbd9cb2
+author Sergei Shtylyov <sshtylyov@ru.mvista.com> Wed, 07 Feb 2007 18:18:13 +0100
+committer Bartlomiej Zolnierkiewicz <bzolnier@gmail.com> Wed, 07 Feb 2007 18:18:13 +0100
+
+ drivers/ide/pci/hpt366.c |   62 ++++++++++++++++++-----------------------------
+ mvl_patches/pro-1394.c   |   16 ++++++++++++
+ 2 files changed, 41 insertions(+), 37 deletions(-)
+
+Index: linux-2.6.10/drivers/ide/pci/hpt366.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ide/pci/hpt366.c
++++ linux-2.6.10/drivers/ide/pci/hpt366.c
+@@ -1,5 +1,5 @@
+ /*
+- * linux/drivers/ide/pci/hpt366.c		Version 0.51	Jun 04, 2006
++ * linux/drivers/ide/pci/hpt366.c		Version 0.52	Jun 07, 2006
+  *
+  * Copyright (C) 1999-2003		Andre Hedrick <andre@linux-ide.org>
+  * Portions Copyright (C) 2001	        Sun Microsystems, Inc.
+@@ -88,6 +88,7 @@
+  *   there; make HPT36x speedproc handler look the same way as the HPT37x one
+  * - fix  the tuneproc handler to always set the PIO mode requested,  not the
+  *   best possible one
++ * - clean up DMA timeout handling for HPT370
+  *		<source@mvista.com>
+  *
+  */
+@@ -680,7 +681,7 @@ static int hpt366_ide_dma_lostirq(ide_dr
+ 	return __ide_dma_lostirq(drive);
+ }
+ 
+-static void hpt370_clear_engine (ide_drive_t *drive)
++static void hpt370_clear_engine(ide_drive_t *drive)
+ {
+ 	ide_hwif_t *hwif = HWIF(drive);
+ 
+@@ -688,6 +689,22 @@ static void hpt370_clear_engine (ide_dri
+ 	udelay(10);
+ }
+ 
++static void hpt370_irq_timeout(ide_drive_t *drive)
++{
++	ide_hwif_t *hwif	= HWIF(drive);
++	u16 bfifo		= 0;
++	u8  dma_cmd;
++
++	pci_read_config_word(hwif->pci_dev, hwif->select_data + 2, &bfifo);
++	printk(KERN_DEBUG "%s: %d bytes in FIFO\n", drive->name, bfifo & 0x1ff);
++
++	/* get DMA command mode */
++	dma_cmd = hwif->INB(hwif->dma_command);
++	/* stop DMA */
++	hwif->OUTB(dma_cmd & ~0x1, hwif->dma_command);
++	hpt370_clear_engine(drive);
++}
++
+ static void hpt370_ide_dma_start(ide_drive_t *drive)
+ {
+ #ifdef HPT_RESET_STATE_ENGINE
+@@ -696,55 +713,27 @@ static void hpt370_ide_dma_start(ide_dri
+ 	ide_dma_start(drive);
+ }
+ 
+-static int hpt370_ide_dma_end (ide_drive_t *drive)
++static int hpt370_ide_dma_end(ide_drive_t *drive)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
+-	u8 dma_stat		= hwif->INB(hwif->dma_status);
++	u8  dma_stat		= hwif->INB(hwif->dma_status);
+ 
+ 	if (dma_stat & 0x01) {
+ 		/* wait a little */
+ 		udelay(20);
+ 		dma_stat = hwif->INB(hwif->dma_status);
++		if (dma_stat & 0x01)
++			hpt370_irq_timeout(drive);
+ 	}
+-	if ((dma_stat & 0x01) != 0) 
+-		/* fallthrough */
+-		(void) HWIF(drive)->ide_dma_timeout(drive);
+-
+ 	return __ide_dma_end(drive);
+ }
+ 
+-static void hpt370_lostirq_timeout (ide_drive_t *drive)
++static int hpt370_ide_dma_timeout(ide_drive_t *drive)
+ {
+-	ide_hwif_t *hwif	= HWIF(drive);
+-	u8 bfifo = 0;
+-	u8 dma_stat = 0, dma_cmd = 0;
+-
+-	pci_read_config_byte(HWIF(drive)->pci_dev, hwif->select_data + 2, &bfifo);
+-	printk(KERN_DEBUG "%s: %d bytes in FIFO\n", drive->name, bfifo);
+-	hpt370_clear_engine(drive);
+-	/* get dma command mode */
+-	dma_cmd = hwif->INB(hwif->dma_command);
+-	/* stop dma */
+-	hwif->OUTB(dma_cmd & ~0x1, hwif->dma_command);
+-	dma_stat = hwif->INB(hwif->dma_status);
+-	/* clear errors */
+-	hwif->OUTB(dma_stat | 0x6, hwif->dma_status);
+-}
+-
+-static int hpt370_ide_dma_timeout (ide_drive_t *drive)
+-{
+-	hpt370_lostirq_timeout(drive);
+-	hpt370_clear_engine(drive);
++	hpt370_irq_timeout(drive);
+ 	return __ide_dma_timeout(drive);
+ }
+ 
+-static int hpt370_ide_dma_lostirq (ide_drive_t *drive)
+-{
+-	hpt370_lostirq_timeout(drive);
+-	hpt370_clear_engine(drive);
+-	return __ide_dma_lostirq(drive);
+-}
+-
+ /* returns 1 if DMA IRQ issued, 0 otherwise */
+ static int hpt374_ide_dma_test_irq(ide_drive_t *drive)
+ {
+@@ -1207,7 +1196,6 @@ static void __devinit init_hwif_hpt366(i
+ 		hwif->dma_start 	= &hpt370_ide_dma_start;
+ 		hwif->ide_dma_end	= &hpt370_ide_dma_end;
+ 		hwif->ide_dma_timeout	= &hpt370_ide_dma_timeout;
+-		hwif->ide_dma_lostirq	= &hpt370_ide_dma_lostirq;
+ 	} else
+ 		hwif->ide_dma_lostirq	= &hpt366_ide_dma_lostirq;
+ 
+Index: linux-2.6.10/mvl_patches/pro-1394.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1394.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1394);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

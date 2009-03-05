@@ -1,0 +1,1212 @@
+#! /usr/bin/env bash
+# Patch: -pro_sh_rt_generic_hardirqs
+# Date: Fri May  4 10:09:18 2007
+# Source: MontaVista Software, Inc. 
+# MR: 20424
+# Type: Enhancement 
+# Disposition:  Local
+# Signed-off-by: Pavel Kiryukhin <pkiryukhin@ru.mvista.com>
+# Description:
+#     Moves 32bit sh kernel to generic hardirqs handling.
+#     Adds realtime preemption capability to sh kernel.
+# 
+
+PATCHNUM=1327
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. 
+MR: 20424
+Type: Enhancement 
+Disposition:  Local
+Signed-off-by: Pavel Kiryukhin <pkiryukhin@ru.mvista.com>
+Description:
+    Moves 32bit sh kernel to generic hardirqs handling.
+    Adds realtime preemption capability to sh kernel.
+
+Index: linux-2.6.10/arch/sh/Kconfig
+===================================================================
+--- linux-2.6.10.orig/arch/sh/Kconfig
++++ linux-2.6.10/arch/sh/Kconfig
+@@ -542,10 +542,6 @@ config CPU_LITTLE_ENDIAN
+ 	  endian byte order. These modes require different kernels. Say Y if
+ 	  your machine is little endian, N if it's a big endian machine.
+ 
+-config PREEMPT
+-	bool "Preemptible Kernel (EXPERIMENTAL)"
+-	depends on EXPERIMENTAL
+-
+ config UBC_WAKEUP
+ 	bool "Wakeup UBC on startup"
+ 	help
+@@ -720,6 +716,8 @@ config RTC_9701JE
+ 	help
+ 	  Selecting this option will support EPSON RTC-9701JE.
+ 
++source "lib/Kconfig.RT"
++
+ endmenu
+ 
+ 
+@@ -828,3 +826,15 @@ source "security/Kconfig"
+ source "crypto/Kconfig"
+ 
+ source "lib/Kconfig"
++
++#
++# Use the generic interrupt handling code in kernel/irq/.
++#
++
++config GENERIC_HARDIRQS
++        bool
++        default y
++
++config GENERIC_IRQ_PROBE
++        bool
++        default y
+Index: linux-2.6.10/arch/sh/kernel/semaphore.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/semaphore.c
++++ linux-2.6.10/arch/sh/kernel/semaphore.c
+@@ -15,7 +15,7 @@
+ #include <asm/semaphore.h>
+ #include <asm/semaphore-helper.h>
+ 
+-spinlock_t semaphore_wake_lock;
++spinlock_t semaphore_wake_lock = SPIN_LOCK_UNLOCKED;
+ 
+ /*
+  * Semaphores are implemented using a two-way counter:
+@@ -47,7 +47,7 @@ spinlock_t semaphore_wake_lock;
+  * critical part is the inline stuff in <asm/semaphore.h>
+  * where we want to avoid any extra jumps and calls.
+  */
+-void __compat_up(struct semaphore *sem)
++void __compat_up(struct compat_semaphore *sem)
+ {
+ 	wake_one_more(sem);
+ 	wake_up(&sem->wait);
+@@ -105,7 +105,7 @@ void __compat_up(struct semaphore *sem)
+ 	tsk->state = TASK_RUNNING;		\
+ 	remove_wait_queue(&sem->wait, &wait);
+ 
+-void __sched __compat_down(struct semaphore * sem)
++void __sched __compat_down(struct compat_semaphore * sem)
+ {
+ 	DOWN_VAR
+ 	DOWN_HEAD(TASK_UNINTERRUPTIBLE)
+@@ -115,15 +115,14 @@ void __sched __compat_down(struct semaph
+ 	DOWN_TAIL(TASK_UNINTERRUPTIBLE)
+ }
+ 
+-int __sched __compat_down_interruptible(struct semaphore * sem)
++int __sched __compat_down_interruptible(struct compat_semaphore * sem)
+ {
+ 	int ret = 0;
+ 	DOWN_VAR
+ 	DOWN_HEAD(TASK_INTERRUPTIBLE)
+ 
+ 	ret = waking_non_zero_interruptible(sem, tsk);
+-	if (ret)
+-	{
++	if (ret) {
+ 		if (ret == 1)
+ 			/* ret != 0 only if we get interrupted -arca */
+ 			ret = 0;
+@@ -134,7 +133,7 @@ int __sched __compat_down_interruptible(
+ 	return ret;
+ }
+ 
+-int __compat_down_trylock(struct semaphore * sem)
++int __compat_down_trylock(struct compat_semaphore * sem)
+ {
+ 	return waking_non_zero_trylock(sem);
+ }
+Index: linux-2.6.10/arch/sh/kernel/signal.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/signal.c
++++ linux-2.6.10/arch/sh/kernel/signal.c
+@@ -570,6 +570,14 @@ int do_signal(struct pt_regs *regs, sigs
+ 	int signr;
+ 	struct k_sigaction ka;
+ 
++#ifdef CONFIG_PREEMPT_RT
++/*
++* Fully-preemptible kernel does not need interrupts disabled:
++*/
++	local_irq_enable();
++	preempt_check_resched();
++#endif
++
+ 	/*
+ 	 * We want the common case to go fast, which
+ 	 * is why we may in certain cases get here from
+Index: linux-2.6.10/arch/sh/kernel/traps.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/traps.c
++++ linux-2.6.10/arch/sh/kernel/traps.c
+@@ -57,6 +57,7 @@ asmlinkage void do_##name(unsigned long 
+ 									\
+ 	asm volatile("stc	r2_bank, %0": "=r" (error_code));	\
+ 	local_irq_enable();						\
++	preempt_check_resched();					\
+ 	tsk->thread.error_code = error_code;				\
+ 	tsk->thread.trap_no = trapnr;					\
+ 	kgdb_handle_exception(trapnr, signr, error_code, &regs);	\
+Index: linux-2.6.10/arch/sh/kernel/time.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/time.c
++++ linux-2.6.10/arch/sh/kernel/time.c
+@@ -441,7 +441,7 @@ static int __init sh_pclk_setup(char *st
+ }
+ __setup("sh_pclk=", sh_pclk_setup);
+ 
+-static struct irqaction irq0  = { timer_interrupt, SA_INTERRUPT, CPU_MASK_NONE, "timer", NULL, NULL};
++static struct irqaction irq0  = { timer_interrupt, SA_INTERRUPT | SA_NODELAY, CPU_MASK_NONE, "timer", NULL, NULL};
+ 
+ void get_current_frequency_divisors(unsigned int *ifc, unsigned int *bfc, unsigned int *pfc)
+ {
+Index: linux-2.6.10/arch/sh/kernel/entry.S
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/entry.S
++++ linux-2.6.10/arch/sh/kernel/entry.S
+@@ -378,17 +378,14 @@ need_resched:
+ 	and	#0xf0, r0		! interrupts off (exception path)?
+ 	cmp/eq	#0xf0, r0
+ 	bt	noresched
++	CLI()
+ 
+-	mov.l	1f, r0
+-	mov.l	r0, @(TI_PRE_COUNT,r8)
+-
+-	STI()
+ 	mov.l	2f, r0
+ 	jsr	@r0
+-	 nop
++	nop
++
+ 	mov	#0, r0
+ 	mov.l	r0, @(TI_PRE_COUNT,r8)
+-	CLI()
+ 
+ 	bra	need_resched
+ 	 nop
+@@ -398,7 +395,7 @@ noresched:
+ 
+ 	.align 2
+ 1:	.long	PREEMPT_ACTIVE
+-2:	.long	schedule
++2:	.long	preempt_schedule_irq
+ #endif
+ /*
+ 	.align 2
+Index: linux-2.6.10/include/asm-sh/semaphore.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/semaphore.h
++++ linux-2.6.10/include/asm-sh/semaphore.h
+@@ -44,7 +44,7 @@ struct compat_semaphore {
+ 	__COMPAT_SEMAPHORE_INIT(name,1)
+ 
+ #define __COMPAT_DECLARE_SEMAPHORE_GENERIC(name,count) \
+-	struct semaphore name = __COMPAT_SEMAPHORE_INIT(name,count)
++	struct compat_semaphore name = __COMPAT_SEMAPHORE_INIT(name,count)
+ 
+ #define COMPAT_DECLARE_MUTEX(name) __COMPAT_DECLARE_SEMAPHORE_GENERIC(name,1)
+ #define COMPAT_DECLARE_MUTEX_LOCKED(name) __COMPAT_DECLARE_SEMAPHORE_GENERIC(name,0)
+@@ -79,22 +79,22 @@ asmlinkage int  __down_failed_trylock(vo
+ asmlinkage void __up_wakeup(void /* special register calling convention */);
+ #endif
+ 
+-asmlinkage void __compat_down(struct semaphore * sem);
+-asmlinkage int  __compat_down_interruptible(struct semaphore * sem);
+-asmlinkage int  __compat_down_trylock(struct semaphore * sem);
+-asmlinkage void __compat_up(struct semaphore * sem);
++asmlinkage void __compat_down(struct compat_semaphore * sem);
++asmlinkage int  __compat_down_interruptible(struct compat_semaphore * sem);
++asmlinkage int  __compat_down_trylock(struct compat_semaphore * sem);
++asmlinkage void __compat_up(struct compat_semaphore * sem);
+ extern int compat_sem_is_locked(struct compat_semaphore *sem);
+ 
+ extern spinlock_t semaphore_wake_lock;
+ 
+-static inline void compat_down(struct semaphore * sem)
++static inline void compat_down(struct compat_semaphore * sem)
+ {
+ 	might_sleep();
+ 	if (atomic_dec_return(&sem->count) < 0)
+ 		__compat_down(sem);
+ }
+ 
+-static inline int compat_down_interruptible(struct semaphore * sem)
++static inline int compat_down_interruptible(struct compat_semaphore * sem)
+ {
+ 	int ret = 0;
+ 
+@@ -104,7 +104,7 @@ static inline int compat_down_interrupti
+ 	return ret;
+ }
+ 
+-static inline int compat_down_trylock(struct semaphore * sem)
++static inline int compat_down_trylock(struct compat_semaphore * sem)
+ {
+ 	int ret = 0;
+ 
+@@ -117,7 +117,7 @@ static inline int compat_down_trylock(st
+  * Note! This is subtle. We jump to wake people up only if
+  * the semaphore was negative (== somebody was waiting on it).
+  */
+-static inline void compat_up(struct semaphore * sem)
++static inline void compat_up(struct compat_semaphore * sem)
+ {
+ 	if (atomic_inc_return(&sem->count) <= 0)
+ 		__compat_up(sem);
+Index: linux-2.6.10/include/asm-sh/semaphore-helper.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/semaphore-helper.h
++++ linux-2.6.10/include/asm-sh/semaphore-helper.h
+@@ -14,12 +14,12 @@
+  * This is trivially done with load_locked/store_cond,
+  * which we have.  Let the rest of the losers suck eggs.
+  */
+-static __inline__ void wake_one_more(struct semaphore * sem)
++static __inline__ void wake_one_more(struct compat_semaphore * sem)
+ {
+ 	atomic_inc((atomic_t *)&sem->sleepers);
+ }
+ 
+-static __inline__ int waking_non_zero(struct semaphore *sem)
++static __inline__ int waking_non_zero(struct compat_semaphore *sem)
+ {
+ 	unsigned long flags;
+ 	int ret = 0;
+@@ -43,7 +43,7 @@ static __inline__ int waking_non_zero(st
+  * protected by the spinlock in order to make atomic this atomic_inc() with the
+  * atomic_read() in wake_one_more(), otherwise we can race. -arca
+  */
+-static __inline__ int waking_non_zero_interruptible(struct semaphore *sem,
++static __inline__ int waking_non_zero_interruptible(struct compat_semaphore *sem,
+ 						struct task_struct *tsk)
+ {
+ 	unsigned long flags;
+@@ -70,7 +70,7 @@ static __inline__ int waking_non_zero_in
+  * protected by the spinlock in order to make atomic this atomic_inc() with the
+  * atomic_read() in wake_one_more(), otherwise we can race. -arca
+  */
+-static __inline__ int waking_non_zero_trylock(struct semaphore *sem)
++static __inline__ int waking_non_zero_trylock(struct compat_semaphore *sem)
+ {
+ 	unsigned long flags;
+ 	int ret = 1;
+Index: linux-2.6.10/drivers/serial/sh-sci.c
+===================================================================
+--- linux-2.6.10.orig/drivers/serial/sh-sci.c
++++ linux-2.6.10/drivers/serial/sh-sci.c
+@@ -1057,7 +1057,12 @@ static int sci_request_irq(struct sci_po
+ 			printk(KERN_ERR "sci: Cannot allocate irq.(IRQ=0)\n");
+ 			return -ENODEV;
+ 		}
+-		if (request_irq(port->irqs[0], sci_mpxed_interrupt, SA_INTERRUPT,
++		if (request_irq(port->irqs[0], sci_mpxed_interrupt,
++#ifdef CONFIG_PREEMPT_HARDIRQS
++				0,
++#else
++				SA_INTERRUPT,
++#endif
+ 				"sci", port)) {
+ 			printk(KERN_ERR "sci: Cannot allocate irq.\n");
+ 			return -ENODEV;
+@@ -1066,7 +1071,12 @@ static int sci_request_irq(struct sci_po
+ 		for (i = 0; i < ARRAY_SIZE(handlers); i++) {
+ 			if (!port->irqs[i])
+ 				continue;
+-			if (request_irq(port->irqs[i], handlers[i], SA_INTERRUPT,
++			if (request_irq(port->irqs[i], handlers[i],
++#ifdef CONFIG_PREEMPT_HARDIRQS
++					0,
++#else
++					SA_INTERRUPT,
++#endif
+ 					desc[i], port)) {
+ 				printk(KERN_ERR "sci: Cannot allocate irq.\n");
+ 				return -ENODEV;
+Index: linux-2.6.10/include/asm-sh/tlb.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/tlb.h
++++ linux-2.6.10/include/asm-sh/tlb.h
+@@ -14,5 +14,10 @@
+  */
+ #define tlb_flush(tlb)				flush_tlb_mm((tlb)->mm)
+ 
++#ifdef CONFIG_PREEMPT_RT
++#include <asm-generic/tlb-simple.h>
++#else
+ #include <asm-generic/tlb.h>
+ #endif
++
++#endif /* __ASM_SH_TLB_H */
+Index: linux-2.6.10/arch/sh/kernel/irq.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/kernel/irq.c
++++ linux-2.6.10/arch/sh/kernel/irq.c
+@@ -43,57 +43,14 @@
+ #include <linux/irq.h>
+ 
+ /*
+- * Controller mappings for all interrupt sources:
+- */
+-irq_desc_t irq_desc[NR_IRQS] __cacheline_aligned = {
+-	[0 ... NR_IRQS-1] = {
+-		.handler = &no_irq_type,
+-		.lock = SPIN_LOCK_UNLOCKED
+-	}
+-};
+-
+-/*
+- * Special irq handlers.
+- */
+-
+-irqreturn_t no_action(int cpl, void *dev_id, struct pt_regs *regs)
+-{ return IRQ_NONE; }
+-
+-/*
+- * Generic no controller code
+- */
+-
+-static void enable_none(unsigned int irq) { }
+-static unsigned int startup_none(unsigned int irq) { return 0; }
+-static void disable_none(unsigned int irq) { }
+-static void ack_none(unsigned int irq)
+-{
+-/*
+  * 'what should we do if we get a hw irq event on an illegal vector'.
+- * each architecture has to answer this themselves, it doesn't deserve
+- * a generic callback i think.
++ * each architecture has to answer this themselves.
+  */
+-	printk("unexpected IRQ trap at vector %02x\n", irq);
++void ack_bad_irq(unsigned int irq)
++{
++	printk("unexpected IRQ # %d\n", irq);
+ }
+ 
+-/* startup is the same as "enable", shutdown is same as "disable" */
+-#define shutdown_none	disable_none
+-#define end_none	enable_none
+-
+-struct hw_interrupt_type no_irq_type = {
+-	"none",
+-	startup_none,
+-	shutdown_none,
+-	enable_none,
+-	disable_none,
+-	ack_none,
+-	end_none
+-};
+-
+-/*
+- * Generic, controller-independent functions:
+- */
+-
+ #if defined(CONFIG_PROC_FS)
+ int show_interrupts(struct seq_file *p, void *v)
+ {
+@@ -128,183 +85,6 @@ unlock:
+ 	return 0;
+ }
+ #endif
+-
+-/*
+- * This should really return information about whether
+- * we should do bottom half handling etc. Right now we
+- * end up _always_ checking the bottom half, which is a
+- * waste of time and is not what some drivers would
+- * prefer.
+- */
+-int handle_IRQ_event(unsigned int irq, struct pt_regs * regs, struct irqaction * action)
+-{
+-	int status = 1;	/* Force the "do bottom halves" bit */
+-	int ret, retval = 0;
+-
+-	if (irq != TIMER_IRQ) /* avoid double-reporting the timer IRQ */
+-		ltt_ev_irq_entry(irq, !(user_mode(regs)));
+-
+-	if (!(action->flags & SA_INTERRUPT))
+-		local_irq_enable();
+-
+-	do {
+-		ret = action->handler(irq, action->dev_id, regs);
+-		if (ret == IRQ_HANDLED)
+-			status |= action->flags;
+-		retval |= ret;
+-		action = action->next;
+-	} while (action);
+-
+-	if (status & SA_SAMPLE_RANDOM)
+-		add_interrupt_randomness(irq);
+-
+-	local_irq_disable();
+-
+-	if (irq != TIMER_IRQ) /* avoid double-reporting the timer IRQ */
+-		ltt_ev_irq_exit();
+-
+-	return retval;
+-}
+-
+-static void __report_bad_irq(int irq, irq_desc_t *desc, irqreturn_t action_ret)
+-{
+-	struct irqaction *action;
+-
+-	if (action_ret != IRQ_HANDLED && action_ret != IRQ_NONE) {
+-		printk(KERN_ERR "irq event %d: bogus return value %x\n",
+-				irq, action_ret);
+-	} else {
+-		printk(KERN_ERR "irq %d: nobody cared!\n", irq);
+-	}
+-	dump_stack();
+-	printk(KERN_ERR "handlers:\n");
+-	action = desc->action;
+-	do {
+-		printk(KERN_ERR "[<%p>]", action->handler);
+-		print_symbol(" (%s)",
+-			(unsigned long)action->handler);
+-		printk("\n");
+-		action = action->next;
+-	} while (action);
+-}
+-
+-static void report_bad_irq(int irq, irq_desc_t *desc, irqreturn_t action_ret)
+-{
+-	static int count = 100;
+-
+-	if (count) {
+-		count--;
+-		__report_bad_irq(irq, desc, action_ret);
+-	}
+-}
+-
+-static int noirqdebug;
+-
+-static int __init noirqdebug_setup(char *str)
+-{
+-	noirqdebug = 1;
+-	printk("IRQ lockup detection disabled\n");
+-	return 1;
+-}
+-
+-__setup("noirqdebug", noirqdebug_setup);
+-
+-/*
+- * If 99,900 of the previous 100,000 interrupts have not been handled then
+- * assume that the IRQ is stuck in some manner.  Drop a diagnostic and try to
+- * turn the IRQ off.
+- *
+- * (The other 100-of-100,000 interrupts may have been a correctly-functioning
+- *  device sharing an IRQ with the failing one)
+- *
+- * Called under desc->lock
+- */
+-static void note_interrupt(int irq, irq_desc_t *desc, irqreturn_t action_ret)
+-{
+-	if (action_ret != IRQ_HANDLED) {
+-		desc->irqs_unhandled++;
+-		if (action_ret != IRQ_NONE)
+-			report_bad_irq(irq, desc, action_ret);
+-	}
+-
+-	desc->irq_count++;
+-	if (desc->irq_count < 100000)
+-		return;
+-
+-	desc->irq_count = 0;
+-	if (desc->irqs_unhandled > 99900) {
+-		/*
+-		 * The interrupt is stuck
+-		 */
+-		__report_bad_irq(irq, desc, action_ret);
+-		/*
+-		 * Now kill the IRQ
+-		 */
+-		printk(KERN_EMERG "Disabling IRQ #%d\n", irq);
+-		desc->status |= IRQ_DISABLED;
+-		desc->handler->disable(irq);
+-	}
+-	desc->irqs_unhandled = 0;
+-}
+-
+-/*
+- * Generic enable/disable code: this just calls
+- * down into the PIC-specific version for the actual
+- * hardware disable after having gotten the irq
+- * controller lock. 
+- */
+-inline void disable_irq_nosync(unsigned int irq)
+-{
+-	irq_desc_t *desc = irq_desc + irq;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&desc->lock, flags);
+-	if (!desc->depth++) {
+-		desc->status |= IRQ_DISABLED;
+-		desc->handler->disable(irq);
+-	}
+-	spin_unlock_irqrestore(&desc->lock, flags);
+-}
+-
+-/*
+- * Synchronous version of the above, making sure the IRQ is
+- * no longer running on any other IRQ..
+- */
+-void disable_irq(unsigned int irq)
+-{
+-	irq_desc_t *desc = irq_desc + irq;
+-	disable_irq_nosync(irq);
+-	if (desc->action)
+-		synchronize_irq(irq);
+-}
+-
+-void enable_irq(unsigned int irq)
+-{
+-	irq_desc_t *desc = irq_desc + irq;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&desc->lock, flags);
+-	switch (desc->depth) {
+-	case 1: {
+-		unsigned int status = desc->status & ~(IRQ_DISABLED | IRQ_INPROGRESS);
+-		desc->status = status;
+-		if ((status & (IRQ_PENDING | IRQ_REPLAY)) == IRQ_PENDING) {
+-			desc->status = status | IRQ_REPLAY;
+-			hw_resend_irq(desc->handler,irq);
+-		}
+-		desc->handler->enable(irq);
+-		/* fall-through */
+-	}
+-	default:
+-		desc->depth--;
+-		break;
+-	case 0:
+-		printk("enable_irq() unbalanced from %p\n",
+-		       __builtin_return_address(0));
+-	}
+-	spin_unlock_irqrestore(&desc->lock, flags);
+-}
+-
+ /*
+  * do_IRQ handles all normal device IRQ's.
+  */
+@@ -323,23 +103,9 @@ asmlinkage int do_IRQ(unsigned long r4, 
+ 	 * handled by some other CPU. (or is disabled)
+ 	 */
+ 	int irq;
+-	irq_desc_t *desc;
+-	struct irqaction * action;
+-	unsigned int status;
+-
+ 	interrupt_overhead_start();
+ 	irq_enter();
+ 
+-#ifdef CONFIG_PREEMPT
+-	/*
+-	 * At this point we're now about to actually call handlers,
+-	 * and interrupts might get reenabled during them... bump
+-	 * preempt_count to prevent any preemption while the handler
+-	 * called here is pending...
+-	 */
+-	preempt_disable();
+-#endif
+-
+ 	/* Get IRQ number */
+ 	asm volatile("stc	r2_bank, %0\n\t"
+ 		     "shlr2	%0\n\t"
+@@ -349,385 +115,12 @@ asmlinkage int do_IRQ(unsigned long r4, 
+ 		     :"=z" (irq));
+ 	irq = irq_demux(irq);
+ 
+-	kstat_this_cpu.irqs[irq]++;
+-	desc = irq_desc + irq;
+-	spin_lock(&desc->lock);
+-	desc->handler->ack(irq);
+-	/*
+-	   REPLAY is when Linux resends an IRQ that was dropped earlier
+-	   WAITING is used by probe to mark irqs that are being tested
+-	   */
+-	status = desc->status & ~(IRQ_REPLAY | IRQ_WAITING);
+-	status |= IRQ_PENDING; /* we _want_ to handle it */
+-
+-	/*
+-	 * If the IRQ is disabled for whatever reason, we cannot
+-	 * use the action we have.
+-	 */
+-	action = NULL;
+-	if (likely(!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))) {
+-		action = desc->action;
+-		status &= ~IRQ_PENDING; /* we commit to handling */
+-		status |= IRQ_INPROGRESS; /* we are handling it */
+-	}
+-	desc->status = status;
+-
+-	/*
+-	 * If there is no IRQ handler or it was disabled, exit early.
+-	   Since we set PENDING, if another processor is handling
+-	   a different instance of this same irq, the other processor
+-	   will take care of it.
+-	 */
+-	if (unlikely(!action))
+-		goto out;
+-
+-	/*
+-	 * Edge triggered interrupts need to remember
+-	 * pending events.
+-	 * This applies to any hw interrupts that allow a second
+-	 * instance of the same irq to arrive while we are in do_IRQ
+-	 * or in the handler. But the code here only handles the _second_
+-	 * instance of the irq, not the third or fourth. So it is mostly
+-	 * useful for irq hardware that does not mask cleanly in an
+-	 * SMP environment.
+-	 */
+-	interrupt_overhead_stop();
+-	for (;;) {
+-		irqreturn_t action_ret;
+-
+-		spin_unlock(&desc->lock);
+-		action_ret = handle_IRQ_event(irq, &regs, action);
+-		spin_lock(&desc->lock);
+-		if (!noirqdebug)
+-			note_interrupt(irq, desc, action_ret);
+-		if (likely(!(desc->status & IRQ_PENDING)))
+-			break;
+-		desc->status &= ~IRQ_PENDING;
+-	}
+-	desc->status &= ~IRQ_INPROGRESS;
+-
+-out:
+-	/*
+-	 * The ->end() handler has to deal with interrupts which got
+-	 * disabled while the handler was running.
+-	 */
+-	desc->handler->end(irq);
+-	spin_unlock(&desc->lock);
+-
++	__do_IRQ(irq, &regs);
+ 	irq_exit();
+-
+-#ifdef CONFIG_PREEMPT
+-	/*
+-	 * We're done with the handlers, interrupts should be
+-	 * currently disabled; decrement preempt_count now so
+-	 * as we return preemption may be allowed...
+-	 */
+-	preempt_enable_no_resched();
+-#endif
+ 	latency_check();
+ 	return 1;
+ }
+ 
+-int request_irq(unsigned int irq, 
+-		irqreturn_t (*handler)(int, void *, struct pt_regs *),
+-		unsigned long irqflags, 
+-		const char * devname,
+-		void *dev_id)
+-{
+-	int retval;
+-	struct irqaction * action;
+-
+-	if (irq >= ACTUAL_NR_IRQS)
+-		return -EINVAL;
+-	if (!handler)
+-		return -EINVAL;
+-
+-	action = (struct irqaction *)
+-			kmalloc(sizeof(struct irqaction), GFP_ATOMIC);
+-	if (!action)
+-		return -ENOMEM;
+-
+-	action->handler = handler;
+-	action->flags = irqflags;
+-	cpus_clear(action->mask);
+-	action->name = devname;
+-	action->next = NULL;
+-	action->dev_id = dev_id;
+-
+-	retval = setup_irq(irq, action);
+-	if (retval)
+-		kfree(action);
+-	return retval;
+-}
+-
+-EXPORT_SYMBOL(request_irq);
+-
+-void free_irq(unsigned int irq, void *dev_id)
+-{
+-	irq_desc_t *desc;
+-	struct irqaction **p;
+-	unsigned long flags;
+-
+-	if (irq >= ACTUAL_NR_IRQS)
+-		return;
+-
+-	desc = irq_desc + irq;
+-	spin_lock_irqsave(&desc->lock,flags);
+-	p = &desc->action;
+-	for (;;) {
+-		struct irqaction * action = *p;
+-		if (action) {
+-			struct irqaction **pp = p;
+-			p = &action->next;
+-			if (action->dev_id != dev_id)
+-				continue;
+-
+-			/* Found it - now remove it from the list of entries */
+-			*pp = action->next;
+-			if (!desc->action) {
+-				desc->status |= IRQ_DISABLED;
+-				desc->handler->shutdown(irq);
+-			}
+-			spin_unlock_irqrestore(&desc->lock,flags);
+-			synchronize_irq(irq);
+-			kfree(action);
+-			return;
+-		}
+-		printk("Trying to free free IRQ%d\n",irq);
+-		spin_unlock_irqrestore(&desc->lock,flags);
+-		return;
+-	}
+-}
+-
+-EXPORT_SYMBOL(free_irq);
+-
+-static DECLARE_MUTEX(probe_sem);
+-
+-/*
+- * IRQ autodetection code..
+- *
+- * This depends on the fact that any interrupt that
+- * comes in on to an unassigned handler will get stuck
+- * with "IRQ_WAITING" cleared and the interrupt
+- * disabled.
+- */
+-unsigned long probe_irq_on(void)
+-{
+-	unsigned int i;
+-	irq_desc_t *desc;
+-	unsigned long val;
+-	unsigned long delay;
+-
+-	down(&probe_sem);
+-	/* 
+-	 * something may have generated an irq long ago and we want to
+-	 * flush such a longstanding irq before considering it as spurious. 
+-	 */
+-	for (i = NR_IRQS-1; i > 0; i--) {
+-		desc = irq_desc + i;
+-
+-		spin_lock_irq(&desc->lock);
+-		if (!desc->action)
+-			desc->handler->startup(i);
+-		spin_unlock_irq(&desc->lock);
+-	}
+-
+-	/* Wait for longstanding interrupts to trigger. */
+-	for (delay = jiffies + HZ/50; time_after(delay, jiffies); )
+-		/* about 20ms delay */ barrier();
+-
+-	/*
+-	 * enable any unassigned irqs
+-	 * (we must startup again here because if a longstanding irq
+-	 * happened in the previous stage, it may have masked itself)
+-	 */
+-	for (i = NR_IRQS-1; i > 0; i--) {
+-		desc = irq_desc + i;
+-
+-		spin_lock_irq(&desc->lock);
+-		if (!desc->action) {
+-			desc->status |= IRQ_AUTODETECT | IRQ_WAITING;
+-			if (desc->handler->startup(i))
+-				desc->status |= IRQ_PENDING;
+-		}
+-		spin_unlock_irq(&desc->lock);
+-	}
+-
+-	/*
+-	 * Wait for spurious interrupts to trigger
+-	 */
+-	for (delay = jiffies + HZ/10; time_after(delay, jiffies); )
+-		/* about 100ms delay */ barrier();
+-
+-	/*
+-	 * Now filter out any obviously spurious interrupts
+-	 */
+-	val = 0;
+-	for (i=0; i<NR_IRQS; i++) {
+-		unsigned int status;
+-
+-		desc = irq_desc + i;
+-
+-		spin_lock_irq(&desc->lock);
+-		status = desc->status;
+-
+-		if (status & IRQ_AUTODETECT) {
+-			/* It triggered already - consider it spurious. */
+-			if (!(status & IRQ_WAITING)) {
+-				desc->status = status & ~IRQ_AUTODETECT;
+-				desc->handler->shutdown(i);
+-			} else
+-				if (i < 32)
+-					val |= 1 << i;
+-		}
+-		spin_unlock_irq(&desc->lock);
+-	}
+-
+-	return val;
+-}
+-
+-EXPORT_SYMBOL(probe_irq_on);
+-
+-/* Return a mask of triggered interrupts (this
+- * can handle only legacy ISA interrupts).
+- */
+-
+-/*
+- *	probe_irq_mask - scan a bitmap of interrupt lines
+- *	@val:	mask of interrupts to consider
+- *
+- *	Scan the ISA bus interrupt lines and return a bitmap of
+- *	active interrupts. The interrupt probe logic state is then
+- *	returned to its previous value.
+- *
+- *	Note: we need to scan all the irq's even though we will
+- *	only return ISA irq numbers - just so that we reset them
+- *	all to a known state.
+- */
+-unsigned int probe_irq_mask(unsigned long val)
+-{
+-	int i;
+-	unsigned int mask;
+-
+-	mask = 0;
+-	for (i = 0; i < NR_IRQS; i++) {
+-		irq_desc_t *desc = irq_desc + i;
+-		unsigned int status;
+-
+-		spin_lock_irq(&desc->lock);
+-		status = desc->status;
+-
+-		if (status & IRQ_AUTODETECT) {
+-			if (i < 16 && !(status & IRQ_WAITING))
+-				mask |= 1 << i;
+-
+-			desc->status = status & ~IRQ_AUTODETECT;
+-			desc->handler->shutdown(i);
+-		}
+-		spin_unlock_irq(&desc->lock);
+-	}
+-	up(&probe_sem);
+-
+-	return mask & val;
+-}
+-
+-int probe_irq_off(unsigned long val)
+-{
+-	int i, irq_found, nr_irqs;
+-
+-	nr_irqs = 0;
+-	irq_found = 0;
+-	for (i=0; i<NR_IRQS; i++) {
+-		irq_desc_t *desc = irq_desc + i;
+-		unsigned int status;
+-
+-		spin_lock_irq(&desc->lock);
+-		status = desc->status;
+-
+-		if (status & IRQ_AUTODETECT) {
+-			if (!(status & IRQ_WAITING)) {
+-				if (!nr_irqs)
+-					irq_found = i;
+-				nr_irqs++;
+-			}
+-			desc->status = status & ~IRQ_AUTODETECT;
+-			desc->handler->shutdown(i);
+-		}
+-		spin_unlock_irq(&desc->lock);
+-	}
+-	up(&probe_sem);
+-
+-	if (nr_irqs > 1)
+-		irq_found = -irq_found;
+-	return irq_found;
+-}
+-
+-EXPORT_SYMBOL(probe_irq_off);
+-
+-int setup_irq(unsigned int irq, struct irqaction * new)
+-{
+-	int shared = 0;
+-	struct irqaction *old, **p;
+-	unsigned long flags;
+-	irq_desc_t *desc = irq_desc + irq;
+-
+-	if (desc->handler == &no_irq_type)
+-		return -ENOSYS;
+- 	/*
+-	 * Some drivers like serial.c use request_irq() heavily,
+-	 * so we have to be careful not to interfere with a
+-	 * running system.
+-	 */
+-	if (new->flags & SA_SAMPLE_RANDOM) {
+-		/*
+-		 * This function might sleep, we want to call it first,
+-		 * outside of the atomic block.
+-		 * Yes, this might clear the entropy pool if the wrong
+-		 * driver is attempted to be loaded, without actually
+-		 * installing a new handler, but is this really a problem,
+-		 * only the sysadmin is able to do this.
+-		 */
+-		rand_initialize_irq(irq);
+-	}
+-
+-	/*
+-	 * The following block of code has to be executed atomically
+-	 */
+-	spin_lock_irqsave(&desc->lock,flags);
+-	p = &desc->action;
+-	if ((old = *p) != NULL) {
+-		/* Can't share interrupts unless both agree to */
+-		if (!(old->flags & new->flags & SA_SHIRQ)) {
+-			spin_unlock_irqrestore(&desc->lock,flags);
+-			return -EBUSY;
+-		}
+-
+-		/* add new interrupt at end of irq queue */
+-		do {
+-			p = &old->next;
+-			old = *p;
+-		} while (old);
+-		shared = 1;
+-	}
+-
+-	*p = new;
+-
+-	if (!shared) {
+-		desc->depth = 0;
+-		desc->status &= ~(IRQ_DISABLED | IRQ_AUTODETECT | IRQ_WAITING | IRQ_INPROGRESS);
+-		desc->handler->startup(irq);
+-	}
+-	spin_unlock_irqrestore(&desc->lock,flags);
+-	return 0;
+-}
+-
+-#if defined(CONFIG_PROC_FS) && defined(CONFIG_SYSCTL)
+-
+-void init_irq_proc(void)
+-{
+-}
+-#endif
+-
+ /* Taken from the 2.5 alpha port */
+ #ifdef CONFIG_SMP
+ void synchronize_irq(unsigned int irq)
+Index: linux-2.6.10/mvl_patches/pro-1327.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1327.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1327);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

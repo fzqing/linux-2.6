@@ -1,0 +1,649 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_cavium_octeon_4Gbpci_fix
+# Date: Tue Feb  6 08:15:50 2007
+# Source: MontaVista Software, Inc.
+# MR:20675
+# Type: Defect Fix
+# Disposition: needs submitting to community
+# Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+# Description:
+# The files changed were:
+# 
+# 1.      arch/mips/pci/ops-cvmx.c
+# 
+#         The code changes in this file were to make the
+# octeon_read_config() and octeon_write_config() calls so that they used
+# the internal configuration registers for the host CPU. This was done by
+# defining OCTEON_HOST_CPU_BUS and OCTEON_HOST_CPU_DEVICE and then
+# switching to internal reads and writes when those values were
+# encountered. On our board the devices are 2, 3, 4 and 5, so I choose 0
+# for the host CPU. If MontaVista wanted to include this in their software
+# they would need to use several CONFIG parameters to set the bus and
+# device numbers as well as enable the feature for when the host CPU does
+# not have a device select line.
+# 2.      arch/mips/pci/pci-cvmx.c
+# 
+#         Added functions npi_write16, npi_read16, npi_write8 and
+# npi_read8 to support the internal register reads and writes needed in
+# ops-cvmx.c. I left them here as npi_write32 and npi_read32 were already
+# defined.
+# 
+#         Added lines of code to mark BAR2 present and enabled in
+# PCI_CTL_STATUS_2 register.
+# 
+#         Linux ignores BAR registers that are mapped to the top of PCI
+# memory space by making calculating their size to be zero during the
+# probing. Therefore I placed BAR0 and BAR2 at 0x0 so that they would be
+# remapped by the standard algorithm. Before I could get this to work I
+# needed to increase OCTEON_PCI_MEMSPACE_SIZE, so that it could hold BAR2
+# being placed above the other BAR registers - I chose (1ull << 40).
+# Before BAR2 would get properly mapped I needed to fix some problems in
+# the next two files below.
+# 3.      drivers/pci/probe.c
+# 
+#         The size returned by a 4GB or greater sized BAR register returns
+# zero which made the algorithm in pci_read_bases() hit a continue instead
+# of continuing to read the upper 32-bits of the address space. I needed
+# to add the code to check if it was a 64-bit memory space by checking the
+# relevant lower bits, in which case the lower 32-bits of the size are
+# 0xffffffff by the way they calculate size. As far as I can tell this has
+# still not been fixed in the latest release of Linux which is 2.6.18. I
+# guess no one has encountered such a large BAR register yet.
+# 4.      drivers/pci/setup-res.c
+# 
+#         The current code in the MontaVista kernel (2.6.10) always writes
+# the upped 32-bits of the address as zero. This has been fixed in Linux
+# 2.6.13 release of the kernel.
+
+PATCHNUM=1068
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR:20675
+Type: Defect Fix
+Disposition: needs submitting to community
+Signed-off-by: Yadviga Grigorieva<yadviga@ru.mvista.com>
+Description:
+The files changed were:
+
+1.      arch/mips/pci/ops-cvmx.c
+
+        The code changes in this file were to make the
+octeon_read_config() and octeon_write_config() calls so that they used
+the internal configuration registers for the host CPU. This was done by
+defining OCTEON_HOST_CPU_BUS and OCTEON_HOST_CPU_DEVICE and then
+switching to internal reads and writes when those values were
+encountered. On our board the devices are 2, 3, 4 and 5, so I choose 0
+for the host CPU. If MontaVista wanted to include this in their software
+they would need to use several CONFIG parameters to set the bus and
+device numbers as well as enable the feature for when the host CPU does
+not have a device select line.
+2.      arch/mips/pci/pci-cvmx.c
+
+        Added functions npi_write16, npi_read16, npi_write8 and
+npi_read8 to support the internal register reads and writes needed in
+ops-cvmx.c. I left them here as npi_write32 and npi_read32 were already
+defined.
+
+        Added lines of code to mark BAR2 present and enabled in
+PCI_CTL_STATUS_2 register.
+
+        Linux ignores BAR registers that are mapped to the top of PCI
+memory space by making calculating their size to be zero during the
+probing. Therefore I placed BAR0 and BAR2 at 0x0 so that they would be
+remapped by the standard algorithm. Before I could get this to work I
+needed to increase OCTEON_PCI_MEMSPACE_SIZE, so that it could hold BAR2
+being placed above the other BAR registers - I chose (1ull << 40).
+Before BAR2 would get properly mapped I needed to fix some problems in
+the next two files below.
+3.      drivers/pci/probe.c
+
+        The size returned by a 4GB or greater sized BAR register returns
+zero which made the algorithm in pci_read_bases() hit a continue instead
+of continuing to read the upper 32-bits of the address space. I needed
+to add the code to check if it was a 64-bit memory space by checking the
+relevant lower bits, in which case the lower 32-bits of the size are
+0xffffffff by the way they calculate size. As far as I can tell this has
+still not been fixed in the latest release of Linux which is 2.6.18. I
+guess no one has encountered such a large BAR register yet.
+4.      drivers/pci/setup-res.c
+
+        The current code in the MontaVista kernel (2.6.10) always writes
+the upped 32-bits of the address as zero. This has been fixed in Linux
+2.6.13 release of the kernel.
+Index: linux-2.6.10/drivers/pci/probe.c
+===================================================================
+--- linux-2.6.10.orig/drivers/pci/probe.c
++++ linux-2.6.10/drivers/pci/probe.c
+@@ -121,8 +121,19 @@ static void pci_read_bases(struct pci_de
+ 			l = 0;
+ 		if ((l & PCI_BASE_ADDRESS_SPACE) == PCI_BASE_ADDRESS_SPACE_MEMORY) {
+ 			sz = pci_size(l, sz, PCI_BASE_ADDRESS_MEM_MASK);
+-			if (!sz)
+-				continue;
++
++			if (!sz) {
++			/* if BAR space is over 4GB we need to make sure that */
++			/* we don't bail out if the size is zero              */
++			if ((l &
++			    (PCI_BASE_ADDRESS_SPACE | PCI_BASE_ADDRESS_MEM_TYPE_MASK))
++			     == (PCI_BASE_ADDRESS_SPACE_MEMORY |
++			     PCI_BASE_ADDRESS_MEM_TYPE_64)) {
++					sz = 0xffffffff;
++				} else {
++					continue;
++				}
++			}
+ 			res->start = l & PCI_BASE_ADDRESS_MEM_MASK;
+ 			res->flags |= l & ~PCI_BASE_ADDRESS_MEM_MASK;
+ 		} else {
+Index: linux-2.6.10/drivers/pci/setup-res.c
+===================================================================
+--- linux-2.6.10.orig/drivers/pci/setup-res.c
++++ linux-2.6.10/drivers/pci/setup-res.c
+@@ -39,6 +39,11 @@ pci_update_resource(struct pci_dev *dev,
+ 	struct pci_bus_region region;
+ 	u32 new, check, mask;
+ 	int reg;
++	/* Ignore resources for unimplemented BARs and unused resource slots
++	for 64 bit BARs. */
++	if (!res->flags)
++	return;
++
+ 
+ 	pcibios_resource_to_bus(dev, &region, res);
+ 
+@@ -75,7 +80,7 @@ pci_update_resource(struct pci_dev *dev,
+ 
+ 	if ((new & (PCI_BASE_ADDRESS_SPACE|PCI_BASE_ADDRESS_MEM_TYPE_MASK)) ==
+ 	    (PCI_BASE_ADDRESS_SPACE_MEMORY|PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+-		new = 0; /* currently everyone zeros the high address */
++		new = region.start >> 16 >> 16;
+ 		pci_write_config_dword(dev, reg + 4, new);
+ 		pci_read_config_dword(dev, reg + 4, &check);
+ 		if (check != new) {
+Index: linux-2.6.10/arch/mips/pci/ops-cvmx.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/pci/ops-cvmx.c
++++ linux-2.6.10/arch/mips/pci/ops-cvmx.c
+@@ -5,6 +5,16 @@
+ #include <asm/time.h>
+ #include "pci-cvmx.h"
+ 
++#define OCTEON_HOST_CPU_BUS     (0)
++#define OCTEON_HOST_CPU_DEVICE  (0)
++
++extern void npi_write32(uint64_t address, uint32_t val);
++extern void npi_write16(uint64_t address, uint16_t val);
++extern void npi_write8(uint64_t address, uint8_t val);
++extern uint32_t npi_read32(uint64_t address);
++extern uint16_t npi_read16(uint64_t address);
++extern uint8_t npi_read8(uint64_t address);
++
+ /**
+  * Read a value from configuration space
+  *
+@@ -32,29 +42,48 @@ static int octeon_read_config(struct pci
+ 	pci_addr.s.func = devfn & 0x7;
+ 	pci_addr.s.reg = reg;
+ 
+-	switch (size) {
+-	case 4:
+-		*val = le32_to_cpup(pci_addr.u32_ptr);
+-		if (unlikely(!do_once && (bus->number == 1) && (reg == 0)
++	if ((pci_addr.s.bus == OCTEON_HOST_CPU_BUS) &&
++	    (pci_addr.s.dev == OCTEON_HOST_CPU_DEVICE)) {
++		u64 octeon_pci_config_addr = OCTEON_NPI_PCI_CFG00 + reg;
++
++		switch (size) {
++		case 4:
++			*val = npi_read32(octeon_pci_config_addr);
++			return PCIBIOS_SUCCESSFUL;
++		case 2:
++			*val = npi_read16(octeon_pci_config_addr);
++			return PCIBIOS_SUCCESSFUL;
++		case 1:
++			*val = npi_read8(octeon_pci_config_addr);
++			return PCIBIOS_SUCCESSFUL;
++		}
++	} else {
++		switch (size) {
++		case 4:
++			*val = le32_to_cpup(pci_addr.u32_ptr);
++			if (unlikely
++			    (!do_once && (bus->number == 1) && (reg == 0)
+ 			     && (*val == 0x06861106))) {
+-			/* VT82C686B Super South South Bridge */
+-			pci_addr.s.reg = 0x48;
+-			if (*pci_addr.u8_ptr & 0x2) {
+-				printk
+-				    ("Force enabling the Via IDE (bus=%d, dev=%d)\n",
+-				     bus->number, devfn >> 3);
+-				*pci_addr.u8_ptr ^= 2;
++				/* VT82C686B Super South South Bridge */
++				pci_addr.s.reg = 0x48;
++				if (*pci_addr.u8_ptr & 0x2) {
++					printk
++					    ("Force enabling the Via IDE (bus=%d, dev=%d)\n",
++					     bus->number, devfn >> 3);
++					*pci_addr.u8_ptr ^= 2;
++				}
++				do_once = 1;
+ 			}
+-			do_once = 1;
++			return PCIBIOS_SUCCESSFUL;
++		case 2:
++			*val = le16_to_cpup(pci_addr.u16_ptr);
++			return PCIBIOS_SUCCESSFUL;
++		case 1:
++			*val = *pci_addr.u8_ptr;
++			return PCIBIOS_SUCCESSFUL;
+ 		}
+-		return PCIBIOS_SUCCESSFUL;
+-	case 2:
+-		*val = le16_to_cpup(pci_addr.u16_ptr);
+-		return PCIBIOS_SUCCESSFUL;
+-	case 1:
+-		*val = *pci_addr.u8_ptr;
+-		return PCIBIOS_SUCCESSFUL;
+ 	}
++
+ 	return PCIBIOS_FUNC_NOT_SUPPORTED;
+ }
+ 
+@@ -84,18 +113,36 @@ static int octeon_write_config(struct pc
+ 	pci_addr.s.func = devfn & 0x7;
+ 	pci_addr.s.reg = reg;
+ 
+-	switch (size) {
+-	case 4:
+-		*pci_addr.u32_ptr = cpu_to_le32(val);
+-		return PCIBIOS_SUCCESSFUL;
+-	case 2:
+-		*pci_addr.u16_ptr = cpu_to_le16(val);
+-		return PCIBIOS_SUCCESSFUL;
+-	case 1:
+-		*pci_addr.u8_ptr = val;
+-		return PCIBIOS_SUCCESSFUL;
++	if ((pci_addr.s.bus == OCTEON_HOST_CPU_BUS) &&
++	    (pci_addr.s.dev == OCTEON_HOST_CPU_DEVICE)) {
++		u64 octeon_pci_config_addr = OCTEON_NPI_PCI_CFG00 + reg;
++
++		switch (size) {
++		case 4:
++			npi_write32(octeon_pci_config_addr, val);
++			return PCIBIOS_SUCCESSFUL;
++		case 2:
++			npi_write16(octeon_pci_config_addr, val);
++			return PCIBIOS_SUCCESSFUL;
++		case 1:
++			npi_write8(octeon_pci_config_addr, val);
++			return PCIBIOS_SUCCESSFUL;
++		}
++		return PCIBIOS_FUNC_NOT_SUPPORTED;
++	} else {
++		switch (size) {
++		case 4:
++			*pci_addr.u32_ptr = cpu_to_le32(val);
++			return PCIBIOS_SUCCESSFUL;
++		case 2:
++			*pci_addr.u16_ptr = cpu_to_le16(val);
++			return PCIBIOS_SUCCESSFUL;
++		case 1:
++			*pci_addr.u8_ptr = val;
++			return PCIBIOS_SUCCESSFUL;
++		}
++		return PCIBIOS_FUNC_NOT_SUPPORTED;
+ 	}
+-	return PCIBIOS_FUNC_NOT_SUPPORTED;
+ }
+ 
+ struct pci_ops octeon_pci_ops = {
+Index: linux-2.6.10/arch/mips/pci/pci-cvmx.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/pci/pci-cvmx.c
++++ linux-2.6.10/arch/mips/pci/pci-cvmx.c
+@@ -16,7 +16,7 @@
+     memory from 0x8000000, right after the 0-128MB BAR1 mapping */
+ #define OCTEON_PCI_MEMSPACE_OFFSET  (0x00011b0000000000ull)
+ #define OCTEON_PCI_MEMSPACE_BASE    (0x0000000008000000ull)
+-#define OCTEON_PCI_MEMSPACE_SIZE    (1ull<<35)
++#define OCTEON_PCI_MEMSPACE_SIZE    (1ull<<40)
+ 
+ static struct resource octeon_pci_mem_resource = {
+ 	"Octeon PCI memory",
+@@ -58,15 +58,45 @@ static void _mdelay(uint64_t msec)
+ }
+ 
+ 
++#define LE_TO_BE_32BIT_MASK ((uint64_t) 0x04)
++#define LE_TO_BE_16BIT_MASK ((uint64_t) 0x06)
++#define LE_TO_BE_8BIT_MASK ((uint64_t) 0x07)
++
+ /**
+  * Write a 32bit value to the Octeon NPI register space
+  *
+  * @param address Address to write to
+  * @param val     Value to write
+  */
+-static void npi_write32(uint64_t address, uint32_t val)
++void npi_write32(uint64_t address, uint32_t val)
++{
++	volatile uint32_t *ptr =
++	    (volatile uint32_t *)(address ^ LE_TO_BE_32BIT_MASK);
++	*ptr = val;
++}
++
++/**
++ * Write a 16bit value to the Octeon NPI register space
++ *
++ * @param address Address to write to
++ * @param val     Value to write
++ */
++void npi_write16(uint64_t address, uint16_t val)
++{
++	volatile uint16_t *ptr =
++	    (volatile uint16_t *)(address ^ LE_TO_BE_16BIT_MASK);
++	*ptr = val;
++}
++
++/**
++ * Write a 8bit value to the Octeon NPI register space
++ *
++ * @param address Address to write to
++ * @param val     Value to write
++ */
++void npi_write8(uint64_t address, uint8_t val)
+ {
+-	volatile uint32_t *ptr = (volatile uint32_t *)(address ^ 4);
++	volatile uint8_t *ptr = (volatile uint8_t *)(address ^ LE_TO_BE_8BIT_MASK);
+ 	*ptr = val;
+ }
+ 
+@@ -76,11 +106,42 @@ static void npi_write32(uint64_t address
+  * @param address Address to read
+  * @return The result
+  */
+-static uint32_t npi_read32(uint64_t address)
++uint32_t npi_read32(uint64_t address)
+ {
+-	volatile uint32_t *ptr = (volatile uint32_t *)(address ^ 4);
++	volatile uint32_t *ptr =
++	    (volatile uint32_t *)(address ^ LE_TO_BE_32BIT_MASK);
+ 	uint32_t d;
+-        d = *ptr;
++	d = *ptr;
++	return d;
++}
++
++/**
++ * Read a 16bit value from the Octeon NPI register space
++ *
++ * @param address Address to read
++ * @return The result
++ */
++uint16_t npi_read16(uint64_t address)
++{
++	volatile uint16_t *ptr =
++	    (volatile uint16_t *)(address ^ LE_TO_BE_16BIT_MASK);
++	uint16_t d;
++	d = *ptr;
++	return d;
++}
++
++/**
++ * Read a 8bit value from the Octeon NPI register space
++ *
++ * @param address Address to read
++ * @return The result
++ */
++uint8_t npi_read8(uint64_t address)
++{
++	volatile uint8_t *ptr =
++	    (volatile uint8_t *)(address ^ LE_TO_BE_8BIT_MASK);
++	uint8_t d;
++	d = *ptr;
+ 	return d;
+ }
+ 
+@@ -118,6 +179,8 @@ static inline void octeon_pci_initialize
+ 	_mdelay(2);		/* Wait 2 ms after deasserting PCI reset */
+ 
+ 	ctl_status_2.u32 = 0;
++	ctl_status_2.s.bar2pres = 1;   /* bar2 present */
++	ctl_status_2.s.bar2_enb = 1;   /* bar2 enable  */
+ 	ctl_status_2.s.tsr_hwm = 1;	/* Initializes to 0.  Must be set before any PCI reads. */
+ 	npi_write32(OCTEON_NPI_PCI_CTL_STATUS_2, ctl_status_2.u32);
+ 	_mdelay(4);		/* Wait 2 ms before doing PCI reads */
+@@ -299,9 +362,9 @@ static int __init octeon_pci_setup(void)
+ 						       /**< PCI Address bits [63:36]. */
+ 	octeon_write_csr(OCTEON_NPI_MEM_ACCESS_SUBID3, mem_access.u64);
+ 
+-	/* Remap the Octeon BAR 0 to disable it. We'll map to to the highest possible address */
+-	npi_write32(OCTEON_NPI_PCI_CFG04, 0xffffffff);
+-	npi_write32(OCTEON_NPI_PCI_CFG05, 0xffffffff);
++    /* place Octeon BAR 0 at zero, so pci scan remaps */
++	npi_write32(OCTEON_NPI_PCI_CFG04, 0);
++	npi_write32(OCTEON_NPI_PCI_CFG05, 0);
+ 
+ 	/* Remap the Octeon BAR 1 to map 0-128MB */
+ 	bar1_index.u32 = 0;
+@@ -315,9 +378,9 @@ static int __init octeon_pci_setup(void)
+ 	npi_write32(OCTEON_NPI_PCI_CFG06, 0);
+ 	npi_write32(OCTEON_NPI_PCI_CFG07, 0);
+ 
+-	/* Remap the Octeon BAR 2 to disable it. We'll map to to the highest possible address */
+-	npi_write32(OCTEON_NPI_PCI_CFG08, 0xffffffff);
+-	npi_write32(OCTEON_NPI_PCI_CFG09, 0xffffffff);
++    /* place Octeon BAR 2 at zero, so pci scan remaps */
++	npi_write32(OCTEON_NPI_PCI_CFG08, 0);
++	npi_write32(OCTEON_NPI_PCI_CFG09, 0);
+ 
+ 	register_pci_controller(&octeon_pci_controller);
+ 	return 0;
+Index: linux-2.6.10/mvl_patches/pro-1068.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1068.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1068);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

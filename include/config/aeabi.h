@@ -1,0 +1,1 @@
+#define CONFIG_AEABI 1

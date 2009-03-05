@@ -1,0 +1,430 @@
+#! /usr/bin/env bash
+# Patch: -common_ppc_smp_kgdb
+# Date: Tue Mar  6 16:11:35 2007
+# Source: MontaVista Software, Inc.
+# MR: 21525
+# Type: Enhancement
+# Disposition: local
+# Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+# Description:
+#     Add KGDB support for PPC32 SMP platforms.
+# 
+#     This is roughly a port of the arch/powerpc version found in more recent
+#     kernels, and therefore does not need to be submitted upstream.
+# 
+
+PATCHNUM=1181
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 21525
+Type: Enhancement
+Disposition: local
+Signed-off-by: Wade Farnsworth <wfarnsworth@mvista.com>
+Description:
+    Add KGDB support for PPC32 SMP platforms.
+
+    This is roughly a port of the arch/powerpc version found in more recent
+    kernels, and therefore does not need to be submitted upstream.
+
+Index: linux-2.6.10/lib/Kconfig.debug
+===================================================================
+--- linux-2.6.10.orig/lib/Kconfig.debug
++++ linux-2.6.10/lib/Kconfig.debug
+@@ -229,7 +229,7 @@ config FRAME_POINTER
+ 
+ config KGDB
+ 	bool "KGDB: kernel debugging with remote gdb"
+-	depends on DEBUG_KERNEL && (ARM || X86 || MIPS || X86_64 || PPC64 || (SUPERH && !SUPERH64) || ((!SMP || BROKEN) && PPC32) || XTENSA)
++	depends on DEBUG_KERNEL && (ARM || X86 || MIPS || X86_64 || PPC64 || (SUPERH && !SUPERH64) || PPC32 || XTENSA)
+ 	help
+ 	  If you say Y here, it will be possible to remotely debug the
+ 	  kernel using gdb. It is strongly suggested that you enable
+Index: linux-2.6.10/arch/ppc/kernel/kgdb.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/kgdb.c
++++ linux-2.6.10/arch/ppc/kernel/kgdb.c
+@@ -85,6 +85,19 @@ static int computeSignal(unsigned int tt
+ 	return SIGHUP; /* default for things we don't know about */
+ }
+ 
++static int kgdb_call_nmi_hook(struct pt_regs *regs)
++{
++        kgdb_nmihook(smp_processor_id(), regs);
++        return 0;
++}
++
++#ifdef CONFIG_SMP
++void kgdb_roundup_cpus(unsigned long flags)
++{
++        smp_send_debugger_break(MSG_ALL_BUT_SELF);
++}
++#endif
++
+ /* KGDB functions to use existing PowerPC hooks. */
+ static void kgdb_debugger (struct pt_regs *regs)
+ {
+@@ -319,6 +332,7 @@ struct kgdb_arch arch_kgdb_ops =
+ 
+ int kgdb_arch_init (void)
+ {
++	debugger_ipi = kgdb_call_nmi_hook;
+ 	debugger = kgdb_debugger;
+ 	debugger_bpt = kgdb_breakpoint;
+ 	debugger_sstep = kgdb_singlestep;
+Index: linux-2.6.10/arch/ppc/kernel/smp.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/smp.c
++++ linux-2.6.10/arch/ppc/kernel/smp.c
+@@ -68,6 +68,10 @@ static int __smp_call_function(void (*fu
+ /* Low level assembly function used to backup CPU 0 state */
+ extern void __save_cpu_setup(void);
+ 
++#ifdef CONFIG_DEBUGGER
++extern int (*debugger_ipi)(struct pt_regs *regs);
++#endif
++
+ /* Since OpenPIC has only 4 IPIs, we use slightly different message numbers.
+  *
+  * Make sure this matches openpic_request_IPIs in open_pic.c, or what shows up
+@@ -75,7 +79,7 @@ extern void __save_cpu_setup(void);
+ #define PPC_MSG_CALL_FUNCTION	0
+ #define PPC_MSG_RESCHEDULE	1
+ #define PPC_MSG_INVALIDATE_TLB	2
+-#define PPC_MSG_XMON_BREAK	3
++#define PPC_MSG_DEBUGGER_BREAK	3
+ 
+ static inline void
+ smp_message_pass(int target, int msg, unsigned long data, int wait)
+@@ -113,11 +117,12 @@ void smp_message_recv(int msg, struct pt
+ 	case PPC_MSG_INVALIDATE_TLB:
+ 		_tlbia();
+ 		break;
+-#ifdef CONFIG_XMON
+-	case PPC_MSG_XMON_BREAK:
+-		xmon(regs);
++	case PPC_MSG_DEBUGGER_BREAK:
++#ifdef CONFIG_DEBUGGER
++		debugger_ipi(regs);
+ 		break;
+-#endif /* CONFIG_XMON */
++#endif /* CONFIG_DEBUGGER */
++		/* FALLTHROUGH */
+ 	default:
+ 		printk("SMP %d: smp_message_recv(): unknown msg %d\n",
+ 		       smp_processor_id(), msg);
+@@ -157,10 +162,10 @@ void smp_send_reschedule_allbutself(void
+ 	smp_message_pass(MSG_ALL_BUT_SELF, PPC_MSG_RESCHEDULE, 0, 0);
+ }
+ 
+-#ifdef CONFIG_XMON
+-void smp_send_xmon_break(int cpu)
++#ifdef CONFIG_DEBUGGER
++void smp_send_debugger_break(int cpu)
+ {
+-	smp_message_pass(cpu, PPC_MSG_XMON_BREAK, 0, 0);
++	smp_message_pass(cpu, PPC_MSG_DEBUGGER_BREAK, 0, 0);
+ }
+ #endif /* CONFIG_XMON */
+ 
+Index: linux-2.6.10/arch/ppc/syslib/open_pic.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/syslib/open_pic.c
++++ linux-2.6.10/arch/ppc/syslib/open_pic.c
+@@ -593,7 +593,7 @@ void openpic_request_IPIs(void)
+ 		    "IPI2 (invalidate tlb)", NULL);
+ 	request_irq(OPENPIC_VEC_IPI+open_pic_irq_offset+3,
+ 		    openpic_ipi_action, SA_INTERRUPT,
+-		    "IPI3 (xmon break)", NULL);
++		    "IPI3 (debugger break)", NULL);
+ 
+ 	for ( i = 0; i < OPENPIC_NUM_IPI ; i++ )
+ 		openpic_enable_ipi(OPENPIC_VEC_IPI+open_pic_irq_offset+i);
+Index: linux-2.6.10/arch/ppc/xmon/xmon.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/xmon/xmon.c
++++ linux-2.6.10/arch/ppc/xmon/xmon.c
+@@ -565,7 +565,7 @@ static void cpu_cmd(void)
+ 		/* interrupt other cpu(s) */
+ 		cpu = MSG_ALL_BUT_SELF;
+ 		if (scanhex(&cpu))
+-			smp_send_xmon_break(cpu);
++			smp_send_debugger_break(cpu);
+ 		return;
+ 	}
+ 	termch = cmd;
+Index: linux-2.6.10/include/asm-ppc/smp.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/smp.h
++++ linux-2.6.10/include/asm-ppc/smp.h
+@@ -37,7 +37,7 @@ extern volatile unsigned long cpu_callin
+ extern int smp_tb_synchronized;
+ 
+ extern void smp_send_tlb_invalidate(int);
+-extern void smp_send_xmon_break(int cpu);
++extern void smp_send_debugger_break(int cpu);
+ struct pt_regs;
+ extern void smp_message_recv(int, struct pt_regs *);
+ extern void smp_local_timer_interrupt(struct pt_regs *);
+Index: linux-2.6.10/arch/ppc/Kconfig.debug
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/Kconfig.debug
++++ linux-2.6.10/arch/ppc/Kconfig.debug
+@@ -9,6 +9,11 @@ config XMON
+ 	  Include in-kernel hooks for the xmon kernel monitor/debugger.
+ 	  Unless you are intending to debug the kernel, say N here.
+ 
++config DEBUGGER
++	bool
++	depends on KGDB || XMON
++	default y
++
+ config BDI_SWITCH
+ 	bool "Include BDI-2000 user context switcher"
+ 	depends on DEBUG_KERNEL
+Index: linux-2.6.10/arch/ppc/kernel/traps.c
+===================================================================
+--- linux-2.6.10.orig/arch/ppc/kernel/traps.c
++++ linux-2.6.10/arch/ppc/kernel/traps.c
+@@ -45,6 +45,7 @@
+ 
+ #ifdef CONFIG_XMON
+ void (*debugger)(struct pt_regs *regs) = xmon;
++int (*debugger_ipi)(struct pt_regs *regs) = xmon;
+ int (*debugger_bpt)(struct pt_regs *regs) = xmon_bpt;
+ int (*debugger_sstep)(struct pt_regs *regs) = xmon_sstep;
+ int (*debugger_iabr_match)(struct pt_regs *regs) = xmon_iabr_match;
+@@ -53,6 +54,7 @@ void (*debugger_fault_handler)(struct pt
+ #else
+ #ifdef CONFIG_KGDB
+ void (*debugger)(struct pt_regs *regs);
++int (*debugger_ipi)(struct pt_regs *regs);
+ int (*debugger_bpt)(struct pt_regs *regs);
+ int (*debugger_sstep)(struct pt_regs *regs);
+ int (*debugger_iabr_match)(struct pt_regs *regs);
+@@ -60,6 +62,7 @@ int (*debugger_dabr_match)(struct pt_reg
+ void (*debugger_fault_handler)(struct pt_regs *regs);
+ #else
+ #define debugger(regs)			do { } while (0)
++#define debugger_ipi(regs)		0
+ #define debugger_bpt(regs)		0
+ #define debugger_sstep(regs)		0
+ #define debugger_iabr_match(regs)	0
+Index: linux-2.6.10/include/asm-ppc/kgdb.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/kgdb.h
++++ linux-2.6.10/include/asm-ppc/kgdb.h
+@@ -36,6 +36,7 @@
+  */
+ struct pt_regs;
+ extern void (*debugger)(struct pt_regs *regs);
++extern int (*debugger_ipi)(struct pt_regs *regs);
+ extern int (*debugger_bpt)(struct pt_regs *regs);
+ extern int (*debugger_sstep)(struct pt_regs *regs);
+ extern int (*debugger_iabr_match)(struct pt_regs *regs);
+Index: linux-2.6.10/mvl_patches/pro-1181.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1181.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1181);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,882 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_video_display_480p_576p_update
+# Date: Fri Jan 25 17:21:13 2008
+# Source: Texas Instruments Inc.
+# MR: 26698
+# Type: Defect Fix
+# Disposition: local
+# Signed-off-by: David Griego <dgriego@mvista.com>
+# Description:
+# 	The patch replaces the 525p/625p string with 480p/576p for the ntsc/pal
+# 	progressive modes. The sysfs attribute function to tune the system
+# 	module register has been moved to davinci plaform specific source file.
+# 	The sysfs attribute support has been added to set/get basepx/basepy 
+# 	values in OSD.
+# 
+
+PATCHNUM=1718
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments Inc.
+MR: 26698
+Type: Defect Fix
+Disposition: local
+Signed-off-by: David Griego <dgriego@mvista.com>
+Description:
+	The patch replaces the 525p/625p string with 480p/576p for the ntsc/pal
+	progressive modes. The sysfs attribute function to tune the system
+	module register has been moved to davinci plaform specific source file.
+	The sysfs attribute support has been added to set/get basepx/basepy 
+	values in OSD.
+
+Index: linux-2.6.10/drivers/media/video/davinci/davinci_enc_mngr.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/davinci/davinci_enc_mngr.c
++++ linux-2.6.10/drivers/media/video/davinci/davinci_enc_mngr.c
+@@ -47,6 +47,7 @@ module_param(ch1_mode, charp, S_IRUGO);
+ 
+ struct vid_enc_device_mgr enc_dev[DAVINCI_ENC_MAX_CHANNELS] = {
+ };
++
+ EXPORT_SYMBOL(enc_dev);
+ extern struct enc_config davinci_enc_default[];
+ extern char *davinci_outputs[];
+@@ -64,8 +65,6 @@ static struct display_device *davinci_di
+ #define to_display_dev(cdev)	container_of(cdev, \
+  struct display_device, class_dev)
+ 
+-static void __iomem *display_cntl_base;
+-
+ static void display_class_release(struct class_device *cdev)
+ {
+ 	struct display_device *dev = to_display_dev(cdev);
+@@ -249,60 +248,6 @@ static ssize_t gain_show(struct class_de
+ 	return control_show(cdev, buf, VID_ENC_CTRL_GAIN);
+ }
+ 
+-static ssize_t
+-reg_store(struct class_device *cdev, const char *buffer, size_t count)
+-{
+-	char *str = 0;
+-	char *bufv = 0;
+-	int addr = 0;
+-	int val = 0;
+-	int len = 0;
+-
+-	if (!buffer || (count == 0) || (count >= 128))
+-		return 0;
+-
+-	str = kmalloc(128, GFP_KERNEL);
+-	if (0 == str)
+-		return -ENOMEM;
+-
+-	strcpy(str, buffer);
+-	/* overwrite the '\n' */
+-	strcpy(str + count - 1, "\0");
+-
+-	/* format: <address> [<value>]
+-	   if only <address> present, it is a read
+-	   if <address> <value>, then it is a write */
+-	len = strcspn(str, " ");
+-	addr = simple_strtoul(str, NULL, 16);
+-
+-	if (len != count - 1) {
+-		bufv = str;
+-		strsep(&bufv, " ");
+-		val = simple_strtoul(bufv, NULL, 16);
+-	}
+-
+-	kfree(str);
+-
+-	/* for now, restrict this to access DDR2 controller
+-	   Peripheral Bust Burst Priority Register PBBPR
+-	   (addr: 0x20000020) only */
+-	if (addr != (DM644X_DDR2_CNTL_BASE + 0x20))
+-		return -EINVAL;
+-
+-	if (bufv != 0) {
+-		writel(val, display_cntl_base + addr - DM644X_DDR2_CNTL_BASE);
+-	}
+-	printk(KERN_NOTICE "%05x  %08x\n", addr,
+-	       readl(display_cntl_base + addr - DM644X_DDR2_CNTL_BASE));
+-
+-	return count;
+-}
+-
+-static ssize_t reg_show(struct class_device *cdev, char *buf)
+-{
+-	return 0;
+-}
+-
+ #define DECLARE_ATTR(_name, _mode, _show, _store)                  \
+ {                                                               \
+ 	.attr   = { .name = __stringify(_name), .mode = _mode,	\
+@@ -316,8 +261,7 @@ static struct class_device_attribute bl_
+ 	DECLARE_ATTR(enable, S_IRWXUGO, enable_show, enable_store),
+ 	DECLARE_ATTR(brightness, S_IRWXUGO, brightness_show, brightness_store),
+ 	DECLARE_ATTR(hue, S_IRWXUGO, hue_show, hue_store),
+-	DECLARE_ATTR(gain, S_IRWXUGO, gain_show, gain_store),
+-	DECLARE_ATTR(reg, S_IRWXUGO, reg_show, reg_store)
++	DECLARE_ATTR(gain, S_IRWXUGO, gain_show, gain_store)
+ };
+ 
+ static void *create_sysfs_files(int channel)
+@@ -429,11 +373,6 @@ static int davinci_enc_mngr_init(void)
+ 	struct vid_enc_device_mgr *ptr = 0;
+ 
+ #ifdef CONFIG_SYSFS
+-	display_cntl_base = ioremap(DM644X_DDR2_CNTL_BASE, 0x24);
+-	if (!display_cntl_base) {
+-		printk(KERN_ERR "Could not remap control registers\n");
+-		return -EINVAL;
+-	}
+ 	class_register(&display_class);
+ #endif
+ 
+@@ -448,7 +387,6 @@ static int davinci_enc_mngr_init(void)
+ 			printk(KERN_ERR
+ 			       "Could not create display control sysfs "
+ 			       "files for channel %d\n", i);
+-			iounmap(display_cntl_base);
+ 			return -EINVAL;
+ 		}
+ #endif
+@@ -471,7 +409,6 @@ static void davinci_enc_mngr_cleanup(voi
+ 		remove_sysfs_files(davinci_display_device[i]);
+ 
+ 	class_unregister(&display_class);
+-	iounmap(display_cntl_base);
+ #endif
+ 
+ 	return;
+Index: linux-2.6.10/drivers/media/video/davinci/davinci_osd.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/davinci/davinci_osd.c
++++ linux-2.6.10/drivers/media/video/davinci/davinci_osd.c
+@@ -2081,3 +2081,4 @@ EXPORT_SYMBOL(davinci_disp_set_field_inv
+ EXPORT_SYMBOL(davinci_disp_get_field_inversion);
+ EXPORT_SYMBOL(davinci_disp_register_callback);
+ EXPORT_SYMBOL(davinci_disp_unregister_callback);
++MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/media/video/davinci/davinci_platform.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/davinci/davinci_platform.c
++++ linux-2.6.10/drivers/media/video/davinci/davinci_platform.c
+@@ -26,6 +26,7 @@
+ #include <asm/arch/mux.h>
+ #include <asm/arch/cpu.h>
+ #include <asm/arch/io.h>
++#include <asm/io.h>
+ #include <media/davinci/davinci_enc.h>
+ #include <media/davinci/vid_encoder_types.h>
+ #include <video/davinci_vpbe.h>
+@@ -39,6 +40,7 @@ struct enc_config davinci_enc_default[DA
+ 	{VID_ENC_OUTPUT_COMPOSITE,
+ 	 VID_ENC_STD_NTSC}
+ };
++
+ EXPORT_SYMBOL(davinci_enc_default);
+ 
+ char *davinci_outputs[] = {
+@@ -52,6 +54,7 @@ char *davinci_outputs[] = {
+ 	VID_ENC_OUTPUT_LCD1,
+ 	""
+ };
++
+ EXPORT_SYMBOL(davinci_outputs);
+ 
+ char *davinci_modes[] = {
+@@ -71,8 +74,8 @@ char *davinci_modes[] = {
+ 	VID_ENC_STD_1080P_30,
+ 	VID_ENC_STD_1080P_50,
+ 	VID_ENC_STD_1080P_60,
+-	VID_ENC_STD_525P_30,
+-	VID_ENC_STD_625P_25,
++	VID_ENC_STD_480P_60,
++	VID_ENC_STD_576P_50,
+ 	VID_ENC_STD_640x480,
+ 	VID_ENC_STD_640x400,
+ 	VID_ENC_STD_640x350,
+@@ -80,8 +83,6 @@ char *davinci_modes[] = {
+ };
+ EXPORT_SYMBOL(davinci_modes);
+ 
+-struct platform_specific_base davinci_platform_base;
+-
+ static __inline__ u32 dispc_reg_in(u32 offset)
+ {
+ 	if (cpu_is_davinci_dm355())
+@@ -113,29 +114,266 @@ static __inline__ u32 dispc_reg_merge(u3
+ 	return (new_val);
+ }
+ 
+-void davinci_enc_set_basep(int channel, unsigned basepx, unsigned basepy)
++#ifdef CONFIG_SYSFS
++
++static spinlock_t reg_access_lock;
++static void davinci_enc_set_basep(int channel, unsigned basepx, unsigned basepy)
++{
++	spin_lock(&reg_access_lock);
++	if (cpu_is_davinci_dm355()) {
++		davinci_writel((basepx & OSD_BASEPX_BPX),
++			       (DM355_OSD_REG_BASE + OSD_BASEPX));
++		davinci_writel((basepy & OSD_BASEPY_BPY),
++			       (DM355_OSD_REG_BASE + OSD_BASEPY));
++	} else if (cpu_is_davinci_dm644x()) {
++		davinci_writel((basepx & OSD_BASEPX_BPX),
++			       (DM644X_OSD_REG_BASE + OSD_BASEPX));
++		davinci_writel((basepy & OSD_BASEPY_BPY),
++			       (DM644X_OSD_REG_BASE + OSD_BASEPY));
++	} else {
++		printk(KERN_WARNING "Unsupported platform\n");
++	}
++	spin_unlock(&reg_access_lock);
++}
++
++static void davinci_enc_get_basep(int channel, unsigned *basepx,
++				  unsigned *basepy)
++{
++	spin_lock(&reg_access_lock);
++	if (cpu_is_davinci_dm355()) {
++		*basepx =
++		    (OSD_BASEPX_BPX &
++		     davinci_readl(DM355_OSD_REG_BASE + OSD_BASEPX));
++		*basepy =
++		    (OSD_BASEPY_BPY &
++		     davinci_readl(DM355_OSD_REG_BASE + OSD_BASEPY));
++	} else if (cpu_is_davinci_dm644x()) {
++		*basepx =
++		    (OSD_BASEPX_BPX &
++		     davinci_readl(DM644X_OSD_REG_BASE + OSD_BASEPX));
++		*basepy =
++		    (OSD_BASEPY_BPY &
++		     davinci_readl(DM644X_OSD_REG_BASE + OSD_BASEPY));
++	} else {
++		*basepx = 0;
++		*basepy = 0;
++		printk(KERN_WARNING "Unsupported platform\n");
++	}
++	spin_unlock(&reg_access_lock);
++}
++
++struct system_device {
++	struct module *owner;
++	struct class_device class_dev;
++};
++
++static struct system_device *davinci_system_device;
++
++#define to_system_dev(cdev)	container_of(cdev, \
++ struct system_device, class_dev)
++
++static void davinci_system_class_release(struct class_device *cdev)
++{
++	struct system_device *dev = to_system_dev(cdev);
++
++	if (dev != NULL)
++		kfree(dev);
++}
++
++static void __iomem *display_cntl_base;
++
++struct class davinci_system_class = {
++	.name = "davinci_system",
++	.release = davinci_system_class_release,
++};
++
++static ssize_t
++reg_store(struct class_device *cdev, const char *buffer, size_t count)
++{
++	char *str = 0;
++	char *bufv = 0;
++	int addr = 0;
++	int val = 0;
++	int len = 0;
++
++	if (!buffer || (count == 0) || (count >= 128))
++		return 0;
++
++	str = kmalloc(128, GFP_KERNEL);
++	if (0 == str)
++		return -ENOMEM;
++
++	strcpy(str, buffer);
++	/* overwrite the '\n' */
++	strcpy(str + count - 1, "\0");
++
++	/* format: <address> [<value>]
++	   if only <address> present, it is a read
++	   if <address> <value>, then it is a write */
++	len = strcspn(str, " ");
++	addr = simple_strtoul(str, NULL, 16);
++
++	if (len != count - 1) {
++		bufv = str;
++		strsep(&bufv, " ");
++		val = simple_strtoul(bufv, NULL, 16);
++	}
++
++	kfree(str);
++
++	/* for now, restrict this to access DDR2 controller
++	   Peripheral Bust Burst Priority Register PBBPR
++	   (addr: 0x20000020) only */
++	if (addr != (DM644X_DDR2_CNTL_BASE + 0x20))
++		return -EINVAL;
++
++	spin_lock(&reg_access_lock);
++	if (bufv != 0)
++		writel(val, display_cntl_base + addr - DM644X_DDR2_CNTL_BASE);
++	printk(KERN_NOTICE "%05x  %08x\n", addr,
++	       readl(display_cntl_base + addr - DM644X_DDR2_CNTL_BASE));
++	spin_unlock(&reg_access_lock);
++
++	return count;
++}
++
++static ssize_t reg_show(struct class_device *cdev, char *buf)
++{
++	return 0;
++}
++
++static ssize_t osd_basepx_show(struct class_device *cdev, char *buf)
++{
++	unsigned int basepx, basepy;
++	int p;
++
++	davinci_enc_get_basep(0, &basepx, &basepy);
++	p = sprintf(buf, "%d\n", basepx);
++	return p;
++}
++
++static ssize_t osd_basepx_store(struct class_device *cdev, const char *buffer,
++				size_t count)
+ {
+-	struct vid_enc_device_mgr *mgr = &enc_dev[channel];
+-	down_interruptible(&mgr->lock);
+-	davinci_platform_base.basepx = basepx;
+-	davinci_platform_base.basepy = basepy;
+-	davinci_writel(basepx, OSD_BASEPX);
+-	davinci_writel(basepx, OSD_BASEPY);
+-	up(&mgr->lock);
++	unsigned int basepx, basepy;
++	char reg_val[10];
++
++	if (count >= 9) {
++		strncpy(reg_val, buffer, 9);
++		reg_val[9] = '\0';
++	} else {
++		/* overwrite the '\n' */
++		strcpy(reg_val, buffer);
++		strcpy(reg_val + count - 1, "\0");
++	}
++	davinci_enc_get_basep(0, &basepx, &basepy);
++	basepx = simple_strtoul(reg_val, NULL, 10);
++
++	if (basepx > OSD_BASEPX_BPX) {
++		printk(KERN_ERR "Invalid value for OSD basepx\n");
++		return count;
++	}
++	davinci_enc_set_basep(0, basepx, basepy);
++	return count;
++}
++
++static ssize_t osd_basepy_show(struct class_device *cdev, char *buf)
++{
++	unsigned int basepx, basepy;
++	int p;
++
++	davinci_enc_get_basep(0, &basepx, &basepy);
++	p = sprintf(buf, "%d\n", basepy);
++	return p;
++}
++
++static ssize_t osd_basepy_store(struct class_device *cdev, const char *buffer,
++				size_t count)
++{
++	unsigned int basepx, basepy;
++	char reg_val[10];
++
++	if (count >= 9) {
++		strncpy(reg_val, buffer, 9);
++		reg_val[9] = '\0';
++	} else {
++		/* overwrite the '\n' */
++		strcpy(reg_val, buffer);
++		strcpy(reg_val + count - 1, "\0");
++	}
++
++	davinci_enc_get_basep(0, &basepx, &basepy);
++	basepy = simple_strtoul(reg_val, NULL, 10);
++	if (basepy > OSD_BASEPY_BPY) {
++		printk(KERN_ERR "Invalid value for OSD basepy\n");
++		return count;
++	}
++	davinci_enc_set_basep(0, basepx, basepy);
++	return count;
+ }
+ 
+-EXPORT_SYMBOL(davinci_enc_set_basep);
++#define DECLARE_ATTR(_name, _mode, _show, _store) {		\
++	.attr   = { .name = __stringify(_name), .mode = _mode,	\
++		    .owner = THIS_MODULE },  			\
++	.show   = _show,                                        \
++	.store  = _store,}
++
++static struct class_device_attribute system_class_device_attributes[] = {
++	DECLARE_ATTR(reg, S_IRWXUGO, reg_show, reg_store),
++	DECLARE_ATTR(vpbe_osd_basepx, S_IRWXUGO, osd_basepx_show,
++		     osd_basepx_store),
++	DECLARE_ATTR(vpbe_osd_basepy, S_IRWXUGO, osd_basepy_show,
++		     osd_basepy_store)
++};
+ 
+-void davinci_enc_get_basep(int channel, unsigned *basepx, unsigned *basepy)
++static void *create_sysfs_files(void)
+ {
+-	struct vid_enc_device_mgr *mgr = &enc_dev[channel];
+-	down_interruptible(&mgr->lock);
+-	*basepx = davinci_platform_base.basepx;
+-	*basepy = davinci_platform_base.basepy;
+-	up(&mgr->lock);
++	struct system_device *dev;
++	int ret;
++	int i;
++
++	dev = kzalloc(sizeof(struct system_device), GFP_KERNEL);
++	if (!dev)
++		return NULL;
++
++	dev->owner = THIS_MODULE;
++	dev->class_dev.class = &davinci_system_class;
++	snprintf(dev->class_dev.class_id, BUS_ID_SIZE, "system");
++	ret = class_device_register(&dev->class_dev);
++	if (ret < 0) {
++		printk(KERN_ERR "Error in class_device_register\n");
++		kfree(dev);
++		return NULL;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(system_class_device_attributes); i++) {
++		ret = class_device_create_file(&dev->class_dev,
++					       &system_class_device_attributes
++					       [i]);
++		if (ret < 0) {
++			while (--i >= 0)
++				class_device_remove_file(&dev->class_dev,
++					&system_class_device_attributes[i]);
++			class_device_unregister(&dev->class_dev);
++			printk(KERN_ERR "Error in class_device_create_file\n");
++			return NULL;
++		}
++	}
++
++	return dev;
+ }
+ 
+-EXPORT_SYMBOL(davinci_enc_get_basep);
++static void remove_sysfs_files(struct system_device *dev)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(system_class_device_attributes); i++)
++		class_device_remove_file(&dev->class_dev,
++					 &system_class_device_attributes[i]);
++
++	class_device_unregister(&dev->class_dev);
++}
++#endif
+ 
+ /**
+  * function davinci_enc_select_venc_clk
+@@ -698,9 +936,9 @@ void davinci_enc_priv_setmode(struct vid
+ 		davinci_enc_set_pal(&mgr->current_mode);
+ 	} else if (strcmp(mgr->current_mode.name, VID_ENC_STD_PAL_RGB) == 0) {
+ 		davinci_enc_set_ntsc_pal_rgb(&mgr->current_mode);
+-	} else if (strcmp(mgr->current_mode.name, VID_ENC_STD_525P_30) == 0) {
++	} else if (strcmp(mgr->current_mode.name, VID_ENC_STD_480P_60) == 0) {
+ 		davinci_enc_set_525p(&mgr->current_mode);
+-	} else if (strcmp(mgr->current_mode.name, VID_ENC_STD_625P_25) == 0) {
++	} else if (strcmp(mgr->current_mode.name, VID_ENC_STD_576P_50) == 0) {
+ 		davinci_enc_set_625p(&mgr->current_mode);
+ 	} else if (strcmp(mgr->current_mode.name, VID_ENC_STD_640x480) == 0 ||
+ 		   strcmp(mgr->current_mode.name, VID_ENC_STD_640x400) == 0 ||
+@@ -736,4 +974,38 @@ void davinci_enc_set_mode_platform(int c
+ 
+ EXPORT_SYMBOL(davinci_enc_set_mode_platform);
+ 
++static int davinci_platform_init(void)
++{
++#ifdef CONFIG_SYSFS
++	display_cntl_base = ioremap(DM644X_DDR2_CNTL_BASE, 0x24);
++	if (!display_cntl_base) {
++		printk(KERN_ERR "Could not remap control registers\n");
++		return -EINVAL;
++	}
++	class_register(&davinci_system_class);
++
++	reg_access_lock = SPIN_LOCK_UNLOCKED;
++	davinci_system_device = create_sysfs_files();
++	if (!davinci_system_device) {
++		printk(KERN_ERR "Could not create davinci system sysfs\n");
++		iounmap(display_cntl_base);
++		return -EINVAL;
++	}
++#endif
++	return 0;
++}
++
++static void davinci_platform_cleanup(void)
++{
++#ifdef CONFIG_SYSFS
++	remove_sysfs_files(davinci_system_device);
++	class_unregister(&davinci_system_class);
++	iounmap(display_cntl_base);
++#endif
++	return;
++}
++
++subsys_initcall(davinci_platform_init);
++module_exit(davinci_platform_cleanup);
++
+ MODULE_LICENSE("GPL");
+Index: linux-2.6.10/drivers/media/video/davinci/vpbe_encoder.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/davinci/vpbe_encoder.c
++++ linux-2.6.10/drivers/media/video/davinci/vpbe_encoder.c
+@@ -132,13 +132,13 @@ static struct vid_enc_mode_info vpbe_enc
+ 	 .vsync_len = 0,
+ 	 .flags = 0},
+ 	{
+-	 .name = VID_ENC_STD_525P_30,
++	 .name = VID_ENC_STD_480P_60,
+ 	 .std = 1,
+ 	 .if_type = VID_ENC_IF_INT,
+ 	 .interlaced = 0,
+ 	 .xres = 720,
+ 	 .yres = 480,
+-	 .fps = {30, 1},
++	 .fps = {60, 1},
+ 	 .left_margin = 0x80,
+ 	 .right_margin = 0,
+ 	 .upper_margin = 0x20,
+@@ -147,13 +147,13 @@ static struct vid_enc_mode_info vpbe_enc
+ 	 .vsync_len = 0,
+ 	 .flags = 0},
+ 	{
+-	 .name = VID_ENC_STD_625P_25,
++	 .name = VID_ENC_STD_576P_50,
+ 	 .std = 1,
+ 	 .if_type = VID_ENC_IF_INT,
+ 	 .interlaced = 0,
+ 	 .xres = 720,
+ 	 .yres = 576,
+-	 .fps = {25, 1},
++	 .fps = {50, 1},
+ 	 .left_margin = 0x7E,
+ 	 .right_margin = 0,
+ 	 .upper_margin = 0x30,
+@@ -183,8 +183,8 @@ static struct vpbe_encoder_config vpbe_e
+ 				    VID_ENC_STD_PAL,
+ 				    VID_ENC_STD_NTSC_RGB,
+ 				    VID_ENC_STD_PAL_RGB,
+-				    VID_ENC_STD_525P_30,
+-				    VID_ENC_STD_625P_25},
++				    VID_ENC_STD_480P_60,
++				    VID_ENC_STD_576P_50},
+ 		      }
+ };
+ 
+@@ -434,8 +434,8 @@ static int vpbe_encoder_setmode(struct v
+ 			dispc_reg_merge(VENC_CMPNT,
+ 					(1 << VENC_CMPNT_MRGB_SHIFT),
+ 					VENC_CMPNT_MRGB);
+-		} else if (!strcmp(mymode, VID_ENC_STD_525P_30) && dm6446) {
+-			/* Setup for 525P, Progressive NTSC */
++		} else if (!strcmp(mymode, VID_ENC_STD_480P_60) && dm6446) {
++			/* Setup for 480P, Progressive NTSC */
+ 			dispc_reg_out(VENC_VMOD, 0);
+ 			dispc_reg_merge(VENC_VMOD,
+ 					(1 << VENC_VMOD_VIE_SHIFT),
+@@ -446,9 +446,9 @@ static int vpbe_encoder_setmode(struct v
+ 					(HDTV_525P << VENC_VMOD_TVTYP_SHIFT),
+ 					VENC_VMOD_TVTYP);
+ 
+-		} else if (!strcmp(mymode, VID_ENC_STD_625P_25) && dm6446) {
++		} else if (!strcmp(mymode, VID_ENC_STD_576P_50) && dm6446) {
+ 			dispc_reg_out(VENC_VMOD, 0);
+-			/* Setup for 625P, Progressive PAL */
++			/* Setup for 576P, Progressive PAL */
+ 			dispc_reg_merge(VENC_VMOD,
+ 					(1 << VENC_VMOD_VIE_SHIFT),
+ 					VENC_VMOD_VIE);
+Index: linux-2.6.10/include/media/davinci/davinci_enc.h
+===================================================================
+--- linux-2.6.10.orig/include/media/davinci/davinci_enc.h
++++ linux-2.6.10/include/media/davinci/davinci_enc.h
+@@ -183,28 +183,6 @@ int davinci_enc_reset(int channel);
+ int davinci_enc_enable_output(int channel, int flag);
+ 
+ /**
+- * davinci_enc_set_basep
+- * @channel: channel number (0 to MAX_CHANNELS-1)
+- * @basepx: horizontal reference position (in pixels) for all layers
+- * @basepy: vertical reference position (in lines) for all layers
+- *
+- * Description:
+- * Set the base display reference position for all display layers.
+- */
+-void davinci_enc_set_basep(int channel, unsigned basepx, unsigned basepy);
+-
+-/**
+- * davinci_enc_get_basep
+- * @channel: channel number (0 to MAX_CHANNELS-1)
+- * @basepx: horizontal reference position (in pixels) for all layers
+- * @basepy: vertical reference position (in lines) for all layers
+- *
+- * Description:
+- * Get the base display reference position for all display layers.
+- */
+-void davinci_disp_get_basep(int channel, unsigned *basepx, unsigned *basepy);
+-
+-/**
+  * davinci_enc_enable_vbi
+  * @flag: flag which tells whether to enable or disable raw vbi
+  * Returns: Zero if successful, or non-zero otherwise
+Index: linux-2.6.10/include/media/davinci/davinci_platform.h
+===================================================================
+--- linux-2.6.10.orig/include/media/davinci/davinci_platform.h
++++ linux-2.6.10/include/media/davinci/davinci_platform.h
+@@ -34,13 +34,7 @@
+ #include <media/davinci/davinci_enc_mngr.h>
+ 
+ #ifdef __KERNEL__
+-struct platform_specific_base {
+-	unsigned int basepx;
+-	unsigned int basepy;
+-};
+-void davinci_enc_get_basep(int channel, unsigned *basepx, unsigned *basepy);
+ int davinci_enc_select_venc_clock(int clk);
+-void davinci_enc_set_basep(int channel, unsigned basepx, unsigned basepy);
+ void davinci_enc_set_display_timing(struct vid_enc_mode_info *mode);
+ void davinci_enc_set_mode_platform(int channel, struct vid_enc_device_mgr *mgr);
+ 
+Index: linux-2.6.10/include/media/davinci/vid_encoder_types.h
+===================================================================
+--- linux-2.6.10.orig/include/media/davinci/vid_encoder_types.h
++++ linux-2.6.10/include/media/davinci/vid_encoder_types.h
+@@ -102,8 +102,6 @@ enum vid_enc_if_type {
+ #define VID_ENC_STD_1080P_60     "1080P-60"
+ #define VID_ENC_STD_480P_60      "480P-60"
+ #define VID_ENC_STD_576P_50      "576P-50"
+-#define VID_ENC_STD_525P_30      "525P-30"
+-#define VID_ENC_STD_625P_25      "625P-25"
+ #define VID_ENC_STD_640x480      "640x480"
+ #define VID_ENC_STD_640x400      "640x400"
+ #define VID_ENC_STD_640x350      "640x350"
+Index: linux-2.6.10/mvl_patches/pro-1718.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1718.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1718);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

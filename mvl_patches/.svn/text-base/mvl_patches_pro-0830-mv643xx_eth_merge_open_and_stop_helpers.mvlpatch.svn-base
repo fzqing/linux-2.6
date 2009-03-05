@@ -1,0 +1,426 @@
+#! /usr/bin/env bash
+# Patch: -mv643xx_eth_merge_open_and_stop_helpers
+# Date: Tue Aug  8 20:55:27 2006
+
+PATCHNUM=830
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree ab4384a6588925607f734e195f49e34a80f31e84 (from 4476e0e4c7e6a2c22288391b853b6e071622f079)
+tree e0fc58cb591c725a4e7a2437099af4eb1febf280
+parent 4476e0e4c7e6a2c22288391b853b6e071622f079
+author Dale Farnsworth <dale@farnsworth.org> 1137455961 -0700
+committer Jeff Garzik <jgarzik@pobox.com> 1137500618 -0500
+
+    [PATCH] mv643xx_eth: Merge open and stop helper functions
+    
+    Move code from helper functions mv643xx_eth_real_open and mv643xx_eth_real_stop
+    as they are no longer needed.
+    
+    Signed-off-by Dale Farnsworth <dale@farnsworth.org>
+    
+ drivers/net/mv643xx_eth.c |  109 ++++++++++++++++++----------------------------
+ mvl_patches/pro-0830.c    |   16 ++++++
+ 2 files changed, 61 insertions(+), 64 deletions(-)
+    
+    Signed-off-by: Jeff Garzik <jgarzik@pobox.com>
+
+diff --git a/drivers/net/mv643xx_eth.c b/drivers/net/mv643xx_eth.c
+index 5de06d7..6118ea7 100644
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -81,8 +81,8 @@ static int eth_port_link_is_up(unsigned 
+ static void eth_port_uc_addr_get(struct net_device *dev,
+ 						unsigned char *MacAddr);
+ static void eth_port_set_multicast_list(struct net_device *);
+-static int mv643xx_eth_real_open(struct net_device *);
+-static int mv643xx_eth_real_stop(struct net_device *);
++static int mv643xx_eth_open(struct net_device *);
++static int mv643xx_eth_stop(struct net_device *);
+ static int mv643xx_eth_change_mtu(struct net_device *, int);
+ static struct net_device_stats *mv643xx_eth_get_stats(struct net_device *);
+ static void eth_port_init_mac_tables(unsigned int eth_port_num);
+@@ -138,11 +138,8 @@ static int mv643xx_eth_change_mtu(struct
+ 	 * to memory is full, which might fail the open function.
+ 	 */
+ 	if (netif_running(dev)) {
+-		if (mv643xx_eth_real_stop(dev))
+-			printk(KERN_ERR
+-				"%s: Fatal error on stopping device\n",
+-				dev->name);
+-		if (mv643xx_eth_real_open(dev))
++		mv643xx_eth_stop(dev);
++		if (mv643xx_eth_open(dev))
+ 			printk(KERN_ERR
+ 				"%s: Fatal error on opening device\n",
+ 				dev->name);
+@@ -630,42 +627,6 @@ static unsigned int eth_port_set_tx_coal
+ }
+ 
+ /*
+- * mv643xx_eth_open
+- *
+- * This function is called when openning the network device. The function
+- * should initialize all the hardware, initialize cyclic Rx/Tx
+- * descriptors chain and buffers and allocate an IRQ to the network
+- * device.
+- *
+- * Input :	a pointer to the network device structure
+- *
+- * Output :	zero of success , nonzero if fails.
+- */
+-
+-static int mv643xx_eth_open(struct net_device *dev)
+-{
+-	struct mv643xx_private *mp = netdev_priv(dev);
+-	unsigned int port_num = mp->port_num;
+-	int err;
+-
+-	err = request_irq(dev->irq, mv643xx_eth_int_handler,
+-			SA_SHIRQ | SA_SAMPLE_RANDOM, dev->name, dev);
+-	if (err) {
+-		printk(KERN_ERR "Can not assign IRQ number to MV643XX_eth%d\n",
+-								port_num);
+-		return -EAGAIN;
+-	}
+-
+-	if (mv643xx_eth_real_open(dev)) {
+-		printk("%s: Error opening interface\n", dev->name);
+-		free_irq(dev->irq, dev);
+-		err = -EBUSY;
+-	}
+-
+-	return err;
+-}
+-
+-/*
+  * ether_init_rx_desc_ring - Curve a Rx chain desc list and buffer in memory.
+  *
+  * DESCRIPTION:
+@@ -757,12 +718,33 @@ static void ether_init_tx_desc_ring(stru
+ 	mp->port_tx_queue_command |= 1;
+ }
+ 
+-/* Helper function for mv643xx_eth_open */
+-static int mv643xx_eth_real_open(struct net_device *dev)
++/*
++ * mv643xx_eth_open
++ *
++ * This function is called when openning the network device. The function
++ * should initialize all the hardware, initialize cyclic Rx/Tx
++ * descriptors chain and buffers and allocate an IRQ to the network
++ * device.
++ *
++ * Input :	a pointer to the network device structure
++ *
++ * Output :	zero of success , nonzero if fails.
++ */
++
++static int mv643xx_eth_open(struct net_device *dev)
+ {
+ 	struct mv643xx_private *mp = netdev_priv(dev);
+ 	unsigned int port_num = mp->port_num;
+ 	unsigned int size;
++	int err;
++
++	err = request_irq(dev->irq, mv643xx_eth_int_handler,
++			SA_SHIRQ | SA_SAMPLE_RANDOM, dev->name, dev);
++	if (err) {
++		printk(KERN_ERR "Can not assign IRQ number to MV643XX_eth%d\n",
++								port_num);
++		return -EAGAIN;
++	}
+ 
+ 	/* Stop RX Queues */
+ 	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
+@@ -786,14 +768,15 @@ static int mv643xx_eth_real_open(struct 
+ 								GFP_KERNEL);
+ 	if (!mp->rx_skb) {
+ 		printk(KERN_ERR "%s: Cannot allocate Rx skb ring\n", dev->name);
+-		return -ENOMEM;
++		err = -ENOMEM;
++		goto out_free_irq;
+ 	}
+ 	mp->tx_skb = kmalloc(sizeof(*mp->tx_skb) * mp->tx_ring_size,
+ 								GFP_KERNEL);
+ 	if (!mp->tx_skb) {
+ 		printk(KERN_ERR "%s: Cannot allocate Tx skb ring\n", dev->name);
+-		kfree(mp->rx_skb);
+-		return -ENOMEM;
++		err = -ENOMEM;
++		goto out_free_rx_skb;
+ 	}
+ 
+ 	/* Allocate TX ring */
+@@ -813,9 +796,8 @@ static int mv643xx_eth_real_open(struct 
+ 	if (!mp->p_tx_desc_area) {
+ 		printk(KERN_ERR "%s: Cannot allocate Tx Ring (size %d bytes)\n",
+ 							dev->name, size);
+-		kfree(mp->rx_skb);
+-		kfree(mp->tx_skb);
+-		return -ENOMEM;
++		err = -ENOMEM;
++		goto out_free_tx_skb;
+ 	}
+ 	BUG_ON((u32) mp->p_tx_desc_area & 0xf);	/* check 16-byte alignment */
+ 	memset((void *)mp->p_tx_desc_area, 0, mp->tx_desc_area_size);
+@@ -846,9 +828,8 @@ static int mv643xx_eth_real_open(struct 
+ 		else
+ 			dma_free_coherent(NULL, mp->tx_desc_area_size,
+ 					mp->p_tx_desc_area, mp->tx_desc_dma);
+-		kfree(mp->rx_skb);
+-		kfree(mp->tx_skb);
+-		return -ENOMEM;
++		err = -ENOMEM;
++		goto out_free_tx_skb;
+ 	}
+ 	memset((void *)mp->p_rx_desc_area, 0, size);
+ 
+@@ -880,6 +861,15 @@ static int mv643xx_eth_real_open(struct 
+ 	mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num),
+ 						INT_CAUSE_UNMASK_ALL);
+ 	return 0;
++
++out_free_tx_skb:
++	kfree(mp->tx_skb);
++out_free_rx_skb:
++	kfree(mp->rx_skb);
++out_free_irq:
++	free_irq(dev->irq, dev);
++
++	return err;
+ }
+ 
+ static void mv643xx_eth_free_tx_rings(struct net_device *dev)
+@@ -953,9 +943,7 @@ static void mv643xx_eth_free_rx_rings(st
+  * Output :	zero if success , nonzero if fails
+  */
+ 
+-/* Helper function for mv643xx_eth_stop */
+-
+-static int mv643xx_eth_real_stop(struct net_device *dev)
++static int mv643xx_eth_stop(struct net_device *dev)
+ {
+ 	struct mv643xx_private *mp = netdev_priv(dev);
+ 	unsigned int port_num = mp->port_num;
+@@ -984,13 +972,6 @@ static int mv643xx_eth_real_stop(struct 
+ 	netif_poll_enable(dev);
+ #endif
+ 
+-	return 0;
+-}
+-
+-static int mv643xx_eth_stop(struct net_device *dev)
+-{
+-	mv643xx_eth_real_stop(dev);
+-
+ 	free_irq(dev->irq, dev);
+ 
+ 	return 0;
+Index: linux-2.6.10/mvl_patches/pro-0830.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0830.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(830);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,434 @@
+#! /usr/bin/env bash
+# Patch: -ata_piix_fix_MAP_VALUE_interpretation_for_ICH6_7
+# Date: Mon Mar 26 17:44:04 2007
+# MR: 21247
+# From: Tejun Heo <htejun@gmail.com>
+# Date: Sun, 18 Dec 2005 08:17:07 +0000 (+0900)
+# Subject: [PATCH] ata_piix: fix MAP VALUE interpretation for for ICH6/7
+# X-Git-Tag: v2.6.16-rc2
+# commit ff0fc1467f8189c8e2340b91161c97138a75e484
+# 
+# [PATCH] ata_piix: fix MAP VALUE interpretation for for ICH6/7
+# 
+# Unlike their older siblings, ICH6 and 7 use different scheme for MAP
+# VALUE.  This patch makes ata_piix interpret MV properly on ICH6/7.
+# 
+# Pre-ICH6/7
+# 
+#  The value of these bits indicate the address range the SATA port
+#  responds to, and whether or not the SATA and IDE functions are
+#  combined.
+# 
+#  000 = Non-combined. P0 is primary master. P1 is secondary master.
+#  001 = Non-combined. P0 is secondary master. P1 is primary master.
+#  100 = Combined. P0 is primary master. P1 is primary slave. P-ATA is
+#        2:0 Map Value secondary.
+#  101 = Combined. P0 is primary slave. P1 is primary master. P-ATA is
+#        secondary.
+#  110 = Combined. P-ATA is primary. P0 is secondary master. P1 is
+#        secondary slave.
+#  111 = Combined. P-ATA is primary. P0 is secondary slave. P1 is
+#        secondary master.
+# 
+# ICH6/7
+# 
+#  Map Value - R/W. Map Value (MV): The value in the bits below indicate
+# the address range the SATA ports responds to, and whether or not the
+# PATA and SATA functions are combined. When in combined mode, the AHCI
+# memory space is not available and AHCI may not be used.
+# 
+#  00 = Non-combined. P0 is primary master, P2 is the primary slave. P1
+#       is secondary master, P3 is the 1:0 secondary slave (desktop
+#       only). P0 is primary master, P2 is the primary slave (mobile
+#       only).
+#  01 = Combined. IDE is primary. P1 is secondary master, P3 is the
+#       secondary slave. (desktop only)
+#  10 = Combined. P0 is primary master. P2 is primary slave. IDE is secondary
+#  11 = Reserved
+# 
+# Signed-off-by: Tejun Heo <htejun@gmail.com>
+# 
+# --
+# 
+# Jeff, without this patch, ata_piix misdetects my ICH7's combined mode,
+# ending up not applying bridge limits to PX-710SA and configuring IDE
+# drive on 40-c cable to UDMA/66.
+# 
+# Thanks.
+# Signed-off-by: Jeff Garzik <jgarzik@pobox.com>
+
+PATCHNUM=1265
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 21247
+From: Tejun Heo <htejun@gmail.com>
+Date: Sun, 18 Dec 2005 08:17:07 +0000 (+0900)
+Subject: [PATCH] ata_piix: fix MAP VALUE interpretation for for ICH6/7
+X-Git-Tag: v2.6.16-rc2
+commit ff0fc1467f8189c8e2340b91161c97138a75e484
+
+[PATCH] ata_piix: fix MAP VALUE interpretation for for ICH6/7
+
+Unlike their older siblings, ICH6 and 7 use different scheme for MAP
+VALUE.  This patch makes ata_piix interpret MV properly on ICH6/7.
+
+Pre-ICH6/7
+
+ The value of these bits indicate the address range the SATA port
+ responds to, and whether or not the SATA and IDE functions are
+ combined.
+
+ 000 = Non-combined. P0 is primary master. P1 is secondary master.
+ 001 = Non-combined. P0 is secondary master. P1 is primary master.
+ 100 = Combined. P0 is primary master. P1 is primary slave. P-ATA is
+       2:0 Map Value secondary.
+ 101 = Combined. P0 is primary slave. P1 is primary master. P-ATA is
+       secondary.
+ 110 = Combined. P-ATA is primary. P0 is secondary master. P1 is
+       secondary slave.
+ 111 = Combined. P-ATA is primary. P0 is secondary slave. P1 is
+       secondary master.
+
+ICH6/7
+
+ Map Value - R/W. Map Value (MV): The value in the bits below indicate
+the address range the SATA ports responds to, and whether or not the
+PATA and SATA functions are combined. When in combined mode, the AHCI
+memory space is not available and AHCI may not be used.
+
+ 00 = Non-combined. P0 is primary master, P2 is the primary slave. P1
+      is secondary master, P3 is the 1:0 secondary slave (desktop
+      only). P0 is primary master, P2 is the primary slave (mobile
+      only).
+ 01 = Combined. IDE is primary. P1 is secondary master, P3 is the
+      secondary slave. (desktop only)
+ 10 = Combined. P0 is primary master. P2 is primary slave. IDE is secondary
+ 11 = Reserved
+
+Signed-off-by: Tejun Heo <htejun@gmail.com>
+
+--
+
+Jeff, without this patch, ata_piix misdetects my ICH7's combined mode,
+ending up not applying bridge limits to PX-710SA and configuring IDE
+drive on 40-c cable to UDMA/66.
+
+Thanks.
+Signed-off-by: Jeff Garzik <jgarzik@pobox.com>
+Index: linux-2.6.10/drivers/scsi/ata_piix.c
+===================================================================
+--- linux-2.6.10.orig/drivers/scsi/ata_piix.c
++++ linux-2.6.10/drivers/scsi/ata_piix.c
+@@ -41,9 +41,11 @@ enum {
+ 	ICH5_PCS		= 0x92,	/* port control and status */
+ 	PIIX_SCC		= 0x0A, /* sub-class code register */
+ 
+-	PIIX_FLAG_AHCI		= (1 << 28), /* AHCI possible */
+-	PIIX_FLAG_CHECKINTR	= (1 << 29), /* make sure PCI INTx enabled */
+-	PIIX_FLAG_COMBINED	= (1 << 30), /* combined mode possible */
++	PIIX_FLAG_AHCI		= (1 << 27), /* AHCI possible */
++	PIIX_FLAG_CHECKINTR	= (1 << 28), /* make sure PCI INTx enabled */
++	PIIX_FLAG_COMBINED	= (1 << 29), /* combined mode possible */
++	/* ICH6/7 use different scheme for map value */
++	PIIX_FLAG_COMBINED_ICH6	= PIIX_FLAG_COMBINED | (1 << 30),
+ 
+ 	/* combined mode.  if set, PATA is channel 0.
+ 	 * if clear, PATA is channel 1.
+@@ -224,8 +226,8 @@ static struct ata_port_info piix_port_in
+ 	{
+ 		.sht		= &piix_sht,
+ 		.host_flags	= ATA_FLAG_SATA | ATA_FLAG_SRST |
+-				  PIIX_FLAG_COMBINED | PIIX_FLAG_CHECKINTR |
+-				  ATA_FLAG_SLAVE_POSS,
++				  PIIX_FLAG_COMBINED_ICH6 |
++				  PIIX_FLAG_CHECKINTR | ATA_FLAG_SLAVE_POSS,
+ 		.pio_mask	= 0x1f,	/* pio0-4 */
+ 		.mwdma_mask	= 0x07, /* mwdma0-2 */
+ 		.udma_mask	= 0x7f,	/* udma0-6 */
+@@ -236,8 +238,9 @@ static struct ata_port_info piix_port_in
+ 	{
+ 		.sht		= &piix_sht,
+ 		.host_flags	= ATA_FLAG_SATA | ATA_FLAG_SRST |
+-				  PIIX_FLAG_COMBINED | PIIX_FLAG_CHECKINTR |
+-				  ATA_FLAG_SLAVE_POSS | PIIX_FLAG_AHCI,
++				  PIIX_FLAG_COMBINED_ICH6 |
++				  PIIX_FLAG_CHECKINTR | ATA_FLAG_SLAVE_POSS |
++				  PIIX_FLAG_AHCI,
+ 		.pio_mask	= 0x1f,	/* pio0-4 */
+ 		.mwdma_mask	= 0x07, /* mwdma0-2 */
+ 		.udma_mask	= 0x7f,	/* udma0-6 */
+@@ -587,6 +590,7 @@ static int piix_init_one (struct pci_dev
+ 	struct ata_port_info *port_info[2];
+ 	unsigned int combined = 0, n_ports = 1;
+ 	unsigned int pata_chan = 0, sata_chan = 0;
++	unsigned long host_flags;
+ 
+ 	if (!printed_version++)
+ 		dev_printk(KERN_DEBUG, &pdev->dev,
+@@ -599,7 +603,9 @@ static int piix_init_one (struct pci_dev
+ 	port_info[0] = &piix_port_info[ent->driver_data];
+ 	port_info[1] = NULL;
+ 
+-	if (port_info[0]->host_flags & PIIX_FLAG_AHCI) {
++	host_flags = port_info[0]->host_flags;
++
++	if (host_flags & PIIX_FLAG_AHCI) {
+                u8 tmp;
+                pci_read_config_byte(pdev, PIIX_SCC, &tmp);
+                if (tmp == PIIX_AHCI_DEVICE) {
+@@ -609,16 +615,35 @@ static int piix_init_one (struct pci_dev
+                }
+ 	}
+ 
+-	if (port_info[0]->host_flags & PIIX_FLAG_COMBINED) {
++	if (host_flags & PIIX_FLAG_COMBINED) {
+ 		u8 tmp;
+ 		pci_read_config_byte(pdev, ICH5_PMR, &tmp);
+ 
+-		if (tmp & PIIX_COMB) {
+-			combined = 1;
+-			if (tmp & PIIX_COMB_PATA_P0)
++		if (host_flags & PIIX_FLAG_COMBINED_ICH6) {
++			switch (tmp) {
++			case 0:
++				break;
++			case 1:
++				combined = 1;
+ 				sata_chan = 1;
+-			else
++				break;
++			case 2:
++				combined = 1;
+ 				pata_chan = 1;
++				break;
++			case 3:
++				dev_printk(KERN_WARNING, &pdev->dev,
++					   "invalid MAP value %u\n", tmp);
++				break;
++			}
++		} else {
++			if (tmp & PIIX_COMB) {
++				combined = 1;
++				if (tmp & PIIX_COMB_PATA_P0)
++					sata_chan = 1;
++				else
++					pata_chan = 1;
++			}
+ 		}
+ 	}
+ 
+@@ -628,7 +653,7 @@ static int piix_init_one (struct pci_dev
+ 	 * MSI is disabled (and it is disabled, as we don't use
+ 	 * message-signalled interrupts currently).
+ 	 */
+-	if (port_info[0]->host_flags & PIIX_FLAG_CHECKINTR)
++	if (host_flags & PIIX_FLAG_CHECKINTR)
+ 		pci_enable_intx(pdev);
+ 
+ 	if (combined) {
+Index: linux-2.6.10/mvl_patches/pro-1265.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1265.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1265);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

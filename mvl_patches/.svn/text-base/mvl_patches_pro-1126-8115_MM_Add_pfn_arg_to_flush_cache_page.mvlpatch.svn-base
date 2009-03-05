@@ -1,0 +1,1156 @@
+#! /usr/bin/env bash
+# Patch: -8115_MM_Add_pfn_arg_to_flush_cache_page
+# Date: Mon Mar  5 19:24:44 2007
+# MR: 18085
+# Commit: 8f2a2e2e4041d036bf77f404171bc5396806decf
+# Author: David S. Miller <davem@nuts.davemloft.net>
+# Date:   Fri Feb 25 00:36:06 2005 -0800
+# 
+#     [MM]: Add 'pfn' arg to flush_cache_page().
+#     
+#     Based almost entirely upon a patch by Russell King.
+#     
+#     Signed-off-by: David S. Miller <davem@davemloft.net>
+# 
+
+PATCHNUM=1126
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 18085
+Commit: 8f2a2e2e4041d036bf77f404171bc5396806decf
+Author: David S. Miller <davem@nuts.davemloft.net>
+Date:   Fri Feb 25 00:36:06 2005 -0800
+
+    [MM]: Add 'pfn' arg to flush_cache_page().
+    
+    Based almost entirely upon a patch by Russell King.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/Documentation/cachetlb.txt b/Documentation/cachetlb.txt
+index 9e2f988..b8faf93 100644
+Index: linux-2.6.10/Documentation/cachetlb.txt
+===================================================================
+--- linux-2.6.10.orig/Documentation/cachetlb.txt
++++ linux-2.6.10/Documentation/cachetlb.txt
+@@ -155,7 +155,7 @@ the sequence will be in one of the follo
+ 	   change_range_of_page_tables(mm, start, end);
+ 	   flush_tlb_range(vma, start, end);
+ 
+-	3) flush_cache_page(vma, addr);
++	3) flush_cache_page(vma, addr, pfn);
+ 	   set_pte(pte_pointer, new_pte_val);
+ 	   flush_tlb_page(vma, addr);
+ 
+@@ -203,7 +203,7 @@ Here are the routines, one by one:
+ 	call flush_cache_page (see below) for each entry which may be
+ 	modified.
+ 
+-3) void flush_cache_page(struct vm_area_struct *vma, unsigned long addr)
++3) void flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn)
+ 
+ 	This time we need to remove a PAGE_SIZE sized range
+ 	from the cache.  The 'vma' is the backing structure used by
+@@ -213,8 +213,14 @@ Here are the routines, one by one:
+ 	executable (and thus could be in the 'instruction cache' in
+ 	"Harvard" type cache layouts).
+ 
++	The 'pfn' indicates the physical page frame (shift this value
++	left by PAGE_SHIFT to get the physical address) that 'addr'
++	translates to.  It is this mapping which should be removed from
++	the cache.
++
+ 	After running, there will be no entries in the cache for
+-	'vma->vm_mm' for virtual address 'addr'.
++	'vma->vm_mm' for virtual address 'addr' which translates
++	to 'pfn'.
+ 
+ 	This is used primarily during fault processing.
+ 
+Index: linux-2.6.10/arch/arm/mm/fault-armv.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/fault-armv.c
++++ linux-2.6.10/arch/arm/mm/fault-armv.c
+@@ -54,7 +54,7 @@ static int adjust_pte(struct vm_area_str
+ 	 * fault (ie, is old), we can safely ignore any issues.
+ 	 */
+ 	if (pte_present(entry) && pte_val(entry) & shared_pte_mask) {
+-		flush_cache_page(vma, address);
++		flush_cache_page(vma, address, pte_pfn(entry));
+ 		pte_val(entry) &= ~shared_pte_mask;
+ 		set_pte(pte, entry);
+ 		flush_tlb_page(vma, address);
+@@ -111,7 +111,7 @@ make_coherent(struct address_space *mapp
+ 	if (aliases)
+ 		adjust_pte(vma, addr);
+ 	else
+-		flush_cache_page(vma, addr);
++		flush_cache_page(vma, addr, page_to_pfn(page));
+ }
+ 
+ void __flush_dcache_page(struct address_space *mapping, struct page *page);
+Index: linux-2.6.10/arch/arm/mm/flush.c
+===================================================================
+--- linux-2.6.10.orig/arch/arm/mm/flush.c
++++ linux-2.6.10/arch/arm/mm/flush.c
+@@ -135,7 +135,7 @@ static void __flush_dcache_aliases(struc
+ 		if (!(mpnt->vm_flags & VM_MAYSHARE))
+ 			continue;
+ 		offset = (pgoff - mpnt->vm_pgoff) << PAGE_SHIFT;
+-		flush_cache_page(mpnt, mpnt->vm_start + offset);
++		flush_cache_page(mpnt, mpnt->vm_start + offset, page_to_pfn(page));
+ 	}
+ 	flush_dcache_mmap_unlock(mapping);
+ }
+Index: linux-2.6.10/arch/mips/mm/c-r3k.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/c-r3k.c
++++ linux-2.6.10/arch/mips/mm/c-r3k.c
+@@ -254,8 +254,7 @@ static void r3k_flush_cache_range(struct
+ {
+ }
+ 
+-static void r3k_flush_cache_page(struct vm_area_struct *vma,
+-	unsigned long page)
++static void r3k_flush_cache_page(struct vm_area_struct *vma, unsigned long page, unsigned long pfn)
+ {
+ }
+ 
+Index: linux-2.6.10/arch/mips/mm/c-r4k.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/c-r4k.c
++++ linux-2.6.10/arch/mips/mm/c-r4k.c
+@@ -426,8 +426,7 @@ static inline void local_r4k_flush_cache
+ 	}
+ }
+ 
+-static void r4k_flush_cache_page(struct vm_area_struct *vma,
+-	unsigned long page)
++static void r4k_flush_cache_page(struct vm_area_struct *vma, unsigned long page, unsigned long pfn)
+ {
+ 	struct flush_cache_page_args args;
+ 
+Index: linux-2.6.10/arch/mips/mm/c-sb1.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/c-sb1.c
++++ linux-2.6.10/arch/mips/mm/c-sb1.c
+@@ -160,8 +160,7 @@ static inline void __sb1_flush_icache_al
+  * dcache first, then invalidate the icache.  If the page isn't
+  * executable, nothing is required.
+  */
+-static void local_sb1_flush_cache_page(struct vm_area_struct *vma,
+-	unsigned long addr)
++static void local_sb1_flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn)
+ {
+ 	int cpu = smp_processor_id();
+ 
+@@ -183,17 +182,18 @@ static void local_sb1_flush_cache_page(s
+ struct flush_cache_page_args {
+ 	struct vm_area_struct *vma;
+ 	unsigned long addr;
++	unsigned long pfn;
+ };
+ 
+ static void sb1_flush_cache_page_ipi(void *info)
+ {
+ 	struct flush_cache_page_args *args = info;
+ 
+-	local_sb1_flush_cache_page(args->vma, args->addr);
++	local_sb1_flush_cache_page(args->vma, args->addr, args->pfn);
+ }
+ 
+ /* Dirty dcache could be on another CPU, so do the IPIs */
+-static void sb1_flush_cache_page(struct vm_area_struct *vma, unsigned long addr)
++static void sb1_flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn)
+ {
+ 	struct flush_cache_page_args args;
+ 
+@@ -205,12 +205,13 @@ static void sb1_flush_cache_page(struct 
+ 	addr &= PAGE_MASK;
+ 	args.vma = vma;
+ 	args.addr = addr;
++	args.pfn = pfn;
+ 	on_each_cpu(sb1_flush_cache_page_ipi, (void *) &args, 1, 1);
+ 
+ 	preempt_enable();
+ }
+ #else
+-void sb1_flush_cache_page(struct vm_area_struct *vma, unsigned long addr)
++void sb1_flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn)
+ 	__attribute__((alias("local_sb1_flush_cache_page")));
+ #endif
+ 
+Index: linux-2.6.10/arch/mips/mm/c-tx39.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/c-tx39.c
++++ linux-2.6.10/arch/mips/mm/c-tx39.c
+@@ -178,8 +178,7 @@ static void tx39_flush_cache_range(struc
+ 	}
+ }
+ 
+-static void tx39_flush_cache_page(struct vm_area_struct *vma,
+-				   unsigned long page)
++static void tx39_flush_cache_page(struct vm_area_struct *vma, unsigned long page, unsigned long pfn)
+ {
+ 	int exec = vma->vm_flags & VM_EXEC;
+ 	struct mm_struct *mm = vma->vm_mm;
+Index: linux-2.6.10/arch/mips/mm/cache.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/mm/cache.c
++++ linux-2.6.10/arch/mips/mm/cache.c
+@@ -23,7 +23,7 @@ void (*__flush_cache_all)(void);
+ void (*flush_cache_mm)(struct mm_struct *mm);
+ void (*flush_cache_range)(struct vm_area_struct *vma, unsigned long start,
+ 	unsigned long end);
+-void (*flush_cache_page)(struct vm_area_struct *vma, unsigned long page);
++void (*flush_cache_page)(struct vm_area_struct *vma, unsigned long page, unsigned long pfn);
+ void (*flush_icache_range)(unsigned long start, unsigned long end);
+ void (*flush_icache_page)(struct vm_area_struct *vma, struct page *page);
+ 
+Index: linux-2.6.10/arch/sh/mm/cache-sh4.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/mm/cache-sh4.c
++++ linux-2.6.10/arch/sh/mm/cache-sh4.c
+@@ -258,10 +258,16 @@ void flush_cache_mm(struct mm_struct *mm
+ 	flush_cache_all();
+ }
+ 
+-static void __flush_cache_page(struct vm_area_struct *vma,
+-			       unsigned long address,
+-			       unsigned long phys)
++/*
++ * Write back and invalidate I/D-caches for the page.
++ *
++ * ADDR: Virtual Address (U0 address)
++ * PFN: Physical page number
++ */
++void flush_cache_page(struct vm_area_struct *vma, unsigned long address, unsigned long pfn)
+ {
++	unsigned long phys = pfn << PAGE_SHIFT;
++
+ 	/* We only need to flush D-cache when we have alias */
+ 	if ((address^phys) & CACHE_ALIAS) {
+ 		/* Loop 4K of the D-cache */
+@@ -342,32 +348,6 @@ void flush_cache_range(struct vm_area_st
+ }
+ 
+ /*
+- * Write back and invalidate I/D-caches for the page.
+- *
+- * ADDR: Virtual Address (U0 address)
+- */
+-void flush_cache_page(struct vm_area_struct *vma, unsigned long address)
+-{
+-	pgd_t *dir;
+-	pmd_t *pmd;
+-	pte_t *pte;
+-	pte_t entry;
+-	unsigned long phys;
+-
+-	dir = pgd_offset(vma->vm_mm, address);
+-	pmd = pmd_offset(dir, address);
+-	if (pmd_none(*pmd) || pmd_bad(*pmd))
+-		return;
+-	pte = pte_offset_kernel(pmd, address);
+-	entry = *pte;
+-	if (!(pte_val(entry) & _PAGE_PRESENT))
+-		return;
+-
+-	phys = pte_val(entry)&PTE_PHYS_MASK;
+-	__flush_cache_page(vma, address, phys);
+-}
+-
+-/*
+  * flush_icache_user_range
+  * @vma: VMA of the process
+  * @page: page
+@@ -377,6 +357,7 @@ void flush_cache_page(struct vm_area_str
+ void flush_icache_user_range(struct vm_area_struct *vma,
+ 			     struct page *page, unsigned long addr, int len)
+ {
+-	__flush_cache_page(vma, addr, PHYSADDR(page_address(page)));
++	__flush_cache_page(vma, addr,
++			   PHYSADDR(page_address(page)) >> PAGE_SHIFT);
+ }
+ 
+Index: linux-2.6.10/arch/sh/mm/cache-sh7705.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh/mm/cache-sh7705.c
++++ linux-2.6.10/arch/sh/mm/cache-sh7705.c
+@@ -186,25 +186,9 @@ void flush_cache_range(struct vm_area_st
+  *
+  * ADDRESS: Virtual Address (U0 address)
+  */
+-void flush_cache_page(struct vm_area_struct *vma, unsigned long address)
++void flush_cache_page(struct vm_area_struct *vma, unsigned long address, unsigned long pfn)
+ {
+-	pgd_t *dir;
+-	pmd_t *pmd;
+-	pte_t *pte;
+-	pte_t entry;
+-	unsigned long phys;
+-
+-	dir = pgd_offset(vma->vm_mm, address);
+-	pmd = pmd_offset(dir, address);
+-	if (pmd_none(*pmd) || pmd_bad(*pmd))
+-		return;
+-	pte = pte_offset(pmd, address);
+-	entry = *pte;
+-	if (pte_none(entry) || !pte_present(entry))
+-		return;
+-
+-	phys = pte_val(entry)&PTE_PHYS_MASK;
+-	__flush_dcache_page(phys);
++	__flush_dcache_page(pfn << PAGE_SHIFT);
+ }
+ 
+ /*
+Index: linux-2.6.10/arch/sh64/mm/cache.c
+===================================================================
+--- linux-2.6.10.orig/arch/sh64/mm/cache.c
++++ linux-2.6.10/arch/sh64/mm/cache.c
+@@ -573,29 +573,9 @@ static void sh64_dcache_purge_phy_page(u
+ 	}
+ }
+ 
+-static void sh64_dcache_purge_virt_page(struct mm_struct *mm, unsigned long eaddr)
++static inline void sh64_dcache_purge_virt_page(struct mm_struct *mm, unsigned long eaddr, unsigned long pfn)
+ {
+-	unsigned long phys;
+-	pgd_t *pgd;
+-	pmd_t *pmd;
+-	pte_t *pte;
+-	pte_t entry;
+-
+-	pgd = pgd_offset(mm, eaddr);
+-	pmd = pmd_offset(pgd, eaddr);
+-
+-	if (pmd_none(*pmd) || pmd_bad(*pmd))
+-		return;
+-
+-	pte = pte_offset_kernel(pmd, eaddr);
+-	entry = *pte;
+-
+-	if (pte_none(entry) || !pte_present(entry))
+-		return;
+-
+-	phys = pte_val(entry) & PAGE_MASK;
+-
+-	sh64_dcache_purge_phy_page(phys);
++	sh64_dcache_purge_phy_page(pfn << PAGE_SHIFT);
+ }
+ 
+ static void sh64_dcache_purge_user_page(struct mm_struct *mm, unsigned long eaddr)
+@@ -904,7 +884,7 @@ void flush_cache_range(struct vm_area_st
+ 
+ /****************************************************************************/
+ 
+-void flush_cache_page(struct vm_area_struct *vma, unsigned long eaddr)
++void flush_cache_page(struct vm_area_struct *vma, unsigned long eaddr, unsigned long pfn)
+ {
+ 	/* Invalidate any entries in either cache for the vma within the user
+ 	   address space vma->vm_mm for the page starting at virtual address
+@@ -915,7 +895,7 @@ void flush_cache_page(struct vm_area_str
+ 	   Note(1), this is called with mm->page_table_lock held.
+ 	   */
+ 
+-	sh64_dcache_purge_virt_page(vma->vm_mm, eaddr);
++	sh64_dcache_purge_virt_page(vma->vm_mm, eaddr, pfn);
+ 
+ 	if (vma->vm_flags & VM_EXEC) {
+ 		sh64_icache_inv_user_page(vma, eaddr);
+Index: linux-2.6.10/arch/sparc/mm/srmmu.c
+===================================================================
+--- linux-2.6.10.orig/arch/sparc/mm/srmmu.c
++++ linux-2.6.10/arch/sparc/mm/srmmu.c
+@@ -1002,8 +1002,7 @@ extern void viking_flush_cache_all(void)
+ extern void viking_flush_cache_mm(struct mm_struct *mm);
+ extern void viking_flush_cache_range(struct vm_area_struct *vma, unsigned long start,
+ 				     unsigned long end);
+-extern void viking_flush_cache_page(struct vm_area_struct *vma,
+-				    unsigned long page);
++extern void viking_flush_cache_page(struct vm_area_struct *vma, unsigned long page);
+ extern void viking_flush_page_to_ram(unsigned long page);
+ extern void viking_flush_page_for_dma(unsigned long page);
+ extern void viking_flush_sig_insns(struct mm_struct *mm, unsigned long addr);
+Index: linux-2.6.10/fs/binfmt_elf.c
+===================================================================
+--- linux-2.6.10.orig/fs/binfmt_elf.c
++++ linux-2.6.10/fs/binfmt_elf.c
+@@ -1562,7 +1562,7 @@ static int elf_core_dump(long signr, str
+ 					DUMP_SEEK (file->f_pos + PAGE_SIZE);
+ 				} else {
+ 					void *kaddr;
+-					flush_cache_page(vma, addr);
++					flush_cache_page(vma, addr, page_to_pfn(page));
+ 					kaddr = kmap(page);
+ 					if ((size += PAGE_SIZE) > limit ||
+ 					    !dump_write(file, kaddr,
+Index: linux-2.6.10/include/asm-alpha/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-alpha/cacheflush.h
++++ linux-2.6.10/include/asm-alpha/cacheflush.h
+@@ -8,7 +8,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-arm/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm/cacheflush.h
++++ linux-2.6.10/include/asm-arm/cacheflush.h
+@@ -237,16 +237,16 @@ extern void dmac_flush_range(unsigned lo
+  * space" model to handle this.
+  */
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
+-		flush_dcache_page(page);	\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
++		flush_dcache_page(page);			\
+ 	} while (0)
+ 
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+ /*
+@@ -269,7 +269,7 @@ flush_cache_range(struct vm_area_struct 
+ }
+ 
+ static inline void
+-flush_cache_page(struct vm_area_struct *vma, unsigned long user_addr)
++flush_cache_page(struct vm_area_struct *vma, unsigned long user_addr, unsigned long pfn)
+ {
+ 	if (cpu_isset(smp_processor_id(), vma->vm_mm->cpu_vm_mask)) {
+ 		unsigned long addr = user_addr & PAGE_MASK;
+Index: linux-2.6.10/include/asm-arm26/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-arm26/cacheflush.h
++++ linux-2.6.10/include/asm-arm26/cacheflush.h
+@@ -23,7 +23,7 @@
+ #define flush_cache_all()                       do { } while (0)
+ #define flush_cache_mm(mm)                      do { } while (0)
+ #define flush_cache_range(vma,start,end)        do { } while (0)
+-#define flush_cache_page(vma,vmaddr)            do { } while (0)
++#define flush_cache_page(vma,vmaddr,pfn)        do { } while (0)
+ #define flush_cache_vmap(start, end)		do { } while (0)
+ #define flush_cache_vunmap(start, end)		do { } while (0)
+ 
+Index: linux-2.6.10/include/asm-cris/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-cris/cacheflush.h
++++ linux-2.6.10/include/asm-cris/cacheflush.h
+@@ -10,7 +10,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-h8300/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-h8300/cacheflush.h
++++ linux-2.6.10/include/asm-h8300/cacheflush.h
+@@ -13,7 +13,7 @@
+ #define flush_cache_all()
+ #define	flush_cache_mm(mm)
+ #define	flush_cache_range(vma,a,b)
+-#define	flush_cache_page(vma,p)
++#define	flush_cache_page(vma,p,pfn)
+ #define	flush_dcache_page(page)
+ #define	flush_dcache_mmap_lock(mapping)
+ #define	flush_dcache_mmap_unlock(mapping)
+Index: linux-2.6.10/include/asm-i386/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-i386/cacheflush.h
++++ linux-2.6.10/include/asm-i386/cacheflush.h
+@@ -8,7 +8,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-ia64/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ia64/cacheflush.h
++++ linux-2.6.10/include/asm-ia64/cacheflush.h
+@@ -19,7 +19,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_icache_page(vma,page)		do { } while (0)
+ #define flush_cache_vmap(start, end)		do { } while (0)
+ #define flush_cache_vunmap(start, end)		do { } while (0)
+Index: linux-2.6.10/include/asm-m32r/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-m32r/cacheflush.h
++++ linux-2.6.10/include/asm-m32r/cacheflush.h
+@@ -11,7 +11,7 @@ extern void _flush_cache_copyback_all(vo
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+@@ -31,7 +31,7 @@ extern void smp_flush_cache_all(void);
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+@@ -43,7 +43,7 @@ extern void smp_flush_cache_all(void);
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-m68k/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-m68k/cacheflush.h
++++ linux-2.6.10/include/asm-m68k/cacheflush.h
+@@ -99,8 +99,7 @@ static inline void flush_cache_range(str
+ 	        __flush_cache_030();
+ }
+ 
+-static inline void flush_cache_page(struct vm_area_struct *vma,
+-				    unsigned long vmaddr)
++static inline void flush_cache_page(struct vm_area_struct *vma, unsigned long vmaddr, unsigned long pfn)
+ {
+ 	if (vma->vm_mm == current->mm)
+ 	        __flush_cache_030();
+@@ -134,15 +133,15 @@ static inline void __flush_page_to_ram(v
+ #define flush_icache_user_range(vma,pg,adr,len)	do { } while (0)
+ 
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+ extern void flush_icache_range(unsigned long address, unsigned long endaddr);
+Index: linux-2.6.10/include/asm-m68knommu/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-m68knommu/cacheflush.h
++++ linux-2.6.10/include/asm-m68knommu/cacheflush.h
+@@ -9,7 +9,7 @@
+ #define flush_cache_all()			__flush_cache_all()
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_range(start,len)		do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+Index: linux-2.6.10/include/asm-mips/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/cacheflush.h
++++ linux-2.6.10/include/asm-mips/cacheflush.h
+@@ -17,7 +17,7 @@
+  *
+  *  - flush_cache_all() flushes entire cache
+  *  - flush_cache_mm(mm) flushes the specified mm context's cache lines
+- *  - flush_cache_page(mm, vmaddr) flushes a single page
++ *  - flush_cache_page(mm, vmaddr, pfn) flushes a single page
+  *  - flush_cache_range(vma, start, end) flushes a range of pages
+  *  - flush_icache_range(start, end) flush a range of instructions
+  *  - flush_dcache_page(pg) flushes(wback&invalidates) a page for dcache
+@@ -34,8 +34,7 @@ extern void (*__flush_cache_all)(void);
+ extern void (*flush_cache_mm)(struct mm_struct *mm);
+ extern void (*flush_cache_range)(struct vm_area_struct *vma,
+ 	unsigned long start, unsigned long end);
+-extern void (*flush_cache_page)(struct vm_area_struct *vma,
+-	unsigned long page);
++extern void (*flush_cache_page)(struct vm_area_struct *vma, unsigned long page, unsigned long pfn);
+ extern void __flush_dcache_page(struct page *page);
+ 
+ static inline void flush_dcache_page(struct page *page)
+Index: linux-2.6.10/include/asm-parisc/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-parisc/cacheflush.h
++++ linux-2.6.10/include/asm-parisc/cacheflush.h
+@@ -78,14 +78,14 @@ extern void flush_dcache_page(struct pag
+ 
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+ do { \
+-	flush_cache_page(vma, vaddr); \
++	flush_cache_page(vma, vaddr, page_to_pfn(page)); \
+ 	memcpy(dst, src, len); \
+ 	flush_kernel_dcache_range_asm((unsigned long)dst, (unsigned long)dst + len); \
+ } while (0)
+ 
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+ do { \
+-	flush_cache_page(vma, vaddr); \
++	flush_cache_page(vma, vaddr, page_to_pfn(page)); \
+ 	memcpy(dst, src, len); \
+ } while (0)
+ 
+@@ -181,7 +181,7 @@ __flush_cache_page(struct vm_area_struct
+ }
+ 
+ static inline void
+-flush_cache_page(struct vm_area_struct *vma, unsigned long vmaddr)
++flush_cache_page(struct vm_area_struct *vma, unsigned long vmaddr, unsigned long pfn)
+ {
+ 	BUG_ON(!vma->vm_mm->context);
+ 
+Index: linux-2.6.10/include/asm-ppc/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc/cacheflush.h
++++ linux-2.6.10/include/asm-ppc/cacheflush.h
+@@ -22,7 +22,7 @@
+ #define flush_cache_all()		do { } while (0)
+ #define flush_cache_mm(mm)		do { } while (0)
+ #define flush_cache_range(vma, a, b)	do { } while (0)
+-#define flush_cache_page(vma, p)	do { } while (0)
++#define flush_cache_page(vma, p, pfn)	do { } while (0)
+ #define flush_icache_page(vma, page)	do { } while (0)
+ #define flush_cache_vmap(start, end)	do { } while (0)
+ #define flush_cache_vunmap(start, end)	do { } while (0)
+Index: linux-2.6.10/include/asm-ppc64/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-ppc64/cacheflush.h
++++ linux-2.6.10/include/asm-ppc64/cacheflush.h
+@@ -12,7 +12,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_icache_page(vma, page)		do { } while (0)
+ #define flush_cache_vmap(start, end)		do { } while (0)
+ #define flush_cache_vunmap(start, end)		do { } while (0)
+Index: linux-2.6.10/include/asm-s390/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-s390/cacheflush.h
++++ linux-2.6.10/include/asm-s390/cacheflush.h
+@@ -8,7 +8,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-sh/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/cacheflush.h
++++ linux-2.6.10/include/asm-sh/cacheflush.h
+@@ -15,14 +15,14 @@ extern void __flush_invalidate_region(vo
+ 
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+ 	do {							\
+-		flush_cache_page(vma, vaddr);			\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
+ 		memcpy(dst, src, len);				\
+ 		flush_icache_user_range(vma, page, vaddr, len);	\
+ 	} while (0)
+ 
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+ 	do {							\
+-		flush_cache_page(vma, vaddr);			\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
+ 		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+Index: linux-2.6.10/include/asm-sh/cpu-sh2/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/cpu-sh2/cacheflush.h
++++ linux-2.6.10/include/asm-sh/cpu-sh2/cacheflush.h
+@@ -15,7 +15,7 @@
+  *
+  *  - flush_cache_all() flushes entire cache
+  *  - flush_cache_mm(mm) flushes the specified mm context's cache lines
+- *  - flush_cache_page(mm, vmaddr) flushes a single page
++ *  - flush_cache_page(mm, vmaddr, pfn) flushes a single page
+  *  - flush_cache_range(vma, start, end) flushes a range of pages
+  *
+  *  - flush_dcache_page(pg) flushes(wback&invalidates) a page for dcache
+@@ -28,7 +28,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-sh/cpu-sh3/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/cpu-sh3/cacheflush.h
++++ linux-2.6.10/include/asm-sh/cpu-sh3/cacheflush.h
+@@ -15,7 +15,7 @@
+  *
+  *  - flush_cache_all() flushes entire cache
+  *  - flush_cache_mm(mm) flushes the specified mm context's cache lines
+- *  - flush_cache_page(mm, vmaddr) flushes a single page
++ *  - flush_cache_page(mm, vmaddr, pfn) flushes a single page
+  *  - flush_cache_range(vma, start, end) flushes a range of pages
+  *
+  *  - flush_dcache_page(pg) flushes(wback&invalidates) a page for dcache
+@@ -43,7 +43,7 @@ extern void flush_cache_all(void);
+ extern void flush_cache_mm(struct mm_struct *mm);
+ extern void flush_cache_range(struct vm_area_struct *vma, unsigned long start,
+                               unsigned long end);
+-extern void flush_cache_page(struct vm_area_struct *vma, unsigned long addr);
++extern void flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn);
+ extern void flush_dcache_page(struct page *pg);
+ extern void flush_icache_range(unsigned long start, unsigned long end);
+ extern void flush_icache_page(struct vm_area_struct *vma, struct page *page);
+@@ -68,7 +68,7 @@ extern void flush_icache_page(struct vm_
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/include/asm-sh/cpu-sh4/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh/cpu-sh4/cacheflush.h
++++ linux-2.6.10/include/asm-sh/cpu-sh4/cacheflush.h
+@@ -28,7 +28,7 @@ extern void flush_cache_all(void);
+ extern void flush_cache_mm(struct mm_struct *mm);
+ extern void flush_cache_range(struct vm_area_struct *vma, unsigned long start,
+ 			      unsigned long end);
+-extern void flush_cache_page(struct vm_area_struct *vma, unsigned long addr);
++extern void flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn);
+ extern void flush_dcache_page(struct page *pg);
+ 
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+Index: linux-2.6.10/include/asm-sh64/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sh64/cacheflush.h
++++ linux-2.6.10/include/asm-sh64/cacheflush.h
+@@ -14,7 +14,7 @@ extern void flush_cache_mm(struct mm_str
+ extern void flush_cache_sigtramp(unsigned long start, unsigned long end);
+ extern void flush_cache_range(struct vm_area_struct *vma, unsigned long start,
+ 			      unsigned long end);
+-extern void flush_cache_page(struct vm_area_struct *vma, unsigned long addr);
++extern void flush_cache_page(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn);
+ extern void flush_dcache_page(struct page *pg);
+ extern void flush_icache_range(unsigned long start, unsigned long end);
+ extern void flush_icache_user_range(struct vm_area_struct *vma,
+@@ -31,14 +31,14 @@ extern void flush_icache_user_range(stru
+ 
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+ 	do {							\
+-		flush_cache_page(vma, vaddr);			\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
+ 		memcpy(dst, src, len);				\
+ 		flush_icache_user_range(vma, page, vaddr, len);	\
+ 	} while (0)
+ 
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+ 	do {							\
+-		flush_cache_page(vma, vaddr);			\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
+ 		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+Index: linux-2.6.10/include/asm-sparc/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sparc/cacheflush.h
++++ linux-2.6.10/include/asm-sparc/cacheflush.h
+@@ -50,21 +50,21 @@ BTFIXUPDEF_CALL(void, flush_cache_page, 
+ #define flush_cache_all() BTFIXUP_CALL(flush_cache_all)()
+ #define flush_cache_mm(mm) BTFIXUP_CALL(flush_cache_mm)(mm)
+ #define flush_cache_range(vma,start,end) BTFIXUP_CALL(flush_cache_range)(vma,start,end)
+-#define flush_cache_page(vma,addr) BTFIXUP_CALL(flush_cache_page)(vma,addr)
++#define flush_cache_page(vma,addr,pfn) BTFIXUP_CALL(flush_cache_page)(vma,addr)
+ #define flush_icache_range(start, end)		do { } while (0)
+ #define flush_icache_page(vma, pg)		do { } while (0)
+ 
+ #define flush_icache_user_range(vma,pg,adr,len)	do { } while (0)
+ 
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+ BTFIXUPDEF_CALL(void, __flush_page_to_ram, unsigned long)
+Index: linux-2.6.10/include/asm-sparc64/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-sparc64/cacheflush.h
++++ linux-2.6.10/include/asm-sparc64/cacheflush.h
+@@ -11,7 +11,7 @@
+ 	do { if ((__mm) == current->mm) flushw_user(); } while(0)
+ #define flush_cache_range(vma, start, end) \
+ 	flush_cache_mm((vma)->vm_mm)
+-#define flush_cache_page(vma, page) \
++#define flush_cache_page(vma, page, pfn) \
+ 	flush_cache_mm((vma)->vm_mm)
+ 
+ /* 
+@@ -38,15 +38,15 @@ extern void __flush_dcache_range(unsigne
+ #define flush_icache_user_range(vma,pg,adr,len)	do { } while (0)
+ 
+ #define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+ #define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+-	do {					\
+-		flush_cache_page(vma, vaddr);	\
+-		memcpy(dst, src, len);		\
++	do {							\
++		flush_cache_page(vma, vaddr, page_to_pfn(page));\
++		memcpy(dst, src, len);				\
+ 	} while (0)
+ 
+ extern void flush_dcache_page(struct page *page);
+Index: linux-2.6.10/include/asm-v850/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-v850/cacheflush.h
++++ linux-2.6.10/include/asm-v850/cacheflush.h
+@@ -25,7 +25,7 @@
+ #define flush_cache_all()			((void)0)
+ #define flush_cache_mm(mm)			((void)0)
+ #define flush_cache_range(vma, start, end)	((void)0)
+-#define flush_cache_page(vma, vmaddr)		((void)0)
++#define flush_cache_page(vma, vmaddr, pfn)	((void)0)
+ #define flush_dcache_page(page)			((void)0)
+ #define flush_dcache_mmap_lock(mapping)		((void)0)
+ #define flush_dcache_mmap_unlock(mapping)	((void)0)
+Index: linux-2.6.10/include/asm-x86_64/cacheflush.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-x86_64/cacheflush.h
++++ linux-2.6.10/include/asm-x86_64/cacheflush.h
+@@ -8,7 +8,7 @@
+ #define flush_cache_all()			do { } while (0)
+ #define flush_cache_mm(mm)			do { } while (0)
+ #define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ #define flush_dcache_page(page)			do { } while (0)
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+ #define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+Index: linux-2.6.10/mm/fremap.c
+===================================================================
+--- linux-2.6.10.orig/mm/fremap.c
++++ linux-2.6.10/mm/fremap.c
+@@ -30,7 +30,7 @@ static inline void zap_pte(struct mm_str
+ 	if (pte_present(pte)) {
+ 		unsigned long pfn = pte_pfn(pte);
+ 
+-		flush_cache_page(vma, addr);
++		flush_cache_page(vma, addr, pfn);
+ 		pte = ptep_clear_flush(vma, addr, ptep);
+ 		if (pfn_valid(pfn)) {
+ 			struct page *page = pfn_to_page(pfn);
+Index: linux-2.6.10/mm/memory.c
+===================================================================
+--- linux-2.6.10.orig/mm/memory.c
++++ linux-2.6.10/mm/memory.c
+@@ -1073,7 +1073,6 @@ static inline void break_cow(struct vm_a
+ {
+ 	pte_t entry;
+ 
+-	flush_cache_page(vma, address);
+ 	entry = maybe_mkwrite(pte_mkdirty(mk_pte(new_page, vma->vm_page_prot)),
+ 			      vma);
+ 	ptep_establish(vma, address, page_table, entry);
+@@ -1182,7 +1181,7 @@ static int do_wp_page(struct mm_struct *
+ 		int reuse = can_share_swap_page(old_page);
+ 		unlock_page(old_page);
+ 		if (reuse) {
+-			flush_cache_page(vma, address);
++			flush_cache_page(vma, address, pfn);
+ 			entry = maybe_mkwrite(pte_mkyoung(pte_mkdirty(pte)),
+ 					      vma);
+ 			ptep_set_access_flags(vma, address, page_table, entry, 1);
+@@ -1220,6 +1219,7 @@ static int do_wp_page(struct mm_struct *
+ 			++mm->rss;
+ 		else
+ 			page_remove_rmap(old_page);
++		flush_cache_page(vma, address, pfn);
+ 		break_cow(vma, new_page, address, page_table);
+ 		lru_cache_add_active(new_page);
+ 		page_add_anon_rmap(new_page, vma, address);
+Index: linux-2.6.10/mm/rmap.c
+===================================================================
+--- linux-2.6.10.orig/mm/rmap.c
++++ linux-2.6.10/mm/rmap.c
+@@ -570,7 +570,7 @@ static int try_to_unmap_one(struct page 
+ 	}
+ 
+ 	/* Nuke the page table entry. */
+-	flush_cache_page(vma, address);
++	flush_cache_page(vma, address, page_to_pfn(page));
+ 	pteval = ptep_clear_flush(vma, address, pte);
+ 
+ 	/* Move the dirty bit to the physical page now the pte is gone. */
+@@ -682,7 +682,7 @@ static void try_to_unmap_cluster(unsigne
+ 			continue;
+ 
+ 		/* Nuke the page table entry. */
+-		flush_cache_page(vma, address);
++		flush_cache_page(vma, address, pfn);
+ 		pteval = ptep_clear_flush(vma, address, pte);
+ 
+ 		/* If nonlinear, store the file page offset in the pte. */
+Index: linux-2.6.10/mvl_patches/pro-1126.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1126.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1126);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,340 @@
+#! /usr/bin/env bash
+# Patch: -pro_fix_missing_wakeup_in_ipc_sem
+# Date: Mon Mar  5 07:57:10 2007
+# MR: 21511
+# 
+# commit 7acbf39cb290f7860c4520087838a64db44f661b
+# Author: manfred <manfred>
+# Date:   Wed Jan 5 05:34:13 2005 +0000
+# 
+#     [PATCH] fix missing wakeup in ipc/sem
+#     
+#     My patch that removed the spin_lock calls from the tail of sys_semtimedop
+#     introduced a bug:
+#     
+#     Before my patch was merged, every operation that altered an array called
+#     update_queue.  That call woke up threads that were waiting until a
+#     semaphore value becomes 0.  I've accidentially removed that call.
+#     
+#     The attached patch fixes that by modifying update_queue: the function now
+#     loops internally and wakes up all threads.  The patch also removes
+#     update_queue calls from the error path of sys_semtimedop: failed operations
+#     do not modify the array, no need to rescan the list of waiting threads.
+#     
+#     Signed-Off-By: Manfred Spraul <manfred@colorfullife.com>
+#     Signed-off-by: Andrew Morton <akpm@osdl.org>
+#     Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+#     
+#     BKrev: 41db7c553RzQwY4uEw5GfiUnM86xpA
+# 
+
+PATCHNUM=1149
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 21511
+
+commit 7acbf39cb290f7860c4520087838a64db44f661b
+Author: manfred <manfred>
+Date:   Wed Jan 5 05:34:13 2005 +0000
+
+    [PATCH] fix missing wakeup in ipc/sem
+    
+    My patch that removed the spin_lock calls from the tail of sys_semtimedop
+    introduced a bug:
+    
+    Before my patch was merged, every operation that altered an array called
+    update_queue.  That call woke up threads that were waiting until a
+    semaphore value becomes 0.  I've accidentially removed that call.
+    
+    The attached patch fixes that by modifying update_queue: the function now
+    loops internally and wakes up all threads.  The patch also removes
+    update_queue calls from the error path of sys_semtimedop: failed operations
+    do not modify the array, no need to rescan the list of waiting threads.
+    
+    Signed-Off-By: Manfred Spraul <manfred@colorfullife.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+    
+    BKrev: 41db7c553RzQwY4uEw5GfiUnM86xpA
+
+diff --git a/include/linux/sem.h b/include/linux/sem.h
+index c365f79..2d8516b 100644
+
+Index: linux-2.6.10/include/linux/sem.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/sem.h
++++ linux-2.6.10/include/linux/sem.h
+@@ -119,6 +119,7 @@ struct sem_queue {
+ 	int			id;	 /* internal sem id */
+ 	struct sembuf *		sops;	 /* array of pending operations */
+ 	int			nsops;	 /* number of operations */
++	int			alter;   /* does the operation alter the array? */
+ };
+ 
+ /* Each task has a list of undo requests. They are executed automatically
+Index: linux-2.6.10/ipc/sem.c
+===================================================================
+--- linux-2.6.10.orig/ipc/sem.c
++++ linux-2.6.10/ipc/sem.c
+@@ -367,8 +367,22 @@ static void update_queue (struct sem_arr
+ 			 */
+ 			preempt_disable();
+ 
+-			n = q->next;
+ 			q->status = IN_WAKEUP;
++			/*
++			 * Continue scanning. The next operation
++			 * that must be checked depends on the type of the
++			 * completed operation:
++			 * - if the operation modified the array, then
++			 *   restart from the head of the queue and
++			 *   check for threads that might be waiting
++			 *   for semaphore values to become 0.
++			 * - if the operation didn't modify the array,
++			 *   then just continue.
++			 */
++			if (q->alter)
++				n = sma->sem_pending;
++			else
++				n = q->next;
+ 			wake_up_process(q->sleeper);
+ 			/* hands-off: q will disappear immediately after
+ 			 * writing q->status.
+@@ -1135,8 +1149,11 @@ retry_undos:
+ 		goto out_unlock_free;
+ 
+ 	error = try_atomic_semop (sma, sops, nsops, un, current->tgid);
+-	if (error <= 0)
+-		goto update;
++	if (error <= 0) {
++		if (alter && error == 0)
++			update_queue (sma);
++		goto out_unlock_free;
++	}
+ 
+ 	/* We need to sleep on this operation, so we put the current
+ 	 * task into the pending queue and go to sleep.
+@@ -1148,6 +1165,7 @@ retry_undos:
+ 	queue.undo = un;
+ 	queue.pid = current->tgid;
+ 	queue.id = semid;
++	queue.alter = alter;
+ 	if (alter)
+ 		append_to_queue(sma ,&queue);
+ 	else
+@@ -1199,9 +1217,6 @@ retry_undos:
+ 	remove_from_queue(sma,&queue);
+ 	goto out_unlock_free;
+ 
+-update:
+-	if (alter)
+-		update_queue (sma);
+ out_unlock_free:
+ 	sem_unlock(sma);
+ out_free:
+Index: linux-2.6.10/mvl_patches/pro-1149.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1149.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1149);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

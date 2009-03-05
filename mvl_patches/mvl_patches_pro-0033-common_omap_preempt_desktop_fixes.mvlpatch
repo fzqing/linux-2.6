@@ -1,0 +1,299 @@
+#! /usr/bin/env bash
+# Patch: -common_omap_preempt_desktop_fixes
+# Date: Wed Dec 28 14:55:26 2005
+# Source: MontaVista Software, Inc.
+# MR: 12550
+# Type: Defect Fix
+# Disposition: needs submitting to bk://linux-omap.bkbits.net
+# Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+# Description:
+# 	Patch for OMAP drivers to work correctly with PREEMPT=y
+# 	The schedule callback shouldn't be wrapped with spin_lock/unlock.
+# 
+
+PATCHNUM=33
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 12550
+Type: Defect Fix
+Disposition: needs submitting to bk://linux-omap.bkbits.net
+Signed-off-by: Vladimir Barinov <vbarinov@ru.mvista.com>
+Description:
+	Patch for OMAP drivers to work correctly with PREEMPT=y
+	The schedule callback shouldn't be wrapped with spin_lock/unlock.
+
+Index: linux-2.6.10/drivers/media/video/omap/camera_core.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/omap/camera_core.c
++++ linux-2.6.10/drivers/media/video/omap/camera_core.c
+@@ -924,7 +924,9 @@ static int camera_core_suspend(struct de
+ 		if (cam->active) {
+ 			cam->cam_hardware->close(cam->hardware_data);
+ 		}
++		spin_unlock(&cam->img_lock);
+ 		cam->cam_sensor->power_off(cam->sensor_data);
++		spin_lock(&cam->img_lock);
+ 		break;
+ 	}
+ 
+@@ -940,7 +942,9 @@ static int camera_core_resume(struct dev
+ 	spin_lock(&cam->img_lock);
+ 	switch (level) {
+ 	case RESUME_POWER_ON:
++		spin_unlock(&cam->img_lock);
+ 		cam->cam_sensor->power_on(cam->sensor_data);
++		spin_lock(&cam->img_lock);
+ 		if (cam->active) {
+ 			cam->capture_completed = 1;
+ 			cam->cam_hardware->open(cam->hardware_data);
+Index: linux-2.6.10/drivers/ssi/omap-tsc2101.c
+===================================================================
+--- linux-2.6.10.orig/drivers/ssi/omap-tsc2101.c
++++ linux-2.6.10/drivers/ssi/omap-tsc2101.c
+@@ -78,7 +78,9 @@ int omap_tsc2101_enable(void)
+ 		reg_val = reg_val | (SOFT_COM_MCK0_REQ_MASK);
+ 		omap_writew(reg_val, CLK_SOFT_REQ_REG_BASE);
+ 
++		spin_unlock(&tsc2101_lock);
+ 		ret = omap_tsc2101_configure();
++		spin_lock(&tsc2101_lock);
+ 		/* Lock the module */
+ 		if (!ret && !try_module_get(THIS_MODULE)) {
+ 			printk(KERN_CRIT "Failed to get TSC module\n");
+@@ -204,6 +206,7 @@ static int omap_tsc2101_configure(void)
+ 	}
+ #endif
+ 
++	spin_lock(&tsc2101_lock);
+ 	if (machine_is_omap_h2()) {
+ 		uwire_flags = UWIRE_READ_RISING_EDGE | UWIRE_WRITE_RISING_EDGE;
+ 		omap_cfg_reg(N15_1610_UWIRE_CS1);
+@@ -217,6 +220,7 @@ static int omap_tsc2101_configure(void)
+ 
+ 	/* Configure MCLK enable */
+ 	omap_writel(omap_readl(PU_PD_SEL_2) | (1 << 22), PU_PD_SEL_2);	
++	spin_unlock(&tsc2101_lock);
+ 
+ 	return 0;
+ }
+Index: linux-2.6.10/drivers/media/video/omap/omap16xxcam.c
+===================================================================
+--- linux-2.6.10.orig/drivers/media/video/omap/omap16xxcam.c
++++ linux-2.6.10/drivers/media/video/omap/omap16xxcam.c
+@@ -350,7 +350,9 @@ omap16xxcam_start_dma(struct sgdma_state
+ 	
+ 	if (data->new) {
+ 		data->new = 0;
++		spin_unlock_irqrestore(&data->dma_lock, irqflags);
+ 		omap16xx_cam_waitfor_syncedge(data, EN_V_UP);
++		spin_lock_irqsave(&data->dma_lock, irqflags);
+ 	} else {
+ 		if (omap_readw(OMAP_DMA_CCR(prev_dmach)) & (1 << 7)) {
+ 			omap_writew((omap_readw(OMAP_DMA_CLNK_CTRL(prev_dmach)) |
+Index: linux-2.6.10/mvl_patches/pro-0033.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0033.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(33);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

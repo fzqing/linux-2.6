@@ -1,0 +1,459 @@
+#! /usr/bin/env bash
+# Patch: -pro_serial_txx9_update_to_v1.04
+# Date: Wed Dec 28 15:03:15 2005
+# Source: MontaVista Software, Inc.
+# MR: 16035
+# Type: Defect Fix
+# Disposition: backport from 2.6.14-rc1
+# Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+# Signed-off-by: Atsushi Nemoto <anemo@mba.ocn.ne.jp>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+# Description:
+# 
+# [PATCH] txx9 serial update
+# 
+# Support for the new RBHMA4500 eval board for the TX4938.  General update
+# from the 8250 ancestor of this driver.  Replace use of deprecated
+# interfaces.
+# 
+# commit f5ee56cc184e0944ebc9ff1691985219959596f6
+# tree d882e1c8c670ad33c54c53c5851e08b012b7988d
+# parent fef266580e5cf897a1b63528fc6b1185e2d6bb87
+# author Ralf Baechle <ralf@linux-mips.org> Fri, 09 Sep 2005 13:01:32 -0700
+# committer Linus Torvalds <torvalds@g5.osdl.org> Fri, 09 Sep 2005 13:57:27 -0700
+# 
+#  drivers/serial/serial_txx9.c |  109 ++++++++++++++++++++++++++++++++-----------
+#  1 files changed, 83 insertions(+), 26 deletions(-)
+# 
+
+PATCHNUM=256
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc.
+MR: 16035
+Type: Defect Fix
+Disposition: backport from 2.6.14-rc1
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+Signed-off-by: Atsushi Nemoto <anemo@mba.ocn.ne.jp>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Description:
+
+[PATCH] txx9 serial update
+
+Support for the new RBHMA4500 eval board for the TX4938.  General update
+from the 8250 ancestor of this driver.  Replace use of deprecated
+interfaces.
+
+commit f5ee56cc184e0944ebc9ff1691985219959596f6
+tree d882e1c8c670ad33c54c53c5851e08b012b7988d
+parent fef266580e5cf897a1b63528fc6b1185e2d6bb87
+author Ralf Baechle <ralf@linux-mips.org> Fri, 09 Sep 2005 13:01:32 -0700
+committer Linus Torvalds <torvalds@g5.osdl.org> Fri, 09 Sep 2005 13:57:27 -0700
+
+ drivers/serial/serial_txx9.c |  109 ++++++++++++++++++++++++++++++++-----------
+ mvl_patches/pro-0256.c       |   16 ++++++
+ 2 files changed, 99 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/serial/serial_txx9.c b/drivers/serial/serial_txx9.c
+index 49afadb..f10c86d 100644
+Index: linux-2.6.10/drivers/serial/serial_txx9.c
+===================================================================
+--- linux-2.6.10.orig/drivers/serial/serial_txx9.c
++++ linux-2.6.10/drivers/serial/serial_txx9.c
+@@ -31,6 +31,8 @@
+  *	1.01	Set fifosize to make tx_empry called properly.
+  *		Use standard uart_get_divisor.
+  *	1.02	Cleanup. (import 8250.c changes)
++ *	1.03	Fix low-latency mode. (import 8250.c changes)
++ *	1.04	Remove usage of deprecated functions, cleanup.
+  */
+ #include <linux/config.h>
+ 
+@@ -55,7 +57,7 @@
+ #include <asm/io.h>
+ #include <asm/irq.h>
+ 
+-static char *serial_version = "1.02";
++static char *serial_version = "1.04";
+ static char *serial_name = "TX39/49 Serial driver";
+ 
+ #define PASS_LIMIT	256
+@@ -87,9 +89,9 @@ static char *serial_name = "TX39/49 Seri
+  */
+ #ifdef ENABLE_SERIAL_TXX9_PCI
+ #define NR_PCI_BOARDS	4
+-#define UART_NR  (2 + NR_PCI_BOARDS)
++#define UART_NR  (4 + NR_PCI_BOARDS)
+ #else
+-#define UART_NR  2
++#define UART_NR  4
+ #endif
+ 
+ struct uart_txx9_port {
+@@ -305,8 +307,11 @@ receive_chars(struct uart_txx9_port *up,
+ 		/* The following is not allowed by the tty layer and
+ 		   unsafe. It should be fixed ASAP */
+ 		if (unlikely(tty->flip.count >= TTY_FLIPBUF_SIZE)) {
+-			if(tty->low_latency)
++			if (tty->low_latency) {
++				spin_unlock(&up->port.lock);
+ 				tty_flip_buffer_push(tty);
++				spin_lock(&up->port.lock);
++			}
+ 			/* If this failed then we will throw away the
+ 			   bytes but must do so to clear interrupts */
+ 		}
+@@ -366,7 +371,9 @@ receive_chars(struct uart_txx9_port *up,
+ 	ignore_char:
+ 		disr = sio_in(up, TXX9_SIDISR);
+ 	} while (!(disr & TXX9_SIDISR_UVALID) && (max_count-- > 0));
++	spin_unlock(&up->port.lock);
+ 	tty_flip_buffer_push(tty);
++	spin_lock(&up->port.lock);
+ 	*status = disr;
+ }
+ 
+@@ -680,17 +687,8 @@ serial_txx9_pm(struct uart_port *port, u
+ 	      unsigned int oldstate)
+ {
+ 	struct uart_txx9_port *up = (struct uart_txx9_port *)port;
+-	if (state) {
+-		/* sleep */
+-
+-		if (up->pm)
+-			up->pm(port, state, oldstate);
+-	} else {
+-		/* wake */
+-
+-		if (up->pm)
+-			up->pm(port, state, oldstate);
+-	}
++	if (up->pm)
++		up->pm(port, state, oldstate);
+ }
+ 
+ static int serial_txx9_request_resource(struct uart_txx9_port *up)
+@@ -992,14 +990,6 @@ static int __init serial_txx9_console_in
+ }
+ console_initcall(serial_txx9_console_init);
+ 
+-static int __init serial_txx9_late_console_init(void)
+-{
+-	if (!(serial_txx9_console.flags & CON_ENABLED))
+-		register_console(&serial_txx9_console);
+-	return 0;
+-}
+-late_initcall(serial_txx9_late_console_init);
+-
+ #define SERIAL_TXX9_CONSOLE	&serial_txx9_console
+ #else
+ #define SERIAL_TXX9_CONSOLE	NULL
+@@ -1052,6 +1042,73 @@ static void serial_txx9_resume_port(int 
+ 	uart_resume_port(&serial_txx9_reg, &serial_txx9_ports[line].port);
+ }
+ 
++static DECLARE_MUTEX(serial_txx9_sem);
++
++/**
++ *	serial_txx9_register_port - register a serial port
++ *	@port: serial port template
++ *
++ *	Configure the serial port specified by the request.
++ *
++ *	The port is then probed and if necessary the IRQ is autodetected
++ *	If this fails an error is returned.
++ *
++ *	On success the port is ready to use and the line number is returned.
++ */
++static int __devinit serial_txx9_register_port(struct uart_port *port)
++{
++	int i;
++	struct uart_txx9_port *uart;
++	int ret = -ENOSPC;
++
++	down(&serial_txx9_sem);
++	for (i = 0; i < UART_NR; i++) {
++		uart = &serial_txx9_ports[i];
++		if (uart->port.type == PORT_UNKNOWN)
++			break;
++	}
++	if (i < UART_NR) {
++		uart_remove_one_port(&serial_txx9_reg, &uart->port);
++		uart->port.iobase   = port->iobase;
++		uart->port.membase  = port->membase;
++		uart->port.irq      = port->irq;
++		uart->port.uartclk  = port->uartclk;
++		uart->port.iotype   = port->iotype;
++		uart->port.flags    = port->flags | UPF_BOOT_AUTOCONF;
++		uart->port.mapbase  = port->mapbase;
++		if (port->dev)
++			uart->port.dev = port->dev;
++		ret = uart_add_one_port(&serial_txx9_reg, &uart->port);
++		if (ret == 0)
++			ret = uart->port.line;
++	}
++	up(&serial_txx9_sem);
++	return ret;
++}
++
++/**
++ *	serial_txx9_unregister_port - remove a txx9 serial port at runtime
++ *	@line: serial line number
++ *
++ *	Remove one serial port.  This may not be called from interrupt
++ *	context.  We hand the port back to the our control.
++ */
++static void __devexit serial_txx9_unregister_port(int line)
++{
++	struct uart_txx9_port *uart = &serial_txx9_ports[line];
++
++	down(&serial_txx9_sem);
++	uart_remove_one_port(&serial_txx9_reg, &uart->port);
++	uart->port.flags = 0;
++	uart->port.type = PORT_UNKNOWN;
++	uart->port.iobase = 0;
++	uart->port.mapbase = 0;
++	uart->port.membase = 0;
++	uart->port.dev = NULL;
++	uart_add_one_port(&serial_txx9_reg, &uart->port);
++	up(&serial_txx9_sem);
++}
++
+ /*
+  * Probe one serial board.  Unfortunately, there is no rhyme nor reason
+  * to the arrangement of serial ports on a PCI card.
+@@ -1069,13 +1126,13 @@ pciserial_txx9_init_one(struct pci_dev *
+ 
+ 	memset(&port, 0, sizeof(port));
+ 	port.ops = &serial_txx9_pops;
+-	port.flags |= UPF_BOOT_AUTOCONF; /* uart_ops.config_port will be called */
+ 	port.flags |= UPF_TXX9_HAVE_CTS_LINE;
+ 	port.uartclk = 66670000;
+ 	port.irq = dev->irq;
+ 	port.iotype = UPIO_PORT;
+ 	port.iobase = pci_resource_start(dev, 1);
+-	line = uart_register_port(&serial_txx9_reg, &port);
++	port.dev = &dev->dev;
++	line = serial_txx9_register_port(&port);
+ 	if (line < 0) {
+ 		printk(KERN_WARNING "Couldn't register serial port %s: %d\n", pci_name(dev), line);
+ 	}
+@@ -1091,7 +1148,7 @@ static void __devexit pciserial_txx9_rem
+ 	pci_set_drvdata(dev, NULL);
+ 
+ 	if (line) {
+-		uart_unregister_port(&serial_txx9_reg, line);
++		serial_txx9_unregister_port(line);
+ 		pci_disable_device(dev);
+ 	}
+ }
+Index: linux-2.6.10/mvl_patches/pro-0256.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0256.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2005 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(256);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

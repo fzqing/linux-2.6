@@ -1,0 +1,658 @@
+#! /usr/bin/env bash
+# Patch: -mv643xx_eth_minimal_spinlocks
+# Date: Tue Aug  8 20:55:09 2006
+
+PATCHNUM=827
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+diff-tree 8f5187035ad475c90ca865318daa09ba43bc3e68 (from dd09b1de08b28ccfb130ca97d617dc3283165d22)
+tree 43b304d094d8fec20a2589239f56ff31bc4aa8d1
+parent dd09b1de08b28ccfb130ca97d617dc3283165d22
+author Dale Farnsworth <dale@farnsworth.org> 1137455790 -0700
+committer Jeff Garzik <jgarzik@pobox.com> 1137500618 -0500
+
+    [PATCH] mv643xx_eth: Hold spinlocks only where needed
+    
+    This driver has historically held a spin_lock during the entire open
+    and stop functions and while receiving multiple packets.  This is
+    unecessarily long and holds locks during calls that may sleep.
+    This patch reduces the size of windows where locks are held.
+    
+    Signed-off-by: Dale Farnsworth <dale@farnsworth.org>
+    
+ drivers/net/mv643xx_eth.c |  170 ++++++++++++++++++++++++----------------------
+ mvl_patches/pro-0827.c    |   16 ++++
+ 2 files changed, 106 insertions(+), 80 deletions(-)
+    Signed-off-by: Jeff Garzik <jgarzik@pobox.com>
+
+diff --git a/drivers/net/mv643xx_eth.c b/drivers/net/mv643xx_eth.c
+index f632323..f6d4ea1 100644
+Index: linux-2.6.10/drivers/net/mv643xx_eth.c
+===================================================================
+--- linux-2.6.10.orig/drivers/net/mv643xx_eth.c
++++ linux-2.6.10/drivers/net/mv643xx_eth.c
+@@ -127,15 +127,8 @@ static inline void mv_write(int offset, 
+  */
+ static int mv643xx_eth_change_mtu(struct net_device *dev, int new_mtu)
+ {
+-	struct mv643xx_private *mp = netdev_priv(dev);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&mp->lock, flags);
+-
+-	if ((new_mtu > 9500) || (new_mtu < 64)) {
+-		spin_unlock_irqrestore(&mp->lock, flags);
++	if ((new_mtu > 9500) || (new_mtu < 64))
+ 		return -EINVAL;
+-	}
+ 
+ 	dev->mtu = new_mtu;
+ 	/*
+@@ -155,7 +148,6 @@ static int mv643xx_eth_change_mtu(struct
+ 				dev->name);
+ 	}
+ 
+-	spin_unlock_irqrestore(&mp->lock, flags);
+ 	return 0;
+ }
+ 
+@@ -351,8 +343,6 @@ static int mv643xx_eth_free_tx_queue(str
+ 	if (!(eth_int_cause_ext & (BIT0 | BIT8)))
+ 		return released;
+ 
+-	spin_lock(&mp->lock);
+-
+ 	/* Check only queue 0 */
+ 	while (eth_tx_return_desc(mp, &pkt_info) == ETH_OK) {
+ 		if (pkt_info.cmd_sts & BIT0) {
+@@ -375,8 +365,6 @@ static int mv643xx_eth_free_tx_queue(str
+ 		}
+ 	}
+ 
+-	spin_unlock(&mp->lock);
+-
+ 	return released;
+ }
+ 
+@@ -516,6 +504,8 @@ static irqreturn_t mv643xx_eth_int_handl
+ 			mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num), 0);
+ 			mv_write(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG
+ 								(port_num), 0);
++			/* ensure previous writes have taken effect */
++			mv_read(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG(port_num));
+ 			__netif_rx_schedule(dev);
+ 		}
+ #else
+@@ -531,6 +521,9 @@ static irqreturn_t mv643xx_eth_int_handl
+ 		/* Unmask all interrupts on ethernet port */
+ 		mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num),
+ 							INT_CAUSE_MASK_ALL);
++		/* wait for previous write to take effect */
++		mv_read(MV643XX_ETH_INTERRUPT_MASK_REG(port_num));
++
+ 		queue_task(&mp->rx_task, &tq_immediate);
+ 		mark_bh(IMMEDIATE_BH);
+ #else
+@@ -655,34 +648,20 @@ static int mv643xx_eth_open(struct net_d
+ 	unsigned int port_num = mp->port_num;
+ 	int err;
+ 
+-	spin_lock_irq(&mp->lock);
+-
+ 	err = request_irq(dev->irq, mv643xx_eth_int_handler,
+ 			SA_SHIRQ | SA_SAMPLE_RANDOM, dev->name, dev);
+-
+ 	if (err) {
+ 		printk(KERN_ERR "Can not assign IRQ number to MV643XX_eth%d\n",
+ 								port_num);
+-		err = -EAGAIN;
+-		goto out;
++		return -EAGAIN;
+ 	}
+ 
+ 	if (mv643xx_eth_real_open(dev)) {
+ 		printk("%s: Error opening interface\n", dev->name);
++		free_irq(dev->irq, dev);
+ 		err = -EBUSY;
+-		goto out_free;
+ 	}
+ 
+-	spin_unlock_irq(&mp->lock);
+-
+-	return 0;
+-
+-out_free:
+-	free_irq(dev->irq, dev);
+-
+-out:
+-	spin_unlock_irq(&mp->lock);
+-
+ 	return err;
+ }
+ 
+@@ -788,18 +767,6 @@ static int mv643xx_eth_real_open(struct 
+ 	/* Stop RX Queues */
+ 	mv_write(MV643XX_ETH_RECEIVE_QUEUE_COMMAND_REG(port_num), 0x0000ff00);
+ 
+-	/* Clear the ethernet port interrupts */
+-	mv_write(MV643XX_ETH_INTERRUPT_CAUSE_REG(port_num), 0);
+-	mv_write(MV643XX_ETH_INTERRUPT_CAUSE_EXTEND_REG(port_num), 0);
+-
+-	/* Unmask RX buffer and TX end interrupt */
+-	mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num),
+-						INT_CAUSE_UNMASK_ALL);
+-
+-	/* Unmask phy and link status changes interrupts */
+-	mv_write(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG(port_num),
+-						INT_CAUSE_UNMASK_ALL_EXT);
+-
+ 	/* Set the MAC Address */
+ 	memcpy(mp->port_mac_addr, dev->dev_addr, 6);
+ 
+@@ -901,8 +868,17 @@ static int mv643xx_eth_real_open(struct 
+ 	mp->tx_int_coal =
+ 		eth_port_set_tx_coal(port_num, 133000000, MV643XX_TX_COAL);
+ 
+-	netif_start_queue(dev);
++	/* Clear any pending ethernet port interrupts */
++	mv_write(MV643XX_ETH_INTERRUPT_CAUSE_REG(port_num), 0);
++	mv_write(MV643XX_ETH_INTERRUPT_CAUSE_EXTEND_REG(port_num), 0);
++
++	/* Unmask phy and link status changes interrupts */
++	mv_write(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG(port_num),
++						INT_CAUSE_UNMASK_ALL_EXT);
+ 
++	/* Unmask RX buffer and TX end interrupt */
++	mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num),
++						INT_CAUSE_UNMASK_ALL);
+ 	return 0;
+ }
+ 
+@@ -981,37 +957,38 @@ static int mv643xx_eth_real_stop(struct 
+ 	struct mv643xx_private *mp = netdev_priv(dev);
+ 	unsigned int port_num = mp->port_num;
+ 
++	/* Mask RX buffer and TX end interrupt */
++	mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num), 0);
++
++	/* Mask phy and link status changes interrupts */
++	mv_write(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG(port_num), 0);
++
++	/* ensure previous writes have taken effect */
++	mv_read(MV643XX_ETH_INTERRUPT_MASK_REG(port_num));
++
++#ifdef MV643XX_NAPI
++	netif_poll_disable(dev);
++#endif
+ 	netif_carrier_off(dev);
+ 	netif_stop_queue(dev);
+ 
+-	mv643xx_eth_free_tx_rings(dev);
+-	mv643xx_eth_free_rx_rings(dev);
+-
+ 	eth_port_reset(mp->port_num);
+ 
+-	/* Disable ethernet port interrupts */
+-	mv_write(MV643XX_ETH_INTERRUPT_CAUSE_REG(port_num), 0);
+-	mv_write(MV643XX_ETH_INTERRUPT_CAUSE_EXTEND_REG(port_num), 0);
+-
+-	/* Mask RX buffer and TX end interrupt */
+-	mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num), 0);
++	mv643xx_eth_free_tx_rings(dev);
++	mv643xx_eth_free_rx_rings(dev);
+ 
+-	/* Mask phy and link status changes interrupts */
+-	mv_write(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG(port_num), 0);
++#ifdef MV643XX_NAPI
++	netif_poll_enable(dev);
++#endif
+ 
+ 	return 0;
+ }
+ 
+ static int mv643xx_eth_stop(struct net_device *dev)
+ {
+-	struct mv643xx_private *mp = netdev_priv(dev);
+-
+-	spin_lock_irq(&mp->lock);
+-
+ 	mv643xx_eth_real_stop(dev);
+ 
+ 	free_irq(dev->irq, dev);
+-	spin_unlock_irq(&mp->lock);
+ 
+ 	return 0;
+ }
+@@ -1052,14 +1029,11 @@ static int mv643xx_poll(struct net_devic
+ 	struct mv643xx_private *mp = netdev_priv(dev);
+ 	int done = 1, orig_budget, work_done;
+ 	unsigned int port_num = mp->port_num;
+-	unsigned long flags;
+ 
+ #ifdef MV643XX_TX_FAST_REFILL
+ 	if (++mp->tx_clean_threshold > 5) {
+-		spin_lock_irqsave(&mp->lock, flags);
+ 		mv643xx_tx(dev);
+ 		mp->tx_clean_threshold = 0;
+-		spin_unlock_irqrestore(&mp->lock, flags);
+ 	}
+ #endif
+ 
+@@ -1077,15 +1051,13 @@ static int mv643xx_poll(struct net_devic
+ 	}
+ 
+ 	if (done) {
+-		spin_lock_irqsave(&mp->lock, flags);
+-		__netif_rx_complete(dev);
++		netif_rx_complete(dev);
+ 		mv_write(MV643XX_ETH_INTERRUPT_CAUSE_REG(port_num), 0);
+ 		mv_write(MV643XX_ETH_INTERRUPT_CAUSE_EXTEND_REG(port_num), 0);
+ 		mv_write(MV643XX_ETH_INTERRUPT_MASK_REG(port_num),
+ 						INT_CAUSE_UNMASK_ALL);
+ 		mv_write(MV643XX_ETH_INTERRUPT_EXTEND_MASK_REG(port_num),
+ 						INT_CAUSE_UNMASK_ALL_EXT);
+-		spin_unlock_irqrestore(&mp->lock, flags);
+ 	}
+ 
+ 	return done ? 0 : 1;
+@@ -2687,6 +2659,7 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 	struct eth_tx_desc *current_descriptor;
+ 	struct eth_tx_desc *first_descriptor;
+ 	u32 command;
++	unsigned long flags;
+ 
+ 	/* Do not process Tx ring in case of Tx ring resource error */
+ 	if (mp->tx_resource_err)
+@@ -2703,6 +2676,8 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 		return ETH_ERROR;
+ 	}
+ 
++	spin_lock_irqsave(&mp->lock, flags);
++
+ 	mp->tx_ring_skbs++;
+ 	BUG_ON(mp->tx_ring_skbs > mp->tx_ring_size);
+ 
+@@ -2752,11 +2727,15 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 		mp->tx_resource_err = 1;
+ 		mp->tx_curr_desc_q = tx_first_desc;
+ 
++		spin_unlock_irqrestore(&mp->lock, flags);
++
+ 		return ETH_QUEUE_LAST_RESOURCE;
+ 	}
+ 
+ 	mp->tx_curr_desc_q = tx_next_desc;
+ 
++	spin_unlock_irqrestore(&mp->lock, flags);
++
+ 	return ETH_OK;
+ }
+ #else
+@@ -2767,11 +2746,14 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 	int tx_desc_used;
+ 	struct eth_tx_desc *current_descriptor;
+ 	unsigned int command_status;
++	unsigned long flags;
+ 
+ 	/* Do not process Tx ring in case of Tx ring resource error */
+ 	if (mp->tx_resource_err)
+ 		return ETH_QUEUE_FULL;
+ 
++	spin_lock_irqsave(&mp->lock, flags);
++
+ 	mp->tx_ring_skbs++;
+ 	BUG_ON(mp->tx_ring_skbs > mp->tx_ring_size);
+ 
+@@ -2802,9 +2784,12 @@ static ETH_FUNC_RET_STATUS eth_port_send
+ 	/* Check for ring index overlap in the Tx desc ring */
+ 	if (tx_desc_curr == tx_desc_used) {
+ 		mp->tx_resource_err = 1;
++
++		spin_unlock_irqrestore(&mp->lock, flags);
+ 		return ETH_QUEUE_LAST_RESOURCE;
+ 	}
+ 
++	spin_unlock_irqrestore(&mp->lock, flags);
+ 	return ETH_OK;
+ }
+ #endif
+@@ -2827,23 +2812,27 @@ static ETH_FUNC_RET_STATUS eth_port_send
+  *	Tx ring 'first' and 'used' indexes are updated.
+  *
+  * RETURN:
+- *	ETH_ERROR in case the routine can not access Tx desc ring.
+- *	ETH_RETRY in case there is transmission in process.
+- *	ETH_END_OF_JOB if the routine has nothing to release.
+- *	ETH_OK otherwise.
++ *	ETH_OK on success
++ *	ETH_ERROR otherwise.
+  *
+  */
+ static ETH_FUNC_RET_STATUS eth_tx_return_desc(struct mv643xx_private *mp,
+ 						struct pkt_info *p_pkt_info)
+ {
+ 	int tx_desc_used;
++	int tx_busy_desc;
++	struct eth_tx_desc *p_tx_desc_used;
++	unsigned int command_status;
++	unsigned long flags;
++	int err = ETH_OK;
++
++	spin_lock_irqsave(&mp->lock, flags);
++
+ #ifdef MV643XX_CHECKSUM_OFFLOAD_TX
+-	int tx_busy_desc = mp->tx_first_desc_q;
++	tx_busy_desc = mp->tx_first_desc_q;
+ #else
+-	int tx_busy_desc = mp->tx_curr_desc_q;
++	tx_busy_desc = mp->tx_curr_desc_q;
+ #endif
+-	struct eth_tx_desc *p_tx_desc_used;
+-	unsigned int command_status;
+ 
+ 	/* Get the Tx Desc ring indexes */
+ 	tx_desc_used = mp->tx_used_desc_q;
+@@ -2851,18 +2840,24 @@ static ETH_FUNC_RET_STATUS eth_tx_return
+ 	p_tx_desc_used = &mp->p_tx_desc_area[tx_desc_used];
+ 
+ 	/* Sanity check */
+-	if (p_tx_desc_used == NULL)
+-		return ETH_ERROR;
++	if (p_tx_desc_used == NULL) {
++		err = ETH_ERROR;
++		goto out;
++	}
+ 
+ 	/* Stop release. About to overlap the current available Tx descriptor */
+-	if (tx_desc_used == tx_busy_desc && !mp->tx_resource_err)
+-		return ETH_END_OF_JOB;
++	if (tx_desc_used == tx_busy_desc && !mp->tx_resource_err) {
++		err = ETH_ERROR;
++		goto out;
++	}
+ 
+ 	command_status = p_tx_desc_used->cmd_sts;
+ 
+ 	/* Still transmitting... */
+-	if (command_status & (ETH_BUFFER_OWNED_BY_DMA))
+-		return ETH_RETRY;
++	if (command_status & (ETH_BUFFER_OWNED_BY_DMA)) {
++		err = ETH_ERROR;
++		goto out;
++	}
+ 
+ 	/* Pass the packet information to the caller */
+ 	p_pkt_info->cmd_sts = command_status;
+@@ -2880,7 +2875,10 @@ static ETH_FUNC_RET_STATUS eth_tx_return
+ 	BUG_ON(mp->tx_ring_skbs == 0);
+ 	mp->tx_ring_skbs--;
+ 
+-	return ETH_OK;
++out:
++	spin_unlock_irqrestore(&mp->lock, flags);
++
++	return err;
+ }
+ 
+ /*
+@@ -2912,11 +2910,14 @@ static ETH_FUNC_RET_STATUS eth_port_rece
+ 	int rx_next_curr_desc, rx_curr_desc, rx_used_desc;
+ 	volatile struct eth_rx_desc *p_rx_desc;
+ 	unsigned int command_status;
++	unsigned long flags;
+ 
+ 	/* Do not process Rx ring in case of Rx ring resource error */
+ 	if (mp->rx_resource_err)
+ 		return ETH_QUEUE_FULL;
+ 
++	spin_lock_irqsave(&mp->lock, flags);
++
+ 	/* Get the Rx Desc ring 'curr and 'used' indexes */
+ 	rx_curr_desc = mp->rx_curr_desc_q;
+ 	rx_used_desc = mp->rx_used_desc_q;
+@@ -2928,8 +2929,10 @@ static ETH_FUNC_RET_STATUS eth_port_rece
+ 	rmb();
+ 
+ 	/* Nothing to receive... */
+-	if (command_status & (ETH_BUFFER_OWNED_BY_DMA))
++	if (command_status & (ETH_BUFFER_OWNED_BY_DMA)) {
++		spin_unlock_irqrestore(&mp->lock, flags);
+ 		return ETH_END_OF_JOB;
++	}
+ 
+ 	p_pkt_info->byte_cnt = (p_rx_desc->byte_cnt) - RX_BUF_OFFSET;
+ 	p_pkt_info->cmd_sts = command_status;
+@@ -2949,6 +2952,8 @@ static ETH_FUNC_RET_STATUS eth_port_rece
+ 	if (rx_next_curr_desc == rx_used_desc)
+ 		mp->rx_resource_err = 1;
+ 
++	spin_unlock_irqrestore(&mp->lock, flags);
++
+ 	return ETH_OK;
+ }
+ 
+@@ -2977,6 +2982,9 @@ static ETH_FUNC_RET_STATUS eth_rx_return
+ {
+ 	int used_rx_desc;	/* Where to return Rx resource */
+ 	volatile struct eth_rx_desc *p_used_rx_desc;
++	unsigned long flags;
++
++	spin_lock_irqsave(&mp->lock, flags);
+ 
+ 	/* Get 'used' Rx descriptor */
+ 	used_rx_desc = mp->rx_used_desc_q;
+@@ -3000,6 +3008,8 @@ static ETH_FUNC_RET_STATUS eth_rx_return
+ 	/* Any Rx return cancels the Rx resource error status */
+ 	mp->rx_resource_err = 0;
+ 
++	spin_unlock_irqrestore(&mp->lock, flags);
++
+ 	return ETH_OK;
+ }
+ 
+Index: linux-2.6.10/mvl_patches/pro-0827.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0827.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(827);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1247 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_touchscreen
+# Date: Mon Mar  6 15:04:13 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 17027
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for TouchScreen IP.
+#     Taken from EDK 6.3 ML300 reference design.
+# 
+
+PATCHNUM=355
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 17027
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for TouchScreen IP.
+    Taken from EDK 6.3 ML300 reference design.
+
+ drivers/char/xilinx_ts/xtouchscreen.c      |  288 +++++++++++++++++++++++++++++
+ drivers/char/xilinx_ts/xtouchscreen.h      |  157 +++++++++++++++
+ drivers/char/xilinx_ts/xtouchscreen_i.h    |   75 +++++++
+ drivers/char/xilinx_ts/xtouchscreen_intr.c |  185 ++++++++++++++++++
+ drivers/char/xilinx_ts/xtouchscreen_l.c    |  100 ++++++++++
+ drivers/char/xilinx_ts/xtouchscreen_l.h    |  172 +++++++++++++++++
+ mvl_patches/pro-0355.c                     |   16 +
+ 7 files changed, 993 insertions(+)
+
+Index: linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen.c
+@@ -0,0 +1,288 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xtouchscreen.c
++*
++* This file contains the required functions for the touchscreen driver.
++* Refer to the header file xtouchscreen.h for more detailed information.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   08/15/02 First release
++* </pre>
++*
++*****************************************************************************/
++
++/***************************** Include Files ********************************/
++
++#include <asm/delay.h>
++#include "xstatus.h"
++#include "xparameters.h"
++#include "xtouchscreen.h"
++#include "xtouchscreen_i.h"
++#include "xtouchscreen_l.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++/************************** Function Prototypes *****************************/
++
++static void XTouchscreen_StubHandler(void *CallBackRef, u32 Event,
++				     unsigned int ByteCount);
++
++/****************************************************************************/
++/**
++*
++* Initializes a specific touchscreen instance such that it is ready to be used.
++* The default operating mode of the driver is polled mode.
++*
++* @param    InstancePtr is a pointer to the XTouchscreen instance to be
++*           worked on.
++* @param    DeviceId is the unique id of the device controlled by this
++*           XTouchscreen instance. Passing in a device id associates the
++*           generic XTouchscreen instance to a specific device, as chosen
++*           by the caller or application developer.
++*
++* @return
++*
++* - XST_SUCCESS if initialization was successful
++* - XST_DEVICE_NOT_FOUND if the device ID could not be found in the
++*           configuration table
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++XStatus XTouchscreen_Initialize(XTouchscreen * InstancePtr, u16 DeviceId)
++{
++	XTouchscreen_Config *TouchscreenConfigPtr;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/*
++	 * Lookup the device configuration in the temporary CROM table. Use this
++	 * configuration info down below when initializing this component.
++	 */
++	TouchscreenConfigPtr = XTouchscreen_LookupConfig(DeviceId);
++
++	if (TouchscreenConfigPtr == (XTouchscreen_Config *) NULL) {
++		return XST_DEVICE_NOT_FOUND;
++	}
++
++	/*
++	 * Setup the data that is from the configuration information
++	 */
++	InstancePtr->BaseAddress = TouchscreenConfigPtr->BaseAddress;
++
++	/*
++	 * Initialize the instance data to some default values and setup a default
++	 * handler
++	 */
++	InstancePtr->Handler = XTouchscreen_StubHandler;
++
++	InstancePtr->CurrentState = XTOUCHSCREEN_STATE_PEN_UP;
++
++	/*
++	 * Enable Touchscreen
++	 */
++	XTouchscreen_mWriteCtrlReg(InstancePtr->BaseAddress, 0xd3);
++	udelay(100);
++	XTouchscreen_mWriteCtrlReg(InstancePtr->BaseAddress, 0xd0);
++	udelay(100);
++
++	/*
++	 * Clear all interrupts
++	 */
++	XTouchscreen_mClearIntr(InstancePtr->BaseAddress,
++				XTOUCHSCREEN_INT_PEN_DOWN |
++				XTOUCHSCREEN_INT_PEN_UP);
++
++	/*
++	 * Indicate the instance is now ready to use, initialized without error
++	 */
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++
++	return XST_SUCCESS;
++}
++
++/****************************************************************************/
++/**
++*
++* Looks up the device configuration based on the unique device ID. A table
++* contains the configuration info for each device in the system.
++*
++* @param    DeviceId contains the ID of the device to look up the configuration
++*           for.
++*
++* @return
++*
++* A pointer to the configuration found or NULL if the specified device ID was
++* not found.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XTouchscreen_Config *XTouchscreen_LookupConfig(u16 DeviceId)
++{
++	XTouchscreen_Config *CfgPtr = NULL;
++
++	int i;
++
++	for (i = 0; i < XPAR_XTOUCHSCREEN_NUM_INSTANCES; i++) {
++		if (XTouchscreen_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XTouchscreen_ConfigTable[i];
++		}
++	}
++
++	return CfgPtr;
++}
++
++/****************************************************************************/
++/**
++*
++* This function reads 2D (X & Y) coordinates from the touchscreen.
++*
++* @param    InstancePtr is a pointer to the XTouchscreen instance to be
++*           worked on.
++* @param    *x pointer to store the x coordinate.
++*           *y pointer to store the y coordinate.
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++void XTouchscreen_GetPosition_2D(XTouchscreen * InstancePtr, u32 * x, u32 * y)
++{
++	*x = XTouchscreen_GetValue(InstancePtr->BaseAddress,
++				   XTOUCHSCREEN_CTRL_CHSEL_X);
++	*y = XTouchscreen_GetValue(InstancePtr->BaseAddress,
++				   XTOUCHSCREEN_CTRL_CHSEL_Y);
++}
++
++/****************************************************************************/
++/**
++*
++* This function reads 3D (X, Y & Z) coordinates from the touchscreen. x and
++* y are the actual positions, the pressure has to be calculated from z1 and
++* z2
++*
++* @param    InstancePtr is a pointer to the XTouchscreen instance to be
++*           worked on.
++* @param    *x pointer to store the x coordinate.
++*           *y pointer to store the y coordinate.
++*           *z pointer to store the z coordinate (pressure)
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++void XTouchscreen_GetPosition_3D(XTouchscreen * InstancePtr, u32 * x,
++				 u32 * y, u32 * z)
++{
++	u32 z1;
++	u32 z2;
++
++   /**x = NORM_FACTOR - XTouchscreen_GetValue(InstancePtr->BaseAddress,
++      XTOUCHSCREEN_CTRL_CHSEL_X);*/
++	*x = XTouchscreen_GetValue(InstancePtr->BaseAddress,
++				   XTOUCHSCREEN_CTRL_CHSEL_X);
++	*y = XTouchscreen_GetValue(InstancePtr->BaseAddress,
++				   XTOUCHSCREEN_CTRL_CHSEL_Y);
++
++	z1 = XTouchscreen_GetValue(InstancePtr->BaseAddress,
++				   XTOUCHSCREEN_CTRL_CHSEL_Z1);
++	z2 = XTouchscreen_GetValue(InstancePtr->BaseAddress,
++				   XTOUCHSCREEN_CTRL_CHSEL_Z2);
++
++	if (z1 == 0) {
++		*z = XTOUCHSCREEN_SAMPLE_ERROR;
++		return;
++	} else if (z1 > z2) {
++		*z = XTOUCHSCREEN_SAMPLE_ERROR;
++		return;
++	} else {
++		*z = ((*x) * (z2 / z1 - 1));
++	}
++}
++
++/****************************************************************************/
++/**
++*
++* This function is a stub handler that is the default handler such that if the
++* application has not set the handler when interrupts are enabled, this
++* function will be called. The function interface has to match the interface
++* specified for a handler even though none of the arguments are used.
++*
++* @param    CallBackRef is unused by this function.
++* @param    Event is unused by this function.
++* @param    ByteCount is unused by this function.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void XTouchscreen_StubHandler(void *CallBackRef, u32 Event,
++				     unsigned int ByteCount)
++{
++	XASSERT_VOID(FALSE);
++}
+Index: linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen.h
+@@ -0,0 +1,157 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xtouchscreen.h
++*
++* This driver supports the following features:
++*
++* - Polled mode
++* - Interrupt driven mode
++*
++* <b>Interrupts</b>
++*
++* In order to use interrupts, it is necessary for the user to connect the
++* driver interrupt handler, XTouchscreen_InterruptHandler(), to the interrupt
++* system of the application. This function does not save and restore the
++* processor context such that the user must provide it. A handler must be set
++* for the driver such that the handler is called when interrupt events occur.
++* The handler is called from interrupt context and is designed to allow
++* application specific processing to be performed.
++*
++* @note
++*
++* None.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   08/15/02 First release
++* </pre>
++*
++******************************************************************************/
++
++#ifndef XTOUCHSCREEN_H		/* prevent circular inclusions */
++#define XTOUCHSCREEN_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++#include "xtouchscreen_l.h"
++
++/************************** Constant Definitions ****************************/
++
++/*
++ * These constants specify the handler events that are passed to
++ * a handler from the driver. These constants are not bit masks suuch that
++ * only one will be passed at a time to the handler
++ */
++#define XTOUCHSCREEN_EVENT_PEN_UP       1
++#define XTOUCHSCREEN_EVENT_PEN_DOWN     2
++
++/*
++ * These constants are used to specify the current pen state.
++ * They are only used internally.
++ */
++#define XTOUCHSCREEN_STATE_PEN_UP       1
++#define XTOUCHSCREEN_STATE_PEN_DOWN     2
++
++/**************************** Type Definitions ******************************/
++
++/*
++ * This typedef contains configuration information for the device
++ */
++typedef struct {
++	u16 DeviceId;
++	u32 BaseAddress;
++} XTouchscreen_Config;
++
++/*
++ * This data type defines a handler which the application must define
++ * when using interrupt mode.  The handler will be called from the driver in an
++ * interrupt context to handle application specific processing.
++ *
++ * @param CallBackRef is a callback reference passed in by the upper layer
++ *        when setting the handler, and is passed back to the upper layer when
++ *        the handler is called.
++ * @param Event contains one of the event constants indicating why the handler
++ *        is being called.
++ * @param EventData contains the number of bytes sent or received at the time
++*         of the call.
++*/
++typedef void (*XTouchscreen_Handler) (void *CallBackRef, u32 Event,
++				      unsigned int EventData);
++/*
++ * The Touchscreen driver instance data. The user is required to allocate a
++ * variable of this type for every touchscreen device in the system.
++ * A pointer to a variable of this type is then passed to the driver API
++ * functions
++ */
++typedef struct {
++	u32 BaseAddress;
++	u32 IsReady;
++	u32 CurrentState;
++	XTouchscreen_Handler Handler;
++	void *CallBackRef;
++} XTouchscreen;
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Function Prototypes *****************************/
++
++/*
++ * required functions is xtouchscreen.c
++ */
++XStatus XTouchscreen_Initialize(XTouchscreen * InstancePtr, u16 DeviceId);
++XTouchscreen_Config *XTouchscreen_LookupConfig(u16 DeviceId);
++void XTouchscreen_GetPosition_2D(XTouchscreen * InstancePtr, u32 * x, u32 * y);
++void XTouchscreen_GetPosition_3D(XTouchscreen * InstancePtr, u32 * x,
++				 u32 * y, u32 * z);
++/*
++ * interrupt functions in xtouchscreen_intr.c
++ */
++void XTouchscreen_SetHandler(XTouchscreen * InstancePtr,
++			     XTouchscreen_Handler FuncPtr, void *CallBackRef);
++void XTouchscreen_InterruptHandler(XTouchscreen * InstancePtr);
++
++#endif
+Index: linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_i.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_i.h
+@@ -0,0 +1,75 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xtouchscreen_i.h
++*
++* This header file contains internal identifiers, which are those shared
++* between the files of the driver. It is intended for internal use only.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   08/15/02 First release
++* </pre>
++*
++******************************************************************************/
++#ifndef XTOUCHSCREEN_I_H	/* prevent circular inclusions */
++#define XTOUCHSCREEN_I_H	/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xtouchscreen.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++extern XTouchscreen_Config XTouchscreen_ConfigTable[];
++
++/************************** Function Prototypes *****************************/
++
++#endif
+Index: linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_intr.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_intr.c
+@@ -0,0 +1,185 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xtouchscreen_intr.c
++*
++* This file contains the functions that are related to interrupt processing
++* for the touchscreen driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   08/15/02 First release
++* </pre>
++*
++*****************************************************************************/
++
++/***************************** Include Files ********************************/
++
++#include "xio.h"
++#include "xtouchscreen.h"
++#include "xtouchscreen_l.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++typedef void (*Handler) (XTouchscreen * InstancePtr);
++
++/************************** Function Prototypes *****************************/
++
++/****************************************************************************/
++/**
++*
++* This function sets the handler that will be called when an event (interrupt)
++* occurs in the driver. The purpose of the handler is to allow application
++* specific processing to be performed.
++*
++* @param    InstancePtr is a pointer to the XTouchscreen instance to be
++*           worked on.
++* @param    FuncPtr is the pointer to the callback function.
++* @param    CallBackRef is the upper layer callback reference passed back when
++*           the callback function is invoked.
++*
++* @return
++*
++* None.
++*
++* @notes
++*
++* There is no assert on the CallBackRef since the driver doesn't know what it
++* is (nor should it)
++*
++*****************************************************************************/
++void XTouchscreen_SetHandler(XTouchscreen * InstancePtr,
++			     XTouchscreen_Handler FuncPtr, void *CallBackRef)
++{
++	/*
++	 * Assert validates the input arguments
++	 * CallBackRef not checked, no way to know what is valid
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	InstancePtr->Handler = FuncPtr;
++	InstancePtr->CallBackRef = CallBackRef;
++}
++
++/****************************************************************************/
++/**
++*
++* This function is the interrupt handler for the Touchscreen driver.
++* It must be connected to an interrupt system by the user such that it is
++* called when an interrupt for any PS/2 port occurs. This function does
++* not save or restore the processor context such that the user must
++* ensure this occurs.
++*
++* @param    InstancePtr contains a pointer to the Touchscreen instance.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XTouchscreen_InterruptHandler(XTouchscreen * InstancePtr)
++{
++	u8 IntrStatus;
++	//   u32 x,y,z;
++
++	XASSERT_VOID(InstancePtr != NULL);
++
++	/*
++	 * Read the interrupt status register to determine which
++	 * interrupt is active
++	 */
++	IntrStatus = XTouchscreen_mGetIntrStatus(InstancePtr->BaseAddress);
++
++	if (IntrStatus & XTOUCHSCREEN_INT_PEN_DOWN) {
++		/*
++		 * Check if the pen is alreay down. This is done for debouncing
++		 */
++		if (!(InstancePtr->CurrentState == XTOUCHSCREEN_STATE_PEN_DOWN)) {
++			/*
++			 * Call the application handler
++			 */
++			InstancePtr->Handler(InstancePtr->CallBackRef,
++					     XTOUCHSCREEN_EVENT_PEN_DOWN, 0);
++		}
++		/*
++		 * Save the current state
++		 */
++		InstancePtr->CurrentState = XTOUCHSCREEN_STATE_PEN_DOWN;
++
++		XTouchscreen_mClearIntr(InstancePtr->BaseAddress,
++					XTOUCHSCREEN_INT_PEN_DOWN);
++	}
++
++	if (IntrStatus & XTOUCHSCREEN_INT_PEN_UP) {
++		/*
++		 * Check if the pen is alreay up. This is done for debouncing
++		 */
++		if (!(InstancePtr->CurrentState == XTOUCHSCREEN_STATE_PEN_UP)) {
++			/*
++			 * Call the application handler
++			 */
++			InstancePtr->Handler(InstancePtr->CallBackRef,
++					     XTOUCHSCREEN_EVENT_PEN_UP, 0);
++		}
++		/*
++		 * Save the current pen state
++		 */
++		InstancePtr->CurrentState = XTOUCHSCREEN_STATE_PEN_UP;
++
++		XTouchscreen_mClearIntr(InstancePtr->BaseAddress,
++					XTOUCHSCREEN_INT_PEN_UP);
++	}
++}
+Index: linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_l.c
+@@ -0,0 +1,100 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/*****************************************************************************/
++/**
++*
++* @file xtouchscreen_l.c
++*
++* This file contains low-level driver functions that can be used to access the
++* device.  The user should refer to the hardware device specification for more
++* details of the device operation.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   08/08/02 First release
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xbasic_types.h"
++#include <asm/delay.h>
++#include "xtouchscreen_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Definitions *****************************/
++
++/****************************************************************************/
++/**
++*
++* This function reads a digitized value from the touchscreen controller.
++*
++* @param    BaseAddress contains the base address of the touchscreen
++*           controller.
++* @param    Channel addresses the channel to be read.
++*
++* @return   Digitized value of the addressed channel.
++*
++* @note     None.
++*
++*****************************************************************************/
++u32 XTouchscreen_GetValue(u32 BaseAddress, u8 Channel)
++{
++	u32 ReadVal;
++
++	XTouchscreen_mWriteCtrlReg(BaseAddress, Channel);
++	udelay(100);
++	ReadVal = XTouchscreen_mReadCtrlReg(BaseAddress);
++	XTouchscreen_mWriteCtrlReg(BaseAddress, 0xd0);
++
++	ReadVal >>= 16;
++
++	return ReadVal;
++}
+Index: linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_ts/xtouchscreen_l.h
+@@ -0,0 +1,172 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2004 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xtouchscreen_l.h
++*
++* This header file contains identifiers and low-level driver functions (or
++* macros) that can be used to access the device.  The user should refer to the
++* hardware device specification for more details of the device operation.
++* High-level driver functions are defined in xtouchscreen.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ch   08/08/02 First release
++* </pre>
++*
++*****************************************************************************/
++
++#ifndef XTOUCHSCREEN_L_H	/* prevent circular inclusions */
++#define XTOUCHSCREEN_L_H	/* by using protection macros  */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/* Register offsets */
++#define XTOUCHSCREEN_CTRL_REG_OFFSET     0
++#define XTOUCHSCREEN_INTR_REG_OFFSET     4
++
++/* control register channel selectors */
++#define XTOUCHSCREEN_CTRL_CHSEL_X    0xd3
++#define XTOUCHSCREEN_CTRL_CHSEL_Y    0x93
++#define XTOUCHSCREEN_CTRL_CHSEL_Z1   0xb3
++#define XTOUCHSCREEN_CTRL_CHSEL_Z2   0xc3
++
++/* interrupt register positions */
++#define XTOUCHSCREEN_INT_PEN_UP      0x01
++#define XTOUCHSCREEN_INT_PEN_DOWN    0x02
++
++/* error reading touchscreen */
++#define XTOUCHSCREEN_SAMPLE_ERROR     0xffffffff
++
++/* normalization factor */
++#define NORM_FACTOR                   1000000
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/*****************************************************************************
++*
++* Low-level driver macros.  The list below provides signatures to help the
++* user use the macros.
++*
++* u32 XTouchscreen_mReadCtrlReg(u32 BaseAddress)
++* void XTouchscreen_mWriteCtrlReg(u32 BaseAddress, u8 Value)
++*
++* u32 XTouchscreen_mGetIntrStatus(u32 BaseAddress)
++* void XTouchscreen_mClearIntr(u32 BaseAddress, u32 ClearMask)
++*
++*****************************************************************************/
++
++/****************************************************************************/
++/**
++* Read the control register.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   The value read from the register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XTouchscreen_mReadCtrlReg(BaseAddress) \
++            XIo_In32((BaseAddress) + XTOUCHSCREEN_CTRL_REG_OFFSET)
++
++/****************************************************************************/
++/**
++* Write to the control register
++*
++* @param    BaseAddress contains the base address of the device.
++            Value to be written
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XTouchscreen_mWriteCtrlReg(BaseAddress, Value) \
++            XIo_Out8((BaseAddress) + XTOUCHSCREEN_CTRL_REG_OFFSET, Value)
++
++/****************************************************************************/
++/**
++* Read the interrupt status register.
++*
++* @param    BaseAddress contains the base address of the device.
++*
++* @return   The value read from the register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XTouchscreen_mGetIntrStatus(BaseAddress) \
++            XIo_In32((BaseAddress) + XTOUCHSCREEN_INTR_REG_OFFSET)
++
++/****************************************************************************/
++/**
++* Clear pending interrupts.
++*
++* @param    BaseAddress contains the base address of the device.
++*           Bitmask for interrupts to be cleared. A "1" clears the interrupt.
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XTouchscreen_mClearIntr(BaseAddress, ClearMask) \
++            XIo_Out32((BaseAddress) + XTOUCHSCREEN_INTR_REG_OFFSET, ClearMask)
++
++/************************** Variable Definitions ****************************/
++
++/************************** Function Prototypes *****************************/
++
++u32 XTouchscreen_GetValue(u32 BaseAddress, u8 Channel);
++
++/****************************************************************************/
++
++#endif
+Index: linux-2.6.10/mvl_patches/pro-0355.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0355.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(355);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

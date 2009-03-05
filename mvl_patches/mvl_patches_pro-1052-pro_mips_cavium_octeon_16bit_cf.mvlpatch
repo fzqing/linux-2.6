@@ -1,0 +1,565 @@
+#! /usr/bin/env bash
+# Patch: -pro_mips_cavium_octeon_16bit_cf
+# Date: Tue Feb  6 08:14:36 2007
+# Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+# MR: 18778
+# Type: Defect Fix
+# Disposition: needs submitting to community
+# Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+# Description:
+#     Cavium Oceon 16-bit mode for CF
+# 
+
+PATCHNUM=1052
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: MontaVista Software, Inc. Sergey Podstavin <spodstavin@ru.mvista.com>
+MR: 18778
+Type: Defect Fix
+Disposition: needs submitting to community
+Signed-off-by: Sergey Podstavin <spodstavin@ru.mvista.com>
+Description:
+    Cavium Oceon 16-bit mode for CF
+
+Index: linux-2.6.10/arch/mips/cavium-octeon/ebt3000_cf.c
+===================================================================
+--- linux-2.6.10.orig/arch/mips/cavium-octeon/ebt3000_cf.c
++++ linux-2.6.10/arch/mips/cavium-octeon/ebt3000_cf.c
+@@ -1,5 +1,5 @@
+ /*
+- * Extra-simple block driver for the Octeon EBT3000 compact flash. This
++ * Extra-simple block driver for the Octeon bootbus compact flash. This
+  * driver is based on the excellent article and example code from LWM.
+  * http://lwn.net/Articles/58719/
+  *
+@@ -26,6 +26,8 @@
+ 
+ #include <hal.h>
+ 
++#define OCTEON_MIO_BOOT_REG_CFGX(offset) (0x8001180000000000ull+((offset)*8))
++
+ #define VERSION "1.0"
+ #define DEVICE_NAME "cf"
+ MODULE_LICENSE("GPL");
+@@ -41,13 +43,14 @@ MODULE_LICENSE("GPL");
+  */
+ 
+ typedef struct {
+-	volatile unsigned char *ata_command;
++	uint64_t base_address;
+ 	unsigned long num_sectors;
+ 	unsigned long sector_size;
+ 	struct gendisk *gd;
+ 	spinlock_t lock;
+ 	request_queue_t *queue;
+ 	struct completion comp;
++	int is16bit;
+ } cf_device_t;
+ 
+ static cf_device_t STATIC_DEVICE;
+@@ -64,16 +67,31 @@ static inline int ata_wait_idle(cf_devic
+ 	unsigned char status;
+ 	cycles_t start_time = get_cycles();
+ 
+-	octeon_led_set(0, 30);
+-	status = cf->ata_command[7];
+-	while (status & 0x80) {
+-		if (unlikely(get_cycles() - start_time > mips_hpt_frequency))
+-			break;
++	if (cf->is16bit) {
++		volatile uint16_t *ata_command =
++		    (volatile uint16_t *)cf->base_address;
++		status = ata_command[3] >> 8;
++		while (status & 0x80) {
++			if (unlikely
++			    (get_cycles() - start_time > mips_hpt_frequency))
++				break;
++
++			udelay(5);	/* For some reason, this can't be a yield() */
++			status = ata_command[3] >> 8;
++		}
++	} else {
++		volatile uint8_t *ata_command =
++		    (volatile uint8_t *)cf->base_address;
++		status = ata_command[7];
++		while (status & 0x80) {
++			if (unlikely
++			    (get_cycles() - start_time > mips_hpt_frequency))
++				break;
+ 
+-		udelay(5);
+-		status = cf->ata_command[7];
++			udelay(5);	/* For some reason, this can't be a yield() */
++			status = ata_command[7];
++		}
+ 	}
+-	octeon_led_clear(0, 30);
+ 
+ 	if (unlikely(status & 0x80)) {
+ 		if (cf->gd)
+@@ -103,12 +121,22 @@ static int ata_command(cf_device_t * cf,
+ 	if (ata_wait_idle(cf))
+ 		return -1;
+ 
+-	cf->ata_command[2] = sectors;
+-	cf->ata_command[3] = (lba & 0xff);
+-	cf->ata_command[4] = ((lba >> 8) & 0xff);
+-	cf->ata_command[5] = ((lba >> 16) & 0xff);
+-	cf->ata_command[6] = ((lba >> 24) & 0xff) | 0xe0;	// LBA | Drive 0
+-	cf->ata_command[7] = command;
++	if (cf->is16bit) {
++		volatile uint16_t *ata_command =
++		    (volatile uint16_t *)cf->base_address;
++		ata_command[1] = sectors | ((lba & 0xff) << 8);
++		ata_command[2] = lba >> 8;
++		ata_command[3] = ((lba >> 24) & 0xff) | 0xe0 | command << 8;
++	} else {
++		volatile uint8_t *ata_command =
++		    (volatile uint8_t *)cf->base_address;
++		ata_command[2] = sectors;
++		ata_command[3] = (lba & 0xff);
++		ata_command[4] = ((lba >> 8) & 0xff);
++		ata_command[5] = ((lba >> 16) & 0xff);
++		ata_command[6] = ((lba >> 24) & 0xff) | 0xe0;	// LBA | Drive 0
++		ata_command[7] = command;
++	}
+ 
+ 	return 0;
+ }
+@@ -122,20 +150,30 @@ static int ata_command(cf_device_t * cf,
+  */
+ static int ata_identify(cf_device_t * cf, struct hd_driveid *drive_info)
+ {
+-	unsigned char *ptr;
+-	int count;
+-
+ 	if (ata_command(cf, 0, 0, WIN_IDENTIFY))
+ 		return -1;
+ 
+ 	/* Wait for read to complete (BSY clear) */
+ 	if (ata_wait_idle(cf))
+ 		return -1;
+-
+-	ptr = (unsigned char *)drive_info;
+-	for (count = 0; count < sizeof(*drive_info); count++)
+-		*ptr++ = cf->ata_command[0];
+-
++	if (cf->is16bit) {
++		volatile uint16_t *ata_command =
++		    (volatile uint16_t *)cf->base_address;
++		uint16_t *ptr = (uint16_t *) drive_info;
++		int count;
++		for (count = 0; count < sizeof(*drive_info); count += 2) {
++			uint16_t data = *ata_command;
++			data = cpu_to_le16(data);
++			*ptr++ = data;
++		}
++	} else {
++		volatile uint8_t *ata_command =
++		    (volatile uint8_t *)cf->base_address;
++		unsigned char *ptr = (unsigned char *)drive_info;
++		int count;
++		for (count = 0; count < sizeof(*drive_info); count++)
++			*ptr++ = *ata_command;
++	}
+ 	ide_fix_driveid(drive_info);
+ 	ide_fixstring(drive_info->model, sizeof(drive_info->model), 0);
+ 	ide_fixstring(drive_info->fw_rev, sizeof(drive_info->fw_rev), 0);
+@@ -158,7 +196,6 @@ static int ata_read(cf_device_t * cf, un
+ {
+ 	int sectors_read = 0;
+ 
+-	octeon_led_set(0, 31);
+ 	while (num_sectors--) {
+ 		int count;
+ 
+@@ -170,10 +207,23 @@ static int ata_read(cf_device_t * cf, un
+ 			break;
+ 
+ 		sectors_read++;
+-		for (count = 0; count < cf->sector_size; count++)
+-			*buffer++ = cf->ata_command[0];
++		if (cf->is16bit) {
++			volatile uint16_t *ata_command =
++			    (volatile uint16_t *)cf->base_address;
++			uint16_t *ptr = (uint16_t *) buffer;
++			for (count = 0; count < cf->sector_size; count += 2) {
++				uint16_t data = *ata_command;
++				data = cpu_to_le16(data);
++				*ptr++ = data;
++			}
++			buffer += cf->sector_size;
++		} else {
++			volatile uint8_t *ata_command =
++			    (volatile uint8_t *)cf->base_address;
++			for (count = 0; count < cf->sector_size; count++)
++				*buffer++ = *ata_command;
++		}
+ 	}
+-	octeon_led_clear(0, 31);
+ 
+ 	return sectors_read;
+ }
+@@ -193,7 +243,6 @@ static int ata_write(cf_device_t * cf, u
+ {
+ 	int sectors_written = 0;
+ 
+-	octeon_led_set(1, 31);
+ 	while (num_sectors--) {
+ 		int count;
+ 
+@@ -204,11 +253,28 @@ static int ata_write(cf_device_t * cf, u
+ 		if (ata_wait_idle(cf))
+ 			break;
+ 
+-		for (count = 0; count < cf->sector_size; count++) {
+-			cf->ata_command[0] = *buffer++;
+-			/* Every 16 writes do a read so the bootbus FIFO doesn't fill up */
+-			if ((count & 0xf) == 0)
+-				cf->ata_command[7];
++		if (cf->is16bit) {
++			volatile uint16_t *ata_command =
++			    (volatile uint16_t *)cf->base_address;
++			const uint16_t *ptr = (const uint16_t *)buffer;
++			for (count = 0; count < cf->sector_size; count += 2) {
++				uint16_t data = *ptr++;
++				data = cpu_to_le16(data);
++				*ata_command = data;
++				/* Every 16 writes do a read so the bootbus FIFO doesn't fill up */
++				if ((count & 0xf) == 0)
++					ata_command[3];
++			}
++			buffer += cf->sector_size;
++		} else {
++			volatile uint8_t *ata_command =
++			    (volatile uint8_t *)cf->base_address;
++			for (count = 0; count < cf->sector_size; count++) {
++				*ata_command = *buffer++;
++				/* Every 16 writes do a read so the bootbus FIFO doesn't fill up */
++				if ((count & 0xf) == 0)
++					ata_command[7];
++			}
+ 		}
+ 
+ 		/* Wait for write to complete (BSY clear) */
+@@ -217,7 +283,6 @@ static int ata_write(cf_device_t * cf, u
+ 
+ 		sectors_written++;
+ 	}
+-	octeon_led_clear(1, 31);
+ 
+ 	return sectors_written;
+ }
+@@ -233,7 +298,6 @@ static int ebt3000cf_identify(cf_device_
+ {
+ 	struct hd_driveid drive_info;
+ 	int result;
+-
+ 	memset(&drive_info, 0, sizeof(drive_info));
+ 
+ 	result = ata_identify(cf, &drive_info);
+@@ -351,9 +415,8 @@ int ebt3000_cf_work(void *cf_obj)
+ 	cf_device_t *cf = cf_obj;
+ 	struct request *req;
+ 	int count;
+-
+ 	/* Give ourself a nice name and become a daemon */
+-	daemonize("ebt3000_%s", cf->gd->disk_name);
++	daemonize("octeon_%s", cf->gd->disk_name);
+ 
+ 	/* Identify the compact flash. We need its size */
+ 	ebt3000cf_identify(cf);
+@@ -411,17 +474,31 @@ static struct block_device_operations eb
+  */
+ static int __init ebt3000_cf_init(void)
+ {
+-	cf_device_t *cf;
++	int region;
+ 	int major_num;
+-
++	cf_device_t *cf;
++	extern octeon_bootinfo_t *octeon_bootinfo;
+ 	printk(KERN_NOTICE DEVICE_NAME
+-	       ": EBT3000 compact flash driver version %s\n", VERSION);
++	       ": Octeon bootbus compact flash driver version %s\n", VERSION);
+ 
+ 	cf = &STATIC_DEVICE;
+ 
+ 	memset(cf, 0, sizeof(*cf));
+ 
+-	cf->ata_command = (unsigned char *)0x800000001d000800;
++	if (octeon_bootinfo->major_version == 1
++	    && octeon_bootinfo->minor_version >= 1) {
++		if (octeon_bootinfo->compact_flash_common_base_addr)
++			cf->base_address =
++			    (1ull << 63 | octeon_bootinfo->
++			     compact_flash_common_base_addr);
++		else {
++			printk(KERN_NOTICE DEVICE_NAME
++			       ": Compact flash interface not present.\n");
++			goto out;
++		}
++	} else
++		cf->base_address = 0x800000001d000800ull;
++
+ 	spin_lock_init(&cf->lock);
+ 	init_completion(&cf->comp);
+ 
+@@ -448,6 +525,20 @@ static int __init ebt3000_cf_init(void)
+ 		goto out_unregister;
+ 	}
+ 
++	/* Find the bootbus region for the CF to determine 16 or 8 bit  */
++	for (region = 0; region < 8; region++) {
++		octeon_mio_boot_reg_cfgx_t cfg;
++		cfg.u64 = octeon_read_csr(OCTEON_MIO_BOOT_REG_CFGX(region));
++		if (cfg.s.base ==
++		    octeon_bootinfo->compact_flash_common_base_addr >> 16) {
++			cf->is16bit = cfg.s.width;
++			printk(KERN_NOTICE DEVICE_NAME
++			       ": Compact flash found in bootbus region %d (%d bit).\n",
++			       region, (cf->is16bit) ? 16 : 8);
++			break;
++		}
++	}
++
+ 	cf->gd->major = major_num;
+ 	cf->gd->first_minor = 0;
+ 	cf->gd->fops = &ebt3000_cf_ops;
+Index: linux-2.6.10/include/asm-mips/mach-cavium-octeon/hal.h
+===================================================================
+--- linux-2.6.10.orig/include/asm-mips/mach-cavium-octeon/hal.h
++++ linux-2.6.10/include/asm-mips/mach-cavium-octeon/hal.h
+@@ -63,6 +63,26 @@ typedef struct {
+ 
+ } octeon_bootinfo_t;
+ 
++#define OCTEON_MIO_BOOT_REG_CFGX(offset) (0x8001180000000000ull+((offset)*8))
++typedef union
++{
++    uint64_t u64;
++    struct
++    {
++        uint64_t reserved                : 27;      /**< Reserved */
++        uint64_t sam                     : 1;       /**< Region 0 SAM */
++        uint64_t we_ext                  : 2;       /**< Region 0 write enable count extension */
++        uint64_t oe_ext                  : 2;       /**< Region 0 output enable count extension */
++        uint64_t en                      : 1;       /**< Region 0 enable */
++        uint64_t orbit                   : 1;       /**< No function for region 0 */
++        uint64_t ale                     : 1;       /**< Region 0 ALE mode */
++        uint64_t width                   : 1;       /**< Region 0 bus width */
++        uint64_t size                    : 12;      /**< Region 0 size */
++        uint64_t base                    : 16;      /**< Region 0 base address */
++    } s;
++} octeon_mio_boot_reg_cfgx_t;
++
++
+ typedef union {
+ 	uint64_t u64;
+ 	struct {
+Index: linux-2.6.10/mvl_patches/pro-1052.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1052.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1052);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

@@ -1,0 +1,1 @@
+#define CONFIG_LTT_MAX_HANDLES 128

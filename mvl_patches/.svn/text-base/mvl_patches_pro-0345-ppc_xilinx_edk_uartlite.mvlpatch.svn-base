@@ -1,0 +1,2092 @@
+#! /usr/bin/env bash
+# Patch: -ppc_xilinx_edk_uartlite
+# Date: Mon Mar  6 15:03:16 2006
+# Source: Xilinx, Inc., www.xilinx.com
+# MR: 15265
+# Type: Integration
+# Disposition: needs submitting to linuxppc-embedded mailing list
+# Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+# Description:
+#     EDK level 1 driver code for UART Lite IP.
+#     Taken from EDK 7.1i SP2.
+# 
+
+PATCHNUM=345
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Xilinx, Inc., www.xilinx.com
+MR: 15265
+Type: Integration
+Disposition: needs submitting to linuxppc-embedded mailing list
+Signed-off-by: Andrei Konovalov <akonovalov@ru.mvista.com>
+Description:
+    EDK level 1 driver code for UART Lite IP.
+    Taken from EDK 7.1i SP2.
+
+ drivers/char/xilinx_uartlite/xuartlite.c      |  638 ++++++++++++++++++++++++++
+ drivers/char/xilinx_uartlite/xuartlite.h      |  223 +++++++++
+ drivers/char/xilinx_uartlite/xuartlite_g.c    |   87 +++
+ drivers/char/xilinx_uartlite/xuartlite_i.h    |  144 +++++
+ drivers/char/xilinx_uartlite/xuartlite_intr.c |  348 ++++++++++++++
+ drivers/char/xilinx_uartlite/xuartlite_l.c    |  121 ++++
+ drivers/char/xilinx_uartlite/xuartlite_l.h    |  255 ++++++++++
+ mvl_patches/pro-0345.c                        |   16 
+ 8 files changed, 1832 insertions(+)
+
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite.c
+@@ -0,0 +1,638 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite.c
++*
++* Contains required functions for the XUartLite driver. See the xuartlite.h
++* header file for more details on this driver.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ecm  08/31/01 First release
++* 1.00b jhl  02/21/02 Repartitioned the driver for smaller files
++* 1.00b rmm  05/13/03 Fixed diab compiler warnings relating to asserts
++* </pre>
++*
++*****************************************************************************/
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++#include "xparameters.h"
++#include "xuartlite.h"
++#include "xuartlite_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Variable Definitions ****************************/
++
++/************************** Function Prototypes *****************************/
++
++static void StubHandler(void *CallBackRef, unsigned int ByteCount);
++
++/****************************************************************************/
++/**
++*
++* Initialize a XUartLite instance.  The receive and transmit FIFOs of the
++* UART are not flushed, so the user may want to flush them. The hardware
++* device does not have any way to disable the receiver such that any valid
++* data may be present in the receive FIFO.  This function disables the UART
++* interrupt. The baudrate and format of the data are fixed in the hardware
++* at hardware build time.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++* @param    DeviceId is the unique id of the device controlled by this
++*           XUartLite instance.  Passing in a device id associates the
++*           generic XUartLite instance to a specific device, as chosen by
++*           the caller or application developer.
++*
++* @return
++*
++* - XST_SUCCESS if everything starts up as expected.
++* - XST_DEVICE_NOT_FOUND if the device is not found in the configuration table.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++XStatus XUartLite_Initialize(XUartLite * InstancePtr, u16 DeviceId)
++{
++	XUartLite_Config *UartLiteConfigPtr;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/*
++	 * Lookup the device configuration in the configuration table. Use this
++	 * configuration info when initializing this component.
++	 */
++	UartLiteConfigPtr = XUartLite_LookupConfig(DeviceId);
++
++	if (UartLiteConfigPtr == (XUartLite_Config *) NULL) {
++		return XST_DEVICE_NOT_FOUND;
++	}
++
++	/*
++	 * Set some default values, including setting the callback
++	 * handlers to stubs.
++	 */
++
++	InstancePtr->SendBuffer.NextBytePtr = NULL;
++	InstancePtr->SendBuffer.RemainingBytes = 0;
++	InstancePtr->SendBuffer.RequestedBytes = 0;
++
++	InstancePtr->ReceiveBuffer.NextBytePtr = NULL;
++	InstancePtr->ReceiveBuffer.RemainingBytes = 0;
++	InstancePtr->ReceiveBuffer.RequestedBytes = 0;
++
++	InstancePtr->IsReady = XCOMPONENT_IS_READY;
++	InstancePtr->RegBaseAddress = UartLiteConfigPtr->RegBaseAddr;
++	InstancePtr->RecvHandler = StubHandler;
++	InstancePtr->SendHandler = StubHandler;
++
++	/* Write to the control register to disable the interrupts, don't
++	 * reset the FIFOs are the user may want the data that's present
++	 */
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET, 0);
++
++	/*
++	 * Clear the statistics for this driver
++	 */
++	XUartLite_mClearStats(InstancePtr);
++
++	return XST_SUCCESS;
++}
++
++/****************************************************************************/
++/**
++*
++* This functions sends the specified buffer of data using the UART in either
++* polled or interrupt driven modes. This function is non-blocking such that it
++* will return before the data has been sent by the UART. If the UART is busy
++* sending data, it will return and indicate zero bytes were sent.
++*
++* In a polled mode, this function will only send as much data as the UART can
++* buffer in the FIFO. The application may need to call it repeatedly to
++* send a buffer.
++*
++* In interrupt mode, this function will start sending the specified buffer and
++* then the interrupt handler of the driver will continue sending data until the
++* buffer has been sent. A callback function, as specified by the application,
++* will be called to indicate the completion of sending the buffer.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++* @param    BufferPtr is pointer to a buffer of data to be sent.
++* @param    NumBytes contains the number of bytes to be sent. A value of zero
++*           will stop a previous send operation that is in progress in interrupt
++*           mode. Any data that was already put into the transmit FIFO will be
++*           sent.
++*
++* @return
++*
++* The number of bytes actually sent.
++*
++* @note
++*
++* The number of bytes is not asserted so that this function may be called with
++* a value of zero to stop an operation that is already in progress.
++*
++******************************************************************************/
++unsigned int XUartLite_Send(XUartLite * InstancePtr, u8 * DataBufferPtr,
++			    unsigned int NumBytes)
++{
++	unsigned int BytesSent;
++	u32 StatusRegister;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(DataBufferPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XASSERT_NONVOID(((signed)NumBytes) >= 0);
++
++	/* Enter a critical region by disabling the UART interrupts to
++	 * allow this call to stop a previous operation that may be interrupt
++	 * driven
++	 */
++	StatusRegister = XUartLite_mGetStatusReg(InstancePtr->RegBaseAddress);
++
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET, 0);
++
++	/* Setup the specified buffer to be sent by setting the instance
++	 * variables so it can be sent with polled or interrupt mode
++	 */
++	InstancePtr->SendBuffer.RequestedBytes = NumBytes;
++	InstancePtr->SendBuffer.RemainingBytes = NumBytes;
++	InstancePtr->SendBuffer.NextBytePtr = DataBufferPtr;
++
++	/* Restore the interrupt enable register to it's previous value such
++	 * that the critical region is exited.
++	 * This is done here to minimize the amount of time the interrupt is
++	 * disabled since there is only one interrupt and the receive could
++	 * be filling up while interrupts are blocked.
++	 */
++
++	StatusRegister &= XUL_CR_ENABLE_INTR;
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET,
++		  StatusRegister);
++
++	/* Send the buffer using the UART and return the number of bytes sent */
++
++	BytesSent = XUartLite_SendBuffer(InstancePtr);
++
++	return BytesSent;
++}
++
++/****************************************************************************/
++/**
++*
++* This function will attempt to receive a specified number of bytes of data
++* from the UART and store it into the specified buffer. This function is
++* designed for either polled or interrupt driven modes. It is non-blocking
++* such that it will return if no data has already received by the UART.
++*
++* In a polled mode, this function will only receive as much data as the UART
++* can buffer in the FIFO. The application may need to call it repeatedly to
++* receive a buffer. Polled mode is the default mode of operation for the driver.
++*
++* In interrupt mode, this function will start receiving and then the interrupt
++* handler of the driver will continue receiving data until the buffer has been
++* received. A callback function, as specified by the application, will be called
++* to indicate the completion of receiving the buffer or when any receive errors
++* or timeouts occur. Interrupt mode must be enabled using the SetOptions function.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++* @param    BufferPtr is pointer to buffer for data to be received into
++* @param    NumBytes is the number of bytes to be received. A value of zero will
++*           stop a previous receive operation that is in progress in interrupt mode.
++*
++* @return
++*
++* The number of bytes received.
++*
++* @note
++*
++* The number of bytes is not asserted so that this function may be called with
++* a value of zero to stop an operation that is already in progress.
++*
++*****************************************************************************/
++unsigned int XUartLite_Recv(XUartLite * InstancePtr, u8 * DataBufferPtr,
++			    unsigned int NumBytes)
++{
++	unsigned int ReceivedCount;
++	u32 StatusRegister;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++	XASSERT_NONVOID(DataBufferPtr != NULL);
++	XASSERT_NONVOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++	XASSERT_NONVOID(((signed)NumBytes) >= 0);
++
++	/* Enter a critical region by disabling all the UART interrupts to allow
++	 * this call to stop a previous operation that may be interrupt driven
++	 */
++	StatusRegister = XUartLite_mGetStatusReg(InstancePtr->RegBaseAddress);
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET, 0);
++
++	/* Setup the specified buffer to be received by setting the instance
++	 * variables so it can be received with polled or interrupt mode
++	 */
++	InstancePtr->ReceiveBuffer.RequestedBytes = NumBytes;
++	InstancePtr->ReceiveBuffer.RemainingBytes = NumBytes;
++	InstancePtr->ReceiveBuffer.NextBytePtr = DataBufferPtr;
++
++	/* Restore the interrupt enable register to it's previous value such
++	 * that the critical region is exited
++	 */
++	StatusRegister &= XUL_CR_ENABLE_INTR;
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET,
++		  StatusRegister);
++
++	/* Receive the data from the UART and return the number of bytes
++	 * received
++	 * This is done here to minimize the amount of time the interrupt is
++	 * disabled since there is only one interrupt and the transmit could
++	 * be emptying out while interrupts are blocked.
++	 */
++
++	ReceivedCount = XUartLite_ReceiveBuffer(InstancePtr);
++
++	return ReceivedCount;
++
++}
++
++/****************************************************************************/
++/**
++*
++* This function resets the FIFOs, both transmit and receive, of the UART such
++* that they are emptied.  Since the UART does not have any way to disable it
++* from receiving data, it may be necessary for the application to reset the
++* FIFOs to get rid of any unwanted data.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++void XUartLite_ResetFifos(XUartLite * InstancePtr)
++{
++	u32 Register;
++
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Read the status register 1st such that the next write to the control
++	 * register won't destroy the state of the interrupt enable bit
++	 */
++	Register =
++	    XIo_In32(InstancePtr->RegBaseAddress + XUL_STATUS_REG_OFFSET);
++
++	/*
++	 * Mask off the interrupt enable bit to maintain it's state.
++	 */
++
++	Register &= XUL_SR_INTR_ENABLED;
++
++	/* Write to the control register to reset both FIFOs, these bits are
++	 * self-clearing such that there's no need to clear them
++	 */
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET,
++		  Register | XUL_CR_FIFO_TX_RESET | XUL_CR_FIFO_RX_RESET);
++}
++
++/****************************************************************************/
++/**
++*
++* This function determines if the specified UART is sending data. If the
++* transmitter register is not empty, it is sending data.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* A value of TRUE if the UART is sending data, otherwise FALSE.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++u32 XUartLite_IsSending(XUartLite * InstancePtr)
++{
++	u32 StatusRegister;
++
++	/*
++	 * Assert validates the input arguments
++	 */
++	XASSERT_NONVOID(InstancePtr != NULL);
++
++	/* Read the status register to determine if the transmitter is
++	 * empty
++	 */
++	StatusRegister =
++	    XIo_In32(InstancePtr->RegBaseAddress + XUL_STATUS_REG_OFFSET);
++
++	/* If the transmitter is not empty then indicate that the UART is still
++	 * sending some data
++	 */
++	return ((StatusRegister & XUL_SR_TX_FIFO_EMPTY) == 0);
++}
++
++/****************************************************************************
++*
++* This function provides a stub handler such that if the application does not
++* define a handler but enables interrupts, this function will be called.
++*
++* @param    CallBackRef has no purpose but is necessary to match the
++*           interface for a handler.
++* @param    ByteCount has no purpose but is necessary to match the
++*           interface for a handler.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void StubHandler(void *CallBackRef, unsigned int ByteCount)
++{
++	/*
++	 * Assert occurs always since this is a stub and should never be called
++	 */
++	XASSERT_VOID_ALWAYS();
++}
++
++/****************************************************************************
++*
++* Looks up the device configuration based on the unique device ID.  The table
++* UartliteConfigTable contains the configuration info for each device in the
++* system.
++*
++* @param DeviceId is the unique device ID to match on.
++*
++* @return
++*
++* A pointer to the configuration data for the device, or NULL if no match
++* was found.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++XUartLite_Config *XUartLite_LookupConfig(u16 DeviceId)
++{
++	XUartLite_Config *CfgPtr = NULL;
++	int i;
++
++	for (i = 0; i < XPAR_XUARTLITE_NUM_INSTANCES; i++) {
++		if (XUartLite_ConfigTable[i].DeviceId == DeviceId) {
++			CfgPtr = &XUartLite_ConfigTable[i];
++			break;
++		}
++	}
++
++	return CfgPtr;
++}
++
++/****************************************************************************/
++/**
++*
++* This function sends a buffer that has been previously specified by setting
++* up the instance variables of the instance. This function is designed to be
++* an internal function for the XUartLite component such that it may be called
++* from a shell function that sets up the buffer or from an interrupt handler.
++*
++* This function sends the specified buffer of data to the UART in either
++* polled or interrupt driven modes. This function is non-blocking such that
++* it will return before the data has been sent by the UART.
++*
++* In a polled mode, this function will only send as much data as the UART can
++* buffer, either in the transmitter or in the FIFO if present and enabled.
++* The application may need to call it repeatedly to send a buffer.
++*
++* In interrupt mode, this function will start sending the specified buffer and
++* then the interrupt handler of the driver will continue until the buffer
++* has been sent. A callback function, as specified by the application, will
++* be called to indicate the completion of sending the buffer.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* NumBytes is the number of bytes actually sent (put into the UART transmitter
++* and/or FIFO).
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++unsigned int XUartLite_SendBuffer(XUartLite * InstancePtr)
++{
++	unsigned int SentCount = 0;
++	u32 StatusRegister;
++
++	/* Read the line status register to determine if the transmitter is
++	 * full
++	 */
++
++	StatusRegister = XUartLite_mGetStatusReg(InstancePtr->RegBaseAddress);
++
++	/*
++	 * Fill the FIFO from the the buffer that was specified
++	 */
++
++	SentCount = 0;
++
++	while (((StatusRegister & XUL_SR_TX_FIFO_FULL) == 0) &&
++	       (SentCount < InstancePtr->SendBuffer.RemainingBytes)) {
++		XIo_Out32(InstancePtr->RegBaseAddress + XUL_TX_FIFO_OFFSET,
++			  InstancePtr->SendBuffer.NextBytePtr[SentCount]);
++
++		SentCount++;
++
++		StatusRegister =
++		    XUartLite_mGetStatusReg(InstancePtr->RegBaseAddress);
++
++	}
++
++	/*
++	 * Update the buffer to reflect the bytes that were sent from it
++	 */
++	InstancePtr->SendBuffer.NextBytePtr += SentCount;
++	InstancePtr->SendBuffer.RemainingBytes -= SentCount;
++
++	/*
++	 * Increment associated counters
++	 */
++	InstancePtr->Stats.CharactersTransmitted += SentCount;
++
++	/*
++	 * Return the number of bytes that were sent, althought they really were
++	 * only put into the FIFO, not completely sent yet
++	 */
++	return SentCount;
++}
++
++/****************************************************************************/
++/**
++*
++* This function receives a buffer that has been previously specified by setting
++* up the instance variables of the instance. This function is designed to be
++* an internal function for the XUartLite component such that it may be called
++* from a shell function that sets up the buffer or from an interrupt handler.
++*
++* This function will attempt to receive a specified number of bytes of data
++* from the UART and store it into the specified buffer. This function is
++* designed for either polled or interrupt driven modes. It is non-blocking
++* such that it will return if there is no data has already received by the
++* UART.
++*
++* In a polled mode, this function will only receive as much data as the UART
++* can buffer, either in the receiver or in the FIFO if present and enabled.
++* The application may need to call it repeatedly to receive a buffer. Polled
++* mode is the default mode of operation for the driver.
++*
++* In interrupt mode, this function will start receiving and then the interrupt
++* handler of the driver will continue until the buffer has been received. A
++* callback function, as specified by the application, will be called to indicate
++* the completion of receiving the buffer or when any receive errors or timeouts
++* occur. Interrupt mode must be enabled using the SetOptions function.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* The number of bytes received.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++unsigned int XUartLite_ReceiveBuffer(XUartLite * InstancePtr)
++{
++	u8 StatusRegister;
++	unsigned int ReceivedCount = 0;
++
++	/* Loop until there is not more data buffered by the UART or the specified
++	 * number of bytes is received
++	 */
++
++	while (ReceivedCount < InstancePtr->ReceiveBuffer.RemainingBytes) {
++		/* Read the Status Register to determine if there is any data in
++		 * the receiver/FIFO
++		 */
++		StatusRegister =
++		    XUartLite_mGetStatusReg(InstancePtr->RegBaseAddress);
++
++		/* If there is data ready to be removed, then put the next byte
++		 * received into the specified buffer and update the stats to reflect
++		 * any receive errors for the byte
++		 */
++		if (StatusRegister & XUL_SR_RX_FIFO_VALID_DATA) {
++			InstancePtr->ReceiveBuffer.
++			    NextBytePtr[ReceivedCount++] =
++			    XIo_In32(InstancePtr->RegBaseAddress +
++				     XUL_RX_FIFO_OFFSET);
++
++			XUartLite_mUpdateStats(InstancePtr, StatusRegister);
++		}
++
++		/* There's no more data buffered, so exit such that this function does
++		 * not block waiting for data
++		 */
++		else {
++			break;
++		}
++	}
++
++	/* Enter a critical region by disabling all the UART interrupts to allow
++	 * this call to stop a previous operation that may be interrupt driven
++	 */
++	StatusRegister = XUartLite_mGetStatusReg(InstancePtr->RegBaseAddress);
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET, 0);
++
++	/* Update the receive buffer to reflect the number of bytes that was
++	 * received
++	 */
++	InstancePtr->ReceiveBuffer.NextBytePtr += ReceivedCount;
++	InstancePtr->ReceiveBuffer.RemainingBytes -= ReceivedCount;
++
++	/*
++	 * Increment associated counters in the statistics
++	 */
++	InstancePtr->Stats.CharactersReceived += ReceivedCount;
++
++	/* Restore the interrupt enable register to it's previous value such
++	 * that the critical region is exited
++	 */
++	StatusRegister &= XUL_CR_ENABLE_INTR;
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET,
++		  StatusRegister);
++
++	return ReceivedCount;
++}
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite.h
+@@ -0,0 +1,223 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite.h
++*
++* This component contains the implementation of the XUartLite component which is
++* the driver for the Xilinx UART Lite device. This UART is a minimal hardware
++* implementation with minimal features.  Most of the features, including baud
++* rate, parity, and number of data bits are only configurable when the hardware
++* device is built, rather than at run time by software.
++*
++* The device has 16 byte transmit and receive FIFOs and supports interrupts.
++* The device does not have any way to disable the receiver such that the
++* receive FIFO may contain unwanted data.  The FIFOs are not flushed when the
++* driver is initialized, but a function is provided to allow the user to
++* reset the FIFOs if desired.
++*
++* The driver defaults to no interrupts at initialization such that interrupts
++* must be enabled if desired. An interrupt is generated when the transmit FIFO
++* transitions from having data to being empty or when any data is contained in
++* the receive FIFO.
++*
++* In order to use interrupts, it's necessary for the user to connect the driver
++* interrupt handler, XUartLite_InterruptHandler, to the interrupt system of the
++* application.  This function does not save and restore the processor context
++* such that the user must provide it.  Send and receive handlers may be set for
++* the driver such that the handlers are called when transmit and receive
++* interrupts occur.  The handlers are called from interrupt context and are
++* designed to allow application specific processing to be performed.
++*
++* The functions, XUartLite_Send and XUartLite_Recv, are provided in the driver
++* to allow data to be sent and received. They are designed to be used in
++* polled or interrupt modes.
++*
++* The driver provides a status for each received byte indicating any parity
++* frame or overrun error. The driver provides statistics which allow visibility
++* into these errors.
++*
++* <b>RTOS Independence</b>
++*
++* This driver is intended to be RTOS and processor independent.  It works
++* with physical addresses only.  Any needs for dynamic memory management,
++* threads or thread mutual exclusion, virtual memory, or cache control must
++* be satisfied by the layer above this driver.
++*
++* @note
++*
++* The driver is partitioned such that a minimal implementation may be used.
++* More features require additional files to be linked in.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ecm  08/31/01 First release
++* 1.00b jhl  02/21/02 Repartitioned the driver for smaller files
++* </pre>
++*
++*****************************************************************************/
++
++#ifndef XUARTLITE_H		/* prevent circular inclusions */
++#define XUARTLITE_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xstatus.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/**
++ * Callback function.  The first argument is a callback reference passed in by
++ * the upper layer when setting the callback functions, and passed back to the
++ * upper layer when the callback is invoked.
++ * The second argument is the ByteCount which is the number of bytes that
++ * actually moved from/to the buffer provided in the _Send/_Receive call.
++ */
++typedef void (*XUartLite_Handler) (void *CallBackRef, unsigned int ByteCount);
++
++/**
++ * Statistics for the XUartLite driver
++ */
++typedef struct {
++	u32 TransmitInterrupts;	/**< Number of transmit interrupts */
++	u32 ReceiveInterrupts;	/**< Number of receive interrupts */
++	u32 CharactersTransmitted;
++				/**< Number of characters transmitted */
++	u32 CharactersReceived;	/**< Number of characters received */
++	u32 ReceiveOverrunErrors;
++				/**< Number of receive overruns */
++	u32 ReceiveParityErrors;/**< Number of receive parity errors */
++	u32 ReceiveFramingErrors;
++				/**< Number of receive framing errors */
++} XUartLite_Stats;
++
++/**
++ * The following data type is used to manage the buffers that are handled
++ * when sending and receiving data in the interrupt mode. It is intended
++ * for internal use only.
++ */
++typedef struct {
++	u8 *NextBytePtr;
++	unsigned int RequestedBytes;
++	unsigned int RemainingBytes;
++} XUartLite_Buffer;
++
++/**
++ * This typedef contains configuration information for the device.
++ */
++typedef struct {
++	u16 DeviceId;	/**< Unique ID  of device */
++	u32 RegBaseAddr;/**< Register base address */
++	u32 BaudRate;	/**< Fixed baud rate */
++	u8 UseParity;	/**< Parity generator enabled when TRUE */
++	u8 ParityOdd;	/**< Parity generated is odd when TRUE, even when
++                                 FALSE */
++	u8 DataBits;	/**< Fixed data bits */
++} XUartLite_Config;
++
++/**
++ * The XUartLite driver instance data. The user is required to allocate a
++ * variable of this type for every UART Lite device in the system. A pointer
++ * to a variable of this type is then passed to the driver API functions.
++ */
++typedef struct {
++	XUartLite_Stats Stats;	/* Component Statistics */
++	u32 RegBaseAddress;	/* Base address of registers */
++	u32 IsReady;		/* Device is initialized and ready */
++
++	XUartLite_Buffer SendBuffer;
++	XUartLite_Buffer ReceiveBuffer;
++
++	XUartLite_Handler RecvHandler;
++	void *RecvCallBackRef;	/* Callback reference for recv handler */
++	XUartLite_Handler SendHandler;
++	void *SendCallBackRef;	/* Callback reference for send handler */
++} XUartLite;
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Function Prototypes *****************************/
++
++/*
++ * Required functions, in file xuart.c
++ */
++XStatus XUartLite_Initialize(XUartLite * InstancePtr, u16 DeviceId);
++
++void XUartLite_ResetFifos(XUartLite * InstancePtr);
++
++unsigned int XUartLite_Send(XUartLite * InstancePtr, u8 * DataBufferPtr,
++			    unsigned int NumBytes);
++unsigned int XUartLite_Recv(XUartLite * InstancePtr, u8 * DataBufferPtr,
++			    unsigned int NumBytes);
++
++u32 XUartLite_IsSending(XUartLite * InstancePtr);
++XUartLite_Config *XUartLite_LookupConfig(u16 DeviceId);
++
++/*
++ * Functions for statistics, in file xuartlite_stats.c
++ */
++void XUartLite_GetStats(XUartLite * InstancePtr, XUartLite_Stats * StatsPtr);
++void XUartLite_ClearStats(XUartLite * InstancePtr);
++
++/*
++ * Functions for self-test, in file xuartlite_selftest.c
++ */
++XStatus XUartLite_SelfTest(XUartLite * InstancePtr);
++
++/*
++ * Functions for interrupts, in file xuartlite_intr.c
++ */
++void XUartLite_EnableInterrupt(XUartLite * InstancePtr);
++void XUartLite_DisableInterrupt(XUartLite * InstancePtr);
++
++void XUartLite_SetRecvHandler(XUartLite * InstancePtr,
++			      XUartLite_Handler FuncPtr, void *CallBackRef);
++void XUartLite_SetSendHandler(XUartLite * InstancePtr,
++			      XUartLite_Handler FuncPtr, void *CallBackRef);
++
++void XUartLite_InterruptHandler(XUartLite * InstancePtr);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_i.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_i.h
+@@ -0,0 +1,144 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite_i.h
++*
++* Contains data which is shared between the files of the XUartLite component.
++* It is intended for internal use only.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ecm  08/31/01 First release
++* 1.00b jhl  02/21/02 Reparitioned the driver for smaller files
++* 1.00b rpm  04/24/02 Moved register definitions to xuartlite_l.h and
++*                     updated macro naming convention
++* </pre>
++*
++*****************************************************************************/
++
++#ifndef XUARTLITE_I_H		/* prevent circular inclusions */
++#define XUARTLITE_I_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xuartlite.h"
++#include "xuartlite_l.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/****************************************************************************
++*
++* Update the statistics of the instance.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++* @param    StatusRegister contains the contents of the UART status register
++*           to update the statistics with.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XUartLite_mUpdateStats(XUartLite *InstancePtr,
++*                                        u32 StatusRegister)
++*
++*****************************************************************************/
++#define XUartLite_mUpdateStats(InstancePtr, StatusRegister)   \
++{                                                       \
++    if ((StatusRegister) & XUL_SR_OVERRUN_ERROR)        \
++    {                                                   \
++        (InstancePtr)->Stats.ReceiveOverrunErrors++;    \
++    }                                                   \
++    if ((StatusRegister) & XUL_SR_PARITY_ERROR)         \
++    {                                                   \
++        (InstancePtr)->Stats.ReceiveParityErrors++;     \
++    }                                                   \
++    if ((StatusRegister) & XUL_SR_FRAMING_ERROR)        \
++    {                                                   \
++        (InstancePtr)->Stats.ReceiveFramingErrors++;    \
++    }                                                   \
++}
++
++/****************************************************************************
++*
++* Clear the statistics for the instance.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* Signature: void XUartLite_mClearStats(XUartLite *InstancePtr)
++*
++*****************************************************************************/
++#define XUartLite_mClearStats(InstancePtr)                    \
++{                                                       \
++    (InstancePtr)->Stats.TransmitInterrupts = 0UL;      \
++    (InstancePtr)->Stats.ReceiveInterrupts = 0UL;       \
++    (InstancePtr)->Stats.CharactersTransmitted = 0UL;   \
++    (InstancePtr)->Stats.CharactersReceived = 0UL;      \
++    (InstancePtr)->Stats.ReceiveOverrunErrors = 0UL;    \
++    (InstancePtr)->Stats.ReceiveFramingErrors = 0UL;    \
++    (InstancePtr)->Stats.ReceiveParityErrors = 0UL;     \
++}
++
++/************************** Variable Definitions ****************************/
++
++/* the configuration table */
++extern XUartLite_Config XUartLite_ConfigTable[];
++
++/************************** Function Prototypes *****************************/
++
++unsigned int XUartLite_SendBuffer(XUartLite * InstancePtr);
++unsigned int XUartLite_ReceiveBuffer(XUartLite * InstancePtr);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_intr.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_intr.c
+@@ -0,0 +1,348 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite_intr.c
++*
++* This file contains interrupt-related functions for the UART Lite component
++* (XUartLite).
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ecm  08/31/01 First release
++* 1.00b jhl  02/21/02 Repartitioned the driver for smaller files
++* </pre>
++*
++*****************************************************************************/
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xuartlite.h"
++#include "xuartlite_i.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/************************** Function Prototypes *****************************/
++
++static void ReceiveDataHandler(XUartLite * InstancePtr);
++static void SendDataHandler(XUartLite * InstancePtr);
++
++/************************** Variable Definitions ****************************/
++
++typedef void (*Handler) (XUartLite * InstancePtr);
++
++/****************************************************************************/
++/**
++*
++* This function sets the handler that will be called when an event (interrupt)
++* occurs in the driver. The purpose of the handler is to allow application
++* specific processing to be performed.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++* @param    FuncPtr is the pointer to the callback function.
++* @param    CallBackRef is the upper layer callback reference passed back when
++*           the callback function is invoked.
++*
++* @return
++*
++* None.
++*
++* @notes
++*
++* There is no assert on the CallBackRef since the driver doesn't know what it
++* is (nor should it)
++*
++*****************************************************************************/
++void XUartLite_SetRecvHandler(XUartLite * InstancePtr,
++			      XUartLite_Handler FuncPtr, void *CallBackRef)
++{
++	/*
++	 * Assert validates the input arguments
++	 * CallBackRef not checked, no way to know what is valid
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	InstancePtr->RecvHandler = FuncPtr;
++	InstancePtr->RecvCallBackRef = CallBackRef;
++}
++
++/****************************************************************************/
++/**
++*
++* This function sets the handler that will be called when an event (interrupt)
++* occurs in the driver. The purpose of the handler is to allow application
++* specific processing to be performed.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++* @param    FuncPtr is the pointer to the callback function.
++* @param    CallBackRef is the upper layer callback reference passed back when
++*           the callback function is invoked.
++*
++* @return
++*
++* None.
++*
++* @notes
++*
++* There is no assert on the CallBackRef since the driver doesn't know what it
++* is (nor should it)
++*
++*****************************************************************************/
++void XUartLite_SetSendHandler(XUartLite * InstancePtr,
++			      XUartLite_Handler FuncPtr, void *CallBackRef)
++{
++	/*
++	 * Assert validates the input arguments
++	 * CallBackRef not checked, no way to know what is valid
++	 */
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(FuncPtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	InstancePtr->SendHandler = FuncPtr;
++	InstancePtr->SendCallBackRef = CallBackRef;
++}
++
++/****************************************************************************/
++/**
++*
++* This function is the interrupt handler for the UART lite driver.
++* It must be connected to an interrupt system by the user such that it is
++* called when an interrupt for any UART lite occurs. This function
++* does not save or restore the processor context such that the user must
++* ensure this occurs.
++*
++* @param    InstancePtr contains a pointer to the instance of the UART that
++*           the interrupt is for.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XUartLite_InterruptHandler(XUartLite * InstancePtr)
++{
++	u32 IsrStatus;
++
++	XASSERT_VOID(InstancePtr != NULL);
++
++	/* Read the status register to determine which, coulb be both
++	 * interrupt is active
++	 */
++	IsrStatus =
++	    XIo_In32(InstancePtr->RegBaseAddress + XUL_STATUS_REG_OFFSET);
++
++	if ((IsrStatus & (XUL_SR_RX_FIFO_FULL | XUL_SR_RX_FIFO_VALID_DATA)) !=
++	    0) {
++		ReceiveDataHandler(InstancePtr);
++	}
++
++	if ((IsrStatus & XUL_SR_TX_FIFO_EMPTY) != 0) {
++		SendDataHandler(InstancePtr);
++	}
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the interrupt when data is received, either a single
++* byte when FIFOs are not enabled, or multiple bytes with the FIFO.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void ReceiveDataHandler(XUartLite * InstancePtr)
++{
++	/*
++	 * If there are bytes still to be received in the specified buffer
++	 * go ahead and receive them
++	 */
++	if (InstancePtr->ReceiveBuffer.RemainingBytes != 0) {
++		XUartLite_ReceiveBuffer(InstancePtr);
++	}
++
++	/* If the last byte of a message was received then call the application
++	 * handler, this code should not use an else from the previous check of
++	 * the number of bytes to receive because the call to receive the buffer
++	 * updates the bytes to receive
++	 */
++	if (InstancePtr->ReceiveBuffer.RemainingBytes == 0) {
++		InstancePtr->RecvHandler(InstancePtr->RecvCallBackRef,
++					 InstancePtr->ReceiveBuffer.
++					 RequestedBytes -
++					 InstancePtr->ReceiveBuffer.
++					 RemainingBytes);
++	}
++
++	/* Update the receive stats to reflect the receive interrupt */
++
++	InstancePtr->Stats.ReceiveInterrupts++;
++}
++
++/****************************************************************************/
++/**
++*
++* This function handles the interrupt when data has been sent, the transmit
++* FIFO is empty (transmitter holding register).
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++static void SendDataHandler(XUartLite * InstancePtr)
++{
++	/*
++	 * If there are not bytes to be sent from the specified buffer ,
++	 * call the callback function
++	 */
++	if (InstancePtr->SendBuffer.RemainingBytes == 0) {
++		/* Call the application handler to indicate the data has been sent */
++
++		InstancePtr->SendHandler(InstancePtr->SendCallBackRef,
++					 InstancePtr->SendBuffer.
++					 RequestedBytes -
++					 InstancePtr->SendBuffer.
++					 RemainingBytes);
++	}
++	/*
++	 * Otherwise there is still more data to send in the specified buffer
++	 * so go ahead and send it
++	 */
++	else {
++		XUartLite_SendBuffer(InstancePtr);
++	}
++
++	/* Update the transmit stats to reflect the transmit interrupt */
++
++	InstancePtr->Stats.TransmitInterrupts++;
++}
++
++/*****************************************************************************/
++/**
++*
++* This function disables the UART interrupt. After calling this function,
++* data may still be received by the UART but no interrupt will be generated
++* since the hardware device has no way to disable the receiver.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++void XUartLite_DisableInterrupt(XUartLite * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Write to the control register to disable the interrupts, the only other
++	 * bits in this register are the FIFO reset bits such that writing them
++	 * to zero will not affect them.
++	 */
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET, 0);
++}
++
++/*****************************************************************************/
++/**
++*
++* This function enables the UART interrupt such that an interrupt will occur
++* when data is received or data has been transmitted.  The device contains
++* 16 byte receive and transmit FIFOs such that an interrupt is generated
++* anytime there is data in the receive FIFO and when the transmit FIFO
++* transitions from not empty to empty.
++*
++* @param    InstancePtr is a pointer to the XUartLite instance to be worked on.
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++*****************************************************************************/
++void XUartLite_EnableInterrupt(XUartLite * InstancePtr)
++{
++	XASSERT_VOID(InstancePtr != NULL);
++	XASSERT_VOID(InstancePtr->IsReady == XCOMPONENT_IS_READY);
++
++	/* Write to the control register to enable the interrupts, the only other
++	 * bits in this register are the FIFO reset bits such that writing them
++	 * to zero will not affect them.
++	 */
++	XIo_Out32(InstancePtr->RegBaseAddress + XUL_CONTROL_REG_OFFSET,
++		  XUL_CR_ENABLE_INTR);
++}
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_l.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_l.c
+@@ -0,0 +1,121 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite_l.c
++*
++* This file contains low-level driver functions that can be used to access the
++* device.  The user should refer to the hardware device specification for more
++* details of the device operation.
++
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00b rpm  04/25/02 First release
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xuartlite_l.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Prototypes ******************************/
++
++/****************************************************************************/
++/**
++*
++* This functions sends a single byte using the UART. It is blocking in that it
++* waits for the transmitter to become non-full before it writes the byte to
++* the transmit register.
++*
++* @param    BaseAddress is the base address of the device
++* @param    Data is the byte of data to send
++*
++* @return
++*
++* None.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++void XUartLite_SendByte(u32 BaseAddress, u8 Data)
++{
++	while (XUartLite_mIsTransmitFull(BaseAddress)) ;
++
++	XIo_Out32(BaseAddress + XUL_TX_FIFO_OFFSET, Data);
++}
++
++/****************************************************************************/
++/**
++*
++* This functions receives a single byte using the UART. It is blocking in that
++* it waits for the receiver to become non-empty before it reads from the
++* receive register.
++*
++* @param    BaseAddress is the base address of the device
++*
++* @return
++*
++* The byte of data received.
++*
++* @note
++*
++* None.
++*
++******************************************************************************/
++u8 XUartLite_RecvByte(u32 BaseAddress)
++{
++	while (XUartLite_mIsReceiveEmpty(BaseAddress)) ;
++
++	return (u8) XIo_In32(BaseAddress + XUL_RX_FIFO_OFFSET);
++}
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_l.h
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_l.h
+@@ -0,0 +1,255 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite_l.h
++*
++* This header file contains identifiers and low-level driver functions (or
++* macros) that can be used to access the device.  High-level driver functions
++* are defined in xuartlite.h.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -------------------------------------------------------
++* 1.00b rpm  04/25/02 First release
++* 1.00b rpm  07/07/03 Removed references to XUartLite_mGetControlReg macro
++*                     since the control register is write-only
++* </pre>
++*
++*****************************************************************************/
++
++#ifndef XUARTLITE_L_H		/* prevent circular inclusions */
++#define XUARTLITE_L_H		/* by using protection macros */
++
++/***************************** Include Files ********************************/
++
++#include "xbasic_types.h"
++#include "xio.h"
++
++/************************** Constant Definitions ****************************/
++
++/* UART Lite register offsets */
++
++#define XUL_RX_FIFO_OFFSET              0	/* receive FIFO, read only */
++#define XUL_TX_FIFO_OFFSET              4	/* transmit FIFO, write only */
++#define XUL_STATUS_REG_OFFSET           8	/* status register, read only */
++#define XUL_CONTROL_REG_OFFSET          12	/* control register, write only */
++
++/* control register bit positions */
++
++#define XUL_CR_ENABLE_INTR              0x10	/* enable interrupt */
++#define XUL_CR_FIFO_RX_RESET            0x02	/* reset receive FIFO */
++#define XUL_CR_FIFO_TX_RESET            0x01	/* reset transmit FIFO */
++
++/* status register bit positions */
++
++#define XUL_SR_PARITY_ERROR             0x80
++#define XUL_SR_FRAMING_ERROR            0x40
++#define XUL_SR_OVERRUN_ERROR            0x20
++#define XUL_SR_INTR_ENABLED             0x10	/* interrupt enabled */
++#define XUL_SR_TX_FIFO_FULL             0x08	/* transmit FIFO full */
++#define XUL_SR_TX_FIFO_EMPTY            0x04	/* transmit FIFO empty */
++#define XUL_SR_RX_FIFO_FULL             0x02	/* receive FIFO full */
++#define XUL_SR_RX_FIFO_VALID_DATA       0x01	/* data in receive FIFO */
++
++/* the following constant specifies the size of the FIFOs, the size of the
++ * FIFOs includes the transmitter and receiver such that it is the total number
++ * of bytes that the UART can buffer
++ */
++#define XUL_FIFO_SIZE               16
++
++/* Stop bits are fixed at 1. Baud, parity, and data bits are fixed on a
++ * per instance basis
++ */
++#define XUL_STOP_BITS               1
++
++/* Parity definitions
++ */
++#define XUL_PARITY_NONE             0
++#define XUL_PARITY_ODD              1
++#define XUL_PARITY_EVEN             2
++
++/**************************** Type Definitions ******************************/
++
++/***************** Macros (Inline Functions) Definitions ********************/
++
++/*****************************************************************************
++*
++* Low-level driver macros and functions. The list below provides signatures
++* to help the user use the macros.
++*
++* void XUartLite_mSetControlReg(u32 BaseAddress, u32 Mask)
++* u32 XUartLite_mGetStatusReg(u32 BaseAddress)
++*
++* u32 XUartLite_mIsReceiveEmpty(u32 BaseAddress)
++* u32 XUartLite_mIsTransmitFull(u32 BaseAddress)
++* u32 XUartLite_mIsIntrEnabled(u32 BaseAddress)
++*
++* void XUartLite_mEnableIntr(u32 BaseAddress)
++* void XUartLite_mDisableIntr(u32 BaseAddress)
++*
++* void XUartLite_SendByte(u32 BaseAddress, u8 Data);
++* u8 XUartLite_RecvByte(u32 BaseAddress);
++*
++*****************************************************************************/
++
++/****************************************************************************/
++/**
++*
++* Set the contents of the control register. Use the XUL_CR_* constants defined
++* above to create the bit-mask to be written to the register.
++*
++* @param    BaseAddress is the base address of the device
++* @param    Mask is the 32-bit value to write to the control register
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mSetControlReg(BaseAddress, Mask) \
++                    XIo_Out32((BaseAddress) + XUL_CONTROL_REG_OFFSET, (Mask))
++
++/****************************************************************************/
++/**
++*
++* Get the contents of the status register. Use the XUL_SR_* constants defined
++* above to interpret the bit-mask returned.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   A 32-bit value representing the contents of the status register.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mGetStatusReg(BaseAddress) \
++                    XIo_In32((BaseAddress) + XUL_STATUS_REG_OFFSET)
++
++/****************************************************************************/
++/**
++*
++* Check to see if the receiver has data.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   TRUE if the receiver is empty, FALSE if there is data present.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mIsReceiveEmpty(BaseAddress) \
++  ((XUartLite_mGetStatusReg((BaseAddress)) & XUL_SR_RX_FIFO_VALID_DATA) != \
++    XUL_SR_RX_FIFO_VALID_DATA)
++
++/****************************************************************************/
++/**
++*
++* Check to see if the transmitter is full.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   TRUE if the transmitter is full, FALSE otherwise.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mIsTransmitFull(BaseAddress) \
++    ((XUartLite_mGetStatusReg((BaseAddress)) & XUL_SR_TX_FIFO_FULL) == \
++      XUL_SR_TX_FIFO_FULL)
++
++/****************************************************************************/
++/**
++*
++* Check to see if the interrupt is enabled.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   TRUE if the interrupt is enabled, FALSE otherwise.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mIsIntrEnabled(BaseAddress) \
++    ((XUartLite_mGetStatusReg((BaseAddress)) & XUL_SR_INTR_ENABLED) == \
++      XUL_SR_INTR_ENABLED)
++
++/****************************************************************************/
++/**
++*
++* Enable the device interrupt. We cannot read the control register, so we
++* just write the enable interrupt bit and clear all others. Since the only
++* other ones are the FIFO reset bits, this works without side effects.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mEnableIntr(BaseAddress) \
++               XUartLite_mSetControlReg((BaseAddress), XUL_CR_ENABLE_INTR)
++
++/****************************************************************************/
++/**
++*
++* Disable the device interrupt. We cannot read the control register, so we
++* just clear all bits. Since the only other ones are the FIFO reset bits,
++* this works without side effects.
++*
++* @param    BaseAddress is the  base address of the device
++*
++* @return   None.
++*
++* @note     None.
++*
++*****************************************************************************/
++#define XUartLite_mDisableIntr(BaseAddress) \
++              XUartLite_mSetControlReg((BaseAddress), 0)
++
++/************************** Function Prototypes *****************************/
++
++void XUartLite_SendByte(u32 BaseAddress, u8 Data);
++u8 XUartLite_RecvByte(u32 BaseAddress);
++
++#endif				/* end of protection macro */
+Index: linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_g.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/drivers/char/xilinx_uartlite/xuartlite_g.c
+@@ -0,0 +1,87 @@
++/******************************************************************************
++*
++*     Author: Xilinx, Inc.
++*
++*
++*     This program is free software; you can redistribute it and/or modify it
++*     under the terms of the GNU General Public License as published by the
++*     Free Software Foundation; either version 2 of the License, or (at your
++*     option) any later version.
++*
++*
++*     XILINX IS PROVIDING THIS DESIGN, CODE, OR INFORMATION "AS IS" AS A
++*     COURTESY TO YOU. BY PROVIDING THIS DESIGN, CODE, OR INFORMATION AS
++*     ONE POSSIBLE IMPLEMENTATION OF THIS FEATURE, APPLICATION OR STANDARD,
++*     XILINX IS MAKING NO REPRESENTATION THAT THIS IMPLEMENTATION IS FREE
++*     FROM ANY CLAIMS OF INFRINGEMENT, AND YOU ARE RESPONSIBLE FOR OBTAINING
++*     ANY THIRD PARTY RIGHTS YOU MAY REQUIRE FOR YOUR IMPLEMENTATION.
++*     XILINX EXPRESSLY DISCLAIMS ANY WARRANTY WHATSOEVER WITH RESPECT TO
++*     THE ADEQUACY OF THE IMPLEMENTATION, INCLUDING BUT NOT LIMITED TO ANY
++*     WARRANTIES OR REPRESENTATIONS THAT THIS IMPLEMENTATION IS FREE FROM
++*     CLAIMS OF INFRINGEMENT, IMPLIED WARRANTIES OF MERCHANTABILITY AND
++*     FITNESS FOR A PARTICULAR PURPOSE.
++*
++*
++*     Xilinx hardware products are not intended for use in life support
++*     appliances, devices, or systems. Use in such applications is
++*     expressly prohibited.
++*
++*
++*     (c) Copyright 2002 Xilinx Inc.
++*     All rights reserved.
++*
++*
++*     You should have received a copy of the GNU General Public License along
++*     with this program; if not, write to the Free Software Foundation, Inc.,
++*     675 Mass Ave, Cambridge, MA 02139, USA.
++*
++******************************************************************************/
++/****************************************************************************/
++/**
++*
++* @file xuartlite_g.c
++*
++* This file contains a configuration table that specifies the configuration of
++* UART Lite devices in the system. Each device in the system should have an
++* entry in the table.
++*
++* <pre>
++* MODIFICATION HISTORY:
++*
++* Ver   Who  Date     Changes
++* ----- ---- -------- -----------------------------------------------
++* 1.00a ecm  08/31/01 First release
++* 1.00b jhl  02/21/02 Repartitioned the driver for smaller files
++* </pre>
++*
++******************************************************************************/
++
++/***************************** Include Files *********************************/
++
++#include "xuartlite.h"
++#include "xparameters.h"
++
++/************************** Constant Definitions *****************************/
++
++/**************************** Type Definitions *******************************/
++
++/***************** Macros (Inline Functions) Definitions *********************/
++
++/************************** Function Prototypes ******************************/
++
++/************************** Variable Prototypes ******************************/
++
++/**
++ * The configuration table for UART Lite devices
++ */
++XUartLite_Config XUartLite_ConfigTable[XPAR_XUARTLITE_NUM_INSTANCES] = {
++	{
++	 XPAR_UARTLITE_0_DEVICE_ID,	/* Unique ID of device */
++	 XPAR_UARTLITE_0_BASEADDR,	/* Device base address */
++	 XPAR_UARTLITE_0_BAUDRATE,	/* Fixed baud rate */
++	 XPAR_UARTLITE_0_USE_PARITY,	/* Fixed parity */
++	 XPAR_UARTLITE_0_ODD_PARITY,	/* Fixed parity type */
++	 XPAR_UARTLITE_0_DATA_BITS	/* Fixed data bits */
++	 }
++	,
++};
+Index: linux-2.6.10/mvl_patches/pro-0345.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-0345.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2006 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(345);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

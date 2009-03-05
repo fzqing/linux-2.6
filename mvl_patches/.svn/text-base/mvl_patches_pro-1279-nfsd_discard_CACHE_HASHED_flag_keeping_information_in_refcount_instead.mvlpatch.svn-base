@@ -1,0 +1,388 @@
+#! /usr/bin/env bash
+# Patch: -nfsd_discard_CACHE_HASHED_flag_keeping_information_in_refcount_instead
+# Date: Sun Apr  8 23:14:41 2007
+# MR: 20999
+# 
+# From ba15d6aa95ae689b083a133a3689ff95f4c47321 Mon Sep 17 00:00:00 2001
+# From: Neil Brown <neilb@cse.unsw.edu.au>
+# Date: Fri, 4 Mar 2005 17:15:09 -0800
+# Subject: [PATCH] [PATCH] nfsd: discard CACHE_HASHED flag, keeping information in refcount instead.
+# 
+# This patch should fix a problem that has been experienced on at-least one
+# busy NFS server, but it has not had lots of testing yet.  If -mm could provide
+# that .....
+# 
+# The rpc auth cache currently differentiates between a reference due to
+# being in a hash chain (signalled by CACHE_HASHED flag) and any other
+# reference (counted in refcnt).
+# 
+# This is an artificial difference due to an historical accident, and it
+# makes cache_put unsafe.
+# 
+# This patch removes the distinction so now existance in a hash chain is
+# counted just like any other reference.  Thus a race window in cache_put is
+# closed.
+# 
+# Signed-off-by: Neil Brown <neilb@cse.unsw.edu.au>
+# Signed-off-by: Andrew Morton <akpm@osdl.org>
+# Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+# 
+
+PATCHNUM=1279
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+MR: 20999
+
+From ba15d6aa95ae689b083a133a3689ff95f4c47321 Mon Sep 17 00:00:00 2001
+From: Neil Brown <neilb@cse.unsw.edu.au>
+Date: Fri, 4 Mar 2005 17:15:09 -0800
+Subject: [PATCH] [PATCH] nfsd: discard CACHE_HASHED flag, keeping information in refcount instead.
+
+This patch should fix a problem that has been experienced on at-least one
+busy NFS server, but it has not had lots of testing yet.  If -mm could provide
+that .....
+
+The rpc auth cache currently differentiates between a reference due to
+being in a hash chain (signalled by CACHE_HASHED flag) and any other
+reference (counted in refcnt).
+
+This is an artificial difference due to an historical accident, and it
+makes cache_put unsafe.
+
+This patch removes the distinction so now existance in a hash chain is
+counted just like any other reference.  Thus a race window in cache_put is
+closed.
+
+Signed-off-by: Neil Brown <neilb@cse.unsw.edu.au>
+Signed-off-by: Andrew Morton <akpm@osdl.org>
+Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+Index: linux-2.6.10/include/linux/sunrpc/cache.h
+===================================================================
+--- linux-2.6.10.orig/include/linux/sunrpc/cache.h
++++ linux-2.6.10/include/linux/sunrpc/cache.h
+@@ -37,8 +37,7 @@
+  * Entries have a ref count and a 'hashed' flag which counts the existance
+  * in the hash table.
+  * We only expire entries when refcount is zero.
+- * Existance in the cache is not measured in refcount but rather in
+- * CACHE_HASHED flag.
++ * Existance in the cache is counted  the refcount.
+  */
+ 
+ /* Every cache item has a common header that is used
+@@ -57,7 +56,6 @@ struct cache_head {
+ #define	CACHE_VALID	0	/* Entry contains valid data */
+ #define	CACHE_NEGATIVE	1	/* Negative entry - there is no match for the key */
+ #define	CACHE_PENDING	2	/* An upcall has been sent but no reply received yet*/
+-#define	CACHE_HASHED	3	/* Entry is in a hash table */
+ 
+ #define	CACHE_NEW_EXPIRY 120	/* keep new things pending confirmation for 120 seconds */
+ 
+@@ -185,7 +183,6 @@ RTN *FNAME ARGS										\
+ 											\
+ 			if (new)							\
+ 				{INIT;}							\
+-			cache_get(&tmp->MEMBER);					\
+ 			if (set) {							\
+ 				if (!INPLACE && test_bit(CACHE_VALID, &tmp->MEMBER.flags))\
+ 				{ /* need to swap in new */				\
+@@ -194,8 +191,6 @@ RTN *FNAME ARGS										\
+ 					new->MEMBER.next = tmp->MEMBER.next;		\
+ 					*hp = &new->MEMBER;				\
+ 					tmp->MEMBER.next = NULL;			\
+-					set_bit(CACHE_HASHED, &new->MEMBER.flags);	\
+-					clear_bit(CACHE_HASHED, &tmp->MEMBER.flags);	\
+ 					t2 = tmp; tmp = new; new = t2;			\
+ 				}							\
+ 				if (test_bit(CACHE_NEGATIVE,  &item->MEMBER.flags))	\
+@@ -205,6 +200,7 @@ RTN *FNAME ARGS										\
+ 					clear_bit(CACHE_NEGATIVE, &tmp->MEMBER.flags);	\
+ 				}							\
+ 			}								\
++			cache_get(&tmp->MEMBER);					\
+ 			if (set||new) write_unlock(&(DETAIL)->hash_lock);		\
+ 			else read_unlock(&(DETAIL)->hash_lock);				\
+ 			if (set)							\
+@@ -220,7 +216,7 @@ RTN *FNAME ARGS										\
+ 		new->MEMBER.next = *head;						\
+ 		*head = &new->MEMBER;							\
+ 		(DETAIL)->entries ++;							\
+-		set_bit(CACHE_HASHED, &new->MEMBER.flags);				\
++		cache_get(&new->MEMBER);						\
+ 		if (set) {								\
+ 			tmp = new;							\
+ 			if (test_bit(CACHE_NEGATIVE, &item->MEMBER.flags))		\
+@@ -270,15 +266,10 @@ static inline struct cache_head  *cache_
+ 
+ static inline int cache_put(struct cache_head *h, struct cache_detail *cd)
+ {
+-	atomic_dec(&h->refcnt);
+-	if (!atomic_read(&h->refcnt) &&
++	if (atomic_read(&h->refcnt) <= 2 &&
+ 	    h->expiry_time < cd->nextcheck)
+ 		cd->nextcheck = h->expiry_time;
+-	if (!test_bit(CACHE_HASHED, &h->flags) &&
+-	    !atomic_read(&h->refcnt))
+-		return 1;
+-
+-	return 0;
++	return atomic_dec_and_test(&h->refcnt);
+ }
+ 
+ extern void cache_init(struct cache_head *h);
+Index: linux-2.6.10/net/sunrpc/cache.c
+===================================================================
+--- linux-2.6.10.orig/net/sunrpc/cache.c
++++ linux-2.6.10/net/sunrpc/cache.c
+@@ -344,12 +344,10 @@ int cache_clean(void)
+ 			if (test_and_clear_bit(CACHE_PENDING, &ch->flags))
+ 				queue_loose(current_detail, ch);
+ 
+-			if (!atomic_read(&ch->refcnt))
++			if (atomic_read(&ch->refcnt) == 1)
+ 				break;
+ 		}
+ 		if (ch) {
+-			cache_get(ch);
+-			clear_bit(CACHE_HASHED, &ch->flags);
+ 			*cp = ch->next;
+ 			ch->next = NULL;
+ 			current_detail->entries--;
+Index: linux-2.6.10/net/sunrpc/svcauth.c
+===================================================================
+--- linux-2.6.10.orig/net/sunrpc/svcauth.c
++++ linux-2.6.10/net/sunrpc/svcauth.c
+@@ -172,12 +172,12 @@ auth_domain_lookup(struct auth_domain *i
+ 		tmp = container_of(*hp, struct auth_domain, h);
+ 		if (!auth_domain_match(tmp, item))
+ 			continue;
+-		cache_get(&tmp->h);
+-		if (!set)
++		if (!set) {
++			cache_get(&tmp->h);
+ 			goto out_noset;
++		}
+ 		*hp = tmp->h.next;
+ 		tmp->h.next = NULL;
+-		clear_bit(CACHE_HASHED, &tmp->h.flags);
+ 		auth_domain_drop(&tmp->h, &auth_domain_cache);
+ 		goto out_set;
+ 	}
+@@ -186,9 +186,9 @@ auth_domain_lookup(struct auth_domain *i
+ 		goto out_nada;
+ 	auth_domain_cache.entries++;
+ out_set:
+-	set_bit(CACHE_HASHED, &item->h.flags);
+ 	item->h.next = *head;
+ 	*head = &item->h;
++	cache_get(&item->h);
+ 	write_unlock(&auth_domain_cache.hash_lock);
+ 	cache_fresh(&auth_domain_cache, &item->h, item->h.expiry_time);
+ 	cache_get(&item->h);
+Index: linux-2.6.10/mvl_patches/pro-1279.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1279.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2007 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1279);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+

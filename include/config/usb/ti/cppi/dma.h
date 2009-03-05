@@ -1,0 +1,1 @@
+#define CONFIG_USB_TI_CPPI_DMA 1

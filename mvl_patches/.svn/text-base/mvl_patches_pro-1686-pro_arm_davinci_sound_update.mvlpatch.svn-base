@@ -1,0 +1,534 @@
+#! /usr/bin/env bash
+# Patch: -pro_arm_davinci_sound_update
+# Date: Mon Jan 21 23:06:50 2008
+# Source: Texas Instruments, Inc.
+# MR: 25659
+# Type: Enhancement
+# Disposition: local
+# Signed-off-by: Steve Chen <schen@mvista.com>
+# Description:
+# There are several small fixes found in the latest TI sound driver.
+# These updates are included in this patch to sync up the two kernel
+# trees.
+# 
+
+PATCHNUM=1686
+LSPINFO=include/linux/lsppatchlevel.h
+TMPFILE=/tmp/mvl_patch_$$
+
+function dopatch() {
+    patch $* >${TMPFILE} 2>&1 <<"EOF"
+Source: Texas Instruments, Inc.
+MR: 25659
+Type: Enhancement
+Disposition: local
+Signed-off-by: Steve Chen <schen@mvista.com>
+Description:
+There are several small fixes found in the latest TI sound driver.
+These updates are included in this patch to sync up the two kernel
+trees.
+
+Index: linux-2.6.10/sound/oss/dm644x/davinci-audio.c
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm644x/davinci-audio.c
++++ linux-2.6.10/sound/oss/dm644x/davinci-audio.c
+@@ -597,7 +597,9 @@ audio_write(struct file *file, const cha
+ 		s->pending_frags++;
+ 		s->active = 1;
+ 		local_irq_restore(flags);
++		atomic_set(&s->in_write_path, 1);
+ 		audio_process_dma(s);
++		atomic_set(&s->in_write_path, 0);
+ 	}
+ 
+ 	if ((buffer - buffer0))
+Index: linux-2.6.10/sound/oss/dm644x/davinci-audio-dma-intfc.c
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm644x/davinci-audio-dma-intfc.c
++++ linux-2.6.10/sound/oss/dm644x/davinci-audio-dma-intfc.c
+@@ -291,6 +291,7 @@ davinci_request_sound_dma(int device_id,
+ 	int *chan = NULL;
+ 	int tcc;
+ 	audio_stream_t *stream = (audio_stream_t *)data;
++	unsigned long null_buffer_phys = virt_to_phys((void *)null_buffer);
+ 	edmacc_paramentry_regs temp;
+ 
+ 	FN_IN;
+@@ -375,7 +376,7 @@ davinci_request_sound_dma(int device_id,
+ 	    memset(null_buffer, 0, NULL_FRAGSIZE);
+ 	    davinci_dma_link_lch(stream->null_lch, stream->null_lch);
+ 	    audio_set_dma_params_play (stream->null_lch
+-				       , (dma_addr_t)null_buffer,
++				       , (dma_addr_t)null_buffer_phys,
+ 				       NULL_FRAGSIZE);
+ 
+ 		    /* Disable interrupts for the null buffer */
+@@ -890,12 +891,14 @@ static int audio_start_dma_chain(audio_s
+ 			local_irq_restore(flags);
+ 	}
+ 
+-	if (s->input_or_output == FMODE_WRITE &&
+-	    atomic_read(&s->playing_null) == 1) {
+-	    edmacc_paramentry_regs temp;
+-	    davinci_get_dma_params(channel, &temp);
+-	    davinci_set_dma_params(s->master_ch, &temp);
+-	    atomic_set(&s->playing_null, 0);
++	if (s->input_or_output == FMODE_WRITE) {
++		if (atomic_dec_and_test(&s->playing_null)) {
++			edmacc_paramentry_regs temp;
++			davinci_get_dma_params(channel, &temp);
++			davinci_set_dma_params(s->master_ch, &temp);
++		} else {
++			atomic_inc(&s->playing_null); /* Reset */
++		}
+ 	}
+ 
+ 	/* else the dma itself will progress forward with out our help */
+@@ -939,7 +942,15 @@ static int davinci_start_sound_dma(audio
+ 		goto sound_out;
+ 	}
+ 	AUDIO_INCREMENT_TAIL(s);
+-	ret = audio_start_dma_chain(s);
++
++	if (atomic_dec_and_test(&s->in_write_path)) {
++		if ( s->dma_q_count >= NUMBER_OF_CHANNELS_TO_LINK) {
++			ret = audio_start_dma_chain(s);
++		}
++	} else {
++		ret = audio_start_dma_chain(s);
++	}
++
+ 	if (ret) {
+ 		ERR("dma start failed");
+ 	}
+@@ -1002,12 +1013,14 @@ static void sound_dma_irq_handler(int so
+ 	FN_IN;
+ 
+ 	if (ch_status == DMA_COMPLETE) {
+-
+-	    if (unlikely(s->input_or_output == FMODE_WRITE &&
+-			 atomic_read(&s->playing_null) == 1)) {
+-		return;
+-	    }
+-
++		/* Very unlikely as we would have disabled the interrupts while
++		   playing the null buffer */
++		if (unlikely(s->input_or_output == FMODE_WRITE)) {
++			if (atomic_dec_and_test(&s->playing_null)) {
++				atomic_inc(&s->playing_null);
++				return;
++			}
++		}
+ #ifdef IRQ_TRACE
+ 		xyz[h++] = '0' + sound_curr_lch;
+ 		if (h == MAX_UP - 1) {
+Index: linux-2.6.10/sound/oss/dm644x/davinci-audio.h
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm644x/davinci-audio.h
++++ linux-2.6.10/sound/oss/dm644x/davinci-audio.h
+@@ -75,6 +75,7 @@ typedef struct {
+ 	int mcbsp_rx_started;
+ 	atomic_t playing_null;
+ 	int null_lch;		/* Link channel for playing the null data */
++	atomic_t            in_write_path;
+ } audio_stream_t;
+ 
+ /*
+Index: linux-2.6.10/sound/oss/dm644x/Kconfig
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm644x/Kconfig
++++ linux-2.6.10/sound/oss/dm644x/Kconfig
+@@ -6,6 +6,7 @@ menu " Davinci DM644x based systems audi
+ config SOUND_DAVINCI
+ 	tristate "DaVinci Sound Driver"
+ 	depends on ARCH_DAVINCI && (MACH_DAVINCI_EVM || MACH_DAVINCI_DM355_EVM) && SOUND_PRIME!=n && SOUND
++	select SOUND_DAVINCI_TLV320AIC33 if SOUND_DAVINCI
+ 	---help---
+ 	DaVinci Sound driver
+ 
+Index: linux-2.6.10/sound/oss/dm644x/Makefile
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm644x/Makefile
++++ linux-2.6.10/sound/oss/dm644x/Makefile
+@@ -1,7 +1,4 @@
+ # Makefile for the Davinci-Audio Files.
+ 
+-obj-$(CONFIG_SOUND_DAVINCI)	+= davinci-audio-oss.o
+-obj-$(CONFIG_SOUND_DAVINCI_TLV320AIC33) += davinci-audio-aic33.o
+-
+-davinci-audio-oss-objs := davinci-audio-dma-intfc.o davinci-audio.o
+-
++obj-$(CONFIG_SOUND_DAVINCI) += dm644x_audio_driver.o
++dm644x_audio_driver-objs := davinci-audio-dma-intfc.o davinci-audio.o davinci-audio-aic33.o
+Index: linux-2.6.10/sound/oss/dm646x/audio_controller.c
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm646x/audio_controller.c
++++ linux-2.6.10/sound/oss/dm646x/audio_controller.c
+@@ -493,8 +493,9 @@ static int audio_ctlr_write(struct file 
+ 
+ 			s->pending_frags++;
+ 			s->active = 1;
+-
++			atomic_set(&s->in_write_path, 1);
+ 			audio_process_dma(s);
++			atomic_set(&s->in_write_path, 0);
+ 		}
+ 
+ 	}
+Index: linux-2.6.10/sound/oss/dm646x/audio_controller.h
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm646x/audio_controller.h
++++ linux-2.6.10/sound/oss/dm646x/audio_controller.h
+@@ -81,7 +81,7 @@ typedef struct {
+ 					    audio_ctrl_open */
+     atomic_t            playing_null;
+     s32                 null_lch;
+-    atomic_t            syncing;
++    atomic_t            in_write_path;
+ } audio_stream_t;
+ 
+ /* State structure for one opened instance */
+Index: linux-2.6.10/sound/oss/dm646x/davinci-audio-aic32.c
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm646x/davinci-audio-aic32.c
++++ linux-2.6.10/sound/oss/dm646x/davinci-audio-aic32.c
+@@ -713,7 +713,7 @@ int davinci_set_samplerate(long sample_r
+ 	/* If PLL is to be used for generation of Fsref
+ 	   Generate the Fsref using the PLL */
+ 
+-	if ((reg_info[count].Fsref == 96000) |
++	if ((reg_info[count].Fsref == 96000) ||
+ 	    (reg_info[count].Fsref == 48000)) {
+ 		    /* For MCLK = 27 MHz and to get Fsref = 48kHz
+ 		       Fsref = (MCLK * k * R)/(2048 * p);
+@@ -726,7 +726,7 @@ int davinci_set_samplerate(long sample_r
+ 	    audio_aic32_write(REGISTER_ADDR5, 0x2C);	/* D-value 8-MSB's */
+ 	    audio_aic32_write(REGISTER_ADDR6, 0x01);	/* D-value 6-LSB's */
+ 	} else if ((reg_info[count].Fsref == 88200)
+-		   | (reg_info[count].Fsref == 44100)) {
++		   || (reg_info[count].Fsref == 44100)) {
+ 
+ 		    /* MCLK = 27 MHz and to get Fsref = 44.1kHz
+ 		       Fsref = (MCLK * k * R)/(2048 * p);
+Index: linux-2.6.10/sound/oss/dm646x/davinci-audio-dma-intfc.c
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm646x/davinci-audio-dma-intfc.c
++++ linux-2.6.10/sound/oss/dm646x/davinci-audio-dma-intfc.c
+@@ -280,7 +280,6 @@ EXPORT_SYMBOL(audio_discard_buf);
+  *
+  ******************************************************************************/
+ 
+-	/* FIXME: Move */
+ #define NULL_FRAGSIZE (1024)
+ static char null_buffer[NULL_FRAGSIZE];
+ 
+@@ -291,6 +290,7 @@ int davinci_request_sound_dma(int device
+ 	int *chan = NULL;
+ 	int tcc;
+ 	audio_stream_t *stream = (audio_stream_t *)data;
++	unsigned long null_buffer_phys = virt_to_phys((void *)null_buffer);
+ 	unsigned long dma_addr;
+ 	edmacc_paramentry_regs temp;
+ 
+@@ -379,7 +379,7 @@ int davinci_request_sound_dma(int device
+ 	    davinci_dma_link_lch(stream->null_lch, stream->null_lch);
+ 	    dma_addr = get_tx_dma_dest_address (stream->device_instance);
+ 	    audio_set_dma_params_play (stream->null_lch
+-				       , (dma_addr_t)null_buffer,
++				       , (dma_addr_t)null_buffer_phys,
+ 				       NULL_FRAGSIZE, dma_addr);
+ 
+ 		    /* Disable interrupts for the null buffer */
+@@ -642,9 +642,7 @@ int audio_sync(struct file *file)
+ 
+ 		s->pending_frags++;
+ 
+-		atomic_set(&s->syncing, 1);
+ 		audio_process_dma(s);
+-		atomic_set(&s->syncing, 0);
+ 		local_irq_restore(flags);
+ 	}
+ 
+@@ -895,12 +893,14 @@ int audio_start_dma_chain(audio_stream_t
+ 		    local_irq_restore(flags);
+ 	}
+ 
+-	if (s->input_or_output == FMODE_WRITE && atomic_read(&s->playing_null)
+-	    == 1) {
+-	    edmacc_paramentry_regs temp;
+-	    davinci_get_dma_params(channel, &temp);
+-	    davinci_set_dma_params(s->master_ch, &temp);
+-	    atomic_set(&s->playing_null, 0);
++	if (s->input_or_output == FMODE_WRITE) {
++		if (atomic_dec_and_test(&s->playing_null)) {
++			edmacc_paramentry_regs temp;
++			davinci_get_dma_params(channel, &temp);
++			davinci_set_dma_params(s->master_ch, &temp);
++		} else {
++			atomic_inc(&s->playing_null); /* Reset */
++		}
+ 	}
+ 
+ 	/* else the dma itself will progress forward with out our help */
+@@ -948,11 +948,11 @@ static int davinci_start_sound_dma(audio
+ 	}
+ 	AUDIO_INCREMENT_TAIL(s);
+ 
+-	/* This is done to avoid the noise that would be generated during the
+-	   SPDIF loopback app. */
+-	if ( s->dma_q_count >= NUMBER_OF_CHANNELS_TO_LINK) {
+-		ret = audio_start_dma_chain(s);
+-	} else if (is_dit_enabled (s->device_instance) != 1) {
++	if (atomic_dec_and_test(&s->in_write_path)) {
++		if ( s->dma_q_count >= NUMBER_OF_CHANNELS_TO_LINK) {
++			ret = audio_start_dma_chain(s);
++		}
++	} else {
+ 		ret = audio_start_dma_chain(s);
+ 	}
+ 
+@@ -1017,11 +1017,14 @@ static void sound_dma_irq_handler(int so
+ 	FN_IN;
+ 
+ 	if (ch_status == DMA_COMPLETE) {
+-
+-	    if (unlikely(s->input_or_output == FMODE_WRITE &&
+-			 atomic_read(&s->playing_null) == 1)) {
+-		return;
+-	    }
++		/* Very unlikely as we would have disabled the interrupts while
++		   playing the null buffer */
++		if (unlikely(s->input_or_output == FMODE_WRITE)) {
++			if (atomic_dec_and_test(&s->playing_null)) {
++				atomic_inc(&s->playing_null);
++				return;
++			}
++		}
+ 
+ #ifdef IRQ_TRACE
+ 		xyz[h++] = '0' + sound_curr_lch;
+Index: linux-2.6.10/sound/oss/dm644x/davinci-audio-aic33.c
+===================================================================
+--- linux-2.6.10.orig/sound/oss/dm644x/davinci-audio-aic33.c
++++ linux-2.6.10/sound/oss/dm644x/davinci-audio-aic33.c
+@@ -694,7 +694,7 @@ int davinci_set_samplerate(long sample_r
+ 	/*Enable the PLL | Q-value | P-value */
+ 	audio_aic33_write(REGISTER_ADDR3, PLL_ENABLE | 0x10 | 0x02);
+ 
+-	if ((reg_info[count].Fsref == 96000) |
++	if ((reg_info[count].Fsref == 96000) ||
+ 	    (reg_info[count].Fsref == 48000)) {
+ 		/*
+ 		 * For MCLK = 22.5792 MHz and to get Fsref = 48kHz
+@@ -729,7 +729,7 @@ int davinci_set_samplerate(long sample_r
+ 		default:
+ 			printk(KERN_ERR "unknown audio codec frequency \n");
+ 		}
+-	} else if ((reg_info[count].Fsref == 88200) |
++	} else if ((reg_info[count].Fsref == 88200) ||
+ 		   (reg_info[count].Fsref == 44100)) {
+ 		/*
+ 		 * MCLK = 22.5792 MHz and to get Fsref = 44.1kHz
+Index: linux-2.6.10/mvl_patches/pro-1686.c
+===================================================================
+--- /dev/null
++++ linux-2.6.10/mvl_patches/pro-1686.c
+@@ -0,0 +1,16 @@
++/*
++ * Author: MontaVista Software, Inc. <source@mvista.com>
++ *
++ * 2008 (c) MontaVista Software, Inc. This file is licensed under
++ * the terms of the GNU General Public License version 2. This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++#include <linux/init.h>
++#include <linux/mvl_patch.h>
++
++static __init int regpatch(void)
++{
++        return mvl_register_patch(1686);
++}
++module_init(regpatch);
+EOF
+
+    rv=0
+    cat /tmp/mvl_patch_$$
+    if [ "$?" != "0" ]; then
+	# Patch had a hard error, return 2
+	rv=2
+    elif grep '^Hunk' ${TMPFILE}; then
+	rv=1
+    fi
+
+    rm -f ${TMPFILE}
+    return $rv
+}
+
+function options() {
+    echo "Options are:"
+    echo "  --force-unsupported - Force the patch to be applied even if the"
+    echo "      patch is out of order or the current kernel is unsupported."
+    echo "      Use of this option is strongly discouraged."
+    echo "  --force-apply-fuzz - If the patch has fuzz, go ahead and apply"
+    echo "      it anyway.  This can occur if the patch is applied to an"
+    echo "      unsupported kernel or applied out of order or if you have"
+    echo "      made your own modifications to the kernel.  Use with"
+    echo "      caution."
+    echo "  --remove - Remove the patch"
+}
+
+
+function checkpatchnum() {
+    local level;
+
+    if [ ! -e ${1} ]; then
+	echo "${1} does not exist, make sure you are in the kernel" 1>&2
+	echo "base directory" 1>&2
+	exit 1;
+    fi
+
+    # Extract the current patch number from the lsp info file.
+    level=`grep '#define LSP_.*PATCH_LEVEL' ${1} | sed 's/^.*\"\\(.*\\)\".*\$/\\1/'`
+    if [ "a$level" = "a" ]; then
+	echo "No patch level defined in ${1}, are you sure this is" 1>&2
+	echo "a valid MVL kernel LSP?" 1>&2
+	exit 1;
+    fi
+
+    expr $level + 0 >/dev/null 2>&1
+    isnum=$?
+
+    # Check if the kernel is supported
+    if [ "$level" = "unsupported" ]; then
+	echo "**Current kernel is unsupported by MontaVista due to patches"
+	echo "  begin applied out of order."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  Application is forced, applying patch anyway"
+	    unsupported=t
+	    fix_patch_level=f
+	else
+	    echo "  Patch application aborted.  Use --force-unsupported to"
+	    echo "  force the patch to be applied, but the kernel will not"
+	    echo "  be supported by MontaVista."
+	    exit 1;
+	fi
+
+    # Check the patch number from the lspinfo file to make sure it is
+    # a valid number
+    elif [ $isnum = 2 ]; then
+	echo "**Patch level from ${1} was not a valid number, " 1>&2
+	echo "  are you sure this is a valid MVL kernel LSP?" 1>&2
+	exit 1;
+
+    # Check that this is the right patch number to be applied.
+    elif [ `expr $level $3` ${4} ${2} ]; then
+	echo "**Application of this patch is out of order and will cause the"
+	echo "  kernel to be unsupported by MontaVista."
+	if [ $force_unsupported == 't' ]; then
+	    echo "  application is forced, applying patch anyway"
+	    unsupported=t
+	else
+	    echo "  Patch application aborted.  Please get all the patches in"
+	    echo "  proper order from MontaVista Zone and apply them in order"
+	    echo "  If you really want to apply this patch, use"
+	    echo "  --force-unsupported to force the patch to be applied, but"
+	    echo "  the kernel will not be supported by MontaVista."
+	    exit 1;
+	fi
+    fi
+}
+
+#
+# Update the patch level in the file.  Note that we use patch to do
+# this.  Certain weak version control systems don't take kindly to
+# arbitrary changes directly to files, but do have a special version
+# of "patch" that understands this.
+#
+function setpatchnum() {
+    sed "s/^#define LSP_\(.*\)PATCH_LEVEL[ \t*]\"[0-9]*\".*$/#define LSP_\1PATCH_LEVEL \"${2}\"/" <${1} >/tmp/$$.tmp1
+    diff -u ${1} /tmp/$$.tmp1 >/tmp/$$.tmp2
+    rm /tmp/$$.tmp1
+    sed "s/^+++ \/tmp\/$$.tmp1/+++ include\/linux\/lsppatchlevel.h/" </tmp/$$.tmp2 >/tmp/$$.tmp1
+    rm /tmp/$$.tmp2
+    patch -p0 </tmp/$$.tmp1
+    rm /tmp/$$.tmp1
+}
+
+force_unsupported=f
+force_apply_fuzz=""
+unsupported=f
+fix_patch_level=t
+reverse=f
+common_patchnum_diff='+ 1'
+common_patchnum=$PATCHNUM
+patch_extraopts=''
+
+# Extract command line parameters.
+while [ $# -gt 0 ]; do
+    if [ "a$1" == 'a--force-unsupported' ]; then
+	force_unsupported=t
+    elif [ "a$1" == 'a--force-apply-fuzz' ]; then
+	force_apply_fuzz=y
+    elif [ "a$1" == 'a--remove' ]; then
+	reverse=t
+	common_patchnum_diff=''
+	common_patchnum=`expr $PATCHNUM - 1`
+	patch_extraopts='--reverse'
+    else
+	echo "'$1' is an invalid command line parameter."
+	options
+	exit 1
+    fi
+    shift
+done
+
+echo "Checking patch level"
+checkpatchnum ${LSPINFO} ${PATCHNUM} "${common_patchnum_diff}" "-ne"
+
+if ! dopatch -p1 --dry-run --force $patch_extraopts; then
+    if [ $? = 2 ]; then
+	echo -n "**Patch had errors, application aborted" 1>&2
+	exit 1;
+    fi
+
+    # Patch has warnings
+    clean_apply=${force_apply_fuzz}
+    while [ "a$clean_apply" != 'ay' -a "a$clean_apply" != 'an' ]; do
+	echo -n "**Patch did not apply cleanly.  Do you still want to apply? (y/n) > "
+	read clean_apply
+	clean_apply=`echo "$clean_apply" | tr '[:upper:]' '[:lower:]'`
+    done
+    if [ $clean_apply = 'n' ]; then
+	exit 1;
+    fi
+fi
+
+dopatch -p1 --force $patch_extraopts
+
+if [ $fix_patch_level = 't' ]; then 
+    if [ $unsupported = 't' ]; then
+	common_patchnum="unsupported"
+    fi
+
+    setpatchnum ${LSPINFO} ${common_patchnum}
+fi
+
+# Move the patch file into the mvl_patches directory if we are not reversing
+if [ $reverse != 't' ]; then 
+    if echo $0 | grep '/' >/dev/null; then
+	# Filename is a path, either absolute or from the current directory.
+	srcfile=$0
+    else
+	# Filename is from the path
+	for i in `echo $PATH | tr ':;' '  '`; do
+	    if [ -e ${i}/$0 ]; then
+		srcfile=${i}/$0
+	    fi
+	done
+    fi
+
+    fname=`basename ${srcfile}`
+    diff -uN mvl_patches/${fname} ${srcfile} | (cd mvl_patches; patch)
+fi
+
